@@ -85,6 +85,10 @@ class MaskedPipelineTests(unittest.TestCase):
         return struct.pack("=IfhBB", index, filtersc, numerator, status, action)
 
     @staticmethod
+    def postfilter_record(index, filtersc, numerator, status, action, vfsc):
+        return struct.pack("=IfhBBf", index, filtersc, numerator, status, action, vfsc)
+
+    @staticmethod
     def table_bytes(hits, format):
         output = io.BytesIO()
         hits.write(output, format=format, header=True)
@@ -359,6 +363,131 @@ class MaskedPipelineTests(unittest.TestCase):
             offsets,
         )
         self.assert_exact_hits(expected, actual)
+
+    def test_all_cpu_postfilter_records_match_sparse_candidate_pipeline(self):
+        hmm = self.hmms[0]
+        offsets = self.residue_offsets(self.sequences)
+        indexes = (1, 7, len(self.sequences) - 1)
+        records = b"".join(
+            self.postfilter_record(index, math.nan, 0, 173, 0, math.nan)
+            for index in indexes
+        )
+        expected = _pipeline._search_hmm_candidates_bound(
+            self.pipeline(),
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            self.candidates(*indexes),
+            offsets,
+        )
+        actual = _pipeline._search_hmm_postfilter_bound(
+            self.pipeline(),
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            records,
+            offsets,
+        )
+        self.assert_exact_hits(expected, actual)
+
+    def test_full_msv_reject_postfilter_row_is_safely_accounted(self):
+        offsets = self.residue_offsets(self.sequences)
+        record = self.postfilter_record(7, math.nan, -12, 0, 1, math.nan)
+        expected = _pipeline._search_hmm_candidates_bound(
+            self.pipeline(),
+            self.hmms[0],
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            self.candidates(),
+            offsets,
+        )
+        actual = _pipeline._search_hmm_postfilter_bound(
+            self.pipeline(),
+            self.hmms[0],
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            record,
+            offsets,
+        )
+        self.assert_exact_hits(expected, actual)
+
+    def test_direct_postfilter_symbol_failure_precedes_pipeline_mutation(self):
+        if _pipeline._filter_scores_seam_available():
+            self.skipTest("private filter-score seam is available")
+        offsets = self.residue_offsets(self.sequences)
+        pipeline = self.pipeline()
+        direct = self.postfilter_record(0, 0.0, 0, 0, 1, 0.0)
+
+        with self.assertRaisesRegex(RuntimeError, "p7_PipelineFromFilterScores"):
+            _pipeline._search_hmm_postfilter_bound(
+                pipeline,
+                self.hmms[0],
+                self.optimized_profiles[0].copy(),
+                self.sequences,
+                direct,
+                offsets,
+            )
+
+        hits = _pipeline._search_hmm_postfilter_bound(
+            pipeline,
+            self.hmms[0],
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            b"",
+            offsets,
+        )
+        self.assertEqual(hits.searched_models, 1)
+
+    def test_invalid_postfilter_rows_fail_before_pipeline_mutation(self):
+        offsets = self.residue_offsets(self.sequences)
+
+        def cpu(index):
+            return self.postfilter_record(index, math.nan, 0, 255, 0, math.nan)
+
+        invalid_rows = (
+            (b"\0", "trailing bytes"),
+            (cpu(0) + cpu(0), "strictly increasing"),
+            (cpu(1) + cpu(0), "strictly increasing"),
+            (cpu(len(self.sequences)), "out of range"),
+            (self.postfilter_record(0, 0.0, 0, 0, 3, 0.0), "unknown.*action"),
+            (
+                self.postfilter_record(0, 0.0, 0, 19, 1, 0.0),
+                "requires eslOK",
+            ),
+            (
+                self.postfilter_record(0, math.nan, 0, 0, 2, math.nan),
+                "finite filter",
+            ),
+            (
+                self.postfilter_record(0, 0.0, 0, 0, 1, math.nan),
+                r"finite or \+infinity",
+            ),
+            (
+                self.postfilter_record(0, 0.0, 0, 16, 1, math.inf),
+                "requires eslOK",
+            ),
+        )
+        for records, message in invalid_rows:
+            with self.subTest(message=message):
+                pipeline = self.pipeline()
+                with self.assertRaisesRegex((IndexError, ValueError), message):
+                    _pipeline._search_hmm_postfilter_bound(
+                        pipeline,
+                        self.hmms[0],
+                        self.optimized_profiles[0].copy(),
+                        self.sequences,
+                        records,
+                        offsets,
+                    )
+                hits = _pipeline._search_hmm_postfilter_bound(
+                    pipeline,
+                    self.hmms[0],
+                    self.optimized_profiles[0].copy(),
+                    self.sequences,
+                    b"",
+                    offsets,
+                )
+                self.assertEqual(hits.searched_models, 1)
 
     def test_direct_bias_symbol_failure_precedes_pipeline_mutation(self):
         if _pipeline._filter_scores_seam_available():

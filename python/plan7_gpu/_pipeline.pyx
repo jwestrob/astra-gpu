@@ -9,7 +9,7 @@ loading it against an unsupported private ABI.
 """
 
 from libc.stddef cimport size_t
-from libc.math cimport isfinite
+from libc.math cimport isfinite, isnan
 from libc.stdint cimport int16_t, uint8_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcpy
@@ -91,6 +91,8 @@ cdef enum:
     BIAS_DEFINITE_REJECT = 1
     BIAS_DEFINITE_PASS = 2
     SSV_OK = 0
+    SSV_ENORESULT = 19
+    P7_VIT_EXTERNAL = 1
     P7_VIT_CPU = 2
 
 
@@ -100,6 +102,15 @@ cdef struct _bias_result:
     int16_t ssv_numerator
     uint8_t ssv_status
     uint8_t action
+
+
+cdef struct _postfilter_result:
+    uint32_t sequence_index
+    float filtersc
+    int16_t msv_numerator
+    uint8_t msv_status
+    uint8_t action
+    float vfsc
 
 
 ctypedef int (*_pipeline_from_filter_scores_f)(
@@ -398,6 +409,117 @@ cdef int _search_loop_bias(
     return 0
 
 
+cdef int _search_loop_postfilter(
+    P7_PIPELINE* pli,
+    P7_OPROFILE* om,
+    P7_BG* bg,
+    const ESL_SQ** sq,
+    size_t n_targets,
+    const uint8_t* record_bytes,
+    size_t record_count,
+    const uint64_t* residue_offsets,
+    P7_TOPHITS* th,
+    _pipeline_from_filter_scores_f filter_scores_seam,
+) except 1 nogil:
+    cdef _postfilter_result record
+    cdef float usc
+    cdef int status
+    cdef size_t cursor
+    cdef size_t previous_end = 0
+    cdef size_t target_end
+    cdef size_t t
+
+    status = p7_pli_NewModel(pli, om, bg)
+    if status == eslEINVAL:
+        Pipeline._missing_cutoffs(pli, om)
+    elif status != eslOK:
+        raise UnexpectedError(status, "p7_pli_NewModel")
+
+    for cursor in range(record_count):
+        memcpy(
+            &record,
+            record_bytes + cursor * sizeof(_postfilter_result),
+            sizeof(_postfilter_result),
+        )
+        t = record.sequence_index
+        target_end = t + 1
+
+        if not pli.long_targets:
+            pli.nseqs += target_end - previous_end
+            if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
+                pli.Z = pli.nseqs
+        pli.nres += residue_offsets[target_end] - residue_offsets[previous_end]
+
+        if cursor == 0 and t != 0:
+            p7_pipeline_Reuse(pli)
+
+        status = p7_bg_SetLength(bg, sq[t].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_bg_SetLength")
+        status = p7_oprofile_ReconfigLength(om, sq[t].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+
+        if record.action == BIAS_CPU_REQUIRED:
+            status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
+        elif isnan(record.filtersc):
+            # A fallback full-MSV score can reject at F1 after the public SSV
+            # path conservatively retained it. Its row is accounted but does
+            # not enter the pipeline continuation.
+            status = eslOK
+        else:
+            usc = <float> record.msv_numerator
+            usc = usc / om.scale_b
+            usc = usc - <float> 3.0
+            status = filter_scores_seam(
+                pli,
+                om,
+                bg,
+                sq[t],
+                NULL,
+                th,
+                usc,
+                record.filtersc,
+                P7_VIT_EXTERNAL,
+                record.vfsc,
+            )
+        if status == eslEINVAL:
+            Pipeline._missing_cutoffs(pli, om)
+        elif status == eslERANGE:
+            raise OverflowError(
+                "numerical overflow in the optimized vector implementation"
+            )
+        elif status != eslOK:
+            raise UnexpectedError(status, "p7_Pipeline")
+
+        p7_pipeline_Reuse(pli)
+        previous_end = target_end
+
+    if previous_end < n_targets:
+        if not pli.long_targets:
+            pli.nseqs += n_targets - previous_end
+            if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
+                pli.Z = pli.nseqs
+        pli.nres += residue_offsets[n_targets] - residue_offsets[previous_end]
+
+    if (
+        n_targets != 0
+        and (
+            record_count == 0
+            or record.sequence_index != n_targets - 1
+        )
+    ):
+        status = p7_bg_SetLength(bg, sq[n_targets - 1].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_bg_SetLength")
+        status = p7_oprofile_ReconfigLength(om, sq[n_targets - 1].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+        p7_pipeline_Reuse(pli)
+
+    return 0
+
+
 cdef void _validate_inputs(
     Pipeline pipeline,
     HMM query,
@@ -495,6 +617,47 @@ cdef TopHits _search_bias_validated(
         pipeline._pli.mode = p7_SEARCH_SEQS
         pipeline._pli.nseqs = 0
         _search_loop_bias(
+            pipeline._pli,
+            optimized_profile._om,
+            pipeline.background._bg,
+            <const ESL_SQ**> sequences._refs,
+            sequences._length,
+            record_ptr,
+            record_count,
+            residue_offsets,
+            hits._th,
+            filter_scores_seam,
+        )
+        hits._sort_by_key()
+        hits._threshold(pipeline)
+
+    hits._query = query
+    hits._empty = False
+    return hits
+
+
+cdef TopHits _search_postfilter_validated(
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+    const uint64_t* residue_offsets,
+    _pipeline_from_filter_scores_f filter_scores_seam,
+):
+    cdef const uint8_t* record_ptr = NULL
+    cdef size_t record_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+    cdef TopHits hits = TopHits(query)
+
+    if postfilter_records.shape[0] != 0:
+        record_ptr = &postfilter_records[0]
+
+    with nogil:
+        pipeline._pli.mode = p7_SEARCH_SEQS
+        pipeline._pli.nseqs = 0
+        _search_loop_postfilter(
             pipeline._pli,
             optimized_profile._om,
             pipeline.background._bg,
@@ -615,6 +778,131 @@ cdef void _validate_bias_residue_offsets(
             &record,
             &bias_records[cursor * sizeof(_bias_result)],
             sizeof(_bias_result),
+        )
+        target = record.sequence_index
+        target_end = target + 1
+        if residue_offsets[target_end] < residue_offsets[previous_end]:
+            raise ValueError("target residue prefix is not monotone")
+        if (
+            residue_offsets[target_end] - residue_offsets[target]
+            != <uint64_t> sequences._refs[target].n
+        ):
+            raise ValueError("target residue prefix differs from target length")
+        previous_end = target_end
+    if residue_offsets[sequences._length] < residue_offsets[previous_end]:
+        raise ValueError("target residue prefix is not monotone")
+    if sequences._length != 0 and (
+        residue_offsets[sequences._length]
+        - residue_offsets[sequences._length - 1]
+        != <uint64_t> sequences._refs[sequences._length - 1].n
+    ):
+        raise ValueError("target residue prefix differs from final target length")
+
+
+cdef bint _validate_postfilter_records(
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+) except -1:
+    cdef _postfilter_result record
+    cdef _float_bits vfsc_bits
+    cdef bint has_direct = False
+    cdef size_t cursor
+    cdef size_t record_count
+    cdef uint32_t previous = 0
+
+    if sizeof(_postfilter_result) != 16:
+        raise RuntimeError("native post-filter result ABI is not 16 bytes")
+    if <size_t> postfilter_records.shape[0] % sizeof(_postfilter_result) != 0:
+        raise ValueError("post-filter result row has trailing bytes")
+    record_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+
+    for cursor in range(record_count):
+        memcpy(
+            &record,
+            &postfilter_records[cursor * sizeof(_postfilter_result)],
+            sizeof(_postfilter_result),
+        )
+        if record.sequence_index >= sequences._length:
+            raise IndexError(
+                f"post-filter result sequence index out of range: "
+                f"{record.sequence_index}"
+            )
+        if cursor != 0 and record.sequence_index <= previous:
+            raise ValueError(
+                "post-filter result sequence indexes must be strictly "
+                "increasing and unique"
+            )
+        if record.action == BIAS_CPU_REQUIRED:
+            pass
+        elif (
+            record.action == BIAS_DEFINITE_REJECT
+            and record.msv_status == SSV_OK
+            and isnan(record.filtersc)
+            and isnan(record.vfsc)
+        ):
+            pass
+        elif (
+            record.action == BIAS_DEFINITE_REJECT
+            or record.action == BIAS_DEFINITE_PASS
+        ):
+            if record.msv_status != SSV_OK:
+                raise ValueError(
+                    "direct post-filter result requires eslOK MSV status"
+                )
+            if not isfinite(record.filtersc):
+                raise ValueError(
+                    "direct post-filter result requires finite filter score"
+                )
+            vfsc_bits.value = record.vfsc
+            if not isfinite(record.vfsc) and vfsc_bits.bits != 0x7f800000:
+                raise ValueError(
+                    "direct post-filter result requires finite or +infinity "
+                    "Viterbi score"
+                )
+            if sequences._refs[record.sequence_index].n == 0:
+                raise ValueError("empty target requires CPU post-filter fallback")
+            has_direct = True
+        else:
+            raise ValueError(f"unknown post-filter result action: {record.action}")
+        previous = record.sequence_index
+
+    if has_direct and (
+        not isfinite(optimized_profile._om.scale_b)
+        or optimized_profile._om.scale_b <= 0.0
+    ):
+        raise ValueError(
+            "direct post-filter results require a positive finite SSV scale"
+        )
+    return has_direct
+
+
+cdef void _validate_postfilter_residue_offsets(
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+    const uint64_t[::1] residue_offsets,
+) except *:
+    cdef _postfilter_result record
+    cdef size_t cursor
+    cdef size_t record_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+    cdef size_t target
+    cdef size_t target_end
+    cdef size_t previous_end = 0
+
+    if residue_offsets.shape[0] != sequences._length + 1:
+        raise ValueError("target residue-prefix length differs from target count")
+    if residue_offsets[0] != 0:
+        raise ValueError("target residue prefix must start at zero")
+
+    for cursor in range(record_count):
+        memcpy(
+            &record,
+            &postfilter_records[cursor * sizeof(_postfilter_result)],
+            sizeof(_postfilter_result),
         )
         target = record.sequence_index
         target_end = target + 1
@@ -780,6 +1068,48 @@ def _search_hmm_bias_bound(
         optimized_profile,
         sequences,
         bias_records,
+        &residue_offsets[0],
+        filter_scores_seam,
+    )
+
+
+def _search_hmm_postfilter_bound(
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+    const uint64_t[::1] residue_offsets,
+):
+    """Consume one provenance-bound row of exact CUDA post-filter records."""
+    cdef bint has_direct
+    cdef _pipeline_from_filter_scores_f filter_scores_seam = NULL
+
+    if type(pipeline) is not _pyhmmer.plan7.Pipeline:
+        raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+    _validate_inputs(pipeline, query, optimized_profile, sequences, False)
+    has_direct = _validate_postfilter_records(
+        optimized_profile, sequences, postfilter_records
+    )
+    _validate_postfilter_residue_offsets(
+        sequences, postfilter_records, residue_offsets
+    )
+
+    if has_direct:
+        with nogil:
+            filter_scores_seam = _resolve_filter_scores_seam()
+        if filter_scores_seam == NULL:
+            raise RuntimeError(
+                "direct post-filter records require the project-private "
+                "p7_PipelineFromFilterScores HMMER seam"
+            )
+
+    return _search_postfilter_validated(
+        pipeline,
+        query,
+        optimized_profile,
+        sequences,
+        postfilter_records,
         &residue_offsets[0],
         filter_scores_seam,
     )
