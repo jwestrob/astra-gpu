@@ -1,7 +1,10 @@
 import importlib.util
 import io
+import json
 import math
+import subprocess
 import struct
+import sys
 import tempfile
 import unittest
 from array import array
@@ -451,6 +454,61 @@ class MaskedPipelineTests(unittest.TestCase):
             self.assertTrue(_pipeline._filter_and_forward_scores_seam_available())
         else:
             self.assertFalse(_pipeline._filter_and_forward_scores_seam_available())
+
+    def test_continuation_seam_cache_handles_concurrent_first_use(self):
+        extension = sorted(PACKAGE_DIR.glob("_pipeline*.so"))[0]
+        code = r"""
+import importlib.util
+import json
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
+spec = importlib.util.spec_from_file_location("_pipeline", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+before = module._continuation_seam_cache_info()
+assert all(not state["resolved"] for state in before.values()), before
+
+barrier = Barrier(32)
+def first_use(index):
+    barrier.wait()
+    if index % 2:
+        return "filter", module._filter_scores_seam_available()
+    return "forward", module._filter_and_forward_scores_seam_available()
+
+with ThreadPoolExecutor(max_workers=32) as executor:
+    results = list(executor.map(first_use, range(32)))
+after_first = module._continuation_seam_cache_info()
+for _ in range(1000):
+    assert module._filter_scores_seam_available() == after_first["filter"]["available"]
+    assert module._filter_and_forward_scores_seam_available() == after_first["forward"]["available"]
+after_repeat = module._continuation_seam_cache_info()
+assert after_repeat == after_first, (after_first, after_repeat)
+assert all(value == after_first[name]["available"] for name, value in results)
+for state in after_repeat.values():
+    assert state["resolved"]
+    assert state["resolutions"] == 1
+    assert state["dlopen_calls"] == 1
+    assert state["dlclose_calls"] == 1
+    assert state["same_dso"] == state["available"]
+print(json.dumps(after_repeat, sort_keys=True))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", code, str(extension)],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        child = json.loads(completed.stdout)
+        self.assertEqual(
+            child["filter"]["available"],
+            _pipeline._filter_scores_seam_available(),
+        )
+        self.assertEqual(
+            child["forward"]["available"],
+            _pipeline._filter_and_forward_scores_seam_available(),
+        )
 
     def test_forward_selector_keeps_exact_f2_survivors(self):
         target = 1
@@ -933,6 +991,9 @@ class MaskedPipelineTests(unittest.TestCase):
                 state = actual.__getstate__()["pipeline"]
                 saw_post_f2 = saw_post_f2 or state["n_past_vit"] > 0
         self.assertTrue(saw_post_f2)
+        cache = _pipeline._continuation_seam_cache_info()["filter"]
+        self.assertEqual(cache["resolutions"], 1)
+        self.assertEqual(cache["dlopen_calls"], cache["dlclose_calls"])
 
     def test_candidate_masks_preserve_auto_and_explicit_search_spaces(self):
         hmm = self.hmms[0]

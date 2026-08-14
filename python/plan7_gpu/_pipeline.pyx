@@ -46,6 +46,7 @@ from pyhmmer.errors import AlphabetMismatch, UnexpectedError
 from array import array as _array
 import importlib.util as _importlib_util
 from pathlib import Path as _Path
+from threading import Lock as _Lock
 
 
 cdef extern from "dlfcn.h" nogil:
@@ -173,6 +174,22 @@ cdef union _double_bits:
     uint64_t bits
 
 
+cdef _pipeline_from_filter_scores_f _filter_scores_seam_cache = NULL
+cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam_cache = NULL
+cdef bint _filter_scores_seam_resolved = False
+cdef bint _forward_scores_seam_resolved = False
+cdef bint _filter_scores_same_dso = False
+cdef bint _forward_scores_same_dso = False
+cdef uint64_t _filter_scores_resolutions = 0
+cdef uint64_t _forward_scores_resolutions = 0
+cdef uint64_t _filter_scores_dlopen_calls = 0
+cdef uint64_t _forward_scores_dlopen_calls = 0
+cdef uint64_t _filter_scores_dlclose_calls = 0
+cdef uint64_t _forward_scores_dlclose_calls = 0
+
+_continuation_seam_resolve_lock = _Lock()
+
+
 def _bias_filter_score_bits(
     Pipeline pipeline,
     OptimizedProfile optimized_profile,
@@ -224,6 +241,9 @@ def _oprofiles_equal_hmmer(
 
 
 cdef _pipeline_from_filter_scores_f _resolve_filter_scores_seam() noexcept nogil:
+    global _filter_scores_dlopen_calls
+    global _filter_scores_dlclose_calls
+    global _filter_scores_same_dso
     cdef Dl_info info
     cdef Dl_info symbol_info
     cdef void* handle
@@ -231,6 +251,7 @@ cdef _pipeline_from_filter_scores_f _resolve_filter_scores_seam() noexcept nogil
 
     if dladdr(<const void*> p7_Pipeline, &info) == 0 or info.dli_fname == NULL:
         return NULL
+    _filter_scores_dlopen_calls += 1
     handle = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_NOW)
     if handle == NULL:
         return NULL
@@ -240,21 +261,38 @@ cdef _pipeline_from_filter_scores_f _resolve_filter_scores_seam() noexcept nogil
         or dladdr(symbol, &symbol_info) == 0
         or symbol_info.dli_fbase != info.dli_fbase
     ):
+        _filter_scores_dlclose_calls += 1
         dlclose(handle)
         return NULL
+    _filter_scores_same_dso = True
+    _filter_scores_dlclose_calls += 1
     dlclose(handle)
     return <_pipeline_from_filter_scores_f> symbol
 
 
+cdef _pipeline_from_filter_scores_f _cached_filter_scores_seam():
+    global _filter_scores_resolutions
+    global _filter_scores_seam_cache
+    global _filter_scores_seam_resolved
+
+    if not _filter_scores_seam_resolved:
+        with _continuation_seam_resolve_lock:
+            if not _filter_scores_seam_resolved:
+                _filter_scores_resolutions += 1
+                _filter_scores_seam_cache = _resolve_filter_scores_seam()
+                _filter_scores_seam_resolved = True
+    return _filter_scores_seam_cache
+
+
 def _filter_scores_seam_available():
     """Return whether the project-private HMMER continuation seam is loaded."""
-    cdef _pipeline_from_filter_scores_f seam
-    with nogil:
-        seam = _resolve_filter_scores_seam()
-    return seam != NULL
+    return _cached_filter_scores_seam() != NULL
 
 
 cdef _pipeline_from_filter_and_forward_scores_f _resolve_filter_and_forward_scores_seam() noexcept nogil:
+    global _forward_scores_dlopen_calls
+    global _forward_scores_dlclose_calls
+    global _forward_scores_same_dso
     cdef Dl_info info
     cdef Dl_info symbol_info
     cdef void* handle
@@ -262,6 +300,7 @@ cdef _pipeline_from_filter_and_forward_scores_f _resolve_filter_and_forward_scor
 
     if dladdr(<const void*> p7_Pipeline, &info) == 0 or info.dli_fname == NULL:
         return NULL
+    _forward_scores_dlopen_calls += 1
     handle = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_NOW)
     if handle == NULL:
         return NULL
@@ -271,18 +310,56 @@ cdef _pipeline_from_filter_and_forward_scores_f _resolve_filter_and_forward_scor
         or dladdr(symbol, &symbol_info) == 0
         or symbol_info.dli_fbase != info.dli_fbase
     ):
+        _forward_scores_dlclose_calls += 1
         dlclose(handle)
         return NULL
+    _forward_scores_same_dso = True
+    _forward_scores_dlclose_calls += 1
     dlclose(handle)
     return <_pipeline_from_filter_and_forward_scores_f> symbol
 
 
+cdef _pipeline_from_filter_and_forward_scores_f _cached_filter_and_forward_scores_seam():
+    global _forward_scores_resolutions
+    global _forward_scores_seam_cache
+    global _forward_scores_seam_resolved
+
+    if not _forward_scores_seam_resolved:
+        with _continuation_seam_resolve_lock:
+            if not _forward_scores_seam_resolved:
+                _forward_scores_resolutions += 1
+                _forward_scores_seam_cache = (
+                    _resolve_filter_and_forward_scores_seam()
+                )
+                _forward_scores_seam_resolved = True
+    return _forward_scores_seam_cache
+
+
 def _filter_and_forward_scores_seam_available():
     """Return whether the exact external-Forward seam is loaded."""
-    cdef _pipeline_from_filter_and_forward_scores_f seam
-    with nogil:
-        seam = _resolve_filter_and_forward_scores_seam()
-    return seam != NULL
+    return _cached_filter_and_forward_scores_seam() != NULL
+
+
+def _continuation_seam_cache_info():
+    """Return private resolver state for concurrency and lifetime tests."""
+    return {
+        "filter": {
+            "resolved": bool(_filter_scores_seam_resolved),
+            "available": _filter_scores_seam_cache != NULL,
+            "same_dso": bool(_filter_scores_same_dso),
+            "resolutions": _filter_scores_resolutions,
+            "dlopen_calls": _filter_scores_dlopen_calls,
+            "dlclose_calls": _filter_scores_dlclose_calls,
+        },
+        "forward": {
+            "resolved": bool(_forward_scores_seam_resolved),
+            "available": _forward_scores_seam_cache != NULL,
+            "same_dso": bool(_forward_scores_same_dso),
+            "resolutions": _forward_scores_resolutions,
+            "dlopen_calls": _forward_scores_dlopen_calls,
+            "dlclose_calls": _forward_scores_dlclose_calls,
+        },
+    }
 
 
 def _select_forward_inputs_bound(
@@ -1707,8 +1784,7 @@ def _search_hmm_bias_bound(
     _validate_bias_residue_offsets(sequences, bias_records, residue_offsets)
 
     if has_direct:
-        with nogil:
-            filter_scores_seam = _resolve_filter_scores_seam()
+        filter_scores_seam = _cached_filter_scores_seam()
         if filter_scores_seam == NULL:
             raise RuntimeError(
                 "direct bias records require the project-private "
@@ -1749,8 +1825,7 @@ def _search_hmm_postfilter_bound(
     )
 
     if has_direct:
-        with nogil:
-            filter_scores_seam = _resolve_filter_scores_seam()
+        filter_scores_seam = _cached_filter_scores_seam()
         if filter_scores_seam == NULL:
             raise RuntimeError(
                 "direct post-filter records require the project-private "
@@ -1813,8 +1888,7 @@ def _search_hmm_postfilter_forward_bound(
     )
 
     if has_direct:
-        with nogil:
-            filter_scores_seam = _resolve_filter_scores_seam()
+        filter_scores_seam = _cached_filter_scores_seam()
         if filter_scores_seam == NULL:
             raise RuntimeError(
                 "direct post-filter records require the project-private "
@@ -1839,8 +1913,7 @@ def _search_hmm_postfilter_forward_bound(
             filter_scores_seam,
         )
 
-    with nogil:
-        forward_scores_seam = _resolve_filter_and_forward_scores_seam()
+    forward_scores_seam = _cached_filter_and_forward_scores_seam()
     if forward_scores_seam == NULL:
         return _search_postfilter_validated(
             pipeline,
