@@ -38,6 +38,14 @@ typedef struct plan7_postfilter_result {
 } plan7_postfilter_result;
 
 typedef struct plan7_viterbi_database plan7_viterbi_database;
+typedef struct plan7_postfilter_workspace plan7_postfilter_workspace;
+
+typedef struct plan7_postfilter_workspace_statistics {
+  uint64_t device_bytes;
+  uint64_t dp_capacity_bytes;
+  uint64_t growth_count;
+  uint64_t run_count;
+} plan7_postfilter_workspace_statistics;
 
 /* Profiles are retained by the Python owner for this object's lifetime. */
 int plan7_viterbi_database_create(const uintptr_t *profile_pointers,
@@ -64,8 +72,46 @@ int plan7_viterbi_database_matches_ssv(
   char *error,
   size_t error_size);
 
+int plan7_postfilter_workspace_create(plan7_postfilter_workspace **workspace,
+                                      char *error,
+                                      size_t error_size);
+
+int plan7_postfilter_workspace_destroy(plan7_postfilter_workspace **workspace,
+                                       char *error,
+                                       size_t error_size);
+
+int plan7_postfilter_workspace_get_statistics(
+  const plan7_postfilter_workspace *workspace,
+  plan7_postfilter_workspace_statistics *statistics,
+  char *error,
+  size_t error_size);
+
 /* Internal resident-buffer entry point used by plan7_ssv_sequence_batch. */
 int plan7_postfilter_candidates_device(
+  const plan7_viterbi_database *database,
+  const uint8_t *device_residues,
+  const uint64_t *device_sequence_offsets,
+  const uint64_t *host_sequence_lengths,
+  size_t sequence_count,
+  const float *device_null_scores,
+  const uint8_t *device_compact_scores,
+  const plan7_ssv_f1_profile *device_f1_profiles,
+  const uint8_t *device_tjb,
+  const float *device_length_logp,
+  const float *device_length_log1mp,
+  const plan7_bias_profile *device_bias_profiles,
+  const plan7_bias_candidate *device_candidates,
+  const plan7_bias_candidate *host_candidates,
+  plan7_bias_ssv_input *device_msv_inputs,
+  size_t candidate_count,
+  plan7_postfilter_result *host_results,
+  char *error,
+  size_t error_size);
+
+/* Serialized resident-workspace variant used by plan7_ssv_sequence_batch.
+ * The workspace and database must belong to the current CUDA device. */
+int plan7_postfilter_candidates_device_with_workspace(
+  plan7_postfilter_workspace *workspace,
   const plan7_viterbi_database *database,
   const uint8_t *device_residues,
   const uint64_t *device_sequence_offsets,

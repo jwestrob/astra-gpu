@@ -3,6 +3,7 @@ import math
 import platform
 import struct
 import sys
+import threading
 import unittest
 from array import array
 from pathlib import Path
@@ -64,6 +65,26 @@ def native_batch(sequences):
         residues.extend(memoryview(sequence.sequence).cast("B"))
         offsets.append(len(residues))
     return _native.SequenceBatch(residues, offsets, sequences[0].alphabet.Kp)
+
+
+def close_concurrently(value, worker_count=8):
+    barrier = threading.Barrier(worker_count)
+    failures = []
+
+    def worker():
+        try:
+            barrier.wait()
+            value.close()
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if failures:
+        raise failures[0]
 
 
 def bias_inputs(background, profiles, f1):
@@ -133,6 +154,56 @@ class CudaPostfilterTests(unittest.TestCase):
                     resident,
                 )
         return records, offsets
+
+    def test_workspace_reuses_high_water_and_closes_concurrently(self):
+        _, background, profile = load_profile("Thioesterase.hmm")
+        with pyhmmer.easel.SequenceFile(
+            PROTEINS, digital=True, alphabet=profile.alphabet
+        ) as sequence_file:
+            source = sequence_file.read_block()
+        sequences = [source[13], source[67], source[1992]]
+        packed = _pack_profiles([profile])
+        packed_bias, mu, lambda_ = bias_inputs(background, [profile], 0.02)
+        batch = native_batch(sequences)
+        with _native.ViterbiProfiles([profile]) as resident:
+            initial = batch.workspace_statistics
+            self.assertEqual(initial["postfilter_device_bytes"], 0)
+            arguments = (
+                *packed,
+                mu,
+                lambda_,
+                0.02,
+                packed_bias,
+                [profile],
+                resident,
+            )
+            first_records, first_offsets = batch.postfilter_candidates_many_csr_raw(
+                *arguments
+            )
+            high_water = batch.workspace_statistics
+            self.assertGreater(high_water["postfilter_device_bytes"], 0)
+            self.assertGreater(high_water["postfilter_dp_capacity_bytes"], 0)
+            self.assertEqual(high_water["postfilter_growth_count"], 9)
+            self.assertEqual(high_water["postfilter_run_count"], 1)
+
+            second_records, second_offsets = batch.postfilter_candidates_many_csr_raw(
+                *arguments
+            )
+            reused = batch.workspace_statistics
+            self.assertEqual(second_records, first_records)
+            self.assertEqual(list(second_offsets), list(first_offsets))
+            for key in (
+                "postfilter_device_bytes",
+                "postfilter_dp_capacity_bytes",
+                "postfilter_growth_count",
+            ):
+                self.assertEqual(reused[key], high_water[key])
+            self.assertEqual(reused["postfilter_run_count"], 2)
+
+        close_concurrently(batch)
+        self.assertTrue(batch.closed)
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            _ = batch.workspace_statistics
 
     def test_versioned_abi_and_direct_prefix(self):
         self.assertEqual(_native.POSTFILTER_RECORD_VERSION, 1)

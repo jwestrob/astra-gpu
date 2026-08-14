@@ -105,7 +105,7 @@ $(CYTHON_OBJ): $(CYTHON_CPP) cuda/ssv_cuda.h cuda/bias_cuda.h \
 		-I$(PYHMMER_INCLUDE)/libhmmer -c -o $@ $<
 
 $(CUDA_OBJ): cuda/ssv_cuda.cu cuda/ssv_cuda.h \
-	cuda/bias_cuda.h cuda/postfilter_cuda.h \
+	cuda/bias_cuda.h cuda/postfilter_cuda.h cuda/forward_cuda.h \
 	$(PYHMMER_EASEL_INCLUDE)/easel.h \
 	$(PYHMMER_EASEL_INCLUDE)/esl_gumbel.h
 	mkdir -p $(@D)

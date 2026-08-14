@@ -456,22 +456,6 @@ struct RunBuffers {
   float *gathered = nullptr;
   cudaEvent_t begin_event = nullptr;
   cudaEvent_t end_event = nullptr;
-
-  ~RunBuffers() {
-    if (end_event != nullptr) cudaEventDestroy(end_event);
-    if (begin_event != nullptr) cudaEventDestroy(begin_event);
-    cudaFree(gathered);
-    cudaFree(survivor_offsets);
-    cudaFree(survivor_candidates);
-    cudaFree(results);
-    cudaFree(xmx);
-    cudaFree(dp);
-    cudaFree(x_offsets);
-    cudaFree(dp_offsets);
-    cudaFree(length_transitions);
-    cudaFree(candidate_sequences);
-    cudaFree(candidate_profiles);
-  }
 };
 
 }  // namespace
@@ -492,6 +476,34 @@ struct plan7_forward_database {
   float upload_milliseconds;
 };
 
+struct plan7_forward_workspace {
+  int device_ordinal;
+  RunBuffers buffers;
+  size_t candidate_profiles_capacity;
+  size_t candidate_sequences_capacity;
+  size_t length_transitions_capacity;
+  size_t dp_offsets_capacity;
+  size_t x_offsets_capacity;
+  size_t dp_capacity;
+  size_t xmx_capacity;
+  size_t results_capacity;
+  size_t survivor_candidates_capacity;
+  size_t survivor_offsets_capacity;
+  size_t gathered_capacity;
+  std::vector<uint32_t> host_candidate_profiles;
+  std::vector<uint32_t> host_candidate_sequences;
+  std::vector<ForwardLengthTransitions> host_length_transitions;
+  std::vector<uint64_t> host_dp_offsets;
+  std::vector<uint64_t> host_x_offsets;
+  std::vector<size_t> tile_boundaries;
+  std::vector<ForwardKernelResult> host_kernel_results;
+  std::vector<uint32_t> host_survivor_candidates;
+  std::vector<uint64_t> host_survivor_offsets;
+  uint64_t growth_count;
+  uint64_t event_create_count;
+  uint64_t run_count;
+};
+
 struct plan7_forward_output {
   std::vector<plan7_forward_result> results;
   std::vector<uint64_t> special_offsets;
@@ -500,6 +512,121 @@ struct plan7_forward_output {
 };
 
 namespace {
+
+template <typename T>
+int grow_forward_workspace_buffer(T **buffer, size_t *capacity,
+                                  size_t required_bytes,
+                                  uint64_t *growth_count, const char *name,
+                                  char *error, size_t error_size) {
+  if (required_bytes <= *capacity) return 0;
+  T *replacement = nullptr;
+  cudaError_t status = cudaMalloc(&replacement, required_bytes);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, name, status);
+    return -1;
+  }
+  status = cudaFree(*buffer);
+  if (status != cudaSuccess) {
+    cudaFree(replacement);
+    set_cuda_error(error, error_size, "cudaFree(Forward workspace)", status);
+    return -1;
+  }
+  *buffer = replacement;
+  *capacity = required_bytes;
+  ++*growth_count;
+  return 0;
+}
+
+uint64_t forward_workspace_device_bytes(
+    const plan7_forward_workspace *workspace) {
+  if (workspace == nullptr) return 0;
+  const size_t capacities[] = {
+      workspace->candidate_profiles_capacity,
+      workspace->candidate_sequences_capacity,
+      workspace->length_transitions_capacity,
+      workspace->dp_offsets_capacity,
+      workspace->x_offsets_capacity,
+      workspace->dp_capacity,
+      workspace->xmx_capacity,
+      workspace->results_capacity,
+      workspace->survivor_candidates_capacity,
+      workspace->survivor_offsets_capacity,
+      workspace->gathered_capacity};
+  uint64_t total = 0;
+  for (const size_t capacity : capacities) {
+    if (capacity > UINT64_MAX - total) return UINT64_MAX;
+    total += static_cast<uint64_t>(capacity);
+  }
+  return total;
+}
+
+int destroy_forward_workspace_device(plan7_forward_workspace *workspace,
+                                     char *error, size_t error_size) {
+  if (workspace == nullptr) return 0;
+  cudaError_t first_error = cudaSuccess;
+  cudaError_t status;
+  int original_device = -1;
+  bool restore_device = false;
+  bool device_ready = true;
+  status = cudaGetDevice(&original_device);
+  if (status == cudaSuccess && original_device != workspace->device_ordinal) {
+    status = cudaSetDevice(workspace->device_ordinal);
+    if (status == cudaSuccess)
+      restore_device = true;
+    else {
+      first_error = status;
+      device_ready = false;
+    }
+  } else if (status != cudaSuccess) {
+    status = cudaSetDevice(workspace->device_ordinal);
+    if (status != cudaSuccess) {
+      first_error = status;
+      device_ready = false;
+    }
+  }
+  RunBuffers &buffers = workspace->buffers;
+#define CUDA_DESTROY_FORWARD(pointer)                                          \
+  do {                                                                         \
+    if (device_ready) {                                                        \
+      status = cudaFree(pointer);                                              \
+      if (status != cudaSuccess && first_error == cudaSuccess)                \
+        first_error = status;                                                  \
+    }                                                                          \
+  } while (0)
+#define CUDA_DESTROY_FORWARD_EVENT(event)                                      \
+  do {                                                                         \
+    if (device_ready && event != nullptr) {                                    \
+      status = cudaEventDestroy(event);                                        \
+      if (status != cudaSuccess && first_error == cudaSuccess)                \
+        first_error = status;                                                  \
+    }                                                                          \
+  } while (0)
+  CUDA_DESTROY_FORWARD_EVENT(buffers.end_event);
+  CUDA_DESTROY_FORWARD_EVENT(buffers.begin_event);
+  CUDA_DESTROY_FORWARD(buffers.gathered);
+  CUDA_DESTROY_FORWARD(buffers.survivor_offsets);
+  CUDA_DESTROY_FORWARD(buffers.survivor_candidates);
+  CUDA_DESTROY_FORWARD(buffers.results);
+  CUDA_DESTROY_FORWARD(buffers.xmx);
+  CUDA_DESTROY_FORWARD(buffers.dp);
+  CUDA_DESTROY_FORWARD(buffers.x_offsets);
+  CUDA_DESTROY_FORWARD(buffers.dp_offsets);
+  CUDA_DESTROY_FORWARD(buffers.length_transitions);
+  CUDA_DESTROY_FORWARD(buffers.candidate_sequences);
+  CUDA_DESTROY_FORWARD(buffers.candidate_profiles);
+#undef CUDA_DESTROY_FORWARD_EVENT
+#undef CUDA_DESTROY_FORWARD
+  if (restore_device) {
+    status = cudaSetDevice(original_device);
+    if (status != cudaSuccess && first_error == cudaSuccess)
+      first_error = status;
+  }
+  if (first_error != cudaSuccess) {
+    set_cuda_error(error, error_size, "destroy Forward workspace", first_error);
+    return -1;
+  }
+  return 0;
+}
 
 bool live_profile_matches_snapshot(const plan7_forward_database *database,
                                    size_t profile_index) {
@@ -866,7 +993,63 @@ extern "C" float plan7_forward_database_upload_milliseconds(
   return database == nullptr ? 0.0f : database->upload_milliseconds;
 }
 
-extern "C" int plan7_forward_run(
+extern "C" int plan7_forward_workspace_create(
+    plan7_forward_workspace **workspace, char *error, size_t error_size) {
+  if (workspace == nullptr || *workspace != nullptr) {
+    set_error(error, error_size, "invalid Forward workspace output");
+    return -1;
+  }
+  int current_device = -1;
+  const cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  auto *created = new (std::nothrow) plan7_forward_workspace{};
+  if (created == nullptr) {
+    set_error(error, error_size, "Forward workspace allocation failed");
+    return -1;
+  }
+  created->device_ordinal = current_device;
+  *workspace = created;
+  return 0;
+}
+
+extern "C" int plan7_forward_workspace_destroy(
+    plan7_forward_workspace **workspace, char *error, size_t error_size) {
+  if (workspace == nullptr) {
+    set_error(error, error_size, "Forward workspace handle is null");
+    return -1;
+  }
+  plan7_forward_workspace *value = *workspace;
+  *workspace = nullptr;
+  if (value == nullptr) return 0;
+  const int status = destroy_forward_workspace_device(value, error, error_size);
+  delete value;
+  return status;
+}
+
+extern "C" int plan7_forward_workspace_get_statistics(
+    const plan7_forward_workspace *workspace,
+    plan7_forward_workspace_statistics *statistics,
+    char *error, size_t error_size) {
+  if (workspace == nullptr || statistics == nullptr) {
+    set_error(error, error_size, "invalid Forward workspace statistics");
+    return -1;
+  }
+  *statistics = {
+      forward_workspace_device_bytes(workspace),
+      static_cast<uint64_t>(workspace->dp_capacity),
+      static_cast<uint64_t>(workspace->xmx_capacity),
+      static_cast<uint64_t>(workspace->gathered_capacity),
+      workspace->growth_count,
+      workspace->event_create_count,
+      workspace->run_count};
+  return 0;
+}
+
+extern "C" int plan7_forward_run_with_workspace(
+    plan7_forward_workspace *workspace,
     const plan7_forward_database *database,
     const plan7_ssv_sequence_batch *batch,
     const uintptr_t *source_profile_pointers, size_t profile_count,
@@ -874,8 +1057,8 @@ extern "C" int plan7_forward_run(
     const float *filter_scores, size_t candidate_count, double f3,
     uint64_t gathered_byte_budget,
     plan7_forward_output **output, char *error, size_t error_size) {
-  if (output == nullptr || *output != nullptr || database == nullptr ||
-      batch == nullptr ||
+  if (output == nullptr || *output != nullptr || workspace == nullptr ||
+      database == nullptr || batch == nullptr ||
       (profile_count != 0 &&
        (source_profile_pointers == nullptr || candidate_offsets == nullptr)) ||
       (candidate_count != 0 &&
@@ -914,6 +1097,11 @@ extern "C" int plan7_forward_run(
       current_device != batch_view.device_ordinal) {
     set_error(error, error_size,
               "Forward inputs belong to a different CUDA device");
+    return -1;
+  }
+  if (current_device != workspace->device_ordinal) {
+    set_error(error, error_size,
+              "Forward workspace belongs to a different CUDA device");
     return -1;
   }
   if ((profile_count != 0 &&
@@ -991,12 +1179,16 @@ extern "C" int plan7_forward_run(
     return 0;
   }
 
-  std::vector<uint32_t> host_candidate_profiles;
-  std::vector<uint32_t> host_candidate_sequences;
-  std::vector<ForwardLengthTransitions> host_length_transitions;
-  std::vector<uint64_t> host_dp_offsets;
-  std::vector<uint64_t> host_x_offsets;
-  std::vector<size_t> tile_boundaries;
+  ++workspace->run_count;
+  std::vector<uint32_t> &host_candidate_profiles =
+      workspace->host_candidate_profiles;
+  std::vector<uint32_t> &host_candidate_sequences =
+      workspace->host_candidate_sequences;
+  std::vector<ForwardLengthTransitions> &host_length_transitions =
+      workspace->host_length_transitions;
+  std::vector<uint64_t> &host_dp_offsets = workspace->host_dp_offsets;
+  std::vector<uint64_t> &host_x_offsets = workspace->host_x_offsets;
+  std::vector<size_t> &tile_boundaries = workspace->tile_boundaries;
   uint64_t maximum_dp_cells = 0;
   uint64_t maximum_x_cells = 0;
   size_t maximum_tile_count = 0;
@@ -1006,6 +1198,7 @@ extern "C" int plan7_forward_run(
     host_length_transitions.resize(candidate_count);
     host_dp_offsets.assign(candidate_count + 1, 0);
     host_x_offsets.assign(candidate_count + 1, 0);
+    tile_boundaries.clear();
     tile_boundaries.push_back(0);
   } catch (...) {
     set_error(error, error_size, "Forward host workspace allocation failed");
@@ -1121,7 +1314,7 @@ extern "C" int plan7_forward_run(
     return -1;
   }
 
-  RunBuffers buffers;
+  RunBuffers &buffers = workspace->buffers;
 #define CUDA_RUN(call)                                                        \
   do {                                                                        \
     status = (call);                                                          \
@@ -1130,19 +1323,55 @@ extern "C" int plan7_forward_run(
       return -1;                                                              \
     }                                                                         \
   } while (0)
-  CUDA_RUN(cudaMalloc(&buffers.candidate_profiles, candidate_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.candidate_sequences, candidate_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.length_transitions,
-                      length_transition_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.dp_offsets, offset_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.x_offsets, offset_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.dp, dp_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.xmx, xmx_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.results, result_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.survivor_candidates,
-                      survivor_candidate_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.survivor_offsets, survivor_offset_bytes));
-  CUDA_RUN(cudaMalloc(&buffers.gathered, xmx_bytes));
+  if (grow_forward_workspace_buffer(
+          &buffers.candidate_profiles,
+          &workspace->candidate_profiles_capacity, candidate_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward profile indexes)",
+          error, error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.candidate_sequences,
+          &workspace->candidate_sequences_capacity, candidate_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward sequence indexes)",
+          error, error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.length_transitions,
+          &workspace->length_transitions_capacity, length_transition_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward length transitions)",
+          error, error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.dp_offsets, &workspace->dp_offsets_capacity, offset_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward DP offsets)", error,
+          error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.x_offsets, &workspace->x_offsets_capacity, offset_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward special offsets)",
+          error, error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.dp, &workspace->dp_capacity, dp_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward DP workspace)", error,
+          error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.xmx, &workspace->xmx_capacity, xmx_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward special workspace)",
+          error, error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.results, &workspace->results_capacity, result_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward results)", error,
+          error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.survivor_candidates,
+          &workspace->survivor_candidates_capacity, survivor_candidate_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward survivors)", error,
+          error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.survivor_offsets, &workspace->survivor_offsets_capacity,
+          survivor_offset_bytes, &workspace->growth_count,
+          "cudaMalloc(Forward survivor offsets)", error, error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.gathered, &workspace->gathered_capacity, xmx_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward gather workspace)",
+          error, error_size) != 0)
+    return -1;
   CUDA_RUN(cudaMemcpy(buffers.candidate_profiles,
                       host_candidate_profiles.data(),
                       candidate_bytes, cudaMemcpyHostToDevice));
@@ -1156,12 +1385,21 @@ extern "C" int plan7_forward_run(
                       offset_bytes, cudaMemcpyHostToDevice));
   CUDA_RUN(cudaMemcpy(buffers.x_offsets, host_x_offsets.data(),
                       offset_bytes, cudaMemcpyHostToDevice));
-  CUDA_RUN(cudaEventCreate(&buffers.begin_event));
-  CUDA_RUN(cudaEventCreate(&buffers.end_event));
+  if (buffers.begin_event == nullptr) {
+    CUDA_RUN(cudaEventCreate(&buffers.begin_event));
+    ++workspace->event_create_count;
+  }
+  if (buffers.end_event == nullptr) {
+    CUDA_RUN(cudaEventCreate(&buffers.end_event));
+    ++workspace->event_create_count;
+  }
 
-  std::vector<ForwardKernelResult> host_kernel_results;
-  std::vector<uint32_t> host_survivor_candidates;
-  std::vector<uint64_t> host_survivor_offsets;
+  std::vector<ForwardKernelResult> &host_kernel_results =
+      workspace->host_kernel_results;
+  std::vector<uint32_t> &host_survivor_candidates =
+      workspace->host_survivor_candidates;
+  std::vector<uint64_t> &host_survivor_offsets =
+      workspace->host_survivor_offsets;
   try {
     host_kernel_results.resize(candidate_count);
     host_survivor_candidates.reserve(maximum_tile_count);
@@ -1335,6 +1573,50 @@ extern "C" int plan7_forward_run(
           std::chrono::steady_clock::now() - total_begin).count();
   *output = created.release();
   return 0;
+}
+
+extern "C" int plan7_forward_run(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  plan7_forward_workspace *workspace = nullptr;
+  if (plan7_forward_workspace_create(&workspace, error, error_size) != 0)
+    return -1;
+  const int run_status = plan7_forward_run_with_workspace(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, error, error_size);
+  char destroy_error[512] = {0};
+  const int destroy_status = plan7_forward_workspace_destroy(
+      &workspace, destroy_error, sizeof(destroy_error));
+  if (run_status != 0) return run_status;
+  if (destroy_status != 0) {
+    set_error(error, error_size, destroy_error);
+    return -1;
+  }
+  return 0;
+}
+
+extern "C" int plan7_forward_run_batch_workspace(
+    const plan7_forward_database *database,
+    plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  plan7_forward_workspace *workspace = nullptr;
+  if (plan7_ssv_sequence_batch_get_forward_workspace(
+          batch, &workspace, error, error_size) != 0)
+    return -1;
+  return plan7_forward_run_with_workspace(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, error, error_size);
 }
 
 extern "C" int plan7_forward_output_destroy(

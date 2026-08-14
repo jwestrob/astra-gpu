@@ -1,4 +1,5 @@
 #include "ssv_cuda.h"
+#include "forward_cuda.h"
 #include "postfilter_cuda.h"
 
 #include <cuda_runtime.h>
@@ -67,6 +68,8 @@ struct plan7_ssv_sequence_batch {
   int bias_length_terms_device_valid;
   int host_float_environment_valid;
   uint64_t input_device_bytes;
+  plan7_postfilter_workspace *postfilter_workspace;
+  plan7_forward_workspace *forward_workspace;
 };
 
 static_assert(sizeof(plan7_ssv_result) == 6,
@@ -765,8 +768,17 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   int original_device = -1;
   bool device_ready = true;
   bool restore_device = false;
+  int workspace_status = 0;
 
   if (batch == nullptr) return 0;
+  if (plan7_forward_workspace_destroy(
+        &batch->forward_workspace, error, error_size) != 0)
+    workspace_status = -1;
+  if (plan7_postfilter_workspace_destroy(
+        &batch->postfilter_workspace,
+        workspace_status == 0 ? error : nullptr,
+        workspace_status == 0 ? error_size : 0) != 0)
+    workspace_status = -1;
   status = cudaGetDevice(&original_device);
   if (status == cudaSuccess && original_device != batch->device_ordinal) {
     status = cudaSetDevice(batch->device_ordinal);
@@ -825,11 +837,12 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   free(batch->host_lengths);
   free(batch);
   if (first_error != cudaSuccess) {
-    set_cuda_error(error, error_size, "destroy CUDA sequence batch",
-                   first_error);
+    if (workspace_status == 0)
+      set_cuda_error(error, error_size, "destroy CUDA sequence batch",
+                     first_error);
     return -1;
   }
-  return 0;
+  return workspace_status;
 }
 
 }  // namespace
@@ -1098,6 +1111,75 @@ plan7_ssv_sequence_batch_get_view(const plan7_ssv_sequence_batch *batch,
   view->device_residues = batch->device_residues;
   view->device_offsets = batch->device_offsets;
   view->input_device_bytes = batch->input_device_bytes;
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_get_forward_workspace(
+  plan7_ssv_sequence_batch *batch,
+  plan7_forward_workspace **workspace,
+  char *error,
+  size_t error_size)
+{
+  if (batch == nullptr || workspace == nullptr) {
+    set_error(error, error_size, "invalid Forward workspace request");
+    return -1;
+  }
+  int current_device = -1;
+  const cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (current_device != batch->device_ordinal) {
+    set_error(error, error_size,
+              "CUDA sequence batch belongs to a different device");
+    return -1;
+  }
+  if (batch->forward_workspace == nullptr &&
+      plan7_forward_workspace_create(
+        &batch->forward_workspace, error, error_size) != 0)
+    return -1;
+  *workspace = batch->forward_workspace;
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_get_workspace_statistics(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_ssv_workspace_statistics *statistics,
+  char *error,
+  size_t error_size)
+{
+  if (batch == nullptr || statistics == nullptr) {
+    set_error(error, error_size, "invalid sequence workspace statistics");
+    return -1;
+  }
+  memset(statistics, 0, sizeof(*statistics));
+  if (batch->postfilter_workspace != nullptr) {
+    plan7_postfilter_workspace_statistics postfilter{};
+    if (plan7_postfilter_workspace_get_statistics(
+          batch->postfilter_workspace, &postfilter, error, error_size) != 0)
+      return -1;
+    statistics->postfilter_device_bytes = postfilter.device_bytes;
+    statistics->postfilter_dp_capacity_bytes =
+      postfilter.dp_capacity_bytes;
+    statistics->postfilter_growth_count = postfilter.growth_count;
+    statistics->postfilter_run_count = postfilter.run_count;
+  }
+  if (batch->forward_workspace != nullptr) {
+    plan7_forward_workspace_statistics forward{};
+    if (plan7_forward_workspace_get_statistics(
+          batch->forward_workspace, &forward, error, error_size) != 0)
+      return -1;
+    statistics->forward_device_bytes = forward.device_bytes;
+    statistics->forward_dp_capacity_bytes = forward.dp_capacity_bytes;
+    statistics->forward_xmx_capacity_bytes = forward.xmx_capacity_bytes;
+    statistics->forward_gather_capacity_bytes = forward.gather_capacity_bytes;
+    statistics->forward_growth_count = forward.growth_count;
+    statistics->forward_event_create_count = forward.event_create_count;
+    statistics->forward_run_count = forward.run_count;
+  }
   return 0;
 }
 
@@ -2140,8 +2222,12 @@ plan7_ssv_sequence_batch_postfilter_candidates_many(
     batch->device_bias_candidates,
     batch->device_bias_ssv_inputs);
   CUDA_TRY_POSTFILTER(cudaGetLastError());
-  if (plan7_postfilter_candidates_device(
-        viterbi_database,
+  if (batch->postfilter_workspace == nullptr &&
+      plan7_postfilter_workspace_create(
+        &batch->postfilter_workspace, error, error_size) != 0)
+    return -1;
+  if (plan7_postfilter_candidates_device_with_workspace(
+        batch->postfilter_workspace, viterbi_database,
         batch->device_residues,
         batch->device_offsets,
         batch->host_lengths,

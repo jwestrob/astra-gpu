@@ -58,6 +58,17 @@ typedef struct plan7_forward_statistics {
 typedef struct plan7_forward_database plan7_forward_database;
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 typedef struct plan7_forward_output plan7_forward_output;
+typedef struct plan7_forward_workspace plan7_forward_workspace;
+
+typedef struct plan7_forward_workspace_statistics {
+  uint64_t device_bytes;
+  uint64_t dp_capacity_bytes;
+  uint64_t xmx_capacity_bytes;
+  uint64_t gather_capacity_bytes;
+  uint64_t growth_count;
+  uint64_t event_create_count;
+  uint64_t run_count;
+} plan7_forward_workspace_statistics;
 
 /* Profiles are retained by the Python owner for this object's lifetime. */
 int plan7_forward_database_create(const uintptr_t *profile_pointers,
@@ -82,12 +93,60 @@ float plan7_forward_database_pack_milliseconds(
 float plan7_forward_database_upload_milliseconds(
   const plan7_forward_database *database);
 
+int plan7_forward_workspace_create(plan7_forward_workspace **workspace,
+                                   char *error,
+                                   size_t error_size);
+
+int plan7_forward_workspace_destroy(plan7_forward_workspace **workspace,
+                                    char *error,
+                                    size_t error_size);
+
+int plan7_forward_workspace_get_statistics(
+  const plan7_forward_workspace *workspace,
+  plan7_forward_workspace_statistics *statistics,
+  char *error,
+  size_t error_size);
+
 /* candidate_offsets is a profile-major CSR indptr with profile_count+1
  * entries. special_offsets has candidate_count+1 float offsets. Rejected and
  * CPU_REQUIRED records have empty special-state spans. */
 int plan7_forward_run(
   const plan7_forward_database *database,
   const plan7_ssv_sequence_batch *batch,
+  const uintptr_t *source_profile_pointers,
+  size_t profile_count,
+  const uint64_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  const float *filter_scores,
+  size_t candidate_count,
+  double f3,
+  uint64_t gathered_byte_budget,
+  plan7_forward_output **output,
+  char *error,
+  size_t error_size);
+
+/* Calls sharing a workspace must be serialized. */
+int plan7_forward_run_with_workspace(
+  plan7_forward_workspace *workspace,
+  const plan7_forward_database *database,
+  const plan7_ssv_sequence_batch *batch,
+  const uintptr_t *source_profile_pointers,
+  size_t profile_count,
+  const uint64_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  const float *filter_scores,
+  size_t candidate_count,
+  double f3,
+  uint64_t gathered_byte_budget,
+  plan7_forward_output **output,
+  char *error,
+  size_t error_size);
+
+/* Internal SequenceBatch entry point. Calls that share a batch must be
+ * serialized, including calls to batch destruction or workspace statistics. */
+int plan7_forward_run_batch_workspace(
+  const plan7_forward_database *database,
+  plan7_ssv_sequence_batch *batch,
   const uintptr_t *source_profile_pointers,
   size_t profile_count,
   const uint64_t *candidate_offsets,

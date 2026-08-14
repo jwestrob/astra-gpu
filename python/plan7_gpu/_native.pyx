@@ -151,6 +151,19 @@ cdef extern from "ssv_cuda.h" nogil:
     ctypedef struct plan7_ssv_sequence_batch:
         pass
 
+    ctypedef struct plan7_ssv_workspace_statistics:
+        uint64_t postfilter_device_bytes
+        uint64_t postfilter_dp_capacity_bytes
+        uint64_t postfilter_growth_count
+        uint64_t postfilter_run_count
+        uint64_t forward_device_bytes
+        uint64_t forward_dp_capacity_bytes
+        uint64_t forward_xmx_capacity_bytes
+        uint64_t forward_gather_capacity_bytes
+        uint64_t forward_growth_count
+        uint64_t forward_event_create_count
+        uint64_t forward_run_count
+
     int plan7_cuda_device_count(char *error, size_t error_size)
     int plan7_tjb_for_length(float scale, uint64_t length)
     int plan7_ssv_f1_decision(
@@ -193,6 +206,13 @@ cdef extern from "ssv_cuda.h" nogil:
 
     int plan7_ssv_sequence_batch_destroy(
         plan7_ssv_sequence_batch **batch,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_get_workspace_statistics(
+        const plan7_ssv_sequence_batch *batch,
+        plan7_ssv_workspace_statistics *statistics,
         char *error,
         size_t error_size,
     )
@@ -425,6 +445,22 @@ cdef extern from "forward_cuda.h" nogil:
     int plan7_forward_run(
         const plan7_forward_database *database,
         const plan7_ssv_sequence_batch *batch,
+        const uintptr_t *source_profile_pointers,
+        size_t profile_count,
+        const uint64_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        const float *filter_scores,
+        size_t candidate_count,
+        double f3,
+        uint64_t gathered_byte_budget,
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_forward_run_batch_workspace(
+        const plan7_forward_database *database,
+        plan7_ssv_sequence_batch *batch,
         const uintptr_t *source_profile_pointers,
         size_t profile_count,
         const uint64_t *candidate_offsets,
@@ -975,6 +1011,41 @@ cdef class SequenceBatch:
     @property
     def closed(self):
         return self._batch == NULL
+
+    @property
+    def workspace_statistics(self):
+        """Return post-filter and Forward cache capacities for this batch.
+
+        These values exclude the batch's input, SSV, and bias allocations.
+        """
+        cdef plan7_ssv_workspace_statistics statistics
+        cdef char error[512]
+        cdef int status
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        error[0] = 0
+        status = plan7_ssv_sequence_batch_get_workspace_statistics(
+            self._batch, &statistics, error, sizeof(error)
+        )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        return {
+            "postfilter_device_bytes": statistics.postfilter_device_bytes,
+            "postfilter_dp_capacity_bytes": (
+                statistics.postfilter_dp_capacity_bytes
+            ),
+            "postfilter_growth_count": statistics.postfilter_growth_count,
+            "postfilter_run_count": statistics.postfilter_run_count,
+            "forward_device_bytes": statistics.forward_device_bytes,
+            "forward_dp_capacity_bytes": statistics.forward_dp_capacity_bytes,
+            "forward_xmx_capacity_bytes": statistics.forward_xmx_capacity_bytes,
+            "forward_gather_capacity_bytes": (
+                statistics.forward_gather_capacity_bytes
+            ),
+            "forward_growth_count": statistics.forward_growth_count,
+            "forward_event_create_count": statistics.forward_event_create_count,
+            "forward_run_count": statistics.forward_run_count,
+        }
 
     def __enter__(self):
         if self._batch == NULL:
@@ -1689,7 +1760,7 @@ cdef class SequenceBatch:
 
         error[0] = 0
         # Keep the GIL while native code validates live private profile arrays.
-        status = plan7_forward_run(
+        status = plan7_forward_run_batch_workspace(
             forward_profiles._database,
             self._batch,
             source_pointers.data() if profile_count else NULL,

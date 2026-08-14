@@ -60,6 +60,21 @@ struct plan7_viterbi_database;
 struct plan7_postfilter_result;
 
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
+struct plan7_forward_workspace;
+
+typedef struct plan7_ssv_workspace_statistics {
+  uint64_t postfilter_device_bytes;
+  uint64_t postfilter_dp_capacity_bytes;
+  uint64_t postfilter_growth_count;
+  uint64_t postfilter_run_count;
+  uint64_t forward_device_bytes;
+  uint64_t forward_dp_capacity_bytes;
+  uint64_t forward_xmx_capacity_bytes;
+  uint64_t forward_gather_capacity_bytes;
+  uint64_t forward_growth_count;
+  uint64_t forward_event_create_count;
+  uint64_t forward_run_count;
+} plan7_ssv_workspace_statistics;
 
 /* Immutable device-input view for sibling CUDA stages. The owning sequence
  * batch must outlive every use of this view. */
@@ -113,6 +128,19 @@ int plan7_ssv_sequence_batch_destroy(plan7_ssv_sequence_batch **batch,
 int plan7_ssv_sequence_batch_get_view(
   const plan7_ssv_sequence_batch *batch,
   plan7_ssv_sequence_batch_view *view,
+  char *error,
+  size_t error_size);
+
+int plan7_ssv_sequence_batch_get_workspace_statistics(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_ssv_workspace_statistics *statistics,
+  char *error,
+  size_t error_size);
+
+/* Internal serialized accessor used by the Forward stage. */
+int plan7_ssv_sequence_batch_get_forward_workspace(
+  plan7_ssv_sequence_batch *batch,
+  struct plan7_forward_workspace **workspace,
   char *error,
   size_t error_size);
 

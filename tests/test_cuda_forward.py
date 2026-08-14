@@ -118,6 +118,85 @@ def close_concurrently(value, worker_count=8):
 
 @unittest.skipUnless(cuda_available(), "CUDA backend or device unavailable")
 class CudaForwardTests(unittest.TestCase):
+    def test_workspace_reuses_high_water_and_closes_concurrently(self):
+        _, _, profile = load_profile("Thioesterase.hmm")
+        sequences = digitize(
+            profile,
+            ["ACDEX", "ACDEFGHIKLMNPQRSTVWY", "ACDEFGHIKLMNPQRSTVWY" * 3],
+        )
+        batch = native_batch(sequences, profile.alphabet)
+        with _native.ForwardProfiles([profile]) as resident:
+            initial = batch.workspace_statistics
+            self.assertEqual(initial["forward_device_bytes"], 0)
+            smaller_arguments = (
+                array("Q", [0, 1]),
+                array("I", [0]),
+                array("f", [0.0]),
+                1.0,
+                [profile],
+                resident,
+            )
+            smaller = batch.forward_candidates_many_raw(*smaller_arguments)
+            self.assertEqual(len(smaller[0]), _native.FORWARD_RESULT_SIZE)
+            low_water = batch.workspace_statistics
+            self.assertEqual(low_water["forward_growth_count"], 11)
+            self.assertEqual(low_water["forward_event_create_count"], 2)
+            self.assertEqual(low_water["forward_run_count"], 1)
+            arguments = (
+                array("Q", [0, 3]),
+                array("I", [0, 1, 2]),
+                array("f", [0.0, 0.0, 0.0]),
+                1.0,
+                [profile],
+                resident,
+            )
+            first = batch.forward_candidates_many_raw(*arguments)
+            high_water = batch.workspace_statistics
+            self.assertGreater(high_water["forward_device_bytes"], 0)
+            self.assertGreater(high_water["forward_dp_capacity_bytes"], 0)
+            self.assertGreater(high_water["forward_xmx_capacity_bytes"], 0)
+            self.assertGreater(
+                high_water["forward_growth_count"],
+                low_water["forward_growth_count"],
+            )
+            self.assertEqual(high_water["forward_event_create_count"], 2)
+            self.assertEqual(high_water["forward_run_count"], 2)
+
+            second = batch.forward_candidates_many_raw(*arguments)
+            reused = batch.workspace_statistics
+            self.assertEqual(second[0], first[0])
+            self.assertEqual(list(second[1]), list(first[1]))
+            self.assertEqual(second[2].tobytes(), first[2].tobytes())
+            for key in (
+                "forward_device_bytes",
+                "forward_dp_capacity_bytes",
+                "forward_xmx_capacity_bytes",
+                "forward_gather_capacity_bytes",
+                "forward_growth_count",
+                "forward_event_create_count",
+            ):
+                self.assertEqual(reused[key], high_water[key])
+            self.assertEqual(reused["forward_run_count"], 3)
+
+            smaller = batch.forward_candidates_many_raw(*smaller_arguments)
+            self.assertEqual(len(smaller[0]), _native.FORWARD_RESULT_SIZE)
+            shrunk = batch.workspace_statistics
+            for key in (
+                "forward_device_bytes",
+                "forward_dp_capacity_bytes",
+                "forward_xmx_capacity_bytes",
+                "forward_gather_capacity_bytes",
+                "forward_growth_count",
+                "forward_event_create_count",
+            ):
+                self.assertEqual(shrunk[key], high_water[key])
+            self.assertEqual(shrunk["forward_run_count"], 4)
+
+        close_concurrently(batch)
+        self.assertTrue(batch.closed)
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            _ = batch.workspace_statistics
+
     def test_native_owners_detach_before_concurrent_close(self):
         _, _, profile = load_profile("Thioesterase.hmm")
         sequence = digitize(profile, ["ACDEX"])[0]

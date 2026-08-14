@@ -585,6 +585,134 @@ struct plan7_viterbi_database {
   size_t exact_rbv_count;
 };
 
+struct plan7_postfilter_workspace {
+  int device_ordinal;
+  std::vector<uint64_t> host_msv_offsets;
+  std::vector<uint64_t> host_vit_offsets;
+  std::vector<VitLengthTransitions> host_moves;
+  std::vector<size_t> msv_tiles;
+  std::vector<size_t> vit_tiles;
+  uint8_t *device_states;
+  plan7_bias_ssv_input *device_bias_inputs;
+  plan7_bias_result *device_bias_results;
+  VitResult *device_vit_results;
+  VitLengthTransitions *device_moves;
+  uint64_t *device_msv_offsets;
+  uint64_t *device_vit_offsets;
+  void *device_dp;
+  plan7_postfilter_result *device_results;
+  size_t states_capacity;
+  size_t bias_inputs_capacity;
+  size_t bias_results_capacity;
+  size_t vit_results_capacity;
+  size_t moves_capacity;
+  size_t msv_offsets_capacity;
+  size_t vit_offsets_capacity;
+  size_t dp_capacity;
+  size_t results_capacity;
+  uint64_t growth_count;
+  uint64_t run_count;
+};
+
+namespace {
+
+template <typename T>
+int grow_workspace_buffer(T **buffer, size_t *capacity, size_t required_bytes,
+                          uint64_t *growth_count, const char *name,
+                          char *error, size_t error_size) {
+  if (required_bytes <= *capacity) return 0;
+  T *replacement = nullptr;
+  cudaError_t status = cudaMalloc(&replacement, required_bytes);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, name, status);
+    return -1;
+  }
+  status = cudaFree(*buffer);
+  if (status != cudaSuccess) {
+    cudaFree(replacement);
+    set_cuda_error(error, error_size, "cudaFree(post-filter workspace)", status);
+    return -1;
+  }
+  *buffer = replacement;
+  *capacity = required_bytes;
+  ++*growth_count;
+  return 0;
+}
+
+uint64_t postfilter_workspace_device_bytes(
+    const plan7_postfilter_workspace *workspace) {
+  if (workspace == nullptr) return 0;
+  const size_t capacities[] = {
+      workspace->states_capacity,       workspace->bias_inputs_capacity,
+      workspace->bias_results_capacity, workspace->vit_results_capacity,
+      workspace->moves_capacity,        workspace->msv_offsets_capacity,
+      workspace->vit_offsets_capacity,  workspace->dp_capacity,
+      workspace->results_capacity};
+  uint64_t total = 0;
+  for (const size_t capacity : capacities) {
+    if (capacity > UINT64_MAX - total) return UINT64_MAX;
+    total += static_cast<uint64_t>(capacity);
+  }
+  return total;
+}
+
+int destroy_postfilter_workspace_device(plan7_postfilter_workspace *workspace,
+                                        char *error, size_t error_size) {
+  if (workspace == nullptr) return 0;
+  cudaError_t first_error = cudaSuccess;
+  cudaError_t status;
+  int original_device = -1;
+  bool restore_device = false;
+  bool device_ready = true;
+  status = cudaGetDevice(&original_device);
+  if (status == cudaSuccess && original_device != workspace->device_ordinal) {
+    status = cudaSetDevice(workspace->device_ordinal);
+    if (status == cudaSuccess)
+      restore_device = true;
+    else {
+      first_error = status;
+      device_ready = false;
+    }
+  } else if (status != cudaSuccess) {
+    status = cudaSetDevice(workspace->device_ordinal);
+    if (status != cudaSuccess) {
+      first_error = status;
+      device_ready = false;
+    }
+  }
+#define CUDA_DESTROY_WORKSPACE(pointer)                                        \
+  do {                                                                         \
+    if (device_ready) {                                                        \
+      status = cudaFree(pointer);                                              \
+      if (status != cudaSuccess && first_error == cudaSuccess)                \
+        first_error = status;                                                  \
+    }                                                                          \
+  } while (0)
+  CUDA_DESTROY_WORKSPACE(workspace->device_results);
+  CUDA_DESTROY_WORKSPACE(workspace->device_dp);
+  CUDA_DESTROY_WORKSPACE(workspace->device_vit_offsets);
+  CUDA_DESTROY_WORKSPACE(workspace->device_msv_offsets);
+  CUDA_DESTROY_WORKSPACE(workspace->device_moves);
+  CUDA_DESTROY_WORKSPACE(workspace->device_vit_results);
+  CUDA_DESTROY_WORKSPACE(workspace->device_bias_results);
+  CUDA_DESTROY_WORKSPACE(workspace->device_bias_inputs);
+  CUDA_DESTROY_WORKSPACE(workspace->device_states);
+#undef CUDA_DESTROY_WORKSPACE
+  if (restore_device) {
+    status = cudaSetDevice(original_device);
+    if (status != cudaSuccess && first_error == cudaSuccess)
+      first_error = status;
+  }
+  if (first_error != cudaSuccess) {
+    set_cuda_error(error, error_size, "destroy post-filter workspace",
+                   first_error);
+    return -1;
+  }
+  return 0;
+}
+
+}  // namespace
+
 bool live_profile_matches_snapshot(const plan7_viterbi_database *database,
                                    size_t profile_index) {
   const auto *source = reinterpret_cast<const P7_OPROFILE *>(
@@ -1071,6 +1199,59 @@ extern "C" size_t plan7_viterbi_database_profile_count(
   return database == nullptr ? 0 : database->host_profiles.size();
 }
 
+extern "C" int plan7_postfilter_workspace_create(
+    plan7_postfilter_workspace **workspace, char *error, size_t error_size) {
+  if (workspace == nullptr || *workspace != nullptr) {
+    set_error(error, error_size, "invalid post-filter workspace output");
+    return -1;
+  }
+  int current_device = -1;
+  const cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  auto *created = new (std::nothrow) plan7_postfilter_workspace{};
+  if (created == nullptr) {
+    set_error(error, error_size, "post-filter workspace allocation failed");
+    return -1;
+  }
+  created->device_ordinal = current_device;
+  *workspace = created;
+  return 0;
+}
+
+extern "C" int plan7_postfilter_workspace_destroy(
+    plan7_postfilter_workspace **workspace, char *error, size_t error_size) {
+  if (workspace == nullptr) {
+    set_error(error, error_size, "post-filter workspace handle is null");
+    return -1;
+  }
+  plan7_postfilter_workspace *value = *workspace;
+  *workspace = nullptr;
+  if (value == nullptr) return 0;
+  const int status = destroy_postfilter_workspace_device(
+      value, error, error_size);
+  delete value;
+  return status;
+}
+
+extern "C" int plan7_postfilter_workspace_get_statistics(
+    const plan7_postfilter_workspace *workspace,
+    plan7_postfilter_workspace_statistics *statistics,
+    char *error, size_t error_size) {
+  if (workspace == nullptr || statistics == nullptr) {
+    set_error(error, error_size, "invalid post-filter workspace statistics");
+    return -1;
+  }
+  *statistics = {
+      postfilter_workspace_device_bytes(workspace),
+      static_cast<uint64_t>(workspace->dp_capacity),
+      workspace->growth_count,
+      workspace->run_count};
+  return 0;
+}
+
 extern "C" int plan7_viterbi_database_matches_ssv(
     const plan7_viterbi_database *database,
     const uint8_t *packed_scores, size_t packed_score_count,
@@ -1118,7 +1299,8 @@ extern "C" int plan7_viterbi_database_matches_ssv(
   return 0;
 }
 
-extern "C" int plan7_postfilter_candidates_device(
+extern "C" int plan7_postfilter_candidates_device_with_workspace(
+    plan7_postfilter_workspace *workspace,
     const plan7_viterbi_database *database, const uint8_t *device_residues,
     const uint64_t *device_sequence_offsets,
     const uint64_t *host_sequence_lengths, size_t sequence_count,
@@ -1131,7 +1313,7 @@ extern "C" int plan7_postfilter_candidates_device(
     const plan7_bias_candidate *host_candidates,
     plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
     plan7_postfilter_result *host_results, char *error, size_t error_size) {
-  if (database == nullptr || device_residues == nullptr ||
+  if (workspace == nullptr || database == nullptr || device_residues == nullptr ||
       device_sequence_offsets == nullptr || host_sequence_lengths == nullptr ||
       device_null_scores == nullptr || device_compact_scores == nullptr ||
       device_f1_profiles == nullptr || device_tjb == nullptr ||
@@ -1154,16 +1336,22 @@ extern "C" int plan7_postfilter_candidates_device(
               "Viterbi database belongs to a different CUDA device");
     return -1;
   }
+  if (current_device != workspace->device_ordinal) {
+    set_error(error, error_size,
+              "post-filter workspace belongs to a different CUDA device");
+    return -1;
+  }
+  ++workspace->run_count;
 
   if (candidate_count == SIZE_MAX) {
     set_error(error, error_size, "post-filter candidate count overflow");
     return -1;
   }
-  std::vector<uint64_t> host_msv_offsets;
-  std::vector<uint64_t> host_vit_offsets;
-  std::vector<VitLengthTransitions> host_moves;
-  std::vector<size_t> msv_tiles;
-  std::vector<size_t> vit_tiles;
+  std::vector<uint64_t> &host_msv_offsets = workspace->host_msv_offsets;
+  std::vector<uint64_t> &host_vit_offsets = workspace->host_vit_offsets;
+  std::vector<VitLengthTransitions> &host_moves = workspace->host_moves;
+  std::vector<size_t> &msv_tiles = workspace->msv_tiles;
+  std::vector<size_t> &vit_tiles = workspace->vit_tiles;
   uint64_t maximum_msv_bytes = 0;
   uint64_t maximum_vit_cells = 0;
   constexpr uint64_t kVitCellLimit = kDpByteLimit / sizeof(int16_t);
@@ -1171,6 +1359,8 @@ extern "C" int plan7_postfilter_candidates_device(
     host_msv_offsets.assign(candidate_count + 1, 0);
     host_vit_offsets.assign(candidate_count + 1, 0);
     host_moves.resize(candidate_count);
+    msv_tiles.clear();
+    vit_tiles.clear();
     msv_tiles.push_back(0);
     vit_tiles.push_back(0);
     for (size_t c = 0; c < candidate_count; ++c) {
@@ -1254,15 +1444,6 @@ extern "C" int plan7_postfilter_candidates_device(
     return -1;
   }
 
-  uint8_t *device_states = nullptr;
-  plan7_bias_ssv_input *device_bias_inputs = nullptr;
-  plan7_bias_result *device_bias_results = nullptr;
-  VitResult *device_vit_results = nullptr;
-  VitLengthTransitions *device_moves = nullptr;
-  uint64_t *device_msv_offsets = nullptr;
-  uint64_t *device_vit_offsets = nullptr;
-  void *device_dp = nullptr;
-  plan7_postfilter_result *device_results = nullptr;
   const unsigned blocks = static_cast<unsigned>(
       (candidate_count - 1) / kThreads + 1);
 
@@ -1271,26 +1452,63 @@ extern "C" int plan7_postfilter_candidates_device(
     status = (call);                                                          \
     if (status != cudaSuccess) {                                              \
       set_cuda_error(error, error_size, #call, status);                       \
-      goto CUDA_ERROR;                                                        \
+      return -1;                                                              \
     }                                                                         \
   } while (0)
 
-  CUDA_RUN(cudaMalloc(&device_states, candidate_bytes));
-  CUDA_RUN(cudaMalloc(&device_bias_inputs, bias_input_bytes));
-  CUDA_RUN(cudaMalloc(&device_bias_results, bias_result_bytes));
-  CUDA_RUN(cudaMalloc(&device_vit_results, vit_result_bytes));
-  CUDA_RUN(cudaMalloc(&device_moves, move_bytes));
-  CUDA_RUN(cudaMalloc(&device_msv_offsets, offset_bytes));
-  CUDA_RUN(cudaMalloc(&device_vit_offsets, offset_bytes));
-  CUDA_RUN(cudaMalloc(&device_dp, static_cast<size_t>(dp_bytes_u64)));
-  CUDA_RUN(cudaMalloc(&device_results, post_result_bytes));
-  CUDA_RUN(cudaMemcpy(device_moves, host_moves.data(), move_bytes,
+  if (grow_workspace_buffer(&workspace->device_states,
+                            &workspace->states_capacity, candidate_bytes,
+                            &workspace->growth_count,
+                            "cudaMalloc(post-filter states)", error,
+                            error_size) != 0 ||
+      grow_workspace_buffer(&workspace->device_bias_inputs,
+                            &workspace->bias_inputs_capacity, bias_input_bytes,
+                            &workspace->growth_count,
+                            "cudaMalloc(post-filter bias inputs)", error,
+                            error_size) != 0 ||
+      grow_workspace_buffer(&workspace->device_bias_results,
+                            &workspace->bias_results_capacity,
+                            bias_result_bytes, &workspace->growth_count,
+                            "cudaMalloc(post-filter bias results)", error,
+                            error_size) != 0 ||
+      grow_workspace_buffer(&workspace->device_vit_results,
+                            &workspace->vit_results_capacity, vit_result_bytes,
+                            &workspace->growth_count,
+                            "cudaMalloc(post-filter Viterbi results)", error,
+                            error_size) != 0 ||
+      grow_workspace_buffer(&workspace->device_moves,
+                            &workspace->moves_capacity, move_bytes,
+                            &workspace->growth_count,
+                            "cudaMalloc(post-filter length transitions)", error,
+                            error_size) != 0 ||
+      grow_workspace_buffer(&workspace->device_msv_offsets,
+                            &workspace->msv_offsets_capacity, offset_bytes,
+                            &workspace->growth_count,
+                            "cudaMalloc(post-filter MSV offsets)", error,
+                            error_size) != 0 ||
+      grow_workspace_buffer(&workspace->device_vit_offsets,
+                            &workspace->vit_offsets_capacity, offset_bytes,
+                            &workspace->growth_count,
+                            "cudaMalloc(post-filter Viterbi offsets)", error,
+                            error_size) != 0 ||
+      grow_workspace_buffer(&workspace->device_dp, &workspace->dp_capacity,
+                            static_cast<size_t>(dp_bytes_u64),
+                            &workspace->growth_count,
+                            "cudaMalloc(post-filter DP workspace)", error,
+                            error_size) != 0 ||
+      grow_workspace_buffer(&workspace->device_results,
+                            &workspace->results_capacity, post_result_bytes,
+                            &workspace->growth_count,
+                            "cudaMalloc(post-filter results)", error,
+                            error_size) != 0)
+    return -1;
+  CUDA_RUN(cudaMemcpy(workspace->device_moves, host_moves.data(), move_bytes,
                       cudaMemcpyHostToDevice));
-  CUDA_RUN(cudaMemcpy(device_msv_offsets, host_msv_offsets.data(),
+  CUDA_RUN(cudaMemcpy(workspace->device_msv_offsets, host_msv_offsets.data(),
                       offset_bytes, cudaMemcpyHostToDevice));
-  CUDA_RUN(cudaMemcpy(device_vit_offsets, host_vit_offsets.data(),
+  CUDA_RUN(cudaMemcpy(workspace->device_vit_offsets, host_vit_offsets.data(),
                       offset_bytes, cudaMemcpyHostToDevice));
-  CUDA_RUN(cudaMemset(device_vit_results, 0xff, vit_result_bytes));
+  CUDA_RUN(cudaMemset(workspace->device_vit_results, 0xff, vit_result_bytes));
 
   for (size_t tile = 0; tile + 1 < msv_tiles.size(); ++tile) {
     const size_t tile_begin = msv_tiles[tile];
@@ -1301,21 +1519,24 @@ extern "C" int plan7_postfilter_candidates_device(
         device_residues, device_sequence_offsets, device_compact_scores,
         database->device_exact_rbv, device_f1_profiles,
         database->device_profiles, device_tjb,
-        device_candidates, device_msv_offsets, tile_begin, tile_count,
-        host_msv_offsets[tile_begin], static_cast<uint8_t *>(device_dp),
+        device_candidates, workspace->device_msv_offsets, tile_begin, tile_count,
+        host_msv_offsets[tile_begin],
+        static_cast<uint8_t *>(workspace->device_dp),
         device_msv_inputs);
     CUDA_RUN(cudaGetLastError());
   }
   prepare_bias_inputs_kernel<<<blocks, kThreads>>>(
       device_null_scores, device_f1_profiles, device_candidates,
-      device_msv_inputs, candidate_count, device_states, device_bias_inputs);
+      device_msv_inputs, candidate_count, workspace->device_states,
+      workspace->device_bias_inputs);
   CUDA_RUN(cudaGetLastError());
   if (plan7_bias_filter_candidates_device(
         device_residues, device_sequence_offsets, device_length_logp,
         device_length_log1mp, device_bias_profiles, device_candidates,
-        device_bias_inputs, candidate_count, device_bias_results,
+        workspace->device_bias_inputs, candidate_count,
+        workspace->device_bias_results,
         error, error_size) != 0)
-    goto CUDA_ERROR;
+    return -1;
 
   for (size_t tile = 0; tile + 1 < vit_tiles.size(); ++tile) {
     const size_t tile_begin = vit_tiles[tile];
@@ -1325,41 +1546,55 @@ extern "C" int plan7_postfilter_candidates_device(
         kThreads>>>(
         device_residues, device_sequence_offsets, database->device_profiles,
         database->device_emissions, database->device_transitions,
-        device_candidates, device_states, device_bias_results, device_moves,
-        device_vit_offsets, tile_begin, tile_count,
-        host_vit_offsets[tile_begin], static_cast<int16_t *>(device_dp),
-        device_vit_results);
+        device_candidates, workspace->device_states,
+        workspace->device_bias_results, workspace->device_moves,
+        workspace->device_vit_offsets, tile_begin, tile_count,
+        host_vit_offsets[tile_begin],
+        static_cast<int16_t *>(workspace->device_dp),
+        workspace->device_vit_results);
     CUDA_RUN(cudaGetLastError());
   }
   merge_results_kernel<<<blocks, kThreads>>>(
-      device_candidates, device_msv_inputs, device_states,
-      device_bias_results, device_vit_results, candidate_count,
-      device_results);
+      device_candidates, device_msv_inputs, workspace->device_states,
+      workspace->device_bias_results, workspace->device_vit_results,
+      candidate_count, workspace->device_results);
   CUDA_RUN(cudaGetLastError());
-  CUDA_RUN(cudaMemcpy(host_results, device_results, post_result_bytes,
+  CUDA_RUN(cudaMemcpy(host_results, workspace->device_results, post_result_bytes,
                       cudaMemcpyDeviceToHost));
-
-  cudaFree(device_results);
-  cudaFree(device_dp);
-  cudaFree(device_vit_offsets);
-  cudaFree(device_msv_offsets);
-  cudaFree(device_moves);
-  cudaFree(device_vit_results);
-  cudaFree(device_bias_results);
-  cudaFree(device_bias_inputs);
-  cudaFree(device_states);
   return 0;
-
-CUDA_ERROR:
-  cudaFree(device_results);
-  cudaFree(device_dp);
-  cudaFree(device_vit_offsets);
-  cudaFree(device_msv_offsets);
-  cudaFree(device_moves);
-  cudaFree(device_vit_results);
-  cudaFree(device_bias_results);
-  cudaFree(device_bias_inputs);
-  cudaFree(device_states);
-  return -1;
 #undef CUDA_RUN
+}
+
+extern "C" int plan7_postfilter_candidates_device(
+    const plan7_viterbi_database *database, const uint8_t *device_residues,
+    const uint64_t *device_sequence_offsets,
+    const uint64_t *host_sequence_lengths, size_t sequence_count,
+    const float *device_null_scores, const uint8_t *device_compact_scores,
+    const plan7_ssv_f1_profile *device_f1_profiles,
+    const uint8_t *device_tjb, const float *device_length_logp,
+    const float *device_length_log1mp,
+    const plan7_bias_profile *device_bias_profiles,
+    const plan7_bias_candidate *device_candidates,
+    const plan7_bias_candidate *host_candidates,
+    plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
+    plan7_postfilter_result *host_results, char *error, size_t error_size) {
+  plan7_postfilter_workspace *workspace = nullptr;
+  if (plan7_postfilter_workspace_create(&workspace, error, error_size) != 0)
+    return -1;
+  const int run_status = plan7_postfilter_candidates_device_with_workspace(
+      workspace, database, device_residues, device_sequence_offsets,
+      host_sequence_lengths, sequence_count, device_null_scores,
+      device_compact_scores, device_f1_profiles, device_tjb,
+      device_length_logp, device_length_log1mp, device_bias_profiles,
+      device_candidates, host_candidates, device_msv_inputs, candidate_count,
+      host_results, error, error_size);
+  char destroy_error[512] = {0};
+  const int destroy_status = plan7_postfilter_workspace_destroy(
+      &workspace, destroy_error, sizeof(destroy_error));
+  if (run_status != 0) return run_status;
+  if (destroy_status != 0) {
+    set_error(error, error_size, destroy_error);
+    return -1;
+  }
+  return 0;
 }
