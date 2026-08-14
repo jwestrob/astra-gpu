@@ -1,0 +1,164 @@
+{
+  "agreement_references": {
+    "scalar_full_msv": 14,
+    "ssv": 1078
+  },
+  "comparisons": 1092,
+  "coverage": {
+    "distinct_sequence_indexes": 52,
+    "distinct_sequence_lengths": 36,
+    "distinct_tjb_b": 14,
+    "sequence_length_max": 10125,
+    "sequence_length_min": 20,
+    "tjb_b_values": [
+      9,
+      10,
+      13,
+      15,
+      16,
+      18,
+      20,
+      22,
+      24,
+      25,
+      31,
+      32,
+      34,
+      35
+    ]
+  },
+  "mismatches": 0,
+  "models": {
+    "CENP-L": {
+      "M": 307,
+      "comparisons": 52
+    },
+    "Fe": {
+      "M": 329,
+      "comparisons": 52
+    },
+    "FeFe": {
+      "M": 182,
+      "comparisons": 52
+    },
+    "Herpes_U47": {
+      "M": 677,
+      "comparisons": 52
+    },
+    "Hobbit": {
+      "M": 2372,
+      "comparisons": 52
+    },
+    "K00046": {
+      "M": 311,
+      "comparisons": 52
+    },
+    "K07521": {
+      "M": 1050,
+      "comparisons": 52
+    },
+    "K07691": {
+      "M": 213,
+      "comparisons": 52
+    },
+    "K07802": {
+      "M": 14,
+      "comparisons": 52
+    },
+    "K10381": {
+      "M": 2678,
+      "comparisons": 52
+    },
+    "K11996": {
+      "M": 681,
+      "comparisons": 52
+    },
+    "K12691": {
+      "M": 86,
+      "comparisons": 52
+    },
+    "K15613": {
+      "M": 459,
+      "comparisons": 52
+    },
+    "K16418": {
+      "M": 17019,
+      "comparisons": 52
+    },
+    "NiFe": {
+      "M": 1052,
+      "comparisons": 52
+    },
+    "Pertactin": {
+      "M": 121,
+      "comparisons": 52
+    },
+    "Pus10_THUMP_arc": {
+      "M": 78,
+      "comparisons": 52
+    },
+    "TOH_N": {
+      "M": 25,
+      "comparisons": 52
+    },
+    "TPR_VPS8_2": {
+      "M": 194,
+      "comparisons": 52
+    },
+    "WWamide": {
+      "M": 7,
+      "comparisons": 52
+    },
+    "YycE-like_N": {
+      "M": 52,
+      "comparisons": 52
+    }
+  },
+  "msv_paths": {
+    "ssv_erange": 1,
+    "ssv_fallback_msv_ok": 14,
+    "ssv_ok": 1077
+  },
+  "oracle_metadata": {
+    "F1": {
+      "class": "finite",
+      "hex": "0x1.47ae147ae147bp-6"
+    },
+    "fasta_path": "results/datasets/oracle-protein-quantiles.faa",
+    "hmm_path": "results/datasets/oracle-hmm-quantiles.hmm",
+    "hmmer_revision": "hmmer-3.4:9acd8b6758a0ca5d21db6d167e0277484341929b",
+    "models_loaded": 21,
+    "record": "metadata",
+    "schema_version": 1,
+    "sequences_loaded": 52
+  },
+  "passes_F1": 35,
+  "public_statuses": {
+    "eslERANGE": 1,
+    "eslOK": 1091
+  },
+  "public_vs_full_msv": {
+    "score_bit_mismatches": 0,
+    "status_mismatches": 0
+  },
+  "scalar_ssv": {
+    "score_bit_mismatches": 0,
+    "status_mismatches": 0,
+    "statuses": {
+      "eslENORESULT": 14,
+      "eslERANGE": 1,
+      "eslOK": 1077
+    },
+    "xE_u8_mismatches": 0
+  },
+  "scalar_statuses": {
+    "eslERANGE": 1,
+    "eslOK": 1091
+  },
+  "schema_version": 1,
+  "skipped": {},
+  "source": {
+    "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/oracle/hmm-quantiles-protein-quantiles-21x52.jsonl",
+    "sha256": "b39ea91edcc726335c04a0e79601be7161f5faae287063eea80f2d7f85779a2e"
+  }
+}

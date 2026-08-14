@@ -1,12 +1,11 @@
 # Byte-MSV oracle
 
 `msv_oracle.c` evaluates pristine HMMER 3.4's public SSV-first
-`p7_MSVFilter()` and an independent scalar implementation of the full
-unsigned-byte MSV recurrence. The scalar path uses only the unstriped emission
-cost array extracted from the optimized profile; it does not call or copy the
-striped SIMD recurrence. On a direct SSV result, strict agreement compares the
-public API with the separately invoked SSV filter. On an `eslENORESULT` SSV
-fallback, it compares the public API with the scalar full-MSV result. The
+`p7_MSVFilter()` and independent scalar implementations of both its signed-byte
+SSV and unsigned-byte full-MSV recurrences. The scalar paths unpack profile
+costs but do not call or copy the striped SIMD recurrences. Strict mode checks
+the scalar SSV status, score bits, and raw maximum on every pair; on an
+`eslENORESULT` fallback it also checks the scalar full-MSV result. The
 `public_vs_full_msv` fields remain available as diagnostics because SSV may
 return a documented conservative overestimate of literal full MSV. Therefore,
 a GPU that computes only literal full MSV cannot be assumed bit-identical to

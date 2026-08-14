@@ -243,6 +243,10 @@ class MsvOracleBoundaryTests(unittest.TestCase):
                 comparison = by_name[name]
                 self.assertEqual(comparison["msv_path"], path)
                 self.assertEqual(comparison["ssv"]["status"], ssv_status)
+                self.assertEqual(comparison["scalar_ssv"]["status"], ssv_status)
+                self.assertTrue(comparison["scalar_ssv"]["agreement"]["status"])
+                self.assertTrue(comparison["scalar_ssv"]["agreement"]["score_bits"])
+                self.assertTrue(comparison["scalar_ssv"]["agreement"]["xE_u8"])
                 self.assertEqual(comparison["public_msv"]["status"], public_status)
                 self.assertEqual(comparison["agreement"]["reference"], reference)
                 self.assertTrue(comparison["agreement"]["status"])

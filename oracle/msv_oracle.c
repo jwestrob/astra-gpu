@@ -33,6 +33,15 @@ typedef struct {
 } SCALAR_MSV_RESULT;
 
 typedef struct {
+  int      status;
+  uint8_t  xe;
+  float    score;
+} SCALAR_SSV_RESULT;
+
+/* Internal SSE reference used only to verify the independent scalar xE. */
+extern uint8_t get_xE(const ESL_DSQ *dsq, int L, const P7_OPROFILE *om);
+
+typedef struct {
   P7_HMM **items;
   size_t   count;
   size_t   capacity;
@@ -78,6 +87,101 @@ static uint8_t
 sat_sub_u8(uint8_t left, uint8_t right)
 {
   return (left < right) ? 0 : (uint8_t) (left - right);
+}
+
+static int16_t
+sat_sub_i8(int16_t left, int8_t right)
+{
+  int value = (int) left - (int) right;
+  if (value > INT8_MAX) return INT8_MAX;
+  if (value < INT8_MIN) return INT8_MIN;
+  return (int16_t) value;
+}
+
+static void
+extract_ssv_costs(const P7_OPROFILE *om, int8_t *costs)
+{
+  int Q = p7O_NQB(om->M);
+  int x;
+  int k;
+
+  for (x = 0; x < om->abc->Kp; x++) {
+    for (k = 1; k <= om->M; k++) {
+      int q = (k - 1) % Q;
+      int lane = (k - 1) / Q;
+      union { __m128i vector; int8_t lane[16]; } striped;
+      striped.vector = om->sbv[x][q];
+      costs[(size_t) om->abc->Kp * (size_t) k + (size_t) x] = striped.lane[lane];
+    }
+  }
+}
+
+static SCALAR_SSV_RESULT
+scalar_ssv(const ESL_DSQ *dsq, int length, const P7_OPROFILE *om,
+           const int8_t *costs)
+{
+  SCALAR_SSV_RESULT result = { eslOK, 128, NAN };
+  int16_t          *dp;
+  uint16_t          xE = 128;
+  uint16_t          xJ;
+  int               i;
+  int               k;
+
+  dp = malloc(((size_t) om->M + 1) * sizeof(*dp));
+  if (dp == NULL) fail("memory allocation failed in scalar SSV");
+  for (k = 0; k <= om->M; k++) dp[k] = INT8_MIN;
+
+  for (i = 1; i <= length; i++) {
+    int16_t previous_diagonal = INT8_MIN;
+    ESL_DSQ residue = dsq[i];
+
+    if ((size_t) residue >= (size_t) om->abc->Kp)
+      fail("digital residue code is outside the optimized-profile alphabet");
+
+    for (k = 1; k <= om->M; k++) {
+      int16_t previous_row = dp[k];
+      int16_t score = sat_sub_i8(
+        previous_diagonal,
+        costs[(size_t) om->abc->Kp * (size_t) k + residue]);
+      uint16_t raw = (uint16_t) (score < 0 ? score + 256 : score);
+      dp[k] = score;
+      if (raw > xE) xE = raw;
+      previous_diagonal = previous_row;
+    }
+  }
+  free(dp);
+  result.xe = (uint8_t) xE;
+
+  if (om->tjb_b + om->tbm_b + om->tec_b + om->bias_b >= 127) {
+    result.status = eslENORESULT;
+    return result;
+  }
+
+  if (xE >= 255 - om->bias_b) {
+    result.score = eslINFINITY;
+    result.status = (om->base_b - om->tjb_b - om->tbm_b < 128)
+                    ? eslENORESULT : eslERANGE;
+    return result;
+  }
+
+  xE = (uint16_t) (xE + (uint16_t) (om->base_b - om->tjb_b - om->tbm_b));
+  xE -= 128;
+  if (xE >= 255 - om->bias_b) {
+    result.status = eslERANGE;
+    result.score = eslINFINITY;
+    return result;
+  }
+
+  xJ = xE - om->tec_b;
+  if (xJ > om->base_b) {
+    result.status = eslENORESULT;
+    return result;
+  }
+
+  result.score = ((float) (xJ - om->tjb_b) - (float) om->base_b);
+  result.score /= om->scale_b;
+  result.score -= 3.0f;
+  return result;
 }
 
 static SCALAR_MSV_RESULT
@@ -414,6 +518,7 @@ main(int argc, char **argv)
     P7_OPROFILE *optimized;
     P7_OMX *matrix;
     uint8_t *emissions;
+    int8_t *ssv_costs;
     size_t emission_count;
 
     if (hmm->M < 1 || alphabet->Kp < 1) fail("invalid model or alphabet dimensions");
@@ -428,12 +533,15 @@ main(int argc, char **argv)
     if (p7_oprofile_Convert(profile, optimized) != eslOK)
       fail("optimized-profile conversion failed");
     emissions = malloc(emission_count * sizeof(*emissions));
-    if (emissions == NULL) fail("emission-array allocation failed");
+    ssv_costs = malloc(emission_count * sizeof(*ssv_costs));
+    if (emissions == NULL || ssv_costs == NULL) fail("emission-array allocation failed");
     if (p7_oprofile_GetSSVEmissionScoreArray(optimized, emissions) != eslOK)
       fail("emission extraction failed");
+    extract_ssv_costs(optimized, ssv_costs);
 
     for (sequence_index = 0; sequence_index < sequences.count; sequence_index++) {
       ESL_SQ *sequence = sequences.items[sequence_index];
+      SCALAR_SSV_RESULT scalar_ssv_result;
       SCALAR_MSV_RESULT scalar;
       float ssv_score = NAN;
       float public_score = NAN;
@@ -446,6 +554,9 @@ main(int argc, char **argv)
       const char *agreement_reference;
       int status_agreement;
       int score_agreement;
+      int scalar_ssv_status_agreement;
+      int scalar_ssv_score_agreement;
+      int scalar_ssv_xe_agreement;
       int full_status_agreement;
       int full_score_agreement;
       int pass;
@@ -470,7 +581,13 @@ main(int argc, char **argv)
 
       ssv_status = p7_SSVFilter(sequence->dsq, length, optimized, &ssv_score);
       public_status = p7_MSVFilter(sequence->dsq, length, optimized, matrix, &public_score);
+      scalar_ssv_result = scalar_ssv(sequence->dsq, length, optimized, ssv_costs);
       scalar = scalar_full_msv(sequence->dsq, length, optimized, emissions);
+
+      scalar_ssv_status_agreement = (ssv_status == scalar_ssv_result.status);
+      scalar_ssv_score_agreement = float_bits_equal(ssv_score, scalar_ssv_result.score);
+      scalar_ssv_xe_agreement =
+        (get_xE(sequence->dsq, length, optimized) == scalar_ssv_result.xe);
 
       path = msv_path(ssv_status, public_status);
       full_status_agreement = (public_status == scalar.status);
@@ -491,7 +608,10 @@ main(int argc, char **argv)
         status_agreement = 0;
         score_agreement = 0;
       }
-      if (!status_agreement || !score_agreement) mismatches++;
+      if (!status_agreement || !score_agreement ||
+          !scalar_ssv_status_agreement || !scalar_ssv_score_agreement ||
+          !scalar_ssv_xe_agreement)
+        mismatches++;
       comparisons++;
 
       bit_score = (float) ((public_score - null_score) / eslCONST_LOG2);
@@ -515,6 +635,13 @@ main(int argc, char **argv)
       printf("},\"msv_path\":\"%s\",\"ssv\":{\"status\":\"%s\",\"score\":",
              path, status_name(ssv_status));
       print_float_value(ssv_score);
+      printf("},\"scalar_ssv\":{\"status\":\"%s\",\"xE_u8\":%u,\"score\":",
+             status_name(scalar_ssv_result.status), (unsigned int) scalar_ssv_result.xe);
+      print_float_value(scalar_ssv_result.score);
+      printf(",\"agreement\":{\"status\":%s,\"score_bits\":%s,\"xE_u8\":%s}",
+             scalar_ssv_status_agreement ? "true" : "false",
+             scalar_ssv_score_agreement ? "true" : "false",
+             scalar_ssv_xe_agreement ? "true" : "false");
       printf("},\"public_msv\":{\"status\":\"%s\",\"score\":", status_name(public_status));
       print_float_value(public_score);
       printf("},\"scalar_full_msv\":{\"status\":\"%s\",\"xJ_u8\":%u,\"overflow_row\":%d,\"overflow_xE_u8\":%u,\"score\":",
@@ -538,6 +665,7 @@ main(int argc, char **argv)
       p7_omx_Reuse(matrix);
     }
 
+    free(ssv_costs);
     free(emissions);
     p7_omx_Destroy(matrix);
     p7_oprofile_Destroy(optimized);

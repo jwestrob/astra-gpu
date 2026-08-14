@@ -33,6 +33,7 @@ def summarize(path: Path) -> dict[str, object]:
     paths: Counter[str] = Counter()
     public_statuses: Counter[str] = Counter()
     scalar_statuses: Counter[str] = Counter()
+    scalar_ssv_statuses: Counter[str] = Counter()
     agreement_references: Counter[str] = Counter()
     skipped: Counter[str] = Counter()
     models: dict[str, dict[str, int]] = {}
@@ -43,6 +44,9 @@ def summarize(path: Path) -> dict[str, object]:
     mismatches = 0
     public_vs_full_status_mismatches = 0
     public_vs_full_score_mismatches = 0
+    scalar_ssv_status_mismatches = 0
+    scalar_ssv_score_mismatches = 0
+    scalar_ssv_xe_mismatches = 0
     passes = 0
 
     with path.open("rb") as handle:
@@ -70,9 +74,26 @@ def summarize(path: Path) -> dict[str, object]:
                 paths[str(record["msv_path"])] += 1
                 public_statuses[str(record["public_msv"]["status"])] += 1
                 scalar_statuses[str(record["scalar_full_msv"]["status"])] += 1
+                scalar_ssv = record.get("scalar_ssv")
+                scalar_ssv_mismatch = False
+                if scalar_ssv is not None:
+                    scalar_ssv_statuses[str(scalar_ssv["status"])] += 1
+                    scalar_ssv_agreement = scalar_ssv["agreement"]
+                    scalar_ssv_status_mismatches += not scalar_ssv_agreement["status"]
+                    scalar_ssv_score_mismatches += not scalar_ssv_agreement["score_bits"]
+                    scalar_ssv_xe_mismatches += not scalar_ssv_agreement["xE_u8"]
+                    scalar_ssv_mismatch = (
+                        not scalar_ssv_agreement["status"]
+                        or not scalar_ssv_agreement["score_bits"]
+                        or not scalar_ssv_agreement["xE_u8"]
+                    )
                 agreement = record["agreement"]
                 agreement_references[str(agreement.get("reference", "legacy"))] += 1
-                if not agreement["status"] or not agreement["score_bits"]:
+                if (
+                    not agreement["status"]
+                    or not agreement["score_bits"]
+                    or scalar_ssv_mismatch
+                ):
                     mismatches += 1
                 full_agreement = agreement.get("public_vs_full_msv")
                 if full_agreement is not None:
@@ -121,6 +142,12 @@ def summarize(path: Path) -> dict[str, object]:
         "public_vs_full_msv": {
             "status_mismatches": public_vs_full_status_mismatches,
             "score_bit_mismatches": public_vs_full_score_mismatches,
+        },
+        "scalar_ssv": {
+            "statuses": dict(sorted(scalar_ssv_statuses.items())),
+            "status_mismatches": scalar_ssv_status_mismatches,
+            "score_bit_mismatches": scalar_ssv_score_mismatches,
+            "xE_u8_mismatches": scalar_ssv_xe_mismatches,
         },
         "passes_F1": passes,
         "msv_paths": dict(sorted(paths.items())),
