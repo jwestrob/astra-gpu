@@ -789,6 +789,18 @@ class SequenceBatch:
             )
 
         parameters = [_f1_parameters(profile) for profile in profiles]
+        parameters = [
+            profile_parameters
+            if (
+                profile_parameters is not None
+                and _native.f1_cutoff(
+                    profile_parameters[0], profile_parameters[1], threshold
+                )[0]
+                != _native.F1_CUTOFF_INVALID
+            )
+            else None
+            for profile_parameters in parameters
+        ]
         valid_profiles = [
             profile
             for profile, profile_parameters in zip(profiles, parameters, strict=True)

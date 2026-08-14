@@ -216,6 +216,11 @@ class CudaSsvTests(unittest.TestCase):
             self.assertEqual(batch.cpu_candidates(profile, thresholds[0]), [])
             self.assertEqual(batch.cpu_candidates(profile, thresholds[1]), [0])
             self.assertEqual(batch.cpu_candidates(profile, thresholds[2]), [0])
+            for threshold in thresholds:
+                self.assertEqual(
+                    batch.cpu_candidates_many([profile], threshold),
+                    [batch.cpu_candidates(profile, threshold)],
+                )
 
     def test_f1_cutoff_matches_scalar_for_all_reachable_numerators(self):
         profiles = [self.optimized(HMM_20AA), self.optimized(HMM_M1)]
@@ -332,7 +337,7 @@ class CudaSsvTests(unittest.TestCase):
                 _native.F1_CPU_REQUIRED,
             )
 
-    def test_f1_cutoff_falls_back_at_easel_smallx_jump(self):
+    def test_f1_cutoff_fails_closed_at_easel_smallx_jump(self):
         smallx = 5e-9
         jump_bottom = 1.0 - math.exp(-smallx)
         threshold = (jump_bottom + smallx) / 2.0
@@ -356,8 +361,10 @@ class CudaSsvTests(unittest.TestCase):
             parameters[1] = 1.0
             with SequenceBatch(sequences) as batch:
                 expected = batch.cpu_candidates(profile, threshold)
+                self.assertEqual(expected, [1, 3])
                 self.assertEqual(
-                    batch.cpu_candidates_many([profile], threshold), [expected]
+                    batch.cpu_candidates_many([profile], threshold),
+                    [list(range(len(sequences)))],
                 )
         finally:
             parameters[0] = original_mu
@@ -511,6 +518,96 @@ class CudaSsvTests(unittest.TestCase):
                 list(reversed(expected_candidates)),
             )
         self.assertEqual([profile.L for profile in profiles], original_lengths)
+
+    def test_fused_candidates_deduplicate_nonadjacent_scale_rows(self):
+        profile = self.optimized(HMM_20AA)
+        profiles = [profile.copy(), profile.copy(), profile.copy()]
+        sequences = self.sequences(
+            profile, ["", "G", "ACDEX", "ACDEFGHIKLMNPQRSTVWY", "G" * 100]
+        )
+        packed = _pack_profiles(profiles)
+        scales = array("f", [profile.scale_b, profile.scale_b * 1.25, profile.scale_b])
+        parameters = profile.evalue_parameters.as_vector()
+        m_mu = array("f", [parameters[0]] * len(profiles))
+        m_lambda = array("f", [parameters[1]] * len(profiles))
+        threshold = 0.02
+
+        with SequenceBatch(sequences) as batch:
+            native = _sequence_native(batch)
+            scores = memoryview(profile.sbv).cast("B")
+            expected = []
+            for scale in scales:
+                raw = native.filter_raw(
+                    scores,
+                    profile.sbv.shape[1],
+                    profile.M,
+                    profile.alphabet.Kp,
+                    profile.tbm,
+                    profile.tec,
+                    profile.base_b,
+                    profile.bias_b,
+                    scale,
+                )
+                row = []
+                for index, result in enumerate(raw):
+                    action, _ = _native.f1_decision(
+                        result[0],
+                        result[3],
+                        len(sequences[index]),
+                        scale,
+                        parameters[0],
+                        parameters[1],
+                        threshold,
+                    )
+                    if action == _native.F1_CPU_REQUIRED:
+                        row.append(index)
+                expected.append(row)
+
+            indices, offsets = native.cpu_candidates_many_csr_raw(
+                packed.scores,
+                packed.score_offsets,
+                packed.score_counts,
+                packed.score_strides,
+                packed.model_lengths,
+                packed.constants,
+                scales,
+                m_mu,
+                m_lambda,
+                threshold,
+            )
+            observed = [
+                list(indices[offsets[row] : offsets[row + 1]])
+                for row in range(len(profiles))
+            ]
+            self.assertEqual(observed, expected)
+
+    def test_fused_candidate_mask_word_boundaries_and_fail_closed_rows(self):
+        profile = self.optimized(HMM_20AA)
+        profiles = [profile.copy(), profile.copy()]
+        packed = _pack_profiles(profiles)
+        parameters = profile.evalue_parameters.as_vector()
+        m_mu = array("f", [parameters[0], math.nan])
+        m_lambda = array("f", [parameters[1], parameters[1]])
+        values = ["G", "ACDEX", "ACDEX" * 3, "ACDEFGHIKLMNPQRSTVWY", ""]
+
+        for target_count in (31, 32, 33, 63, 64, 65):
+            with self.subTest(target_count=target_count):
+                sequences = self.sequences(
+                    profile,
+                    [values[index % len(values)] for index in range(target_count)],
+                )
+                with SequenceBatch(sequences) as batch:
+                    expected = batch.cpu_candidates(profile)
+                    native = _sequence_native(batch)
+                    indices, offsets = native.cpu_candidates_many_csr_raw(
+                        *packed, m_mu, m_lambda, 0.02
+                    )
+
+                self.assertEqual(list(indices[offsets[0] : offsets[1]]), expected)
+                self.assertEqual(
+                    list(indices[offsets[1] : offsets[2]]),
+                    list(range(target_count)),
+                )
 
     def test_compact_candidate_csr_matches_diagnostic_lists(self):
         profiles = [
@@ -1248,6 +1345,32 @@ class CudaCandidateBatchTests(unittest.TestCase):
         self.assert_exact_hits(
             self.pipeline().search_hmm(pair.hmm, self.targets),
             candidates.search(1, self.pipeline()),
+        )
+
+    def test_unprovable_cutoff_uses_shared_fail_closed_row(self):
+        pair = self.pairs[0]
+        profile_state = _pair_state(pair)
+        parameters = profile_state.optimized_profile.evalue_parameters.as_vector()
+        original_mu = parameters[0]
+        original_lambda = parameters[1]
+        smallx = 5e-9
+        threshold = ((1.0 - math.exp(-smallx)) + smallx) / 2.0
+        try:
+            parameters[0] = struct.unpack("=f", struct.pack("=f", math.log(smallx)))[0]
+            parameters[1] = 1.0
+            with SequenceBatch(self.targets) as sequences:
+                candidates = sequences.candidate_batch([pair], F1=threshold)
+        finally:
+            parameters[0] = original_mu
+            parameters[1] = original_lambda
+
+        candidate_state = _candidate_state(candidates)
+        self.assertEqual(candidate_state.all_rows, b"\x01")
+        self.assertEqual(len(candidate_state.indices), 0)
+        self.assertEqual(candidates.candidate_count(0), len(self.targets))
+        self.assert_exact_hits(
+            self.pipeline(F1=threshold).search_hmm(pair.hmm, self.targets),
+            candidates.search(0, self.pipeline(F1=threshold)),
         )
 
     def test_only_lockstep_pressed_pairs_are_accepted(self):

@@ -128,6 +128,20 @@ int plan7_ssv_sequence_batch_f1_candidates_many(
   char *error,
   size_t error_size);
 
+int plan7_ssv_sequence_batch_f1_mask_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  const float *m_mu,
+  const float *m_lambda,
+  double f1,
+  uint32_t *profile_major_candidate_words,
+  size_t candidate_word_count,
+  char *error,
+  size_t error_size);
+
 int plan7_ssv_filter_cuda(const uint8_t *striped_scores,
                           size_t striped_score_count,
                           int score_stride,

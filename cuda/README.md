@@ -11,9 +11,10 @@ empty targets, and invalid parameters are always retained. `filter_ssv`
 remains available for score diagnostics. The corresponding `*_many` methods
 compact HMMER's striped scores into GPU-native `[model][residue]` rows and
 evaluate a profile batch in one two-dimensional CUDA launch. The single-profile
-path keeps HMMER's striped layout. The batched host gate caches length-only terms
-and uses an exact per-profile binary32 cutoff, falling back to the scalar Easel
-calculation whenever a cutoff cannot be proven safe.
+path keeps HMMER's striped layout. The fused batched gate reuses exact
+host-computed length terms, evaluates the binary32 cutoff on-device, and copies
+one candidate bit per pair instead of a full result. If a cutoff cannot be
+proven safe, the whole profile row is retained for the CPU pipeline.
 
 `load_pressed_profiles` verifies that each protein HMM and pressed optimized
 profile agree before either can enter a provenance-bound `CandidateBatch`.

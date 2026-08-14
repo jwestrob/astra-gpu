@@ -23,12 +23,13 @@ only 26% for HydDB, so GPU use must be workload-selective. Host packing and
 target upload can now be reused across profiles, and the native adapter returns
 only pairs that direct SSV cannot safely reject at HMMER's exact F1 decision.
 Profiles can now be evaluated in batches rather than one kernel launch apiece.
-Length terms and exact binary32 F1 cutoffs are cached for the host gate.
+The batched kernel applies the exact binary32 F1 cutoff on-device and returns
+an ordered candidate bitmask instead of a dense score table.
 Candidate rows are now immutably bound to verified pressed profiles, copied
 targets, and F1. The ABI-pinned CPU handoff skips definite rejects while
 preserving HMMER accounting and exact `TopHits`; all 21,000 real pilot pairs
-match ordinary PyHMMER end to end. End-to-end Astra integration remains open,
-and there is no performance claim yet.
+match ordinary PyHMMER end to end. An opt-in Astra integration is validated on
+an isolated branch; there is no performance claim yet.
 
 ## Layout
 

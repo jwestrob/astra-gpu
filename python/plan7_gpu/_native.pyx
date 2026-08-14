@@ -14,6 +14,19 @@ cdef carray _UINT32_ARRAY_TEMPLATE = _array.array("I")
 cdef carray _UINT64_ARRAY_TEMPLATE = _array.array("Q")
 
 
+cdef extern from * nogil:
+    """
+    static inline unsigned plan7_popcount_u32(uint32_t value) {
+      return (unsigned) __builtin_popcount(value);
+    }
+    static inline unsigned plan7_ctz_u32(uint32_t value) {
+      return (unsigned) __builtin_ctz(value);
+    }
+    """
+    unsigned plan7_popcount_u32(uint32_t value)
+    unsigned plan7_ctz_u32(uint32_t value)
+
+
 cdef extern from "ssv_cuda.h" nogil:
     cdef enum plan7_ssv_status:
         PLAN7_SSV_OK
@@ -141,6 +154,21 @@ cdef extern from "ssv_cuda.h" nogil:
         uint32_t *candidate_indices,
         size_t candidate_index_count,
         size_t *candidate_counts,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_f1_mask_many(
+        plan7_ssv_sequence_batch *batch,
+        const uint8_t *packed_scores,
+        size_t packed_score_count,
+        const plan7_ssv_profile *profiles,
+        size_t profile_count,
+        const float *m_mu,
+        const float *m_lambda,
+        double f1,
+        uint32_t *profile_major_candidate_words,
+        size_t candidate_word_count,
         char *error,
         size_t error_size,
     )
@@ -330,6 +358,7 @@ cdef class SequenceBatch:
     cdef vector[plan7_ssv_result] _results
     cdef vector[plan7_ssv_result] _many_results
     cdef vector[plan7_ssv_profile] _profiles
+    cdef vector[uint32_t] _candidate_words
     cdef vector[uint32_t] _candidate_indices
     cdef vector[size_t] _candidate_offsets
     cdef vector[size_t] _candidate_counts
@@ -520,9 +549,8 @@ cdef class SequenceBatch:
                 output.append(i)
         return output
 
-    cdef size_t _run_filter_many(
+    cdef size_t _prepare_profiles(
         self,
-        const uint8_t[::1] packed_scores,
         const uint64_t[::1] score_offsets,
         const uint64_t[::1] score_counts,
         const int32_t[::1] score_strides,
@@ -530,11 +558,8 @@ cdef class SequenceBatch:
         const uint8_t[::1] constants,
         const float[::1] scales,
     ) except? 0:
-        cdef char error[512]
         cdef size_t i
         cdef size_t profile_count = <size_t> score_offsets.shape[0]
-        cdef size_t result_count
-        cdef int status
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
@@ -546,12 +571,8 @@ cdef class SequenceBatch:
             or <size_t> constants.shape[0] != profile_count * 4
         ):
             raise ValueError("profile metadata lengths differ")
-        if self._sequence_count and profile_count > (<size_t> -1) / self._sequence_count:
-            raise OverflowError("multi-profile result count overflows size_t")
 
-        result_count = profile_count * self._sequence_count
         self._profiles.resize(profile_count)
-        self._many_results.resize(result_count)
         for i in range(profile_count):
             self._profiles[i].score_offset = score_offsets[i]
             self._profiles[i].score_count = score_counts[i]
@@ -562,6 +583,35 @@ cdef class SequenceBatch:
             self._profiles[i].base = constants[4 * i + 2]
             self._profiles[i].bias = constants[4 * i + 3]
             self._profiles[i].scale = scales[i]
+        return profile_count
+
+    cdef size_t _run_filter_many(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+    ) except? 0:
+        cdef char error[512]
+        cdef size_t profile_count
+        cdef size_t result_count
+        cdef int status
+
+        profile_count = self._prepare_profiles(
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+        )
+        if self._sequence_count and profile_count > (<size_t> -1) / self._sequence_count:
+            raise OverflowError("multi-profile result count overflows size_t")
+        result_count = profile_count * self._sequence_count
+        self._many_results.resize(result_count)
 
         error[0] = 0
         with nogil:
@@ -616,8 +666,14 @@ cdef class SequenceBatch:
     ) except? 0:
         cdef size_t profile_count
         cdef size_t profile_index
-        cdef size_t result_count
+        cdef size_t words_per_profile
+        cdef size_t candidate_word_count
+        cdef size_t word_index
+        cdef size_t sequence_index
         cdef size_t candidate_count = 0
+        cdef size_t output_index
+        cdef uint32_t word
+        cdef unsigned bit
         cdef int status
         cdef char error[512]
 
@@ -627,8 +683,7 @@ cdef class SequenceBatch:
             or <size_t> m_lambda.shape[0] != profile_count
         ):
             raise ValueError("e-value parameter lengths differ")
-        profile_count = self._run_filter_many(
-            packed_scores,
+        profile_count = self._prepare_profiles(
             score_offsets,
             score_counts,
             score_strides,
@@ -636,56 +691,67 @@ cdef class SequenceBatch:
             constants,
             scales,
         )
-        result_count = profile_count * self._sequence_count
+        if self._sequence_count > (<size_t> -1) - 31:
+            raise OverflowError("candidate mask size overflows size_t")
+        words_per_profile = (self._sequence_count + 31) // 32
+        if words_per_profile and profile_count > (<size_t> -1) // words_per_profile:
+            raise OverflowError("candidate mask size overflows size_t")
+        candidate_word_count = profile_count * words_per_profile
+        self._candidate_words.resize(candidate_word_count)
         self._candidate_counts.resize(profile_count)
         error[0] = 0
         with nogil:
-            status = plan7_ssv_sequence_batch_f1_candidates_many(
+            status = plan7_ssv_sequence_batch_f1_mask_many(
                 self._batch,
-                self._many_results.data() if result_count else NULL,
-                result_count,
-                &scales[0] if profile_count else NULL,
+                &packed_scores[0] if packed_scores.shape[0] else NULL,
+                <size_t> packed_scores.shape[0],
+                self._profiles.data() if profile_count else NULL,
+                profile_count,
                 &m_mu[0] if profile_count else NULL,
                 &m_lambda[0] if profile_count else NULL,
-                profile_count,
                 f1,
-                NULL,
-                NULL,
-                0,
-                self._candidate_counts.data() if profile_count else NULL,
+                self._candidate_words.data() if candidate_word_count else NULL,
+                candidate_word_count,
                 error,
                 sizeof(error),
             )
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
+
         self._candidate_offsets.resize(profile_count)
         for profile_index in range(profile_count):
+            self._candidate_counts[profile_index] = 0
+            for word_index in range(words_per_profile):
+                self._candidate_counts[profile_index] += plan7_popcount_u32(
+                    self._candidate_words[
+                        profile_index * words_per_profile + word_index
+                    ]
+                )
             self._candidate_offsets[profile_index] = candidate_count
             if self._candidate_counts[profile_index] > (<size_t> -1) - candidate_count:
                 raise OverflowError("candidate count overflows size_t")
             candidate_count += self._candidate_counts[profile_index]
+
         self._candidate_indices.resize(candidate_count)
-        if candidate_count:
-            error[0] = 0
-            with nogil:
-                status = plan7_ssv_sequence_batch_f1_candidates_many(
-                    self._batch,
-                    self._many_results.data(),
-                    result_count,
-                    &scales[0],
-                    &m_mu[0],
-                    &m_lambda[0],
-                    profile_count,
-                    f1,
-                    self._candidate_offsets.data(),
-                    self._candidate_indices.data(),
-                    candidate_count,
-                    self._candidate_counts.data(),
-                    error,
-                    sizeof(error),
-                )
-            if status != 0:
-                raise RuntimeError(error.decode("utf-8", "replace"))
+        for profile_index in range(profile_count):
+            output_index = self._candidate_offsets[profile_index]
+            for word_index in range(words_per_profile):
+                word = self._candidate_words[
+                    profile_index * words_per_profile + word_index
+                ]
+                while word:
+                    bit = plan7_ctz_u32(word)
+                    sequence_index = word_index * 32 + bit
+                    if sequence_index >= self._sequence_count:
+                        raise RuntimeError("candidate mask has trailing bits set")
+                    self._candidate_indices[output_index] = <uint32_t> sequence_index
+                    output_index += 1
+                    word &= word - 1
+            if output_index != (
+                self._candidate_offsets[profile_index]
+                + self._candidate_counts[profile_index]
+            ):
+                raise RuntimeError("candidate mask count changed")
         return profile_count
 
     def cpu_candidates_many_raw(
