@@ -1,0 +1,76 @@
+{
+  "comparisons": 3000,
+  "coverage": {
+    "distinct_sequence_indexes": 1000,
+    "distinct_sequence_lengths": 475,
+    "distinct_tjb_b": 17,
+    "sequence_length_max": 1718,
+    "sequence_length_min": 32,
+    "tjb_b_values": [
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+    ]
+  },
+  "mismatches": 0,
+  "models": {
+    "Fe": {
+      "M": 329,
+      "comparisons": 1000
+    },
+    "FeFe": {
+      "M": 182,
+      "comparisons": 1000
+    },
+    "NiFe": {
+      "M": 1052,
+      "comparisons": 1000
+    }
+  },
+  "msv_paths": {
+    "ssv_fallback_msv_erange": 2,
+    "ssv_fallback_msv_ok": 6,
+    "ssv_ok": 2992
+  },
+  "oracle_metadata": {
+    "F1": {
+      "class": "finite",
+      "hex": "0x1.47ae147ae147bp-6"
+    },
+    "fasta_path": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa",
+    "hmm_path": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm",
+    "hmmer_revision": "hmmer-3.4:9acd8b6758a0ca5d21db6d167e0277484341929b",
+    "models_loaded": 3,
+    "record": "metadata",
+    "schema_version": 1,
+    "sequences_loaded": 1000
+  },
+  "passes_F1": 119,
+  "public_statuses": {
+    "eslERANGE": 2,
+    "eslOK": 2998
+  },
+  "scalar_statuses": {
+    "eslERANGE": 2,
+    "eslOK": 2998
+  },
+  "schema_version": 1,
+  "source": {
+    "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/oracle/hyddb-plm2_5-3x1000.jsonl",
+    "sha256": "11785ecca62cf80fb554d06c4e1c85bcd3c9d5c19983d0d2c8cdc261c83559d2"
+  }
+}

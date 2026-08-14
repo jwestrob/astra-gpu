@@ -1,0 +1,48 @@
+{
+  "comparisons": 45,
+  "coverage": {
+    "distinct_sequence_indexes": 45,
+    "distinct_sequence_lengths": 6,
+    "distinct_tjb_b": 1,
+    "sequence_length_max": 153,
+    "sequence_length_min": 141,
+    "tjb_b_values": [
+      17
+    ]
+  },
+  "mismatches": 0,
+  "models": {
+    "globins4": {
+      "M": 149,
+      "comparisons": 45
+    }
+  },
+  "msv_paths": {
+    "ssv_erange": 45
+  },
+  "oracle_metadata": {
+    "F1": {
+      "class": "finite",
+      "hex": "0x1.47ae147ae147bp-6"
+    },
+    "fasta_path": "refs/src/hmmer-3.4/tutorial/globins45.fa",
+    "hmm_path": "refs/src/hmmer-3.4/tutorial/globins4.hmm",
+    "hmmer_revision": "hmmer-3.4:9acd8b6758a0ca5d21db6d167e0277484341929b",
+    "models_loaded": 1,
+    "record": "metadata",
+    "schema_version": 1,
+    "sequences_loaded": 45
+  },
+  "passes_F1": 45,
+  "public_statuses": {
+    "eslERANGE": 45
+  },
+  "scalar_statuses": {
+    "eslERANGE": 45
+  },
+  "schema_version": 1,
+  "source": {
+    "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/baseline/oracle-globins45.jsonl",
+    "sha256": "ab5020e653750f3bfdb35c6d39533a8fdc8a37e5961f22f148e77914467ca029"
+  }
+}

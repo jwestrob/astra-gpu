@@ -1,0 +1,146 @@
+{
+  "comparisons": 2100,
+  "coverage": {
+    "distinct_sequence_indexes": 100,
+    "distinct_sequence_lengths": 97,
+    "distinct_tjb_b": 15,
+    "sequence_length_max": 1112,
+    "sequence_length_min": 48,
+    "tjb_b_values": [
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26
+    ]
+  },
+  "mismatches": 0,
+  "models": {
+    "CENP-L": {
+      "M": 307,
+      "comparisons": 100
+    },
+    "Fe": {
+      "M": 329,
+      "comparisons": 100
+    },
+    "FeFe": {
+      "M": 182,
+      "comparisons": 100
+    },
+    "Herpes_U47": {
+      "M": 677,
+      "comparisons": 100
+    },
+    "Hobbit": {
+      "M": 2372,
+      "comparisons": 100
+    },
+    "K00046": {
+      "M": 311,
+      "comparisons": 100
+    },
+    "K07521": {
+      "M": 1050,
+      "comparisons": 100
+    },
+    "K07691": {
+      "M": 213,
+      "comparisons": 100
+    },
+    "K07802": {
+      "M": 14,
+      "comparisons": 100
+    },
+    "K10381": {
+      "M": 2678,
+      "comparisons": 100
+    },
+    "K11996": {
+      "M": 681,
+      "comparisons": 100
+    },
+    "K12691": {
+      "M": 86,
+      "comparisons": 100
+    },
+    "K15613": {
+      "M": 459,
+      "comparisons": 100
+    },
+    "K16418": {
+      "M": 17019,
+      "comparisons": 100
+    },
+    "NiFe": {
+      "M": 1052,
+      "comparisons": 100
+    },
+    "Pertactin": {
+      "M": 121,
+      "comparisons": 100
+    },
+    "Pus10_THUMP_arc": {
+      "M": 78,
+      "comparisons": 100
+    },
+    "TOH_N": {
+      "M": 25,
+      "comparisons": 100
+    },
+    "TPR_VPS8_2": {
+      "M": 194,
+      "comparisons": 100
+    },
+    "WWamide": {
+      "M": 7,
+      "comparisons": 100
+    },
+    "YycE-like_N": {
+      "M": 52,
+      "comparisons": 100
+    }
+  },
+  "msv_paths": {
+    "ssv_fallback_msv_erange": 2,
+    "ssv_fallback_msv_ok": 17,
+    "ssv_ok": 2081
+  },
+  "oracle_metadata": {
+    "F1": {
+      "class": "finite",
+      "hex": "0x1.47ae147ae147bp-6"
+    },
+    "fasta_path": "results/datasets/PLM2_5.first1000.faa",
+    "hmm_path": "results/datasets/oracle-hmm-quantiles.hmm",
+    "hmmer_revision": "hmmer-3.4:9acd8b6758a0ca5d21db6d167e0277484341929b",
+    "models_loaded": 21,
+    "record": "metadata",
+    "schema_version": 1,
+    "sequences_loaded": 100
+  },
+  "passes_F1": 66,
+  "public_statuses": {
+    "eslERANGE": 2,
+    "eslOK": 2098
+  },
+  "scalar_statuses": {
+    "eslERANGE": 2,
+    "eslOK": 2098
+  },
+  "schema_version": 1,
+  "source": {
+    "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/oracle/hmm-quantiles-plm2_5-21x100.jsonl",
+    "sha256": "7627b73beb0ccdc8f0cc6405f65711309497953f2a4e4ab7e7b1a9d4331d7961"
+  }
+}
