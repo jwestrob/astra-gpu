@@ -1,7 +1,7 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
 
 from libc.stddef cimport size_t
-from libc.stdint cimport int16_t, uint8_t, uint32_t, uint64_t
+from libc.stdint cimport int16_t, int32_t, uint8_t, uint32_t, uint64_t
 from libc.math cimport isfinite
 from libcpp.vector cimport vector
 
@@ -23,6 +23,17 @@ cdef extern from "ssv_cuda.h" nogil:
         uint8_t tjb
         uint8_t reserved
         int16_t numerator
+
+    ctypedef struct plan7_ssv_profile:
+        uint64_t score_offset
+        uint64_t score_count
+        int32_t score_stride
+        int32_t model_length
+        uint8_t tbm
+        uint8_t tec
+        uint8_t base
+        uint8_t bias
+        float scale
 
     ctypedef struct plan7_ssv_sequence_batch:
         pass
@@ -70,6 +81,18 @@ cdef extern from "ssv_cuda.h" nogil:
         uint8_t bias,
         float scale,
         plan7_ssv_result *results,
+        size_t result_count,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_filter_many(
+        plan7_ssv_sequence_batch *batch,
+        const uint8_t *packed_striped_scores,
+        size_t packed_score_count,
+        const plan7_ssv_profile *profiles,
+        size_t profile_count,
+        plan7_ssv_result *profile_major_results,
         size_t result_count,
         char *error,
         size_t error_size,
@@ -125,6 +148,39 @@ cdef list _format_results(vector[plan7_ssv_result]& results, float scale):
     return output
 
 
+cdef list _format_many_results(
+    vector[plan7_ssv_result]& results,
+    const float[::1] scales,
+    size_t sequence_count,
+):
+    cdef size_t profile_index
+    cdef size_t sequence_index
+    cdef size_t result_index
+    cdef plan7_ssv_result result
+    cdef float_bits score
+    cdef object score_value
+    cdef list profile_results
+    cdef list output = []
+
+    for profile_index in range(<size_t> scales.shape[0]):
+        profile_results = []
+        for sequence_index in range(sequence_count):
+            result_index = profile_index * sequence_count + sequence_index
+            result = results[result_index]
+            if result.status == PLAN7_SSV_OK:
+                score.value = <float> result.numerator
+                score.value /= scales[profile_index]
+                score.value -= 3.0
+                score_value = score.bits
+            else:
+                score_value = None
+            profile_results.append(
+                (result.status, result.xE, result.tjb, result.numerator, score_value)
+            )
+        output.append(profile_results)
+    return output
+
+
 def device_count():
     cdef char error[512]
     cdef int count
@@ -156,6 +212,8 @@ def tjb_for_lengths(float scale, const uint64_t[::1] lengths):
 cdef class SequenceBatch:
     cdef plan7_ssv_sequence_batch *_batch
     cdef vector[plan7_ssv_result] _results
+    cdef vector[plan7_ssv_result] _many_results
+    cdef vector[plan7_ssv_profile] _profiles
     cdef vector[uint64_t] _lengths
     cdef size_t _sequence_count
     cdef int _alphabet_size
@@ -341,6 +399,142 @@ cdef class SequenceBatch:
             )
             if action == PLAN7_F1_CPU_REQUIRED:
                 output.append(i)
+        return output
+
+    cdef size_t _run_filter_many(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+    ) except? 0:
+        cdef char error[512]
+        cdef size_t i
+        cdef size_t profile_count = <size_t> score_offsets.shape[0]
+        cdef size_t result_count
+        cdef int status
+
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        if (
+            <size_t> score_counts.shape[0] != profile_count
+            or <size_t> score_strides.shape[0] != profile_count
+            or <size_t> model_lengths.shape[0] != profile_count
+            or <size_t> scales.shape[0] != profile_count
+            or <size_t> constants.shape[0] != profile_count * 4
+        ):
+            raise ValueError("profile metadata lengths differ")
+        if self._sequence_count and profile_count > (<size_t> -1) / self._sequence_count:
+            raise OverflowError("multi-profile result count overflows size_t")
+
+        result_count = profile_count * self._sequence_count
+        self._profiles.resize(profile_count)
+        self._many_results.resize(result_count)
+        for i in range(profile_count):
+            self._profiles[i].score_offset = score_offsets[i]
+            self._profiles[i].score_count = score_counts[i]
+            self._profiles[i].score_stride = score_strides[i]
+            self._profiles[i].model_length = model_lengths[i]
+            self._profiles[i].tbm = constants[4 * i]
+            self._profiles[i].tec = constants[4 * i + 1]
+            self._profiles[i].base = constants[4 * i + 2]
+            self._profiles[i].bias = constants[4 * i + 3]
+            self._profiles[i].scale = scales[i]
+
+        error[0] = 0
+        with nogil:
+            status = plan7_ssv_sequence_batch_filter_many(
+                self._batch,
+                &packed_scores[0] if packed_scores.shape[0] else NULL,
+                <size_t> packed_scores.shape[0],
+                self._profiles.data() if profile_count else NULL,
+                profile_count,
+                self._many_results.data() if result_count else NULL,
+                result_count,
+                error,
+                sizeof(error),
+            )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        return profile_count
+
+    def filter_many_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+    ):
+        self._run_filter_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+        )
+        return _format_many_results(self._many_results, scales, self._sequence_count)
+
+    def cpu_candidates_many_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+    ):
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t sequence_index
+        cdef size_t result_index
+        cdef int action
+        cdef list candidates
+        cdef list output = []
+
+        profile_count = <size_t> score_offsets.shape[0]
+        if (
+            <size_t> m_mu.shape[0] != profile_count
+            or <size_t> m_lambda.shape[0] != profile_count
+        ):
+            raise ValueError("e-value parameter lengths differ")
+        profile_count = self._run_filter_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+        )
+        for profile_index in range(profile_count):
+            candidates = []
+            for sequence_index in range(self._sequence_count):
+                result_index = profile_index * self._sequence_count + sequence_index
+                action = plan7_ssv_f1_decision(
+                    self._many_results[result_index].status,
+                    self._many_results[result_index].numerator,
+                    self._lengths[sequence_index],
+                    scales[profile_index],
+                    m_mu[profile_index],
+                    m_lambda[profile_index],
+                    f1,
+                    NULL,
+                )
+                if action == PLAN7_F1_CPU_REQUIRED:
+                    candidates.append(sequence_index)
+            output.append(candidates)
         return output
 
 

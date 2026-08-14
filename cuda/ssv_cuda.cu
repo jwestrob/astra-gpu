@@ -11,6 +11,7 @@ extern "C" {
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 struct plan7_ssv_sequence_batch {
   int device_ordinal;
@@ -18,12 +19,17 @@ struct plan7_ssv_sequence_batch {
   size_t sequence_count;
   uint64_t *host_lengths;
   uint8_t *host_tjb;
+  size_t host_tjb_capacity;
   uint8_t *device_residues;
   uint64_t *device_offsets;
   uint8_t *device_tjb;
+  size_t device_tjb_capacity;
   plan7_ssv_result *device_results;
+  size_t device_result_capacity;
   uint8_t *device_scores;
   size_t device_score_capacity;
+  plan7_ssv_profile *device_profiles;
+  size_t device_profile_capacity;
   float cached_tjb_scale;
   int tjb_cache_valid;
 };
@@ -32,6 +38,16 @@ static_assert(sizeof(plan7_ssv_result) == 6,
               "plan7_ssv_result ABI size changed");
 static_assert(offsetof(plan7_ssv_result, numerator) == 4,
               "plan7_ssv_result ABI layout changed");
+static_assert(sizeof(float) == 4, "plan7 profile ABI requires binary32 float");
+static_assert(sizeof(plan7_ssv_profile) == 32,
+              "plan7_ssv_profile ABI size changed");
+static_assert(offsetof(plan7_ssv_profile, score_offset) == 0 &&
+              offsetof(plan7_ssv_profile, score_count) == 8 &&
+              offsetof(plan7_ssv_profile, score_stride) == 16 &&
+              offsetof(plan7_ssv_profile, model_length) == 20 &&
+              offsetof(plan7_ssv_profile, tbm) == 24 &&
+              offsetof(plan7_ssv_profile, scale) == 28,
+              "plan7_ssv_profile ABI layout changed");
 
 namespace {
 
@@ -47,22 +63,21 @@ saturating_signed_subtract(int left, int right)
   return value > INT8_MAX ? INT8_MAX : (value < INT8_MIN ? INT8_MIN : value);
 }
 
-__global__ void
-ssv_kernel(const uint8_t *scores,
-           int score_stride,
-           int model_length,
-           int alphabet_size,
-           const uint8_t *residues,
-           const uint64_t *offsets,
-           const uint8_t *tjb,
-           uint8_t tbm,
-           uint8_t tec,
-           uint8_t base,
-           uint8_t bias,
-           plan7_ssv_result *results)
+__device__ __forceinline__ void
+ssv_filter_block(const uint8_t *scores,
+                 int score_stride,
+                 int model_length,
+                 const uint8_t *residues,
+                 const uint64_t *offsets,
+                 size_t sequence,
+                 uint8_t length_tjb,
+                 uint8_t tbm,
+                 uint8_t tec,
+                 uint8_t base,
+                 uint8_t bias,
+                 plan7_ssv_result *result_out,
+                 unsigned *maxima)
 {
-  __shared__ unsigned maxima[kThreads];
-  const size_t sequence = static_cast<size_t>(blockIdx.x);
   const uint64_t start = offsets[sequence];
   const int length = static_cast<int>(offsets[sequence + 1] - start);
   const int Q = max(2, (model_length + 15) / 16);
@@ -70,7 +85,7 @@ ssv_kernel(const uint8_t *scores,
 
   if (length == 0) {
     if (threadIdx.x == 0)
-      results[sequence] = {128, PLAN7_SSV_EMPTY, tjb[sequence], 0, 0};
+      *result_out = {128, PLAN7_SSV_EMPTY, length_tjb, 0, 0};
     return;
   }
 
@@ -109,7 +124,6 @@ ssv_kernel(const uint8_t *scores,
 
   if (threadIdx.x == 0) {
     const unsigned raw_xE = maxima[0];
-    const unsigned length_tjb = tjb[sequence];
     plan7_ssv_result result = {
       static_cast<uint8_t>(raw_xE), PLAN7_SSV_OK,
       static_cast<uint8_t>(length_tjb), 0, 0
@@ -139,8 +153,61 @@ ssv_kernel(const uint8_t *scores,
         }
       }
     }
-    results[sequence] = result;
+    *result_out = result;
   }
+}
+
+__global__ void
+ssv_kernel(const uint8_t *scores,
+           int score_stride,
+           int model_length,
+           const uint8_t *residues,
+           const uint64_t *offsets,
+           const uint8_t *tjb,
+           uint8_t tbm,
+           uint8_t tec,
+           uint8_t base,
+           uint8_t bias,
+           plan7_ssv_result *results)
+{
+  __shared__ unsigned maxima[kThreads];
+  const size_t sequence = static_cast<size_t>(blockIdx.x);
+  ssv_filter_block(scores, score_stride, model_length, residues, offsets,
+                   sequence, tjb[sequence], tbm, tec, base, bias,
+                   &results[sequence], maxima);
+}
+
+__global__ void
+ssv_many_kernel(const uint8_t *packed_scores,
+                const plan7_ssv_profile *profiles,
+                size_t sequence_count,
+                const uint8_t *residues,
+                const uint64_t *offsets,
+                const uint8_t *profile_major_tjb,
+                plan7_ssv_result *profile_major_results)
+{
+  __shared__ unsigned maxima[kThreads];
+  __shared__ plan7_ssv_profile profile_descriptor;
+  const size_t sequence = static_cast<size_t>(blockIdx.x);
+  const size_t profile = static_cast<size_t>(blockIdx.y);
+  const size_t result_index = profile * sequence_count + sequence;
+
+  if (threadIdx.x == 0) profile_descriptor = profiles[profile];
+  __syncthreads();
+  ssv_filter_block(
+    packed_scores + profile_descriptor.score_offset,
+    profile_descriptor.score_stride,
+    profile_descriptor.model_length,
+    residues,
+    offsets,
+    sequence,
+    profile_major_tjb[result_index],
+    profile_descriptor.tbm,
+    profile_descriptor.tec,
+    profile_descriptor.base,
+    profile_descriptor.bias,
+    &profile_major_results[result_index],
+    maxima);
 }
 
 void
@@ -163,6 +230,69 @@ checked_product(size_t left, size_t right, size_t *product)
 {
   if (right != 0 && left > SIZE_MAX / right) return false;
   *product = left * right;
+  return true;
+}
+
+template<typename T>
+int
+grow_device_buffer(T **buffer,
+                   size_t *capacity,
+                   size_t required_bytes,
+                   const char *malloc_name,
+                   const char *free_name,
+                   char *error,
+                   size_t error_size)
+{
+  T *replacement = nullptr;
+  cudaError_t status;
+
+  if (required_bytes <= *capacity) return 0;
+  status = cudaMalloc(&replacement, required_bytes);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, malloc_name, status);
+    return -1;
+  }
+  status = cudaFree(*buffer);
+  if (status != cudaSuccess) {
+    cudaFree(replacement);
+    set_cuda_error(error, error_size, free_name, status);
+    return -1;
+  }
+  *buffer = replacement;
+  *capacity = required_bytes;
+  return 0;
+}
+
+bool
+validate_profile(const plan7_ssv_profile *profile,
+                 int alphabet_size,
+                 size_t packed_score_count,
+                 char *error,
+                 size_t error_size)
+{
+  size_t expected_score_count;
+
+  if (profile->model_length < 1 || profile->model_length > 100000 ||
+      profile->score_stride < 1 || !isfinite(profile->scale) ||
+      profile->scale <= 0.0f) {
+    set_error(error, error_size, "invalid packed profile dimensions or scale");
+    return false;
+  }
+  const int Q = profile->model_length < 17
+                  ? 2
+                  : (profile->model_length + 15) / 16;
+  const int minimum_stride = 16 * (Q + kExtraScoreVectors);
+  if (profile->score_stride < minimum_stride ||
+      !checked_product(static_cast<size_t>(profile->score_stride),
+                       static_cast<size_t>(alphabet_size),
+                       &expected_score_count) ||
+      profile->score_count != expected_score_count ||
+      profile->score_offset > packed_score_count ||
+      profile->score_count >
+        static_cast<uint64_t>(packed_score_count - profile->score_offset)) {
+    set_error(error, error_size, "invalid packed profile score range");
+    return false;
+  }
   return true;
 }
 
@@ -212,6 +342,7 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   } while (0)
 
   CUDA_FREE(batch->device_scores);
+  CUDA_FREE(batch->device_profiles);
   CUDA_FREE(batch->device_results);
   CUDA_FREE(batch->device_tjb);
   CUDA_FREE(batch->device_offsets);
@@ -387,6 +518,7 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
     set_error(error, error_size, "host sequence metadata allocation failed");
     goto cleanup;
   }
+  batch->host_tjb_capacity = sequence_count;
   for (size_t i = 0; i < sequence_count; ++i)
     batch->host_lengths[i] = offsets[i + 1] - offsets[i];
 
@@ -403,7 +535,9 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
     CUDA_TRY(cudaMalloc(&batch->device_residues, residue_count));
   CUDA_TRY(cudaMalloc(&batch->device_offsets, offset_bytes));
   CUDA_TRY(cudaMalloc(&batch->device_tjb, sequence_count));
+  batch->device_tjb_capacity = sequence_count;
   CUDA_TRY(cudaMalloc(&batch->device_results, result_bytes));
+  batch->device_result_capacity = result_bytes;
   if (residue_count != 0)
     CUDA_TRY(cudaMemcpy(batch->device_residues, residues, residue_count,
                         cudaMemcpyHostToDevice));
@@ -521,14 +655,188 @@ plan7_ssv_sequence_batch_filter(plan7_ssv_sequence_batch *batch,
   }
 
   ssv_kernel<<<static_cast<unsigned>(batch->sequence_count), kThreads>>>(
-    batch->device_scores, score_stride, model_length, alphabet_size,
-    batch->device_residues, batch->device_offsets, batch->device_tjb, tbm, tec,
-    base, bias, batch->device_results);
+    batch->device_scores, score_stride, model_length, batch->device_residues,
+    batch->device_offsets, batch->device_tjb, tbm, tec, base, bias,
+    batch->device_results);
   CUDA_TRY(cudaGetLastError());
   CUDA_TRY(cudaMemcpy(results, batch->device_results,
                       batch->sequence_count * sizeof(*results),
                       cudaMemcpyDeviceToHost));
 #undef CUDA_TRY
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_filter_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_striped_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  plan7_ssv_result *profile_major_results,
+  size_t result_count,
+  char *error,
+  size_t error_size)
+{
+  cudaError_t status;
+  size_t cell_count;
+  size_t result_bytes;
+  size_t profile_bytes;
+  uint8_t *new_host_tjb;
+  int current_device;
+  int maximum_grid_x;
+  int maximum_grid_y;
+
+  if (batch == nullptr) {
+    set_error(error, error_size, "sequence batch is null");
+    return -1;
+  }
+  status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (current_device != batch->device_ordinal) {
+    set_error(error, error_size,
+              "CUDA sequence batch belongs to a different device");
+    return -1;
+  }
+  if (profile_count == 0) return 0;
+
+  status = cudaDeviceGetAttribute(
+    &maximum_grid_x, cudaDevAttrMaxGridDimX, current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaDeviceGetAttribute(maximum grid x)", status);
+    return -1;
+  }
+  status = cudaDeviceGetAttribute(
+    &maximum_grid_y, cudaDevAttrMaxGridDimY, current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaDeviceGetAttribute(maximum grid y)", status);
+    return -1;
+  }
+  if (batch->sequence_count > static_cast<size_t>(maximum_grid_x) ||
+      profile_count > static_cast<size_t>(maximum_grid_y)) {
+    set_error(error, error_size, "multi-profile CUDA grid is too large");
+    return -1;
+  }
+  if (packed_striped_scores == nullptr || profiles == nullptr) {
+    set_error(error, error_size, "packed profile buffers are null");
+    return -1;
+  }
+  for (size_t profile = 0; profile < profile_count; ++profile)
+    if (!validate_profile(&profiles[profile], batch->alphabet_size,
+                          packed_score_count, error, error_size))
+      return -1;
+
+  if (!checked_product(profile_count, batch->sequence_count, &cell_count) ||
+      !checked_product(cell_count, sizeof(plan7_ssv_result), &result_bytes) ||
+      !checked_product(profile_count, sizeof(plan7_ssv_profile),
+                       &profile_bytes)) {
+    set_error(error, error_size, "multi-profile batch size overflow");
+    return -1;
+  }
+  if (cell_count != 0 &&
+      (profile_major_results == nullptr || result_count < cell_count)) {
+    set_error(error, error_size, "multi-profile result buffer is too short");
+    return -1;
+  }
+  if (batch->sequence_count == 0) return 0;
+
+  if (cell_count > batch->host_tjb_capacity) {
+    new_host_tjb = static_cast<uint8_t *>(
+      realloc(batch->host_tjb, cell_count));
+    if (new_host_tjb == nullptr) {
+      set_error(error, error_size,
+                "host multi-profile transition allocation failed");
+      return -1;
+    }
+    batch->host_tjb = new_host_tjb;
+    batch->host_tjb_capacity = cell_count;
+  }
+  if (grow_device_buffer(&batch->device_scores,
+                         &batch->device_score_capacity,
+                         packed_score_count,
+                         "cudaMalloc(packed profile scores)",
+                         "cudaFree(packed profile scores)",
+                         error,
+                         error_size) != 0 ||
+      grow_device_buffer(&batch->device_profiles,
+                         &batch->device_profile_capacity,
+                         profile_bytes,
+                         "cudaMalloc(profile descriptors)",
+                         "cudaFree(profile descriptors)",
+                         error,
+                         error_size) != 0 ||
+      grow_device_buffer(&batch->device_tjb,
+                         &batch->device_tjb_capacity,
+                         cell_count,
+                         "cudaMalloc(profile transitions)",
+                         "cudaFree(profile transitions)",
+                         error,
+                         error_size) != 0 ||
+      grow_device_buffer(&batch->device_results,
+                         &batch->device_result_capacity,
+                         result_bytes,
+                         "cudaMalloc(profile results)",
+                         "cudaFree(profile results)",
+                         error,
+                         error_size) != 0)
+    return -1;
+
+#define CUDA_TRY_MANY(call)                                                   \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, #call, status);                       \
+      return -1;                                                              \
+    }                                                                         \
+  } while (0)
+
+  CUDA_TRY_MANY(cudaMemcpy(batch->device_scores,
+                           packed_striped_scores,
+                           packed_score_count,
+                           cudaMemcpyHostToDevice));
+  CUDA_TRY_MANY(cudaMemcpy(batch->device_profiles,
+                           profiles,
+                           profile_bytes,
+                           cudaMemcpyHostToDevice));
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    const size_t row = profile * batch->sequence_count;
+    if (profile != 0 && profiles[profile].scale == profiles[profile - 1].scale) {
+      memcpy(batch->host_tjb + row,
+             batch->host_tjb + row - batch->sequence_count,
+             batch->sequence_count);
+    } else {
+      for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence)
+        batch->host_tjb[row + sequence] =
+          compute_tjb(profiles[profile].scale, batch->host_lengths[sequence]);
+    }
+  }
+  batch->tjb_cache_valid = 0;
+  CUDA_TRY_MANY(cudaMemcpy(batch->device_tjb,
+                           batch->host_tjb,
+                           cell_count,
+                           cudaMemcpyHostToDevice));
+
+  const dim3 grid(static_cast<unsigned>(batch->sequence_count),
+                  static_cast<unsigned>(profile_count));
+  ssv_many_kernel<<<grid, kThreads>>>(
+    batch->device_scores,
+    batch->device_profiles,
+    batch->sequence_count,
+    batch->device_residues,
+    batch->device_offsets,
+    batch->device_tjb,
+    batch->device_results);
+  CUDA_TRY_MANY(cudaGetLastError());
+  CUDA_TRY_MANY(cudaMemcpy(profile_major_results,
+                           batch->device_results,
+                           result_bytes,
+                           cudaMemcpyDeviceToHost));
+#undef CUDA_TRY_MANY
   return 0;
 }
 

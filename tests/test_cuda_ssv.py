@@ -301,6 +301,61 @@ class CudaSsvTests(unittest.TestCase):
 
         self.assertTrue(batch.closed)
 
+    def test_multi_profile_batch_matches_repeated_calls(self):
+        profiles = [
+            self.optimized(HMM_20AA),
+            self.optimized(HMM_M1),
+            self.optimized(HMM_20AA),
+        ]
+        sequences = self.sequences(
+            profiles[0], ["", "G", "ACDEX", "ACDEFGHIKLMNPQRSTVWY"]
+        )
+        expected_results = [filter_ssv(profile, sequences) for profile in profiles]
+        expected_candidates = [
+            cpu_candidates(profile, sequences) for profile in profiles
+        ]
+        original_lengths = [profile.L for profile in profiles]
+
+        with SequenceBatch(sequences) as batch:
+            self.assertEqual(batch.filter_ssv_many(profiles), expected_results)
+            self.assertEqual(batch.cpu_candidates_many(profiles), expected_candidates)
+            self.assertEqual(batch.filter_ssv(profiles[0]), expected_results[0])
+            self.assertEqual(batch.filter_ssv_many(profiles[:1]), expected_results[:1])
+            self.assertEqual(
+                batch.cpu_candidates_many(reversed(profiles)),
+                list(reversed(expected_candidates)),
+            )
+        self.assertEqual([profile.L for profile in profiles], original_lengths)
+
+    def test_multi_profile_empty_and_invalid_parameter_cases(self):
+        profiles = [self.optimized(HMM_20AA), self.optimized(HMM_M1)]
+        sequences = self.sequences(profiles[0], ["G", "ACDEX", ""])
+        with SequenceBatch(sequences) as batch:
+            self.assertEqual(batch.filter_ssv_many([]), [])
+            self.assertEqual(batch.cpu_candidates_many([]), [])
+            self.assertEqual(
+                batch.cpu_candidates_many(profiles, F1=1.0),
+                [list(range(len(sequences)))] * len(profiles),
+            )
+
+            parameters = profiles[1].evalue_parameters.as_vector()
+            original_mu = parameters[0]
+            try:
+                parameters[0] = math.nan
+                self.assertEqual(
+                    batch.cpu_candidates_many(profiles),
+                    [
+                        cpu_candidates(profiles[0], sequences),
+                        list(range(len(sequences))),
+                    ],
+                )
+            finally:
+                parameters[0] = original_mu
+
+        with SequenceBatch([], alphabet=profiles[0].alphabet) as empty:
+            self.assertEqual(empty.filter_ssv_many(profiles), [[], []])
+            self.assertEqual(empty.cpu_candidates_many(profiles), [[], []])
+
     def test_persistent_batch_invalidates_length_transition_cache(self):
         profile = self.optimized(HMM_20AA)
         sequences = self.sequences(profile, ["G", "ACDEX", "G" * 100])

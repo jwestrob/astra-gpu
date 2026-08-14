@@ -8,4 +8,5 @@ Astra; it does not load biological files or replace Astra's search pipeline.
 across profiles. `cpu_candidates(profile, F1)` applies HMMER's exact F1 gate and
 returns indexes that direct SSV cannot safely reject. Fallbacks, overflows,
 empty targets, and invalid parameters are always retained. `filter_ssv`
-remains available for score diagnostics.
+remains available for score diagnostics. The corresponding `*_many` methods
+evaluate a profile batch in one two-dimensional CUDA launch.

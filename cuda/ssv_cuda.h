@@ -28,6 +28,18 @@ typedef struct {
   int16_t numerator;
 } plan7_ssv_result;
 
+typedef struct {
+  uint64_t score_offset;
+  uint64_t score_count;
+  int32_t score_stride;
+  int32_t model_length;
+  uint8_t tbm;
+  uint8_t tec;
+  uint8_t base;
+  uint8_t bias;
+  float scale;
+} plan7_ssv_profile;
+
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 
 int plan7_cuda_device_count(char *error, size_t error_size);
@@ -69,6 +81,17 @@ int plan7_ssv_sequence_batch_filter(plan7_ssv_sequence_batch *batch,
                                     size_t result_count,
                                     char *error,
                                     size_t error_size);
+
+int plan7_ssv_sequence_batch_filter_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_striped_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  plan7_ssv_result *profile_major_results,
+  size_t result_count,
+  char *error,
+  size_t error_size);
 
 int plan7_ssv_filter_cuda(const uint8_t *striped_scores,
                           size_t striped_score_count,

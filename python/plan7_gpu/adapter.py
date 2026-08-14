@@ -4,9 +4,70 @@ from array import array
 from collections.abc import Iterable
 import math
 from threading import Lock
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from . import _native  # type: ignore[attr-defined]
+
+
+class _PackedProfiles(NamedTuple):
+    scores: bytearray
+    score_offsets: array[int]
+    score_counts: array[int]
+    score_strides: array[int]
+    model_lengths: array[int]
+    constants: bytearray
+    scales: array[float]
+
+
+def _pack_profiles(profiles: list[Any]) -> _PackedProfiles:
+    scores = bytearray()
+    score_offsets = array("Q")
+    score_counts = array("Q")
+    score_strides = array("i")
+    model_lengths = array("i")
+    constants = bytearray()
+    scales = array("f")
+
+    for profile in profiles:
+        striped_scores = memoryview(profile.sbv).cast("B")
+        score_offsets.append(len(scores))
+        score_counts.append(len(striped_scores))
+        score_strides.append(profile.sbv.shape[1])
+        model_lengths.append(profile.M)
+        constants.extend((profile.tbm, profile.tec, profile.base_b, profile.bias_b))
+        scales.append(profile.scale_b)
+        scores.extend(striped_scores)
+
+    return _PackedProfiles(
+        scores,
+        score_offsets,
+        score_counts,
+        score_strides,
+        model_lengths,
+        constants,
+        scales,
+    )
+
+
+def _f1_parameters(profile: Any) -> tuple[float, float, float] | None:
+    try:
+        parameters = profile.evalue_parameters.as_vector()
+        m_mu = float(parameters[0])
+        m_lambda = float(parameters[1])
+        scale = float(profile.scale_b)
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(m_mu)
+        or not math.isfinite(m_lambda)
+        or not math.isfinite(scale)
+        or m_mu == -99999.0
+        or m_lambda == -99999.0
+        or m_lambda <= 0.0
+        or scale <= 0.0
+    ):
+        return None
+    return m_mu, m_lambda, scale
 
 
 def _format_results(raw_results: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
@@ -121,25 +182,15 @@ class SequenceBatch:
 
             try:
                 threshold = float(F1)
-                parameters = optimized_profile.evalue_parameters.as_vector()
-                m_mu = float(parameters[0])
-                m_lambda = float(parameters[1])
-                scale = float(optimized_profile.scale_b)
-            except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, OverflowError):
                 return list(range(len(self)))
 
-            if (
-                not math.isfinite(threshold)
-                or not 0.0 <= threshold < 1.0
-                or not math.isfinite(m_mu)
-                or not math.isfinite(m_lambda)
-                or not math.isfinite(scale)
-                or m_mu == -99999.0
-                or m_lambda == -99999.0
-                or m_lambda <= 0.0
-                or scale <= 0.0
-            ):
+            if not math.isfinite(threshold) or not 0.0 <= threshold < 1.0:
                 return list(range(len(self)))
+            parameters = _f1_parameters(optimized_profile)
+            if parameters is None:
+                return list(range(len(self)))
+            m_mu, m_lambda, scale = parameters
 
             scores = memoryview(optimized_profile.sbv).cast("B")
             return cast(
@@ -159,6 +210,71 @@ class SequenceBatch:
                     threshold,
                 ),
             )
+
+    def filter_ssv_many(
+        self, optimized_profiles: Iterable[Any]
+    ) -> list[list[dict[str, Any]]]:
+        profiles = list(optimized_profiles)
+        with self._lock:
+            if self._native.closed:
+                raise RuntimeError("sequence batch is closed")
+            for profile in profiles:
+                if profile.alphabet != self.alphabet:
+                    raise ValueError("profile and sequence alphabets differ")
+            packed = _pack_profiles(profiles)
+            raw = cast(
+                list[list[tuple[Any, ...]]],
+                self._native.filter_many_raw(*packed),
+            )
+        return [_format_results(profile_results) for profile_results in raw]
+
+    def cpu_candidates_many(
+        self, optimized_profiles: Iterable[Any], F1: float = 0.02
+    ) -> list[list[int]]:
+        profiles = list(optimized_profiles)
+        with self._lock:
+            if self._native.closed:
+                raise RuntimeError("sequence batch is closed")
+            for profile in profiles:
+                if profile.alphabet != self.alphabet:
+                    raise ValueError("profile and sequence alphabets differ")
+            try:
+                threshold = float(F1)
+            except (TypeError, ValueError, OverflowError):
+                return [list(range(len(self))) for _ in profiles]
+            if not math.isfinite(threshold) or not 0.0 <= threshold < 1.0:
+                return [list(range(len(self))) for _ in profiles]
+
+            output: list[list[int] | None] = [None] * len(profiles)
+            valid_profiles = []
+            valid_indices = []
+            m_mu = array("f")
+            m_lambda = array("f")
+            for index, profile in enumerate(profiles):
+                parameters = _f1_parameters(profile)
+                if parameters is None:
+                    output[index] = list(range(len(self)))
+                else:
+                    profile_mu, profile_lambda, _ = parameters
+                    valid_profiles.append(profile)
+                    valid_indices.append(index)
+                    m_mu.append(profile_mu)
+                    m_lambda.append(profile_lambda)
+
+            if valid_profiles:
+                packed = _pack_profiles(valid_profiles)
+                candidates = cast(
+                    list[list[int]],
+                    self._native.cpu_candidates_many_raw(
+                        *packed, m_mu, m_lambda, threshold
+                    ),
+                )
+                for index, profile_candidates in zip(
+                    valid_indices, candidates, strict=True
+                ):
+                    output[index] = profile_candidates
+
+            return cast(list[list[int]], output)
 
 
 def filter_ssv(

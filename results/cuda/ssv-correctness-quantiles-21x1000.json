@@ -8,19 +8,19 @@
     "source": [
       {
         "path": "cuda/ssv_cuda.cu",
-        "sha256": "679ece3d430eb02854620a210ebbbfb615c651723a20d9a3f80ec3043d851b36"
+        "sha256": "8c30f8f87c601353a9f303bddf930e00045cfa19a43ff564bf4d31d98ed5c93a"
       },
       {
         "path": "cuda/ssv_cuda.h",
-        "sha256": "6ac8b622119f608160ac83b12a49521f695e201ac5c015e0f3ab65ead8e713f9"
+        "sha256": "fe7025866d2ee897da9cae48a1a9f711c73b495947e1490580471221872f8c6a"
       },
       {
         "path": "python/plan7_gpu/_native.pyx",
-        "sha256": "eba6bd43498d0cf8b27a99e02169600bcd9f672fcdc3752b73803523dff59b36"
+        "sha256": "0514eb44769bd1771bceb813aac88c5480296beebad182834099e72696e269d3"
       },
       {
         "path": "python/plan7_gpu/adapter.py",
-        "sha256": "d6c056c56618c131da0d74185db2f1cbd27d555f98dc25355ee4316115c1a6b7"
+        "sha256": "c2c163cbcc08bc5958117ad499c208f16217787ade1f2212f01998a470840d01"
       },
       {
         "path": "Makefile",
@@ -63,7 +63,12 @@
       "eslERANGE": 7
     },
     "profile_length_mutations": 0,
-    "resident_sequence_batch": true
+    "resident_sequence_batch": true,
+    "multi_profile_batch": {
+      "profiles": 21,
+      "pairs": 21000,
+      "raw_mismatches_vs_repeated_single_profile": 0
+    }
   },
   "f1_gate": {
     "reference": "HMMER_3.4_strict_oracle",
@@ -72,10 +77,11 @@
     "cpu_candidates": 721,
     "fallback_or_overflow_candidates": 174,
     "decision_mismatches": 0,
+    "multi_profile_decision_mismatches": 0,
     "exact_boundary_probability_hex": "0x1.e726801175503p-1"
   },
   "additional_checks": {
-    "focused_tests": 14,
+    "focused_tests": 16,
     "all_lengths_tjb_checked": [0, 100000],
     "compute_sanitizer": {
       "memcheck_errors": 0,
