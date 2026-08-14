@@ -20,6 +20,7 @@ The first CUDA SSV kernel matches HMMER's public status and score on 21,000
 real profile/sequence pairs and passes CUDA memory checking. Direct Astra
 measurements put stage one at about 45% of wall time for the PFAM pilot but
 only 26% for HydDB, so GPU use must be workload-selective. Host packing and
+target upload can now be reused across profiles. Exact survivor compaction and
 end-to-end Astra integration remain open; there is no performance claim yet.
 
 ## Layout

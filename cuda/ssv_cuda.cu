@@ -7,6 +7,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+struct plan7_ssv_sequence_batch {
+  int device_ordinal;
+  int alphabet_size;
+  size_t sequence_count;
+  uint64_t *host_lengths;
+  uint8_t *host_tjb;
+  uint8_t *device_residues;
+  uint64_t *device_offsets;
+  uint8_t *device_tjb;
+  plan7_ssv_result *device_results;
+  uint8_t *device_scores;
+  size_t device_score_capacity;
+  float cached_tjb_scale;
+  int tjb_cache_valid;
+};
+
+static_assert(sizeof(plan7_ssv_result) == 6,
+              "plan7_ssv_result ABI size changed");
+static_assert(offsetof(plan7_ssv_result, numerator) == 4,
+              "plan7_ssv_result ABI layout changed");
+
 namespace {
 
 constexpr int kThreads = 256;
@@ -43,7 +64,7 @@ ssv_kernel(const uint8_t *scores,
 
   if (length == 0) {
     if (threadIdx.x == 0)
-      results[sequence] = {128, PLAN7_SSV_EMPTY, tjb[sequence], 0};
+      results[sequence] = {128, PLAN7_SSV_EMPTY, tjb[sequence], 0, 0};
     return;
   }
 
@@ -85,7 +106,7 @@ ssv_kernel(const uint8_t *scores,
     const unsigned length_tjb = tjb[sequence];
     plan7_ssv_result result = {
       static_cast<uint8_t>(raw_xE), PLAN7_SSV_OK,
-      static_cast<uint8_t>(length_tjb), 0
+      static_cast<uint8_t>(length_tjb), 0, 0
     };
 
     if (length_tjb + tbm + tec + bias >= 127) {
@@ -146,6 +167,66 @@ compute_tjb(float scale, uint64_t length)
   return cost > 255.0f ? 255 : static_cast<uint8_t>(cost);
 }
 
+int
+destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
+                       char *error,
+                       size_t error_size)
+{
+  cudaError_t first_error = cudaSuccess;
+  cudaError_t status;
+  int original_device = -1;
+  bool device_ready = true;
+  bool restore_device = false;
+
+  if (batch == nullptr) return 0;
+  status = cudaGetDevice(&original_device);
+  if (status == cudaSuccess && original_device != batch->device_ordinal) {
+    status = cudaSetDevice(batch->device_ordinal);
+    if (status == cudaSuccess)
+      restore_device = true;
+    else {
+      first_error = status;
+      device_ready = false;
+    }
+  } else if (status != cudaSuccess) {
+    status = cudaSetDevice(batch->device_ordinal);
+    if (status != cudaSuccess) {
+      first_error = status;
+      device_ready = false;
+    }
+  }
+
+#define CUDA_FREE(pointer)                                                    \
+  do {                                                                        \
+    if (device_ready) {                                                       \
+      status = cudaFree(pointer);                                             \
+      if (first_error == cudaSuccess && status != cudaSuccess)                \
+        first_error = status;                                                 \
+    }                                                                         \
+  } while (0)
+
+  CUDA_FREE(batch->device_scores);
+  CUDA_FREE(batch->device_results);
+  CUDA_FREE(batch->device_tjb);
+  CUDA_FREE(batch->device_offsets);
+  CUDA_FREE(batch->device_residues);
+#undef CUDA_FREE
+  if (restore_device) {
+    status = cudaSetDevice(original_device);
+    if (first_error == cudaSuccess && status != cudaSuccess)
+      first_error = status;
+  }
+  free(batch->host_tjb);
+  free(batch->host_lengths);
+  free(batch);
+  if (first_error != cudaSuccess) {
+    set_cuda_error(error, error_size, "destroy CUDA sequence batch",
+                   first_error);
+    return -1;
+  }
+  return 0;
+}
+
 }  // namespace
 
 extern "C" int
@@ -169,6 +250,232 @@ plan7_tjb_for_length(float scale, uint64_t length)
 }
 
 extern "C" int
+plan7_ssv_sequence_batch_create(const uint8_t *residues,
+                                size_t residue_count,
+                                const uint64_t *offsets,
+                                size_t offset_count,
+                                int alphabet_size,
+                                plan7_ssv_sequence_batch **batch_out,
+                                char *error,
+                                size_t error_size)
+{
+  plan7_ssv_sequence_batch *batch = nullptr;
+  cudaError_t status;
+  size_t sequence_count;
+  size_t offset_bytes;
+  size_t result_bytes;
+  int rc = -1;
+  int device_ordinal;
+
+  if (batch_out == nullptr) {
+    set_error(error, error_size, "sequence batch output is null");
+    return -1;
+  }
+  *batch_out = nullptr;
+  status = cudaGetDevice(&device_ordinal);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (alphabet_size < 1 || offset_count == 0 || offsets == nullptr ||
+      (residue_count != 0 && residues == nullptr)) {
+    set_error(error, error_size, "invalid sequence batch buffers");
+    return -1;
+  }
+  sequence_count = offset_count - 1;
+  if (sequence_count > INT_MAX) {
+    set_error(error, error_size, "too many sequences in CUDA batch");
+    return -1;
+  }
+  if (offsets[0] != 0 || offsets[sequence_count] != residue_count) {
+    set_error(error, error_size, "invalid sequence offsets");
+    return -1;
+  }
+  for (size_t i = 0; i < sequence_count; ++i) {
+    if (offsets[i] > offsets[i + 1] ||
+        offsets[i + 1] - offsets[i] > kMaximumTargetLength) {
+      set_error(error, error_size, "invalid target length or offsets");
+      return -1;
+    }
+  }
+  for (size_t i = 0; i < residue_count; ++i) {
+    if (residues[i] >= alphabet_size) {
+      set_error(error, error_size, "digital residue is outside the alphabet");
+      return -1;
+    }
+  }
+  if (!checked_product(offset_count, sizeof(*offsets), &offset_bytes) ||
+      !checked_product(sequence_count, sizeof(plan7_ssv_result),
+                       &result_bytes)) {
+    set_error(error, error_size, "sequence batch size overflow");
+    return -1;
+  }
+
+  batch = static_cast<plan7_ssv_sequence_batch *>(calloc(1, sizeof(*batch)));
+  if (batch == nullptr) {
+    set_error(error, error_size, "host sequence batch allocation failed");
+    return -1;
+  }
+  batch->alphabet_size = alphabet_size;
+  batch->device_ordinal = device_ordinal;
+  batch->sequence_count = sequence_count;
+  if (sequence_count == 0) {
+    *batch_out = batch;
+    return 0;
+  }
+  batch->host_lengths =
+    static_cast<uint64_t *>(malloc(sequence_count * sizeof(uint64_t)));
+  batch->host_tjb = static_cast<uint8_t *>(malloc(sequence_count));
+  if (batch->host_lengths == nullptr || batch->host_tjb == nullptr) {
+    set_error(error, error_size, "host sequence metadata allocation failed");
+    goto cleanup;
+  }
+  for (size_t i = 0; i < sequence_count; ++i)
+    batch->host_lengths[i] = offsets[i + 1] - offsets[i];
+
+#define CUDA_TRY(call)                                                        \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, #call, status);                       \
+      goto cleanup;                                                           \
+    }                                                                         \
+  } while (0)
+
+  if (residue_count != 0)
+    CUDA_TRY(cudaMalloc(&batch->device_residues, residue_count));
+  CUDA_TRY(cudaMalloc(&batch->device_offsets, offset_bytes));
+  CUDA_TRY(cudaMalloc(&batch->device_tjb, sequence_count));
+  CUDA_TRY(cudaMalloc(&batch->device_results, result_bytes));
+  if (residue_count != 0)
+    CUDA_TRY(cudaMemcpy(batch->device_residues, residues, residue_count,
+                        cudaMemcpyHostToDevice));
+  CUDA_TRY(cudaMemcpy(batch->device_offsets, offsets, offset_bytes,
+                      cudaMemcpyHostToDevice));
+  *batch_out = batch;
+  rc = 0;
+
+cleanup:
+  if (rc != 0) destroy_sequence_batch(batch, nullptr, 0);
+#undef CUDA_TRY
+  return rc;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_destroy(plan7_ssv_sequence_batch **batch_out,
+                                 char *error,
+                                 size_t error_size)
+{
+  plan7_ssv_sequence_batch *batch;
+
+  if (batch_out == nullptr) {
+    set_error(error, error_size, "sequence batch pointer is null");
+    return -1;
+  }
+  batch = *batch_out;
+  *batch_out = nullptr;
+  return destroy_sequence_batch(batch, error, error_size);
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_filter(plan7_ssv_sequence_batch *batch,
+                                const uint8_t *striped_scores,
+                                size_t striped_score_count,
+                                int score_stride,
+                                int model_length,
+                                int alphabet_size,
+                                uint8_t tbm,
+                                uint8_t tec,
+                                uint8_t base,
+                                uint8_t bias,
+                                float scale,
+                                plan7_ssv_result *results,
+                                size_t result_count,
+                                char *error,
+                                size_t error_size)
+{
+  uint8_t *new_device_scores = nullptr;
+  cudaError_t status;
+  size_t score_bytes;
+  int current_device;
+
+  if (batch == nullptr || model_length < 1 || model_length > 100000 ||
+      alphabet_size < 1 || alphabet_size != batch->alphabet_size) {
+    set_error(error, error_size, "invalid SSV batch dimensions");
+    return -1;
+  }
+  status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (current_device != batch->device_ordinal) {
+    set_error(error, error_size,
+              "CUDA sequence batch belongs to a different device");
+    return -1;
+  }
+  const int Q = model_length < 17 ? 2 : (model_length + 15) / 16;
+  const int minimum_stride = 16 * (Q + kExtraScoreVectors);
+  if (score_stride < minimum_stride || striped_scores == nullptr ||
+      !checked_product(static_cast<size_t>(score_stride),
+                       static_cast<size_t>(alphabet_size), &score_bytes) ||
+      striped_score_count < score_bytes) {
+    set_error(error, error_size, "invalid striped score buffer");
+    return -1;
+  }
+  if (!isfinite(scale) || scale <= 0.0f ||
+      (batch->sequence_count != 0 &&
+       (results == nullptr || result_count < batch->sequence_count))) {
+    set_error(error, error_size, "invalid SSV result buffer or scale");
+    return -1;
+  }
+  if (batch->sequence_count == 0) return 0;
+
+#define CUDA_TRY(call)                                                        \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, #call, status);                       \
+      return -1;                                                              \
+    }                                                                         \
+  } while (0)
+
+  if (score_bytes > batch->device_score_capacity) {
+    CUDA_TRY(cudaMalloc(&new_device_scores, score_bytes));
+    status = cudaFree(batch->device_scores);
+    if (status != cudaSuccess) {
+      cudaFree(new_device_scores);
+      set_cuda_error(error, error_size, "cudaFree(device_scores)", status);
+      return -1;
+    }
+    batch->device_scores = new_device_scores;
+    batch->device_score_capacity = score_bytes;
+  }
+  CUDA_TRY(cudaMemcpy(batch->device_scores, striped_scores, score_bytes,
+                      cudaMemcpyHostToDevice));
+  if (!batch->tjb_cache_valid || scale != batch->cached_tjb_scale) {
+    for (size_t i = 0; i < batch->sequence_count; ++i)
+      batch->host_tjb[i] = compute_tjb(scale, batch->host_lengths[i]);
+    batch->tjb_cache_valid = 0;
+    CUDA_TRY(cudaMemcpy(batch->device_tjb, batch->host_tjb,
+                        batch->sequence_count, cudaMemcpyHostToDevice));
+    batch->cached_tjb_scale = scale;
+    batch->tjb_cache_valid = 1;
+  }
+
+  ssv_kernel<<<static_cast<unsigned>(batch->sequence_count), kThreads>>>(
+    batch->device_scores, score_stride, model_length, alphabet_size,
+    batch->device_residues, batch->device_offsets, batch->device_tjb, tbm, tec,
+    base, bias, batch->device_results);
+  CUDA_TRY(cudaGetLastError());
+  CUDA_TRY(cudaMemcpy(results, batch->device_results,
+                      batch->sequence_count * sizeof(*results),
+                      cudaMemcpyDeviceToHost));
+#undef CUDA_TRY
+  return 0;
+}
+
+extern "C" int
 plan7_ssv_filter_cuda(const uint8_t *striped_scores,
                       size_t striped_score_count,
                       int score_stride,
@@ -189,112 +496,24 @@ plan7_ssv_filter_cuda(const uint8_t *striped_scores,
                       char *error,
                       size_t error_size)
 {
-  uint8_t *device_scores = nullptr;
-  uint8_t *device_residues = nullptr;
-  uint64_t *device_offsets = nullptr;
-  uint8_t *device_tjb = nullptr;
-  uint8_t *host_tjb = nullptr;
-  plan7_ssv_result *device_results = nullptr;
-  cudaError_t status;
-  size_t score_bytes;
-  size_t offset_bytes;
-  size_t result_bytes;
-  int rc = -1;
+  plan7_ssv_sequence_batch *batch = nullptr;
+  int rc;
+  int destroy_rc;
 
-  if (model_length < 1 || model_length > 100000 || alphabet_size < 1 ||
-      sequence_count > INT_MAX) {
-    set_error(error, error_size, "invalid SSV dimensions");
-    return -1;
-  }
-  const int Q = model_length < 17 ? 2 : (model_length + 15) / 16;
-  const int minimum_stride = 16 * (Q + kExtraScoreVectors);
-  if (score_stride < minimum_stride || striped_scores == nullptr ||
-      offset_count != sequence_count + 1 || offsets == nullptr ||
-      (residue_count != 0 && residues == nullptr)) {
-    set_error(error, error_size, "invalid SSV buffers");
-    return -1;
-  }
-  if (offsets[0] != 0 || offsets[sequence_count] != residue_count) {
+  if (offset_count != sequence_count + 1) {
     set_error(error, error_size, "invalid sequence offsets");
     return -1;
   }
-  if (sequence_count == 0) return 0;
-  if (result_count < sequence_count || results == nullptr ||
-      !isfinite(scale) || scale <= 0.0f) {
-    set_error(error, error_size, "invalid SSV result buffer or scale");
-    return -1;
-  }
-  for (size_t i = 0; i < sequence_count; ++i) {
-    if (offsets[i] > offsets[i + 1] ||
-        offsets[i + 1] - offsets[i] > kMaximumTargetLength) {
-      set_error(error, error_size, "invalid target length or offsets");
-      return -1;
-    }
-  }
-  for (size_t i = 0; i < residue_count; ++i) {
-    if (residues[i] >= alphabet_size) {
-      set_error(error, error_size, "digital residue is outside the alphabet");
-      return -1;
-    }
-  }
-  if (!checked_product(static_cast<size_t>(score_stride),
-                       static_cast<size_t>(alphabet_size), &score_bytes) ||
-      !checked_product(sequence_count + 1, sizeof(*offsets), &offset_bytes) ||
-      !checked_product(sequence_count, sizeof(*results), &result_bytes)) {
-    set_error(error, error_size, "SSV buffer size overflow");
-    return -1;
-  }
-  if (striped_score_count < score_bytes) {
-    set_error(error, error_size, "striped score buffer is too short");
-    return -1;
-  }
-
-#define CUDA_TRY(call)                                                        \
-  do {                                                                        \
-    status = (call);                                                          \
-    if (status != cudaSuccess) {                                              \
-      set_cuda_error(error, error_size, #call, status);                       \
-      goto cleanup;                                                           \
-    }                                                                         \
-  } while (0)
-
-  CUDA_TRY(cudaMalloc(&device_scores, score_bytes));
-  if (residue_count != 0) CUDA_TRY(cudaMalloc(&device_residues, residue_count));
-  CUDA_TRY(cudaMalloc(&device_offsets, offset_bytes));
-  CUDA_TRY(cudaMalloc(&device_tjb, sequence_count));
-  CUDA_TRY(cudaMalloc(&device_results, result_bytes));
-  CUDA_TRY(cudaMemcpy(device_scores, striped_scores, score_bytes,
-                      cudaMemcpyHostToDevice));
-  if (residue_count != 0)
-    CUDA_TRY(cudaMemcpy(device_residues, residues, residue_count,
-                        cudaMemcpyHostToDevice));
-  CUDA_TRY(cudaMemcpy(device_offsets, offsets, offset_bytes,
-                      cudaMemcpyHostToDevice));
-  host_tjb = static_cast<uint8_t *>(malloc(sequence_count));
-  if (host_tjb == nullptr) {
-    set_error(error, error_size, "host tjb allocation failed");
-    goto cleanup;
-  }
-  for (size_t i = 0; i < sequence_count; ++i)
-    host_tjb[i] = compute_tjb(scale, offsets[i + 1] - offsets[i]);
-  CUDA_TRY(cudaMemcpy(device_tjb, host_tjb, sequence_count,
-                      cudaMemcpyHostToDevice));
-
-  ssv_kernel<<<static_cast<unsigned>(sequence_count), kThreads>>>(
-    device_scores, score_stride, model_length, alphabet_size, device_residues,
-    device_offsets, device_tjb, tbm, tec, base, bias, device_results);
-  CUDA_TRY(cudaGetLastError());
-  CUDA_TRY(cudaMemcpy(results, device_results, result_bytes,
-                      cudaMemcpyDeviceToHost));
-  rc = 0;
-
-cleanup:
-  free(host_tjb);
-  cudaFree(device_results);
-  cudaFree(device_tjb);
-  cudaFree(device_offsets);
-  cudaFree(device_residues);
-  cudaFree(device_scores);
-#undef CUDA_TRY
+  rc = plan7_ssv_sequence_batch_create(
+    residues, residue_count, offsets, offset_count, alphabet_size, &batch,
+    error, error_size);
+  if (rc == 0)
+    rc = plan7_ssv_sequence_batch_filter(
+      batch, striped_scores, striped_score_count, score_stride, model_length,
+      alphabet_size, tbm, tec, base, bias, scale, results, result_count, error,
+      error_size);
+  destroy_rc = plan7_ssv_sequence_batch_destroy(
+    &batch, rc == 0 ? error : nullptr, rc == 0 ? error_size : 0);
+  if (rc == 0 && destroy_rc != 0) rc = -1;
   return rc;
 }

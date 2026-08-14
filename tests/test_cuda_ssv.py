@@ -10,8 +10,9 @@ import pyhmmer
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 try:
-    from plan7_gpu import _native, filter_ssv
+    from plan7_gpu import SequenceBatch, _native, filter_ssv
 except ImportError:
+    SequenceBatch = None
     _native = None
     filter_ssv = None
 
@@ -169,6 +170,93 @@ class CudaSsvTests(unittest.TestCase):
     def test_empty_batch_is_valid(self):
         profile = self.optimized(HMM_M1)
         self.assertEqual(filter_ssv(profile, []), [])
+
+    def test_persistent_batch_matches_repeated_one_shot_calls(self):
+        first_profile = self.optimized(HMM_20AA)
+        second_profile = self.optimized(HMM_M1)
+        sequences = self.sequences(
+            first_profile,
+            ["", "G", "ACDEX", "ACDEFGHIKLMNPQRSTVWY"],
+        )
+        expected_first = filter_ssv(first_profile, sequences)
+        expected_second = filter_ssv(second_profile, sequences)
+
+        with SequenceBatch(sequences) as batch:
+            self.assertEqual(len(batch), len(sequences))
+            self.assertEqual(batch.filter_ssv(first_profile), expected_first)
+            self.assertEqual(filter_ssv(second_profile, batch), expected_second)
+            self.assertEqual(batch.filter_ssv(first_profile), expected_first)
+
+        self.assertTrue(batch.closed)
+
+    def test_persistent_batch_invalidates_length_transition_cache(self):
+        profile = self.optimized(HMM_20AA)
+        sequences = self.sequences(profile, ["G", "ACDEX", "G" * 100])
+        lengths = array("Q", map(len, sequences))
+        scores = memoryview(profile.sbv).cast("B")
+        batch = SequenceBatch(sequences)
+
+        def observed_tjb(scale):
+            raw = batch._native.filter_raw(
+                scores,
+                profile.sbv.shape[1],
+                profile.M,
+                profile.alphabet.Kp,
+                profile.tbm,
+                profile.tec,
+                profile.base_b,
+                profile.bias_b,
+                scale,
+            )
+            return bytearray(result[2] for result in raw)
+
+        try:
+            first_scale = profile.scale_b
+            second_scale = first_scale * 1.25
+            for scale in (first_scale, first_scale, second_scale, first_scale):
+                self.assertEqual(
+                    observed_tjb(scale),
+                    _native.tjb_for_lengths(scale, lengths),
+                )
+        finally:
+            batch.close()
+
+    def test_persistent_batch_lifecycle_is_idempotent(self):
+        profile = self.optimized(HMM_20AA)
+        sequences = self.sequences(profile, ["G", "ACDEX"])
+        batch = SequenceBatch(iter(sequences))
+        del sequences
+        self.assertFalse(batch.closed)
+        self.assertEqual(len(batch.filter_ssv(profile)), 2)
+
+        batch.close()
+        batch.close()
+        self.assertTrue(batch.closed)
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            batch.filter_ssv(profile)
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            batch.__enter__()
+
+    def test_persistent_empty_and_independent_batches(self):
+        profile = self.optimized(HMM_20AA)
+        empty = SequenceBatch([], alphabet=profile.alphabet)
+        first = SequenceBatch(self.sequences(profile, ["G"]))
+        second = SequenceBatch(self.sequences(profile, ["ACDEX", ""]))
+        try:
+            self.assertEqual(empty.filter_ssv(profile), [])
+            self.assertEqual(
+                first.filter_ssv(profile),
+                filter_ssv(profile, self.sequences(profile, ["G"])),
+            )
+            self.assertEqual(
+                second.filter_ssv(profile),
+                filter_ssv(profile, self.sequences(profile, ["ACDEX", ""])),
+            )
+            self.assertEqual(len(first.filter_ssv(profile)), 1)
+        finally:
+            empty.close()
+            first.close()
+            second.close()
 
     def test_all_length_transition_quantization_matches_hmmer(self):
         profile = self.optimized(HMM_20AA)

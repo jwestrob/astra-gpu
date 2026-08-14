@@ -1,3 +1,3 @@
-from .adapter import filter_ssv
+from .adapter import SequenceBatch, filter_ssv
 
-__all__ = ["filter_ssv"]
+__all__ = ["SequenceBatch", "filter_ssv"]

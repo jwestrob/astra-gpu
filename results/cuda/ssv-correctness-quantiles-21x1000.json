@@ -8,19 +8,19 @@
     "source": [
       {
         "path": "cuda/ssv_cuda.cu",
-        "sha256": "a47d50b96e016d84d3583945bb873040639a938eac156cb8c7b67680e40b19c4"
+        "sha256": "733a0c3b4dd02f04c1925bd374068baf03f9149f63bbcccdbd0970ad70949a18"
       },
       {
         "path": "cuda/ssv_cuda.h",
-        "sha256": "43a60acaf20b192489af367d00b1ddd8d51d3f2713624148354e61fc26aae0f7"
+        "sha256": "821b044ca4d8fc3bdd7f63bf8c1b83d28beb5d18806ead3081eb0781a5f19076"
       },
       {
         "path": "python/plan7_gpu/_native.pyx",
-        "sha256": "4f5c70ca83410dcf5019db6926953012e4e6f99ce201e771e4f1fa9a59fa2be2"
+        "sha256": "1ae871873d3720d104cbe97f7a0254314c4c0218f967ef60d4545851166f05fa"
       },
       {
         "path": "python/plan7_gpu/adapter.py",
-        "sha256": "bfa7308c5acf95855dfc2d02592b94297d9867f38ef75ecd11849467c027389d"
+        "sha256": "9960c13bd10986d58b325f52c0f3a85a41fc5be58bc7e739ad5b78984b37c370"
       }
     ]
   },
@@ -53,11 +53,18 @@
       "eslENORESULT": 167,
       "eslERANGE": 7
     },
-    "profile_length_mutations": 0
+    "profile_length_mutations": 0,
+    "resident_sequence_batch": true
   },
   "additional_checks": {
-    "focused_tests": 7,
+    "focused_tests": 11,
     "all_lengths_tjb_checked": [0, 100000],
-    "compute_sanitizer_memcheck_errors": 0
+    "compute_sanitizer": {
+      "memcheck_errors": 0,
+      "leaked_bytes": 0,
+      "initcheck_errors": 0,
+      "racecheck_hazards": 0,
+      "synccheck_errors": 0
+    }
   }
 }
