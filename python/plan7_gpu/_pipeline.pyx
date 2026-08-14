@@ -10,12 +10,13 @@ loading it against an unsupported private ABI.
 
 from libc.stddef cimport size_t
 from libc.math cimport isfinite, isnan
-from libc.stdint cimport int16_t, uint8_t, uint32_t, uint64_t
+from libc.stdint cimport int16_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcpy
 
-from libeasel cimport eslERRBUFSIZE, eslEINVAL, eslERANGE, eslOK
+from libeasel cimport eslCONST_LOG2, eslERRBUFSIZE, eslEINVAL, eslERANGE, eslOK
 from libeasel.sq cimport ESL_SQ
+from libhmmer cimport p7_MLAMBDA, p7_MMU, p7_VLAMBDA, p7_VMU
 from libhmmer.impl.p7_oprofile cimport (
     P7_OPROFILE,
     p7_oprofile_Compare,
@@ -42,6 +43,7 @@ from pyhmmer.plan7 cimport HMM, OptimizedProfile, Pipeline, TopHits
 
 import pyhmmer as _pyhmmer
 from pyhmmer.errors import AlphabetMismatch, UnexpectedError
+from array import array as _array
 import importlib.util as _importlib_util
 from pathlib import Path as _Path
 
@@ -57,6 +59,10 @@ cdef extern from "dlfcn.h" nogil:
     int dlclose(void* handle)
     void* dlopen(const char* filename, int flags)
     void* dlsym(void* handle, const char* symbol)
+
+
+cdef extern from "esl_gumbel.h" nogil:
+    double esl_gumbel_surv(double, double, double)
 
 
 _abi_spec = _importlib_util.spec_from_file_location(
@@ -92,6 +98,13 @@ cdef enum:
     BIAS_DEFINITE_PASS = 2
     SSV_OK = 0
     SSV_ENORESULT = 19
+    FORWARD_CPU_REQUIRED = 0
+    FORWARD_DEFINITE_REJECT = 1
+    FORWARD_DEFINITE_PASS = 2
+    FORWARD_OK = 0
+    FORWARD_ERANGE = 16
+    FORWARD_ENORESULT = 19
+    FORWARD_EMPTY = 255
     P7_VIT_EXTERNAL = 1
     P7_VIT_CPU = 2
 
@@ -111,6 +124,14 @@ cdef struct _postfilter_result:
     uint8_t msv_status
     uint8_t action
     float vfsc
+
+
+cdef struct _forward_result:
+    uint32_t sequence_index
+    float fwdsc
+    uint8_t status
+    uint8_t action
+    uint16_t reserved
 
 
 ctypedef int (*_pipeline_from_filter_scores_f)(
@@ -145,6 +166,11 @@ ctypedef int (*_pipeline_from_filter_and_forward_scores_f)(
 cdef union _float_bits:
     float value
     uint32_t bits
+
+
+cdef union _double_bits:
+    double value
+    uint64_t bits
 
 
 def _bias_filter_score_bits(
@@ -257,6 +283,141 @@ def _filter_and_forward_scores_seam_available():
     with nogil:
         seam = _resolve_filter_and_forward_scores_seam()
     return seam != NULL
+
+
+def _select_forward_inputs_bound(
+    profiles,
+    const uint8_t[::1] postfilter_records,
+    const uint64_t[::1] postfilter_offsets,
+    const uint64_t[::1] residue_offsets,
+    double f2,
+):
+    """Select exact F2 survivors from trusted profile-major post-filter rows.
+
+    Rows that fail F2 remain in the original post-filter stream and therefore
+    take the ordinary CPU Forward continuation. The native Forward runner caps
+    actual gathered F3-pass matrices; charging all F2 survivors here would
+    discard work that ultimately needs no matrix.
+    """
+    cdef size_t profile_count = len(profiles)
+    cdef size_t profile_index
+    cdef size_t cursor
+    cdef size_t start
+    cdef size_t stop
+    cdef size_t record_count
+    cdef size_t sequence_count
+    cdef uint32_t previous
+    cdef bint have_previous
+    cdef uint64_t sequence_length
+    cdef float usc
+    cdef float bit_score
+    cdef double probability
+    cdef _float_bits vfsc_bits
+    cdef _postfilter_result record
+    cdef OptimizedProfile profile
+    cdef object value
+    cdef object candidate_offsets = _array("Q", [0])
+    cdef object candidate_indices = _array("I")
+    cdef object filter_scores = _array("f")
+
+    if sizeof(_postfilter_result) != 16:
+        raise RuntimeError("native post-filter result ABI is not 16 bytes")
+    if postfilter_offsets.shape[0] != profile_count + 1:
+        raise ValueError("post-filter row-offset count differs from profiles")
+    if postfilter_offsets[0] != 0:
+        raise ValueError("post-filter row offsets must start at zero")
+    if <size_t> postfilter_records.shape[0] % sizeof(_postfilter_result) != 0:
+        raise ValueError("post-filter result storage has trailing bytes")
+    record_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+    if postfilter_offsets[profile_count] != record_count:
+        raise ValueError("post-filter row offsets do not span result storage")
+    if residue_offsets.shape[0] == 0 or residue_offsets[0] != 0:
+        raise ValueError("target residue prefix must contain an initial zero")
+    sequence_count = <size_t> residue_offsets.shape[0] - 1
+
+    for profile_index in range(profile_count):
+        start = <size_t> postfilter_offsets[profile_index]
+        stop = <size_t> postfilter_offsets[profile_index + 1]
+        if start > stop or stop > record_count:
+            raise ValueError("post-filter row offsets are not monotone")
+        value = profiles[profile_index]
+        if not isinstance(value, _pyhmmer.plan7.OptimizedProfile):
+            raise TypeError("Forward source profiles must be OptimizedProfile objects")
+        profile = value
+        previous = 0
+        have_previous = False
+        for cursor in range(start, stop):
+            memcpy(
+                &record,
+                &postfilter_records[cursor * sizeof(_postfilter_result)],
+                sizeof(_postfilter_result),
+            )
+            if record.sequence_index >= sequence_count:
+                raise IndexError(
+                    f"post-filter result sequence index out of range: "
+                    f"{record.sequence_index}"
+                )
+            if have_previous and record.sequence_index <= previous:
+                raise ValueError(
+                    "post-filter result sequence indexes must be strictly "
+                    "increasing and unique within each row"
+                )
+            previous = record.sequence_index
+            have_previous = True
+
+            if record.action != BIAS_DEFINITE_PASS:
+                continue
+            vfsc_bits.value = record.vfsc
+            if (
+                record.msv_status != SSV_OK
+                or not isfinite(record.filtersc)
+                or (
+                    not isfinite(record.vfsc)
+                    and vfsc_bits.bits != 0x7f800000
+                )
+                or not isfinite(profile._om.scale_b)
+                or profile._om.scale_b <= 0.0
+            ):
+                continue
+
+            usc = <float> record.msv_numerator
+            usc = usc / profile._om.scale_b
+            usc = usc - <float> 3.0
+            bit_score = <float> ((usc - record.filtersc) / eslCONST_LOG2)
+            probability = esl_gumbel_surv(
+                bit_score,
+                profile._om.evparam[<int> p7_MMU],
+                profile._om.evparam[<int> p7_MLAMBDA],
+            )
+            if probability > f2:
+                bit_score = <float> (
+                    (record.vfsc - record.filtersc) / eslCONST_LOG2
+                )
+                probability = esl_gumbel_surv(
+                    bit_score,
+                    profile._om.evparam[<int> p7_VMU],
+                    profile._om.evparam[<int> p7_VLAMBDA],
+                )
+                if probability > f2:
+                    continue
+
+            if residue_offsets[record.sequence_index + 1] < (
+                residue_offsets[record.sequence_index]
+            ):
+                raise ValueError("target residue prefix is not monotone")
+            sequence_length = (
+                residue_offsets[record.sequence_index + 1]
+                - residue_offsets[record.sequence_index]
+            )
+            if sequence_length > HMMER_TARGET_LIMIT:
+                raise ValueError("Forward target exceeds HMMER's protein limit")
+            candidate_indices.append(record.sequence_index)
+            filter_scores.append(record.filtersc)
+        candidate_offsets.append(len(candidate_indices))
+
+    return candidate_offsets, candidate_indices, filter_scores
 
 
 cdef int _search_loop_candidates(
@@ -566,6 +727,167 @@ cdef int _search_loop_postfilter(
     return 0
 
 
+cdef int _search_loop_postfilter_forward(
+    P7_PIPELINE* pli,
+    P7_OPROFILE* om,
+    P7_BG* bg,
+    const ESL_SQ** sq,
+    size_t n_targets,
+    const uint8_t* postfilter_bytes,
+    size_t postfilter_count,
+    const uint8_t* forward_bytes,
+    size_t forward_count,
+    const uint64_t* special_offsets,
+    const float* specials,
+    const uint64_t* residue_offsets,
+    P7_TOPHITS* th,
+    _pipeline_from_filter_scores_f filter_scores_seam,
+    _pipeline_from_filter_and_forward_scores_f forward_scores_seam,
+) except 1 nogil:
+    cdef _postfilter_result postfilter
+    cdef _forward_result forward
+    cdef const float* xmx = NULL
+    cdef uint64_t xmx_count = 0
+    cdef float usc
+    cdef int status
+    cdef size_t cursor
+    cdef size_t forward_cursor = 0
+    cdef size_t previous_end = 0
+    cdef size_t target_end
+    cdef size_t t
+    cdef bint has_forward
+    cdef bint used_forward_seam
+
+    status = p7_pli_NewModel(pli, om, bg)
+    if status == eslEINVAL:
+        Pipeline._missing_cutoffs(pli, om)
+    elif status != eslOK:
+        raise UnexpectedError(status, "p7_pli_NewModel")
+
+    for cursor in range(postfilter_count):
+        memcpy(
+            &postfilter,
+            postfilter_bytes + cursor * sizeof(_postfilter_result),
+            sizeof(_postfilter_result),
+        )
+        t = postfilter.sequence_index
+        target_end = t + 1
+
+        if not pli.long_targets:
+            pli.nseqs += target_end - previous_end
+            if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
+                pli.Z = pli.nseqs
+        pli.nres += residue_offsets[target_end] - residue_offsets[previous_end]
+
+        if cursor == 0 and t != 0:
+            p7_pipeline_Reuse(pli)
+
+        status = p7_bg_SetLength(bg, sq[t].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_bg_SetLength")
+        status = p7_oprofile_ReconfigLength(om, sq[t].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+
+        has_forward = False
+        if forward_cursor < forward_count:
+            memcpy(
+                &forward,
+                forward_bytes + forward_cursor * sizeof(_forward_result),
+                sizeof(_forward_result),
+            )
+            has_forward = forward.sequence_index == postfilter.sequence_index
+
+        used_forward_seam = False
+        if postfilter.action == BIAS_CPU_REQUIRED:
+            status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
+        elif isnan(postfilter.filtersc):
+            status = eslOK
+        else:
+            usc = <float> postfilter.msv_numerator
+            usc = usc / om.scale_b
+            usc = usc - <float> 3.0
+            if has_forward and forward.action != FORWARD_CPU_REQUIRED:
+                xmx_count = (
+                    special_offsets[forward_cursor + 1]
+                    - special_offsets[forward_cursor]
+                )
+                if xmx_count == 0:
+                    xmx = NULL
+                else:
+                    xmx = specials + special_offsets[forward_cursor]
+                status = forward_scores_seam(
+                    pli,
+                    om,
+                    bg,
+                    sq[t],
+                    NULL,
+                    th,
+                    usc,
+                    postfilter.filtersc,
+                    postfilter.vfsc,
+                    forward.fwdsc,
+                    xmx,
+                    xmx_count,
+                )
+                used_forward_seam = True
+            else:
+                status = filter_scores_seam(
+                    pli,
+                    om,
+                    bg,
+                    sq[t],
+                    NULL,
+                    th,
+                    usc,
+                    postfilter.filtersc,
+                    P7_VIT_EXTERNAL,
+                    postfilter.vfsc,
+                )
+
+        if has_forward:
+            forward_cursor += 1
+        if status == eslEINVAL:
+            if used_forward_seam:
+                raise UnexpectedError(
+                    status, "p7_PipelineFromFilterAndForwardScores"
+                )
+            Pipeline._missing_cutoffs(pli, om)
+        elif status == eslERANGE:
+            raise OverflowError(
+                "numerical overflow in the optimized vector implementation"
+            )
+        elif status != eslOK:
+            raise UnexpectedError(status, "p7_Pipeline")
+
+        p7_pipeline_Reuse(pli)
+        previous_end = target_end
+
+    if previous_end < n_targets:
+        if not pli.long_targets:
+            pli.nseqs += n_targets - previous_end
+            if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
+                pli.Z = pli.nseqs
+        pli.nres += residue_offsets[n_targets] - residue_offsets[previous_end]
+
+    if (
+        n_targets != 0
+        and (
+            postfilter_count == 0
+            or postfilter.sequence_index != n_targets - 1
+        )
+    ):
+        status = p7_bg_SetLength(bg, sq[n_targets - 1].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_bg_SetLength")
+        status = p7_oprofile_ReconfigLength(om, sq[n_targets - 1].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+        p7_pipeline_Reuse(pli)
+
+    return 0
+
+
 cdef void _validate_inputs(
     Pipeline pipeline,
     HMM query,
@@ -714,6 +1036,65 @@ cdef TopHits _search_postfilter_validated(
             residue_offsets,
             hits._th,
             filter_scores_seam,
+        )
+        hits._sort_by_key()
+        hits._threshold(pipeline)
+
+    hits._query = query
+    hits._empty = False
+    return hits
+
+
+cdef TopHits _search_postfilter_forward_validated(
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+    const uint8_t[::1] forward_records,
+    const uint64_t[::1] special_offsets,
+    const float[::1] specials,
+    const uint64_t* residue_offsets,
+    _pipeline_from_filter_scores_f filter_scores_seam,
+    _pipeline_from_filter_and_forward_scores_f forward_scores_seam,
+):
+    cdef const uint8_t* postfilter_ptr = NULL
+    cdef const uint8_t* forward_ptr = NULL
+    cdef const float* special_ptr = NULL
+    cdef size_t postfilter_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+    cdef size_t forward_count = (
+        <size_t> forward_records.shape[0] // sizeof(_forward_result)
+    )
+    cdef TopHits hits = TopHits(query)
+
+    if postfilter_records.shape[0] != 0:
+        postfilter_ptr = &postfilter_records[0]
+    if forward_records.shape[0] != 0:
+        forward_ptr = &forward_records[0]
+    if specials.shape[0] != 0:
+        special_ptr = &specials[0]
+
+    with nogil:
+        pipeline._pli.mode = p7_SEARCH_SEQS
+        pipeline._pli.nseqs = 0
+        _search_loop_postfilter_forward(
+            pipeline._pli,
+            optimized_profile._om,
+            pipeline.background._bg,
+            <const ESL_SQ**> sequences._refs,
+            sequences._length,
+            postfilter_ptr,
+            postfilter_count,
+            forward_ptr,
+            forward_count,
+            &special_offsets[0],
+            special_ptr,
+            residue_offsets,
+            hits._th,
+            filter_scores_seam,
+            forward_scores_seam,
         )
         hits._sort_by_key()
         hits._threshold(pipeline)
@@ -970,6 +1351,232 @@ cdef void _validate_postfilter_residue_offsets(
         raise ValueError("target residue prefix differs from final target length")
 
 
+cdef bint _validate_forward_augmentation(
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+    const uint8_t[::1] forward_records,
+    const uint64_t[::1] special_offsets,
+    const float[::1] specials,
+) except -1:
+    cdef _postfilter_result postfilter
+    cdef _forward_result forward
+    cdef size_t postfilter_count
+    cdef size_t forward_count
+    cdef size_t postfilter_cursor = 0
+    cdef size_t forward_cursor
+    cdef size_t special_cursor
+    cdef uint32_t previous = 0
+    cdef uint64_t special_start
+    cdef uint64_t special_stop
+    cdef uint64_t expected_count
+    cdef bint has_external = False
+
+    if sizeof(_forward_result) != 12:
+        raise RuntimeError("native Forward result ABI is not 12 bytes")
+    if <size_t> forward_records.shape[0] % sizeof(_forward_result) != 0:
+        raise ValueError("Forward result row has trailing bytes")
+    forward_count = (
+        <size_t> forward_records.shape[0] // sizeof(_forward_result)
+    )
+    if special_offsets.shape[0] != forward_count + 1:
+        raise ValueError("Forward special-offset count differs from result count")
+    if special_offsets[0] > <uint64_t> specials.shape[0]:
+        raise ValueError("Forward special offsets start outside storage")
+    postfilter_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+
+    for forward_cursor in range(forward_count):
+        memcpy(
+            &forward,
+            &forward_records[forward_cursor * sizeof(_forward_result)],
+            sizeof(_forward_result),
+        )
+        if forward.sequence_index >= sequences._length:
+            raise IndexError(
+                f"Forward result sequence index out of range: "
+                f"{forward.sequence_index}"
+            )
+        if forward_cursor != 0 and forward.sequence_index <= previous:
+            raise ValueError(
+                "Forward result sequence indexes must be strictly increasing "
+                "and unique"
+            )
+        previous = forward.sequence_index
+        if forward.reserved != 0:
+            raise ValueError("Forward result reserved field is nonzero")
+
+        while postfilter_cursor < postfilter_count:
+            memcpy(
+                &postfilter,
+                &postfilter_records[
+                    postfilter_cursor * sizeof(_postfilter_result)
+                ],
+                sizeof(_postfilter_result),
+            )
+            if postfilter.sequence_index >= forward.sequence_index:
+                break
+            postfilter_cursor += 1
+        if (
+            postfilter_cursor == postfilter_count
+            or postfilter.sequence_index != forward.sequence_index
+            or postfilter.action != BIAS_DEFINITE_PASS
+        ):
+            raise ValueError(
+                "Forward results must be a subset of direct post-filter passes"
+            )
+
+        special_start = special_offsets[forward_cursor]
+        special_stop = special_offsets[forward_cursor + 1]
+        if special_start > special_stop:
+            raise ValueError("Forward special offsets are not monotone")
+        if special_stop > <uint64_t> specials.shape[0]:
+            raise ValueError("Forward special offsets exceed storage")
+
+        if forward.action == FORWARD_CPU_REQUIRED:
+            if forward.status not in (
+                FORWARD_OK,
+                FORWARD_ERANGE,
+                FORWARD_ENORESULT,
+                FORWARD_EMPTY,
+            ):
+                raise ValueError("unknown CPU-required Forward status")
+            if forward.status == FORWARD_OK:
+                if not isfinite(forward.fwdsc):
+                    raise ValueError(
+                        "eslOK CPU-required Forward result needs a finite score"
+                    )
+            elif not isnan(forward.fwdsc):
+                raise ValueError(
+                    "failed CPU-required Forward result must have NaN score"
+                )
+            if special_start != special_stop:
+                raise ValueError(
+                    "CPU-required Forward result must not have special states"
+                )
+        elif (
+            forward.action == FORWARD_DEFINITE_REJECT
+            or forward.action == FORWARD_DEFINITE_PASS
+        ):
+            if forward.status != FORWARD_OK:
+                raise ValueError("direct Forward result requires eslOK status")
+            if not isfinite(forward.fwdsc):
+                raise ValueError("direct Forward result requires finite score")
+            if forward.action == FORWARD_DEFINITE_REJECT:
+                if special_start != special_stop:
+                    raise ValueError(
+                        "rejected Forward result must not have special states"
+                    )
+            else:
+                expected_count = 6 * (
+                    <uint64_t> sequences._refs[forward.sequence_index].n + 1
+                )
+                if special_stop - special_start != expected_count:
+                    raise ValueError(
+                        "passing Forward result has wrong special-state span"
+                    )
+                for special_cursor in range(
+                    <size_t> special_start, <size_t> special_stop
+                ):
+                    if (
+                        not isfinite(specials[special_cursor])
+                        or specials[special_cursor] < 0.0
+                    ):
+                        raise ValueError(
+                            "Forward special states must be finite and nonnegative"
+                        )
+            has_external = True
+        else:
+            raise ValueError(f"unknown Forward result action: {forward.action}")
+
+    return has_external
+
+
+def _validate_forward_batch_bound(
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+    const uint64_t[::1] postfilter_offsets,
+    const uint8_t[::1] forward_records,
+    const uint64_t[::1] forward_offsets,
+    const uint32_t[::1] expected_indices,
+    const uint64_t[::1] special_offsets,
+    const float[::1] specials,
+):
+    """Validate one complete native Forward result before it is retained."""
+    cdef _forward_result forward
+    cdef size_t profile_count
+    cdef size_t profile_index
+    cdef size_t cursor
+    cdef size_t postfilter_count
+    cdef size_t forward_count
+    cdef size_t postfilter_start
+    cdef size_t postfilter_stop
+    cdef size_t forward_start
+    cdef size_t forward_stop
+
+    if postfilter_offsets.shape[0] == 0:
+        raise ValueError("post-filter row offsets need an initial zero")
+    if postfilter_offsets.shape[0] != forward_offsets.shape[0]:
+        raise ValueError("Forward row-offset count differs from post-filter rows")
+    profile_count = <size_t> postfilter_offsets.shape[0] - 1
+    if postfilter_offsets[0] != 0 or forward_offsets[0] != 0:
+        raise ValueError("Forward batch row offsets must start at zero")
+    if <size_t> postfilter_records.shape[0] % sizeof(_postfilter_result) != 0:
+        raise ValueError("post-filter result storage has trailing bytes")
+    if <size_t> forward_records.shape[0] % sizeof(_forward_result) != 0:
+        raise ValueError("Forward result storage has trailing bytes")
+    postfilter_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+    forward_count = (
+        <size_t> forward_records.shape[0] // sizeof(_forward_result)
+    )
+    if postfilter_offsets[profile_count] != postfilter_count:
+        raise ValueError("post-filter row offsets do not span result storage")
+    if forward_offsets[profile_count] != forward_count:
+        raise ValueError("Forward row offsets do not span result storage")
+    if expected_indices.shape[0] != forward_count:
+        raise ValueError("Forward result count differs from selected inputs")
+    if special_offsets.shape[0] != forward_count + 1:
+        raise ValueError("Forward special-offset count differs from result count")
+    if special_offsets[0] != 0:
+        raise ValueError("Forward global special offsets must start at zero")
+    if special_offsets[forward_count] != <uint64_t> specials.shape[0]:
+        raise ValueError("Forward special offsets do not span matrix storage")
+
+    for cursor in range(forward_count):
+        memcpy(
+            &forward,
+            &forward_records[cursor * sizeof(_forward_result)],
+            sizeof(_forward_result),
+        )
+        if forward.sequence_index != expected_indices[cursor]:
+            raise ValueError("Forward result order differs from selected inputs")
+
+    for profile_index in range(profile_count):
+        postfilter_start = <size_t> postfilter_offsets[profile_index]
+        postfilter_stop = <size_t> postfilter_offsets[profile_index + 1]
+        forward_start = <size_t> forward_offsets[profile_index]
+        forward_stop = <size_t> forward_offsets[profile_index + 1]
+        if postfilter_start > postfilter_stop or postfilter_stop > postfilter_count:
+            raise ValueError("post-filter row offsets are not monotone")
+        if forward_start > forward_stop or forward_stop > forward_count:
+            raise ValueError("Forward row offsets are not monotone")
+        _validate_forward_augmentation(
+            sequences,
+            postfilter_records[
+                postfilter_start * sizeof(_postfilter_result):
+                postfilter_stop * sizeof(_postfilter_result)
+            ],
+            forward_records[
+                forward_start * sizeof(_forward_result):
+                forward_stop * sizeof(_forward_result)
+            ],
+            special_offsets[forward_start:forward_stop + 1],
+            specials,
+        )
+
+
 def _search_hmm_candidates(
     Pipeline pipeline,
     HMM query,
@@ -1158,4 +1765,103 @@ def _search_hmm_postfilter_bound(
         postfilter_records,
         &residue_offsets[0],
         filter_scores_seam,
+    )
+
+
+def _search_hmm_postfilter_forward_bound(
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+    const uint8_t[::1] forward_records,
+    const uint64_t[::1] special_offsets,
+    const float[::1] specials,
+    const uint64_t[::1] residue_offsets,
+    uint64_t generation_f2_bits,
+    uint64_t generation_f3_bits,
+    bint generation_bias_filter,
+):
+    """Consume one provenance-bound post-filter row augmented by Forward.
+
+    The original post-filter row remains authoritative. If the live pipeline
+    options differ bit-for-bit from generation, the complete row takes the
+    existing exact continuation and computes Forward on the CPU.
+    """
+    cdef bint has_direct
+    cdef bint has_external
+    cdef _double_bits live_f2
+    cdef _double_bits live_f3
+    cdef _pipeline_from_filter_scores_f filter_scores_seam = NULL
+    cdef _pipeline_from_filter_and_forward_scores_f forward_scores_seam = NULL
+
+    if type(pipeline) is not _pyhmmer.plan7.Pipeline:
+        raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+    _validate_inputs(pipeline, query, optimized_profile, sequences, False)
+    has_direct = _validate_postfilter_records(
+        optimized_profile, sequences, postfilter_records
+    )
+    _validate_postfilter_residue_offsets(
+        sequences, postfilter_records, residue_offsets
+    )
+    has_external = _validate_forward_augmentation(
+        sequences,
+        postfilter_records,
+        forward_records,
+        special_offsets,
+        specials,
+    )
+
+    if has_direct:
+        with nogil:
+            filter_scores_seam = _resolve_filter_scores_seam()
+        if filter_scores_seam == NULL:
+            raise RuntimeError(
+                "direct post-filter records require the project-private "
+                "p7_PipelineFromFilterScores HMMER seam"
+            )
+
+    live_f2.value = pipeline._pli.F2
+    live_f3.value = pipeline._pli.F3
+    if (
+        not has_external
+        or live_f2.bits != generation_f2_bits
+        or live_f3.bits != generation_f3_bits
+        or pipeline._pli.do_biasfilter != generation_bias_filter
+    ):
+        return _search_postfilter_validated(
+            pipeline,
+            query,
+            optimized_profile,
+            sequences,
+            postfilter_records,
+            &residue_offsets[0],
+            filter_scores_seam,
+        )
+
+    with nogil:
+        forward_scores_seam = _resolve_filter_and_forward_scores_seam()
+    if forward_scores_seam == NULL:
+        return _search_postfilter_validated(
+            pipeline,
+            query,
+            optimized_profile,
+            sequences,
+            postfilter_records,
+            &residue_offsets[0],
+            filter_scores_seam,
+        )
+
+    return _search_postfilter_forward_validated(
+        pipeline,
+        query,
+        optimized_profile,
+        sequences,
+        postfilter_records,
+        forward_records,
+        special_offsets,
+        specials,
+        &residue_offsets[0],
+        filter_scores_seam,
+        forward_scores_seam,
     )

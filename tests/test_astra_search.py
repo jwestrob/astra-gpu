@@ -1,4 +1,5 @@
 import io
+import math
 import random
 import struct
 import sys
@@ -18,13 +19,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 try:
     from plan7_gpu import _native, _pipeline
-    from plan7_gpu.adapter import CandidateBatch, SequenceBatch, load_pressed_profiles
+    from plan7_gpu.adapter import (
+        CandidateBatch,
+        SequenceBatch,
+        _candidate_state,
+        load_pressed_profiles,
+    )
     from plan7_gpu.astra_search import hmmsearch
 except ImportError:
     _native = None
     _pipeline = None
     CandidateBatch = None
     SequenceBatch = None
+    _candidate_state = None
     load_pressed_profiles = None
     hmmsearch = None
 
@@ -218,6 +225,97 @@ class AstraSearchTests(unittest.TestCase):
                         expected, actual, strict=True
                     ):
                         self.assert_exact_hits(expected_hits, actual_hits)
+
+    def test_forward_augmentation_tiny_budget_falls_back_exactly(self):
+        if (
+            _pipeline is None
+            or not _pipeline._filter_scores_seam_available()
+            or not _pipeline._filter_and_forward_scores_seam_available()
+            or not hasattr(_native, "ForwardProfiles")
+            or not hasattr(_native.SequenceBatch, "forward_candidates_many_raw")
+        ):
+            self.skipTest("exact Forward augmentation is unavailable")
+
+        pairs = self.pairs[2:3]
+        options = {"F1": 0.5, "F2": 1.0, "F3": 1.0}
+        expected = self.reference(pairs, self.synthetic_targets, **options)
+        original = SequenceBatch._postfilter_forward_batch
+        calls = []
+        built = []
+
+        def observed(batch, profile_pairs, f1, f2, f3, bias_filter):
+            calls.append((tuple(profile_pairs), f1, f2, f3, bias_filter))
+            candidates = original(batch, profile_pairs, f1, f2, f3, bias_filter)
+            built.append(candidates)
+            return candidates
+
+        with (
+            mock.patch.object(SequenceBatch, "_postfilter_forward_batch", new=observed),
+            mock.patch("plan7_gpu.adapter._FORWARD_SPECIAL_BYTE_BUDGET", 1),
+        ):
+            actual = list(
+                hmmsearch(
+                    pairs,
+                    self.synthetic_batch,
+                    cpus=1,
+                    postfilter=True,
+                    **options,
+                )
+            )
+
+        self.assertEqual(calls, [(pairs, 0.5, 1.0, 1.0, True)])
+        forward = _candidate_state(built[0]).forward
+        self.assertIsNotNone(forward)
+        self.assertTrue(
+            any(
+                status == 0 and action == 0 and math.isfinite(fwdsc)
+                for _, fwdsc, status, action, _ in struct.iter_unpack(
+                    "=IfBBH", forward.records
+                )
+            )
+        )
+        self.assert_exact_hits(expected[0], actual[0])
+
+    def test_candidate_search_consumes_real_forward_augmentation(self):
+        if (
+            _pipeline is None
+            or not _pipeline._filter_scores_seam_available()
+            or not _pipeline._filter_and_forward_scores_seam_available()
+            or not hasattr(_native, "ForwardProfiles")
+            or not hasattr(_native.SequenceBatch, "forward_candidates_many_raw")
+        ):
+            self.skipTest("exact Forward augmentation is unavailable")
+
+        pairs = self.pairs[2:4]
+        options = {"F1": 0.5, "F2": 1.0, "F3": 1.0}
+        with SequenceBatch(self.synthetic_targets) as batch:
+            candidates = batch._postfilter_forward_batch(pairs, 0.5, 1.0, 1.0, True)
+        state = _candidate_state(candidates)
+        self.assertIsNotNone(state.forward)
+        self.assertTrue(
+            any(
+                state.forward.row_offsets[row] != state.forward.row_offsets[row + 1]
+                for row in range(len(pairs))
+            )
+        )
+        expected = self.reference(pairs, self.synthetic_targets, **options)
+        original = _pipeline._search_hmm_postfilter_forward_bound
+        calls = []
+
+        def observed(*args):
+            calls.append(threading.get_ident())
+            return original(*args)
+
+        with mock.patch.object(
+            _pipeline,
+            "_search_hmm_postfilter_forward_bound",
+            new=observed,
+        ):
+            actual = list(hmmsearch(pairs, candidates, cpus=2, **options))
+
+        self.assertGreaterEqual(len(calls), 1)
+        for expected_hits, actual_hits in zip(expected, actual, strict=True):
+            self.assert_exact_hits(expected_hits, actual_hits)
 
     def test_precomputed_none_sparse_and_all_rows_match_pyhmmer(self):
         cases = (

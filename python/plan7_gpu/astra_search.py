@@ -76,6 +76,39 @@ def _same_bound_pairs(
     )
 
 
+def _forward_generation_options(
+    pipeline_options: dict[str, Any], alphabet: Any
+) -> tuple[float, float, bool] | None:
+    """Normalize only the Pipeline fields that bind Forward provenance."""
+    known = {
+        name: pipeline_options[name]
+        for name in ("F2", "F3", "bias_filter")
+        if name in pipeline_options
+    }
+    try:
+        probe = pyhmmer.plan7.Pipeline(alphabet, **known)
+    except (TypeError, ValueError, OverflowError):
+        # Preserve the bridge's existing lazy Pipeline error: the real worker
+        # construction will report invalid user options when iteration starts.
+        return None
+    return float(probe.F2), float(probe.F3), bool(probe.bias_filter)
+
+
+def _forward_augmentation_available() -> bool:
+    from . import _native, _pipeline  # type: ignore[attr-defined]
+
+    return (
+        callable(getattr(_pipeline, "_filter_scores_seam_available", None))
+        and _pipeline._filter_scores_seam_available()
+        and callable(
+            getattr(_pipeline, "_filter_and_forward_scores_seam_available", None)
+        )
+        and _pipeline._filter_and_forward_scores_seam_available()
+        and getattr(_native, "ForwardProfiles", None) is not None
+        and hasattr(_native.SequenceBatch, "forward_candidates_many_raw")
+    )
+
+
 def _prepare_candidates(
     pairs: tuple[PressedProfilePair, ...],
     batch: SequenceBatch | CandidateBatch,
@@ -83,9 +116,22 @@ def _prepare_candidates(
     postfilter: bool,
 ) -> CandidateBatch:
     if type(batch) is SequenceBatch:
-        build = batch.postfilter_batch if postfilter else batch.candidate_batch
-        candidates = build(pairs, F1=pipeline_options.get("F1", 0.02))
         alphabet = batch.alphabet
+        f1 = pipeline_options.get("F1", 0.02)
+        if postfilter:
+            forward_options = None
+            if _forward_augmentation_available():
+                forward_options = _forward_generation_options(
+                    pipeline_options, alphabet
+                )
+            if forward_options is None:
+                candidates = batch.postfilter_batch(pairs, F1=f1)
+            else:
+                candidates = batch._postfilter_forward_batch(
+                    pairs, f1, *forward_options
+                )
+        else:
+            candidates = batch.candidate_batch(pairs, F1=f1)
     elif type(batch) is CandidateBatch:
         candidates = batch
         if not _same_bound_pairs(pairs, candidates):

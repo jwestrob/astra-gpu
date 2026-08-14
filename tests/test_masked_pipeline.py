@@ -89,6 +89,14 @@ class MaskedPipelineTests(unittest.TestCase):
         return struct.pack("=IfhBBf", index, filtersc, numerator, status, action, vfsc)
 
     @staticmethod
+    def forward_record(index, fwdsc, status, action, reserved=0):
+        return struct.pack("=IfBBH", index, fwdsc, status, action, reserved)
+
+    @staticmethod
+    def double_bits(value):
+        return struct.unpack("=Q", struct.pack("=d", value))[0]
+
+    @staticmethod
     def table_bytes(hits, format):
         output = io.BytesIO()
         hits.write(output, format=format, header=True)
@@ -443,6 +451,238 @@ class MaskedPipelineTests(unittest.TestCase):
             self.assertTrue(_pipeline._filter_and_forward_scores_seam_available())
         else:
             self.assertFalse(_pipeline._filter_and_forward_scores_seam_available())
+
+    def test_forward_selector_keeps_exact_f2_survivors(self):
+        target = 1
+        records = self.postfilter_record(target, 0.0, 0, 0, 2, 0.0)
+        postfilter_offsets = array("Q", [0, 1])
+        residue_offsets = self.residue_offsets(self.sequences)
+
+        selected = _pipeline._select_forward_inputs_bound(
+            [self.optimized_profiles[0]],
+            records,
+            postfilter_offsets,
+            residue_offsets,
+            1.0,
+        )
+        self.assertEqual(list(selected[0]), [0, 1])
+        self.assertEqual(list(selected[1]), [target])
+        self.assertEqual(len(selected[2]), 1)
+
+    def test_forward_batch_validation_preserves_global_row_mapping(self):
+        matrix_target = 3
+        matrix_count = 6 * (len(self.sequences[matrix_target]) + 1)
+        postfilter = b"".join(
+            (
+                self.postfilter_record(1, 0.0, 0, 0, 2, 0.0),
+                self.postfilter_record(2, 0.0, 0, 0, 2, 0.0),
+                self.postfilter_record(matrix_target, 0.0, 0, 0, 2, 0.0),
+                self.postfilter_record(4, 0.0, 0, 0, 2, 0.0),
+            )
+        )
+        forward = b"".join(
+            (
+                self.forward_record(1, -7.0, 0, 1),
+                self.forward_record(2, -7.0, 0, 0),
+                self.forward_record(matrix_target, -7.0, 0, 2),
+            )
+        )
+        postfilter_offsets = array("Q", [0, 1, 4, 4])
+        forward_offsets = array("Q", [0, 1, 3, 3])
+        expected_indices = array("I", [1, 2, matrix_target])
+        special_offsets = array("Q", [0, 0, 0, matrix_count])
+        specials = array("f", [0.0]) * matrix_count
+
+        _pipeline._validate_forward_batch_bound(
+            self.sequences,
+            postfilter,
+            postfilter_offsets,
+            forward,
+            forward_offsets,
+            expected_indices,
+            special_offsets,
+            specials,
+        )
+        with self.assertRaisesRegex(ValueError, "order differs"):
+            _pipeline._validate_forward_batch_bound(
+                self.sequences,
+                postfilter,
+                postfilter_offsets,
+                forward,
+                forward_offsets,
+                array("I", [2, 1, matrix_target]),
+                special_offsets,
+                specials,
+            )
+        with self.assertRaisesRegex(ValueError, "subset"):
+            _pipeline._validate_forward_batch_bound(
+                self.sequences,
+                postfilter,
+                postfilter_offsets,
+                forward,
+                array("Q", [0, 2, 3, 3]),
+                expected_indices,
+                special_offsets,
+                specials,
+            )
+
+    def test_ok_cpu_forward_cap_fallback_uses_original_continuation(self):
+        if not _pipeline._filter_scores_seam_available():
+            self.skipTest("private filter-score seam is unavailable")
+        target = 1
+        offsets = self.residue_offsets(self.sequences)
+        postfilter = self.postfilter_record(target, 0.0, 0, 0, 2, 0.0)
+        # Native output-budget fallback preserves its exact finite fwdsc but
+        # deliberately supplies no special matrix.
+        forward = self.forward_record(target, -7.0, 0, 0)
+        options = {"F1": 1.0, "F2": 1.0, "F3": 1.0}
+        expected = _pipeline._search_hmm_postfilter_bound(
+            self.pipeline(**options),
+            self.hmms[0],
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            postfilter,
+            offsets,
+        )
+        actual = _pipeline._search_hmm_postfilter_forward_bound(
+            self.pipeline(**options),
+            self.hmms[0],
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            postfilter,
+            forward,
+            array("Q", [0, 0]),
+            array("f"),
+            offsets,
+            self.double_bits(1.0),
+            self.double_bits(1.0),
+            True,
+        )
+        self.assert_exact_hits(expected, actual)
+
+    def test_forward_option_mismatch_uses_original_continuation(self):
+        if not _pipeline._filter_scores_seam_available():
+            self.skipTest("private filter-score seam is unavailable")
+        target = 1
+        offsets = self.residue_offsets(self.sequences)
+        postfilter = self.postfilter_record(target, 0.0, 0, 0, 2, 0.0)
+        forward = self.forward_record(target, -7.0, 0, 1)
+        ordinary = {"F1": 1.0, "F2": 1.0, "F3": 1.0}
+        mismatches = (
+            ("F2 nextafter", ordinary, math.nextafter(1.0, 0.0), 1.0, True),
+            ("F3 nextafter", ordinary, 1.0, math.nextafter(1.0, 0.0), True),
+            ("F2 NaN", ordinary, math.nan, 1.0, True),
+            ("F3 NaN", ordinary, 1.0, math.nan, True),
+            ("F2 infinity", ordinary, math.inf, 1.0, True),
+            ("F3 infinity", ordinary, 1.0, math.inf, True),
+            ("F2 negative", ordinary, -1.0, 1.0, True),
+            ("F3 negative", ordinary, 1.0, -1.0, True),
+            (
+                "F2 signed zero",
+                {"F1": 1.0, "F2": 0.0, "F3": 1.0},
+                -0.0,
+                1.0,
+                True,
+            ),
+            (
+                "F3 signed zero",
+                {"F1": 1.0, "F2": 1.0, "F3": 0.0},
+                1.0,
+                -0.0,
+                True,
+            ),
+            ("bias", ordinary, 1.0, 1.0, False),
+        )
+        for label, options, generation_f2, generation_f3, bias_filter in mismatches:
+            with self.subTest(label=label):
+                expected = _pipeline._search_hmm_postfilter_bound(
+                    self.pipeline(**options),
+                    self.hmms[0],
+                    self.optimized_profiles[0].copy(),
+                    self.sequences,
+                    postfilter,
+                    offsets,
+                )
+                actual = _pipeline._search_hmm_postfilter_forward_bound(
+                    self.pipeline(**options),
+                    self.hmms[0],
+                    self.optimized_profiles[0].copy(),
+                    self.sequences,
+                    postfilter,
+                    forward,
+                    array("Q", [0, 0]),
+                    array("f"),
+                    offsets,
+                    self.double_bits(generation_f2),
+                    self.double_bits(generation_f3),
+                    bias_filter,
+                )
+                self.assert_exact_hits(expected, actual)
+
+    def test_invalid_forward_augmentation_precedes_pipeline_mutation(self):
+        target = 1
+        offsets = self.residue_offsets(self.sequences)
+        postfilter = self.postfilter_record(target, 0.0, 0, 0, 2, 0.0)
+        invalid = (
+            (b"\0", array("Q", [0]), array("f"), "trailing bytes"),
+            (
+                self.forward_record(target, math.nan, 19, 0, 1),
+                array("Q", [0, 0]),
+                array("f"),
+                "reserved field",
+            ),
+            (
+                self.forward_record(target + 1, math.nan, 19, 0),
+                array("Q", [0, 0]),
+                array("f"),
+                "subset",
+            ),
+            (
+                self.forward_record(target, 0.0, 0, 3),
+                array("Q", [0, 0]),
+                array("f"),
+                "unknown Forward.*action",
+            ),
+            (
+                self.forward_record(target, 0.0, 0, 2),
+                array("Q", [0, 0]),
+                array("f"),
+                "wrong special-state span",
+            ),
+            (
+                self.forward_record(target, 0.0, 0, 1),
+                array("Q", [0, 1]),
+                array("f", [0.0]),
+                "must not have special states",
+            ),
+        )
+        for records, special_offsets, specials, message in invalid:
+            with self.subTest(message=message):
+                pipeline = self.pipeline(F1=1.0, F2=1.0, F3=1.0)
+                with self.assertRaisesRegex((IndexError, ValueError), message):
+                    _pipeline._search_hmm_postfilter_forward_bound(
+                        pipeline,
+                        self.hmms[0],
+                        self.optimized_profiles[0].copy(),
+                        self.sequences,
+                        postfilter,
+                        records,
+                        special_offsets,
+                        specials,
+                        offsets,
+                        self.double_bits(1.0),
+                        self.double_bits(1.0),
+                        True,
+                    )
+                hits = _pipeline._search_hmm_postfilter_bound(
+                    pipeline,
+                    self.hmms[0],
+                    self.optimized_profiles[0].copy(),
+                    self.sequences,
+                    b"",
+                    offsets,
+                )
+                self.assertEqual(hits.searched_models, 1)
 
     def test_invalid_postfilter_rows_fail_before_pipeline_mutation(self):
         offsets = self.residue_offsets(self.sequences)

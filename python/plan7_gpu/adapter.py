@@ -20,6 +20,7 @@ from . import _native  # type: ignore[attr-defined]
 
 _MISSING = object()
 _PIPELINE_LEASES_LOCK = Lock()
+_FORWARD_SPECIAL_BYTE_BUDGET = 384 << 20
 
 
 class _PipelineLease:
@@ -429,6 +430,36 @@ def _format_results(raw_results: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
     ]
 
 
+class _ForwardAugmentation:
+    __slots__ = (
+        "records",
+        "row_offsets",
+        "special_offsets",
+        "specials",
+        "f2_bits",
+        "f3_bits",
+        "bias_filter",
+    )
+
+    def __init__(
+        self,
+        records: bytes,
+        row_offsets: Any,
+        special_offsets: Any,
+        specials: Any,
+        f2_bits: int,
+        f3_bits: int,
+        bias_filter: bool,
+    ) -> None:
+        self.records = records
+        self.row_offsets = memoryview(row_offsets).toreadonly()
+        self.special_offsets = memoryview(special_offsets).toreadonly()
+        self.specials = memoryview(specials).toreadonly()
+        self.f2_bits = f2_bits
+        self.f3_bits = f3_bits
+        self.bias_filter = bias_filter
+
+
 class _CandidateState:
     __slots__ = (
         "pairs",
@@ -439,6 +470,7 @@ class _CandidateState:
         "all_rows",
         "all_targets",
         "postfilter_records",
+        "forward",
         "f1",
     )
 
@@ -452,6 +484,7 @@ class _CandidateState:
         all_rows: bytes,
         all_targets: bytes,
         postfilter_records: bytes | None,
+        forward: _ForwardAugmentation | None,
         f1: float,
     ) -> None:
         self.pairs = pairs
@@ -462,6 +495,7 @@ class _CandidateState:
         self.all_rows = all_rows
         self.all_targets = all_targets
         self.postfilter_records = postfilter_records
+        self.forward = forward
         self.f1 = f1
 
 
@@ -530,12 +564,28 @@ class CandidateBatch:
         candidate_state = _candidate_state(self)
         pair = candidate_state.pairs[row_index]
         postfilter_records = candidate_state.postfilter_records
+        forward = candidate_state.forward
+        forward_row = None
+        forward_special_offsets = None
+        forward_specials = None
         if postfilter_records is not None:
             offsets = memoryview(candidate_state.offsets).cast("Q")
             record_size = _native.POSTFILTER_RESULT_SIZE
             start = offsets[row_index] * record_size
             stop = offsets[row_index + 1] * record_size
             candidate_row = memoryview(postfilter_records)[start:stop]
+            if forward is not None:
+                forward_offsets = forward.row_offsets
+                forward_start = forward_offsets[row_index]
+                forward_stop = forward_offsets[row_index + 1]
+                if forward_start != forward_stop:
+                    start = forward_start * _native.FORWARD_RESULT_SIZE
+                    stop = forward_stop * _native.FORWARD_RESULT_SIZE
+                    forward_row = memoryview(forward.records)[start:stop]
+                    forward_special_offsets = forward.special_offsets[
+                        forward_start : forward_stop + 1
+                    ]
+                    forward_specials = forward.specials
         elif candidate_state.all_rows[row_index]:
             candidate_row = memoryview(candidate_state.all_targets).cast("I")
         else:
@@ -564,6 +614,25 @@ class CandidateBatch:
                 )
             with state.lock:
                 if postfilter_records is not None:
+                    if forward_row is not None:
+                        if forward is None:
+                            raise RuntimeError(
+                                "Forward row is missing its batch provenance"
+                            )
+                        return _pipeline._search_hmm_postfilter_forward_bound(
+                            pipeline,
+                            state.hmm.copy(),
+                            state.optimized_profile,
+                            candidate_state.targets,
+                            candidate_row,
+                            forward_row,
+                            forward_special_offsets,
+                            forward_specials,
+                            residue_offsets,
+                            forward.f2_bits,
+                            forward.f3_bits,
+                            forward.bias_filter,
+                        )
                     return _pipeline._search_hmm_postfilter_bound(
                         pipeline,
                         state.hmm.copy(),
@@ -607,6 +676,7 @@ def _new_candidate_batch(
     f1: float,
     *,
     postfilter_records: bytes | None = None,
+    forward: _ForwardAugmentation | None = None,
 ) -> CandidateBatch:
     candidates = object.__new__(CandidateBatch)
     _CANDIDATE_STATES[candidates] = _CandidateState(
@@ -618,6 +688,7 @@ def _new_candidate_batch(
         all_rows,
         all_targets.tobytes(),
         postfilter_records,
+        forward,
         f1,
     )
     return candidates
@@ -994,6 +1065,32 @@ class SequenceBatch:
         F1: float = 0.02,
     ) -> CandidateBatch:
         """Bind exact CUDA MSV, bias, and Viterbi records to pressed pairs."""
+        return self._postfilter_batch(profile_pairs, F1, None)
+
+    def _postfilter_forward_batch(
+        self,
+        profile_pairs: Iterable[PressedProfilePair],
+        F1: float,
+        F2: float,
+        F3: float,
+        bias_filter: bool,
+    ) -> CandidateBatch:
+        """Build a private post-filter batch with bounded Forward results."""
+        try:
+            f2 = float(F2)
+            f3 = float(F3)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("Forward thresholds must be real numbers") from error
+        if type(bias_filter) is not bool:
+            raise TypeError("bias_filter must be bool")
+        return self._postfilter_batch(profile_pairs, F1, (f2, f3, bias_filter))
+
+    def _postfilter_batch(
+        self,
+        profile_pairs: Iterable[PressedProfilePair],
+        F1: float,
+        forward_options: tuple[float, float, bool] | None,
+    ) -> CandidateBatch:
         from . import _pipeline  # type: ignore[attr-defined]
 
         if not _pipeline._filter_scores_seam_available():
@@ -1025,6 +1122,7 @@ class SequenceBatch:
             states.append(state)
 
         postfilter_records: bytes | None = None
+        forward: _ForwardAugmentation | None = None
         unique_locks = {id(state.lock): state.lock for state in states}
         with ExitStack() as locks:
             for lock_id in sorted(unique_locks):
@@ -1057,6 +1155,75 @@ class SequenceBatch:
                             ),
                         )
                     postfilter_records = bytes(records)
+                    if (
+                        forward_options is not None
+                        and forward_options[2]
+                        and math.isfinite(forward_options[1])
+                        and forward_options[1] >= 0.0
+                        and _pipeline._filter_and_forward_scores_seam_available()
+                        and hasattr(_native, "ForwardProfiles")
+                        and hasattr(
+                            type(sequence_state.native),
+                            "forward_candidates_many_raw",
+                        )
+                    ):
+                        f2, f3, bias_filter = forward_options
+                        (
+                            forward_row_offsets,
+                            forward_indices,
+                            forward_filters,
+                        ) = _pipeline._select_forward_inputs_bound(
+                            profiles,
+                            memoryview(postfilter_records),
+                            memoryview(offsets),
+                            memoryview(sequence_state.residue_offsets).cast("Q"),
+                            f2,
+                        )
+                        if len(forward_indices) != 0:
+                            with _native.ForwardProfiles(profiles) as forward_profiles:
+                                (
+                                    forward_records,
+                                    special_offsets,
+                                    specials,
+                                    statistics,
+                                ) = sequence_state.native.forward_candidates_many_raw(
+                                    forward_row_offsets,
+                                    forward_indices,
+                                    forward_filters,
+                                    f3,
+                                    profiles,
+                                    forward_profiles,
+                                    gathered_byte_budget=(_FORWARD_SPECIAL_BYTE_BUDGET),
+                                )
+                            f2_bits = struct.unpack("=Q", struct.pack("=d", f2))[0]
+                            f3_bits = struct.unpack("=Q", struct.pack("=d", f3))[0]
+                            if statistics["generation_f3_bits"] != f3_bits:
+                                raise RuntimeError(
+                                    "Forward generation F3 provenance changed"
+                                )
+                            if statistics["candidate_count"] != len(forward_indices):
+                                raise RuntimeError(
+                                    "Forward result count differs from input"
+                                )
+                            _pipeline._validate_forward_batch_bound(
+                                sequence_state.targets,
+                                memoryview(postfilter_records),
+                                memoryview(offsets),
+                                memoryview(forward_records),
+                                memoryview(forward_row_offsets),
+                                memoryview(forward_indices),
+                                memoryview(special_offsets),
+                                memoryview(specials),
+                            )
+                            forward = _ForwardAugmentation(
+                                bytes(forward_records),
+                                forward_row_offsets,
+                                special_offsets,
+                                specials,
+                                f2_bits,
+                                f3_bits,
+                                bias_filter,
+                            )
                     indices = array("I")
                     all_rows = bytes(len(profiles))
                     all_targets = array("I")
@@ -1071,6 +1238,7 @@ class SequenceBatch:
             all_targets,
             threshold,
             postfilter_records=postfilter_records,
+            forward=forward,
         )
 
 
