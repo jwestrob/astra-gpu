@@ -1,0 +1,272 @@
+{
+  "captured_at_utc": "2026-08-14T08:12:16.265693+00:00",
+  "datasets": {
+    "HydDB": {
+      "cutoff_counts": {
+        "GA": 0,
+        "NC": 0,
+        "TC": 0
+      },
+      "files": 1,
+      "formats": {
+        "HMMER3/f [3.3.2 | Nov 2020]": 3
+      },
+      "input_pattern": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm",
+      "label": "HydDB",
+      "length": {
+        "max": 1052,
+        "mean": 521.0,
+        "median": 329,
+        "min": 182
+      },
+      "metadata_sha256": "92e635f95bfca5d1528710621b32323529d2c14e949f2d7c9ed8904072cfcffb",
+      "profiles": 3,
+      "quantile_profiles": {
+        "p0": {
+          "accession": null,
+          "length": 182,
+          "name": "FeFe",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        },
+        "p1": {
+          "accession": null,
+          "length": 182,
+          "name": "FeFe",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        },
+        "p10": {
+          "accession": null,
+          "length": 182,
+          "name": "FeFe",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        },
+        "p100": {
+          "accession": null,
+          "length": 1052,
+          "name": "NiFe",
+          "ordinal_in_file": 2,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        },
+        "p25": {
+          "accession": null,
+          "length": 182,
+          "name": "FeFe",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        },
+        "p50": {
+          "accession": null,
+          "length": 329,
+          "name": "Fe",
+          "ordinal_in_file": 1,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        },
+        "p75": {
+          "accession": null,
+          "length": 1052,
+          "name": "NiFe",
+          "ordinal_in_file": 2,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        },
+        "p90": {
+          "accession": null,
+          "length": 1052,
+          "name": "NiFe",
+          "ordinal_in_file": 2,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        },
+        "p99": {
+          "accession": null,
+          "length": 1052,
+          "name": "NiFe",
+          "ordinal_in_file": 2,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm"
+        }
+      },
+      "size_bytes": 729830,
+      "total_profile_states": 1563
+    },
+    "KOFAM": {
+      "cutoff_counts": {
+        "GA": 26498,
+        "NC": 26498,
+        "TC": 26498
+      },
+      "files": 27816,
+      "formats": {
+        "HMMER3/f [3.2.1 | June 2018]": 1318,
+        "HMMER3/f [3.4 | Aug 2023]": 26498
+      },
+      "input_pattern": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K*.hmm",
+      "label": "KOFAM",
+      "length": {
+        "max": 17019,
+        "mean": 589.148799252229,
+        "median": 459.0,
+        "min": 14
+      },
+      "metadata_sha256": "1e886797e5b2be33deec7f28e5008cebf989f6d00b6f0967cbb20af4ef4ed104",
+      "profiles": 27816,
+      "quantile_profiles": {
+        "p0": {
+          "accession": null,
+          "length": 14,
+          "name": "K07802",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K07802.hmm"
+        },
+        "p1": {
+          "accession": null,
+          "length": 86,
+          "name": "K12691",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K12691.hmm"
+        },
+        "p10": {
+          "accession": null,
+          "length": 213,
+          "name": "K07691",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K07691.hmm"
+        },
+        "p100": {
+          "accession": null,
+          "length": 17019,
+          "name": "K16418",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K16418.hmm"
+        },
+        "p25": {
+          "accession": null,
+          "length": 311,
+          "name": "K00046",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K00046.hmm"
+        },
+        "p50": {
+          "accession": null,
+          "length": 459,
+          "name": "K15613",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K15613.hmm"
+        },
+        "p75": {
+          "accession": null,
+          "length": 681,
+          "name": "K11996",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K11996.hmm"
+        },
+        "p90": {
+          "accession": null,
+          "length": 1050,
+          "name": "K07521",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K07521.hmm"
+        },
+        "p99": {
+          "accession": null,
+          "length": 2678,
+          "name": "K10381",
+          "ordinal_in_file": 0,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K10381.hmm"
+        }
+      },
+      "size_bytes": 7650011464,
+      "total_profile_states": 16387763
+    },
+    "PFAM": {
+      "cutoff_counts": {
+        "GA": 27481,
+        "NC": 27481,
+        "TC": 27481
+      },
+      "files": 1,
+      "formats": {
+        "HMMER3/f [3.3 | Nov 2019]": 27481
+      },
+      "input_pattern": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm",
+      "label": "PFAM",
+      "length": {
+        "max": 2372,
+        "mean": 159.16884392853245,
+        "median": 121,
+        "min": 7
+      },
+      "metadata_sha256": "f4921d9ad7bbbbcd143405865eb2d0dbe243d389295136dc2e5bd698abc3e53b",
+      "profiles": 27481,
+      "quantile_profiles": {
+        "p0": {
+          "accession": "PF08258.17",
+          "length": 7,
+          "name": "WWamide",
+          "ordinal_in_file": 26381,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        },
+        "p1": {
+          "accession": "PF12549.14",
+          "length": 25,
+          "name": "TOH_N",
+          "ordinal_in_file": 24624,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        },
+        "p10": {
+          "accession": "PF22658.3",
+          "length": 52,
+          "name": "YycE-like_N",
+          "ordinal_in_file": 27054,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        },
+        "p100": {
+          "accession": "PF10344.16",
+          "length": 2372,
+          "name": "Hobbit",
+          "ordinal_in_file": 14240,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        },
+        "p25": {
+          "accession": "PF22023.2",
+          "length": 78,
+          "name": "Pus10_THUMP_arc",
+          "ordinal_in_file": 20904,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        },
+        "p50": {
+          "accession": "PF03212.21",
+          "length": 121,
+          "name": "Pertactin",
+          "ordinal_in_file": 19182,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        },
+        "p75": {
+          "accession": "PF25066.1",
+          "length": 194,
+          "name": "TPR_VPS8_2",
+          "ordinal_in_file": 24911,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        },
+        "p90": {
+          "accession": "PF13092.13",
+          "length": 307,
+          "name": "CENP-L",
+          "ordinal_in_file": 3124,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        },
+        "p99": {
+          "accession": "PF05467.16",
+          "length": 677,
+          "name": "Herpes_U47",
+          "ordinal_in_file": 13962,
+          "source": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm"
+        }
+      },
+      "size_bytes": 2067046650,
+      "total_profile_states": 4374119
+    }
+  },
+  "digest_scope": "File path/size/mtime plus selected HMM header fields; not a content digest.",
+  "schema_version": 1
+}

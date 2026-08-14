@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-14",
+  "astra": {
+    "config_dir": "/groups/banfield/users/jwestrob/.config/Astra",
+    "config_manifest": {
+      "path": "/groups/banfield/users/jwestrob/.config/Astra/hmm_databases.json",
+      "sha256": "494cd9146684e866e185d7b685ad00a5fcf2e6faa03a5f026c39237d80b17edd"
+    },
+    "source_revision": "966220c15b626626149c37199973818a773d270e",
+    "version": "astra-hmm 0.1.0",
+    "pyhmmer_version": "0.12.0",
+    "warning": "Do not use the stale legacy ~/.astra database configuration."
+  },
+  "protein_fastas": [
+    {
+      "id": "PLM2_5_b1",
+      "path": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa",
+      "size_bytes": 112069869,
+      "mtime": "2018-02-14T02:23:22-08:00",
+      "sequences": 300186,
+      "residues": 69453045,
+      "sha256": "eadfb887b8a8a25921cd318d0e278b43f900b05e3dbe0fae7d30233d4932fd04"
+    },
+    {
+      "id": "H2a2",
+      "path": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa",
+      "size_bytes": 117957813,
+      "mtime": "2017-11-24T15:44:18-08:00",
+      "sequences": 384431,
+      "residues": 89347627,
+      "sha256": "3d161e157dd0f4797c1528930da372335c2f7d4da730449af7fe9f367512e929"
+    },
+    {
+      "id": "ERMLT890",
+      "path": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa",
+      "size_bytes": 131119396,
+      "mtime": "2022-10-16T14:55:53-07:00",
+      "sequences": 348471,
+      "residues": 83294108,
+      "sha256": "558a011f6a404236b5fa317c31ceb5ebf04e153532bad3d7c6d227bd9e75d94b"
+    },
+    {
+      "id": "HR_Copper",
+      "path": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa",
+      "size_bytes": 119516184,
+      "mtime": "2021-01-22T17:41:37-08:00",
+      "sequences": 307667,
+      "residues": 71396566,
+      "sha256": "849ce9835716e3aa774196c343374f9dfccaa23fdf2b131ad0791febee3511ca"
+    },
+    {
+      "id": "HR_Shumway",
+      "path": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa",
+      "size_bytes": 180157328,
+      "mtime": "2021-01-22T17:57:01-08:00",
+      "sequences": 461684,
+      "residues": 107057618,
+      "sha256": "dcf7be3d4da7e59e06c342a8a2169c53eca6249a56f6561f0497c27630e371ff"
+    }
+  ],
+  "protein_fasta_totals": {
+    "size_bytes": 660820590,
+    "sequences": 1802439,
+    "residues": 420548964
+  },
+  "hmm_databases": {
+    "KOFAM": {
+      "release": "2026-07-30",
+      "installed": "2026-08-06",
+      "profile_glob": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/K*.hmm",
+      "profiles": 27816,
+      "profile_bytes": 7650011464,
+      "formats": {
+        "HMMER3/f [3.2.1 | June 2018]": 1318,
+        "HMMER3/f [3.4 | Aug 2023]": 26498
+      },
+      "total_profile_states": 16387763,
+      "length_range": [14, 17019],
+      "cutoff_records": {
+        "GA": 26498,
+        "TC": 26498,
+        "NC": 26498
+      },
+      "header_inventory_sha256": "1e886797e5b2be33deec7f28e5008cebf989f6d00b6f0967cbb20af4ef4ed104",
+      "ko_list": {
+        "path": "/groups/banfield/users/jwestrob/.config/Astra/ko_list",
+        "size_bytes": 2870196,
+        "sha256": "f7cf94b595def80949b4e7335b2f99ea91dad8be197a2efe86977c0dd0cdb463"
+      },
+      "pressed_base": "/groups/banfield/users/jwestrob/.config/Astra/KOFAM/KOFAM",
+      "pressed_sizes": {
+        "h3f": 1186762272,
+        "h3i": 918063,
+        "h3m": 3171683747,
+        "h3p": 3720988324
+      },
+      "notes": "Astra injected GA/TC/NC into the 26,498 HMMER 3.4 records; the 1,318 legacy-format records have no such fields. The header-inventory digest covers path/size/mtime and selected headers, not complete file content."
+    },
+    "PFAM": {
+      "primary": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/Pfam-A.hmm",
+      "size_bytes": 2067046650,
+      "mtime": "2026-02-12T16:14:51-08:00",
+      "sha256": "a78a42d6faf265b6bfca59e8f062d06fae6083ce2c6e335d7b381f20b82b7903",
+      "profiles": 27481,
+      "format": "HMMER3/f [3.3] amino",
+      "total_profile_states": 4374119,
+      "length_range": [7, 2372],
+      "header_inventory_sha256": "f4921d9ad7bbbbcd143405865eb2d0dbe243d389295136dc2e5bd698abc3e53b",
+      "pressed_base": "/groups/banfield/users/jwestrob/.config/Astra/PFAM/PFAM",
+      "pressed_sizes": {
+        "h3f": 487128688,
+        "h3i": 2720752,
+        "h3m": 854484190,
+        "h3p": 1006902695
+      },
+      "notes": "The Astra manifest does not record a PFAM release version/date."
+    },
+    "HydDB": {
+      "primary": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm",
+      "size_bytes": 729830,
+      "mtime": "2026-02-12T16:09:51-08:00",
+      "sha256": "65c092838948289f481afabda88aa3b02ee94910cc3d137c6fed966deffb70da",
+      "profiles": 3,
+      "profile_lengths": [182, 329, 1052],
+      "total_profile_states": 1563,
+      "format": "HMMER3/f [3.3.2] amino",
+      "pressed_base": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm",
+      "pressed_sizes": {
+        "h3f": 116032,
+        "h3i": 243,
+        "h3m": 302605,
+        "h3p": 355349
+      },
+      "warning": "The manifest claims GA thresholds, but the installed HMM records contain no GA/TC/NC fields."
+    },
+    "MopB": {
+      "available": false,
+      "notes": "No artifact was found in current/legacy Astra resources or bounded lab searches."
+    }
+  }
+}

@@ -1,0 +1,431 @@
+{
+  "captured_at_utc": "2026-08-14T07:53:37.032192+00:00",
+  "cpu": {
+    "command": {
+      "argv": [
+        "lscpu",
+        "--json"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"46 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"224\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-223\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"GenuineIntel\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"Intel(R) Xeon(R) Platinum 8176M CPU @ 2.10GHz\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"6\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"85\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"2\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"28\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"4\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"4\"\n      },{\n         \"field\": \"CPU max MHz:\",\n         \"data\": \"3800.0000\"\n      },{\n         \"field\": \"CPU min MHz:\",\n         \"data\": \"1000.0000\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"4200.00\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cdp_l3 invpcid_single pti intel_ppin ssbd mba ibrs ibpb stibp tpr_shadow vnmi flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm cqm mpx rdt_a avx512f avx512dq rdseed adx smap clflushopt clwb intel_pt avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local dtherm ida arat pln pts pku ospke md_clear flush_l1d arch_capabilities\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"VT-x\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"3.5 MiB (112 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"3.5 MiB (112 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"112 MiB (112 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"154 MiB (4 instances)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"4\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220\"\n      },{\n         \"field\": \"NUMA node1 CPU(s):\",\n         \"data\": \"1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61,65,69,73,77,81,85,89,93,97,101,105,109,113,117,121,125,129,133,137,141,145,149,153,157,161,165,169,173,177,181,185,189,193,197,201,205,209,213,217,221\"\n      },{\n         \"field\": \"NUMA node2 CPU(s):\",\n         \"data\": \"2,6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,66,70,74,78,82,86,90,94,98,102,106,110,114,118,122,126,130,134,138,142,146,150,154,158,162,166,170,174,178,182,186,190,194,198,202,206,210,214,218,222\"\n      },{\n         \"field\": \"NUMA node3 CPU(s):\",\n         \"data\": \"3,7,11,15,19,23,27,31,35,39,43,47,51,55,59,63,67,71,75,79,83,87,91,95,99,103,107,111,115,119,123,127,131,135,139,143,147,151,155,159,163,167,171,175,179,183,187,191,195,199,203,207,211,215,219,223\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Mitigation; Microcode\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"KVM: Mitigation: VMX disabled\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Mitigation; PTE Inversion; VMX conditional cache flushes, SMT vulnerable\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Mitigation; Clear CPU buffers; SMT vulnerable\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Mitigation; PTI\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Mitigation; Clear CPU buffers; SMT vulnerable\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Mitigation; IBRS\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl and seccomp\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; IBRS; IBPB conditional; STIBP conditional; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Mitigation; Clear CPU buffers; SMT vulnerable\"\n      }\n   ]\n}"
+    },
+    "lscpu": {
+      "lscpu": [
+        {
+          "data": "x86_64",
+          "field": "Architecture:"
+        },
+        {
+          "data": "32-bit, 64-bit",
+          "field": "CPU op-mode(s):"
+        },
+        {
+          "data": "46 bits physical, 48 bits virtual",
+          "field": "Address sizes:"
+        },
+        {
+          "data": "Little Endian",
+          "field": "Byte Order:"
+        },
+        {
+          "data": "224",
+          "field": "CPU(s):"
+        },
+        {
+          "data": "0-223",
+          "field": "On-line CPU(s) list:"
+        },
+        {
+          "data": "GenuineIntel",
+          "field": "Vendor ID:"
+        },
+        {
+          "data": "Intel(R) Xeon(R) Platinum 8176M CPU @ 2.10GHz",
+          "field": "Model name:"
+        },
+        {
+          "data": "6",
+          "field": "CPU family:"
+        },
+        {
+          "data": "85",
+          "field": "Model:"
+        },
+        {
+          "data": "2",
+          "field": "Thread(s) per core:"
+        },
+        {
+          "data": "28",
+          "field": "Core(s) per socket:"
+        },
+        {
+          "data": "4",
+          "field": "Socket(s):"
+        },
+        {
+          "data": "4",
+          "field": "Stepping:"
+        },
+        {
+          "data": "3800.0000",
+          "field": "CPU max MHz:"
+        },
+        {
+          "data": "1000.0000",
+          "field": "CPU min MHz:"
+        },
+        {
+          "data": "4200.00",
+          "field": "BogoMIPS:"
+        },
+        {
+          "data": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cdp_l3 invpcid_single pti intel_ppin ssbd mba ibrs ibpb stibp tpr_shadow vnmi flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm cqm mpx rdt_a avx512f avx512dq rdseed adx smap clflushopt clwb intel_pt avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local dtherm ida arat pln pts pku ospke md_clear flush_l1d arch_capabilities",
+          "field": "Flags:"
+        },
+        {
+          "data": "VT-x",
+          "field": "Virtualization:"
+        },
+        {
+          "data": "3.5 MiB (112 instances)",
+          "field": "L1d cache:"
+        },
+        {
+          "data": "3.5 MiB (112 instances)",
+          "field": "L1i cache:"
+        },
+        {
+          "data": "112 MiB (112 instances)",
+          "field": "L2 cache:"
+        },
+        {
+          "data": "154 MiB (4 instances)",
+          "field": "L3 cache:"
+        },
+        {
+          "data": "4",
+          "field": "NUMA node(s):"
+        },
+        {
+          "data": "0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220",
+          "field": "NUMA node0 CPU(s):"
+        },
+        {
+          "data": "1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61,65,69,73,77,81,85,89,93,97,101,105,109,113,117,121,125,129,133,137,141,145,149,153,157,161,165,169,173,177,181,185,189,193,197,201,205,209,213,217,221",
+          "field": "NUMA node1 CPU(s):"
+        },
+        {
+          "data": "2,6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,66,70,74,78,82,86,90,94,98,102,106,110,114,118,122,126,130,134,138,142,146,150,154,158,162,166,170,174,178,182,186,190,194,198,202,206,210,214,218,222",
+          "field": "NUMA node2 CPU(s):"
+        },
+        {
+          "data": "3,7,11,15,19,23,27,31,35,39,43,47,51,55,59,63,67,71,75,79,83,87,91,95,99,103,107,111,115,119,123,127,131,135,139,143,147,151,155,159,163,167,171,175,179,183,187,191,195,199,203,207,211,215,219,223",
+          "field": "NUMA node3 CPU(s):"
+        },
+        {
+          "data": "Mitigation; Microcode",
+          "field": "Vulnerability Gather data sampling:"
+        },
+        {
+          "data": "KVM: Mitigation: VMX disabled",
+          "field": "Vulnerability Itlb multihit:"
+        },
+        {
+          "data": "Mitigation; PTE Inversion; VMX conditional cache flushes, SMT vulnerable",
+          "field": "Vulnerability L1tf:"
+        },
+        {
+          "data": "Mitigation; Clear CPU buffers; SMT vulnerable",
+          "field": "Vulnerability Mds:"
+        },
+        {
+          "data": "Mitigation; PTI",
+          "field": "Vulnerability Meltdown:"
+        },
+        {
+          "data": "Mitigation; Clear CPU buffers; SMT vulnerable",
+          "field": "Vulnerability Mmio stale data:"
+        },
+        {
+          "data": "Mitigation; IBRS",
+          "field": "Vulnerability Retbleed:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Spec rstack overflow:"
+        },
+        {
+          "data": "Mitigation; Speculative Store Bypass disabled via prctl and seccomp",
+          "field": "Vulnerability Spec store bypass:"
+        },
+        {
+          "data": "Mitigation; usercopy/swapgs barriers and __user pointer sanitization",
+          "field": "Vulnerability Spectre v1:"
+        },
+        {
+          "data": "Mitigation; IBRS; IBPB conditional; STIBP conditional; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected",
+          "field": "Vulnerability Spectre v2:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Srbds:"
+        },
+        {
+          "data": "Mitigation; Clear CPU buffers; SMT vulnerable",
+          "field": "Vulnerability Tsx async abort:"
+        }
+      ]
+    }
+  },
+  "cuda": {
+    "nvcc": {
+      "argv": [
+        "nvcc",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2024 NVIDIA Corporation\nBuilt on Thu_Jun__6_02:18:23_PDT_2024\nCuda compilation tools, release 12.5, V12.5.82\nBuild cuda_12.5.r12.5/compiler.34385749_0"
+    }
+  },
+  "gpu": {
+    "devices": [
+      {
+        "compute_capability": "7.5",
+        "driver_version": "555.42.06",
+        "index": "0",
+        "memory_mib": "11264",
+        "name": "NVIDIA GeForce RTX 2080 Ti",
+        "pci_bus_id": "00000000:5B:00.0",
+        "uuid": "GPU-942c2749-c9d1-fb00-a711-c3e4aa8dcc3c"
+      }
+    ],
+    "query": {
+      "argv": [
+        "nvidia-smi",
+        "--query-gpu=index,name,uuid,compute_cap,memory.total,driver_version,pci.bus_id",
+        "--format=csv,noheader,nounits"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "0, NVIDIA GeForce RTX 2080 Ti, GPU-942c2749-c9d1-fb00-a711-c3e4aa8dcc3c, 7.5, 11264, 555.42.06, 00000000:5B:00.0"
+    },
+    "topology": {
+      "argv": [
+        "nvidia-smi",
+        "topo",
+        "-m"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "\t\u001b[4mGPU0\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \t1,5,9,13,17\t1\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks"
+    }
+  },
+  "host": {
+    "hostname": "biotite",
+    "kernel": "5.15.0-113-generic",
+    "machine": "x86_64",
+    "platform": "Linux-5.15.0-113-generic-x86_64-with-glibc2.35"
+  },
+  "numa": {
+    "numactl": {
+      "argv": [
+        "numactl",
+        "--hardware"
+      ],
+      "exit_code": 127,
+      "stderr": "[Errno 2] No such file or directory: 'numactl'",
+      "stdout": ""
+    },
+    "sysfs": [
+      {
+        "cpulist": "0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220",
+        "distance": "10 21 21 21",
+        "meminfo": "Node 0 MemTotal:       461527552 kB\nNode 0 MemFree:        133213932 kB\nNode 0 MemUsed:        328313620 kB\nNode 0 SwapCached:      8729696 kB\nNode 0 Active:         20398256 kB\nNode 0 Inactive:       91568484 kB\nNode 0 Active(anon):    9217592 kB\nNode 0 Inactive(anon): 59641760 kB\nNode 0 Active(file):   11180664 kB\nNode 0 Inactive(file): 31926724 kB\nNode 0 Unevictable:        6300 kB\nNode 0 Mlocked:            3228 kB\nNode 0 Dirty:             39840 kB\nNode 0 Writeback:             0 kB\nNode 0 FilePages:      69605380 kB\nNode 0 Mapped:           438844 kB\nNode 0 AnonPages:      42367956 kB\nNode 0 Shmem:          17769116 kB\nNode 0 KernelStack:      102596 kB\nNode 0 PageTables:       252312 kB\nNode 0 NFS_Unstable:          0 kB\nNode 0 Bounce:                0 kB\nNode 0 WritebackTmp:          0 kB\nNode 0 KReclaimable:   14731092 kB\nNode 0 Slab:           60803136 kB\nNode 0 SReclaimable:   14731092 kB\nNode 0 SUnreclaim:     46072044 kB\nNode 0 AnonHugePages:  10276864 kB\nNode 0 ShmemHugePages:        0 kB\nNode 0 ShmemPmdMapped:        0 kB\nNode 0 FileHugePages:        0 kB\nNode 0 FilePmdMapped:        0 kB\nNode 0 HugePages_Total:     0\nNode 0 HugePages_Free:      0\nNode 0 HugePages_Surp:      0",
+        "node": "node0"
+      },
+      {
+        "cpulist": "1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61,65,69,73,77,81,85,89,93,97,101,105,109,113,117,121,125,129,133,137,141,145,149,153,157,161,165,169,173,177,181,185,189,193,197,201,205,209,213,217,221",
+        "distance": "21 10 21 21",
+        "meminfo": "Node 1 MemTotal:       462359084 kB\nNode 1 MemFree:        22563204 kB\nNode 1 MemUsed:        439795880 kB\nNode 1 SwapCached:      1336100 kB\nNode 1 Active:         56965812 kB\nNode 1 Inactive:       72766948 kB\nNode 1 Active(anon):    2037272 kB\nNode 1 Inactive(anon): 19226332 kB\nNode 1 Active(file):   54928540 kB\nNode 1 Inactive(file): 53540616 kB\nNode 1 Unevictable:      168788 kB\nNode 1 Mlocked:          168788 kB\nNode 1 Dirty:             16360 kB\nNode 1 Writeback:            24 kB\nNode 1 FilePages:      112028632 kB\nNode 1 Mapped:           156700 kB\nNode 1 AnonPages:      17874068 kB\nNode 1 Shmem:           2223500 kB\nNode 1 KernelStack:       57204 kB\nNode 1 PageTables:       225676 kB\nNode 1 NFS_Unstable:          0 kB\nNode 1 Bounce:                0 kB\nNode 1 WritebackTmp:          0 kB\nNode 1 KReclaimable:   16403648 kB\nNode 1 Slab:           178118952 kB\nNode 1 SReclaimable:   16403648 kB\nNode 1 SUnreclaim:     161715304 kB\nNode 1 AnonHugePages:    223232 kB\nNode 1 ShmemHugePages:        0 kB\nNode 1 ShmemPmdMapped:        0 kB\nNode 1 FileHugePages:        0 kB\nNode 1 FilePmdMapped:        0 kB\nNode 1 HugePages_Total:     0\nNode 1 HugePages_Free:      0\nNode 1 HugePages_Surp:      0",
+        "node": "node1"
+      },
+      {
+        "cpulist": "2,6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,66,70,74,78,82,86,90,94,98,102,106,110,114,118,122,126,130,134,138,142,146,150,154,158,162,166,170,174,178,182,186,190,194,198,202,206,210,214,218,222",
+        "distance": "21 21 10 21",
+        "meminfo": "Node 2 MemTotal:       462407680 kB\nNode 2 MemFree:        29358748 kB\nNode 2 MemUsed:        433048932 kB\nNode 2 SwapCached:       781360 kB\nNode 2 Active:         98784264 kB\nNode 2 Inactive:       123934648 kB\nNode 2 Active(anon):    4066408 kB\nNode 2 Inactive(anon): 39369240 kB\nNode 2 Active(file):   94717856 kB\nNode 2 Inactive(file): 84565408 kB\nNode 2 Unevictable:        2720 kB\nNode 2 Mlocked:            2720 kB\nNode 2 Dirty:             71540 kB\nNode 2 Writeback:            12 kB\nNode 2 FilePages:      185853020 kB\nNode 2 Mapped:           702092 kB\nNode 2 AnonPages:      36869164 kB\nNode 2 Shmem:           5789120 kB\nNode 2 KernelStack:      101156 kB\nNode 2 PageTables:       277984 kB\nNode 2 NFS_Unstable:          0 kB\nNode 2 Bounce:                0 kB\nNode 2 WritebackTmp:          0 kB\nNode 2 KReclaimable:   10411416 kB\nNode 2 Slab:           62108804 kB\nNode 2 SReclaimable:   10411416 kB\nNode 2 SUnreclaim:     51697388 kB\nNode 2 AnonHugePages:   1218560 kB\nNode 2 ShmemHugePages:        0 kB\nNode 2 ShmemPmdMapped:        0 kB\nNode 2 FileHugePages:        0 kB\nNode 2 FilePmdMapped:        0 kB\nNode 2 HugePages_Total:     0\nNode 2 HugePages_Free:      0\nNode 2 HugePages_Surp:      0",
+        "node": "node2"
+      },
+      {
+        "cpulist": "3,7,11,15,19,23,27,31,35,39,43,47,51,55,59,63,67,71,75,79,83,87,91,95,99,103,107,111,115,119,123,127,131,135,139,143,147,151,155,159,163,167,171,175,179,183,187,191,195,199,203,207,211,215,219,223",
+        "distance": "21 21 21 10",
+        "meminfo": "Node 3 MemTotal:       462395952 kB\nNode 3 MemFree:        18399764 kB\nNode 3 MemUsed:        443996188 kB\nNode 3 SwapCached:       768668 kB\nNode 3 Active:         114140508 kB\nNode 3 Inactive:       131156924 kB\nNode 3 Active(anon):    3511528 kB\nNode 3 Inactive(anon): 51773040 kB\nNode 3 Active(file):   110628980 kB\nNode 3 Inactive(file): 79383884 kB\nNode 3 Unevictable:        6912 kB\nNode 3 Mlocked:            6912 kB\nNode 3 Dirty:             22584 kB\nNode 3 Writeback:            76 kB\nNode 3 FilePages:      191625996 kB\nNode 3 Mapped:           451600 kB\nNode 3 AnonPages:      53678832 kB\nNode 3 Shmem:            841548 kB\nNode 3 KernelStack:      151572 kB\nNode 3 PageTables:       421264 kB\nNode 3 NFS_Unstable:          0 kB\nNode 3 Bounce:                0 kB\nNode 3 WritebackTmp:          0 kB\nNode 3 KReclaimable:   23247756 kB\nNode 3 Slab:           85329712 kB\nNode 3 SReclaimable:   23247756 kB\nNode 3 SUnreclaim:     62081956 kB\nNode 3 AnonHugePages:   1744896 kB\nNode 3 ShmemHugePages:        0 kB\nNode 3 ShmemPmdMapped:        0 kB\nNode 3 FileHugePages:        0 kB\nNode 3 FilePmdMapped:        0 kB\nNode 3 HugePages_Total:     0\nNode 3 HugePages_Free:      0\nNode 3 HugePages_Surp:      0",
+        "node": "node3"
+      }
+    ]
+  },
+  "process": {
+    "gid": 601,
+    "python_executable": "/home/jwestrob/.pyenv/versions/3.12.0/bin/python3",
+    "uid": 601
+  },
+  "project_root": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu",
+  "schema_version": 1,
+  "slurm": {
+    "configuration": {
+      "argv": [
+        "scontrol",
+        "show",
+        "partition"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "PartitionName=standard\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=YES QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-48-256g-[2-3,8-9,12-14,17-20],node-48-384g-[1-4],node-64-768g-[1-33],node-112-1500g-[1-4],node-224-3t-[1-2]\n   PriorityJobFactor=100 PriorityTier=100 RootOnly=NO ReqResv=NO OverSubscribe=EXCLUSIVE\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=3728 TotalNodes=54 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=3728,mem=42100818M,node=54,billing=3728\n\nPartitionName=memory\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-64-768g-[1-33],node-112-1500g-[1-4],node-224-3t-[1-2]\n   PriorityJobFactor=1000 PriorityTier=1000 RootOnly=NO ReqResv=NO OverSubscribe=EXCLUSIVE\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=3008 TotalNodes=39 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=3008,mem=37722329M,node=39,billing=3008\n\nPartitionName=high-memory\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-224-3t-[1-2],node-344-8t-1\n   PriorityJobFactor=10000 PriorityTier=10000 RootOnly=NO ReqResv=NO OverSubscribe=EXCLUSIVE\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=792 TotalNodes=3 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=792,mem=14446676M,node=3,billing=792\n\nPartitionName=min_1500g\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-112-1500g-[1-4],node-224-3t-[1-2],node-344-8t-1\n   PriorityJobFactor=1000 PriorityTier=1000 RootOnly=NO ReqResv=NO OverSubscribe=EXCLUSIVE\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=1240 TotalNodes=7 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=1240,mem=20633692M,node=7,billing=1240\n\nPartitionName=min_3t\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-224-3t-[1-2],node-344-8t-1\n   PriorityJobFactor=1000 PriorityTier=1000 RootOnly=NO ReqResv=NO OverSubscribe=EXCLUSIVE\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=792 TotalNodes=3 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=792,mem=14446676M,node=3,billing=792\n\nPartitionName=min_8t\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-344-8t-1\n   PriorityJobFactor=1000 PriorityTier=1000 RootOnly=NO ReqResv=NO OverSubscribe=EXCLUSIVE\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=344 TotalNodes=1 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=344,mem=8256990M,node=1,billing=344\n\nPartitionName=test\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=biotite,igi.biotite\n   PriorityJobFactor=1 PriorityTier=1 RootOnly=NO ReqResv=NO OverSubscribe=EXCLUSIVE\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=81 TotalNodes=2 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=81,mem=2M,node=2,billing=81\n\nPartitionName=gpu\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-128-512g-8gpu-1,node-224-2t-8gpu-1\n   PriorityJobFactor=1 PriorityTier=1 RootOnly=NO ReqResv=NO OverSubscribe=NO\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=352 TotalNodes=2 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=352,mem=2579500M,node=2,billing=352\n\nPartitionName=gpu_h200\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-224-2t-8gpu-1\n   PriorityJobFactor=50000 PriorityTier=50000 RootOnly=NO ReqResv=NO OverSubscribe=NO\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=224 TotalNodes=1 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=224,mem=2063701M,node=1,billing=224\n\nPartitionName=standard-shared\n   AllowGroups=ALL AllowAccounts=ALL AllowQos=ALL\n   AllocNodes=ALL Default=NO QoS=N/A\n   DefaultTime=NONE DisableRootJobs=NO ExclusiveUser=NO GraceTime=0 Hidden=NO\n   MaxNodes=UNLIMITED MaxTime=UNLIMITED MinNodes=0 LLN=NO MaxCPUsPerNode=UNLIMITED MaxCPUsPerSocket=UNLIMITED\n   Nodes=node-48-256g-[2-3,8-9,12-14,17-20],node-48-384g-[1-4],node-64-768g-[1-33],node-112-1500g-[1-4],node-224-3t-[1-2]\n   PriorityJobFactor=1 PriorityTier=1 RootOnly=NO ReqResv=NO OverSubscribe=NO\n   OverTimeLimit=NONE PreemptMode=OFF\n   State=UP TotalCPUs=3728 TotalNodes=54 SelectTypeParameters=NONE\n   JobDefaults=(null)\n   DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED\n   TRES=cpu=3728,mem=42100818M,node=54,billing=3728"
+    },
+    "gpu_nodes": {
+      "node-128-512g-8gpu-1": {
+        "argv": [
+          "scontrol",
+          "show",
+          "node",
+          "node-128-512g-8gpu-1"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "NodeName=node-128-512g-8gpu-1 Arch=x86_64 CoresPerSocket=32 \n   CPUAlloc=36 CPUEfctv=128 CPUTot=128 CPULoad=22.47\n   AvailableFeatures=(null)\n   ActiveFeatures=(null)\n   Gres=gpu:8\n   NodeAddr=node-128-512g-8gpu-1 NodeHostName=node-128-512g-8gpu-1 Version=23.02.1\n   OS=Linux 6.8.0-86-generic #87~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Mon Sep 29 09:48:07 UTC 2 \n   RealMemory=515799 AllocMem=0 FreeMem=15514 Sockets=2 Boards=1\n   State=MIXED ThreadsPerCore=2 TmpDisk=0 Weight=1 Owner=N/A MCS_label=N/A\n   Partitions=gpu \n   BootTime=2025-10-29T16:36:01 SlurmdStartTime=2026-01-13T20:48:50\n   LastBusyTime=2026-07-20T09:29:15 ResumeAfterTime=None\n   CfgTRES=cpu=128,mem=515799M,billing=128\n   AllocTRES=cpu=36\n   CapWatts=n/a\n   CurrentWatts=0 AveWatts=0\n   ExtSensorsJoules=n/s ExtSensorsWatts=0 ExtSensorsTemp=n/s"
+      },
+      "node-224-2t-8gpu-1": {
+        "argv": [
+          "scontrol",
+          "show",
+          "node",
+          "node-224-2t-8gpu-1"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "NodeName=node-224-2t-8gpu-1 Arch=x86_64 CoresPerSocket=56 \n   CPUAlloc=84 CPUEfctv=224 CPUTot=224 CPULoad=47.77\n   AvailableFeatures=(null)\n   ActiveFeatures=(null)\n   Gres=gpu:8\n   NodeAddr=node-224-2t-8gpu-1 NodeHostName=node-224-2t-8gpu-1 Version=23.02.1\n   OS=Linux 6.8.0-94-generic #96~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Jan 16 13:19:05 UTC 2 \n   RealMemory=2063701 AllocMem=0 FreeMem=10480 Sockets=2 Boards=1\n   State=MIXED ThreadsPerCore=2 TmpDisk=0 Weight=1 Owner=N/A MCS_label=N/A\n   Partitions=gpu,gpu_h200 \n   BootTime=2026-02-02T01:49:28 SlurmdStartTime=2026-02-02T01:51:03\n   LastBusyTime=2026-08-01T19:04:45 ResumeAfterTime=None\n   CfgTRES=cpu=224,mem=2063701M,billing=224\n   AllocTRES=cpu=84\n   CapWatts=n/a\n   CurrentWatts=0 AveWatts=0\n   ExtSensorsJoules=n/s ExtSensorsWatts=0 ExtSensorsTemp=n/s"
+      }
+    },
+    "partitions": {
+      "argv": [
+        "sinfo",
+        "--format=%P|%a|%l|%D|%G"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "PARTITION|AVAIL|TIMELIMIT|NODES|GRES\nstandard*|up|infinite|54|(null)\nmemory|up|infinite|39|(null)\nhigh-memory|up|infinite|3|(null)\nmin_1500g|up|infinite|7|(null)\nmin_3t|up|infinite|3|(null)\nmin_8t|up|infinite|1|(null)\ntest|up|infinite|2|(null)\ngpu|up|infinite|2|gpu:8\ngpu_h200|up|infinite|1|gpu:8\nstandard-shared|up|infinite|54|(null)"
+    }
+  },
+  "software": {
+    "cmake": {
+      "command": {
+        "argv": [
+          "cmake",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "cmake version 3.24.0\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake)."
+      },
+      "version": "cmake version 3.24.0"
+    },
+    "g++": {
+      "command": {
+        "argv": [
+          "g++",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0\nCopyright (C) 2021 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+      },
+      "version": "g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+    },
+    "gcc": {
+      "command": {
+        "argv": [
+          "gcc",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0\nCopyright (C) 2021 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+      },
+      "version": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0"
+    },
+    "make": {
+      "command": {
+        "argv": [
+          "make",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "GNU Make 4.3\nBuilt for x86_64-pc-linux-gnu\nCopyright (C) 1988-2020 Free Software Foundation, Inc.\nLicense GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\nThis is free software: you are free to change and redistribute it.\nThere is NO WARRANTY, to the extent permitted by law."
+      },
+      "version": "GNU Make 4.3"
+    },
+    "ncu": {
+      "command": {
+        "argv": [
+          "ncu",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "NVIDIA (R) Nsight Compute Command Line Profiler\nCopyright (c) 2018-2024 NVIDIA Corporation\nVersion 2024.2.1.0 (build 34372528) (public-release)"
+      },
+      "version": "NVIDIA (R) Nsight Compute Command Line Profiler"
+    },
+    "nsys": {
+      "command": {
+        "argv": [
+          "nsys",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "NVIDIA Nsight Systems version 2024.2.3.38-242334140272v0"
+      },
+      "version": "NVIDIA Nsight Systems version 2024.2.3.38-242334140272v0"
+    },
+    "python": {
+      "command": {
+        "argv": [
+          "python3",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "Python 3.12.0"
+      },
+      "version": "Python 3.12.0"
+    },
+    "slurm": {
+      "command": {
+        "argv": [
+          "scontrol",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "slurm 23.02.1"
+      },
+      "version": "slurm 23.02.1"
+    },
+    "uv": {
+      "command": {
+        "argv": [
+          "uv",
+          "--version"
+        ],
+        "exit_code": 0,
+        "stderr": "",
+        "stdout": "uv 0.11.6 (x86_64-unknown-linux-gnu)"
+      },
+      "version": "uv 0.11.6 (x86_64-unknown-linux-gnu)"
+    }
+  }
+}

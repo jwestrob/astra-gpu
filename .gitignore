@@ -1,0 +1,45 @@
+# Local dependency sources, builds, and installations
+/refs/downloads/
+/refs/src/
+/refs/build/
+/refs/install/
+
+# Isolated Python environments
+/env/
+/.venv/
+
+# Generated build products
+/build/
+/cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Runtime and profiler artifacts
+*.log
+*.nsys-rep
+*.ncu-rep
+core
+
+# Generated biological subsets and verbose run output
+/results/datasets/*.faa
+/results/datasets/*.hmm
+/results/**/*.out
+/results/**/*.err
+/results/**/*.jsonl
+/results/baseline/pilot-*/
+/results/baseline/*.json
+!/results/baseline/*-summary.json
+/results/oracle/*-run.json
+/results/oracle/*-stats.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor/OS noise
+.DS_Store
+*~

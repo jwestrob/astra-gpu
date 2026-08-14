@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-14",
+  "hmmer": {
+    "version": "3.4",
+    "source_url": "http://eddylab.org/software/hmmer/hmmer-3.4.tar.gz",
+    "source_sha256": "ca70d94fd0cf271bd7063423aabb116d42de533117343a9b27a65c17ff06fbf3",
+    "compiler": "gcc 11.4.0",
+    "configure_flags": "--prefix=<project>/refs/install/hmmer-3.4",
+    "effective_cflags": "-O3 -pthread",
+    "dp_implementation": "sse",
+    "tests": {
+      "easel": {
+        "passed": 87,
+        "total": 87
+      },
+      "hmmer": {
+        "passed": 307,
+        "total": 307
+      },
+      "successful_host": "node-128-512g-8gpu-1",
+      "note": "The shared interactive host had fixed-port collisions in the two hmmpgmd daemon tests; the complete unmodified suite passed in a Slurm allocation."
+    }
+  },
+  "pyhmmer": {
+    "version": "0.12.1",
+    "python": "3.11.15",
+    "installer": "uv 0.11.6",
+    "dependencies": {
+      "psutil": "7.2.2"
+    },
+    "environment": "env/pyhmmer-0.12.1"
+  }
+}
