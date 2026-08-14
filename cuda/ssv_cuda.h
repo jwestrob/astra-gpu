@@ -49,6 +49,16 @@ typedef struct {
   float scale;
 } plan7_ssv_profile;
 
+typedef struct plan7_ssv_f1_profile {
+  plan7_ssv_profile profile;
+  int32_t cutoff_mode;
+  float cutoff_bit_score;
+  uint64_t tjb_offset;
+} plan7_ssv_f1_profile;
+
+struct plan7_viterbi_database;
+struct plan7_postfilter_result;
+
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 
 int plan7_cuda_device_count(char *error, size_t error_size);
@@ -152,6 +162,20 @@ int plan7_ssv_sequence_batch_bias_candidates_many(
   const uint32_t *candidate_indices,
   size_t candidate_count,
   plan7_bias_result *results,
+  size_t result_count,
+  char *error,
+  size_t error_size);
+
+int plan7_ssv_sequence_batch_postfilter_candidates_many(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  const uintptr_t *source_profile_pointers,
+  const struct plan7_viterbi_database *viterbi_database,
+  struct plan7_postfilter_result *results,
   size_t result_count,
   char *error,
   size_t error_size);

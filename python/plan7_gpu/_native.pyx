@@ -1,13 +1,33 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
 
 from libc.stddef cimport size_t
-from libc.stdint cimport int16_t, int32_t, uint8_t, uint32_t, uint64_t
+from libc.stdint cimport int16_t, int32_t, uintptr_t, uint8_t, uint32_t, uint64_t
 from libc.math cimport isfinite
 from libc.string cimport memcpy
 from cpython.array cimport array as carray, clone
 from libcpp.vector cimport vector
+from pyhmmer.plan7 cimport OptimizedProfile
 
 import array as _array
+import pyhmmer as _pyhmmer
+
+from . import _abi as _abi_module
+
+
+PYHMMER_PRIVATE_ABI = "0.12.0"
+PYHMMER_PRIVATE_ABI_SHA256 = PYHMMER_ABI_SHA256
+if _pyhmmer.__version__ != PYHMMER_PRIVATE_ABI:
+    raise ImportError(
+        f"plan7_gpu._native requires PyHMMER {PYHMMER_PRIVATE_ABI}, "
+        f"found {_pyhmmer.__version__}"
+    )
+_abi_module.validate_private_abi_platform()
+_runtime_abi_sha256 = _abi_module.pyhmmer_abi_fingerprint()
+if _runtime_abi_sha256 != PYHMMER_PRIVATE_ABI_SHA256:
+    raise ImportError(
+        "plan7_gpu._native was built against a different PyHMMER private ABI "
+        f"({PYHMMER_PRIVATE_ABI_SHA256} != {_runtime_abi_sha256})"
+    )
 
 
 cdef carray _UINT32_ARRAY_TEMPLATE = _array.array("I")
@@ -246,6 +266,56 @@ cdef extern from "ssv_cuda.h" nogil:
         const uint32_t *candidate_indices,
         size_t candidate_count,
         plan7_bias_result *results,
+        size_t result_count,
+        char *error,
+        size_t error_size,
+    )
+
+
+cdef extern from "postfilter_cuda.h" nogil:
+    cdef enum plan7_postfilter_abi:
+        PLAN7_POSTFILTER_RECORD_VERSION
+        PLAN7_POSTFILTER_RECORD_SIZE
+
+    ctypedef struct plan7_postfilter_result:
+        uint32_t sequence_index
+        float filtersc
+        int16_t msv_numerator
+        uint8_t msv_status
+        uint8_t action
+        float vfsc
+
+    ctypedef struct plan7_viterbi_database:
+        pass
+
+    int plan7_viterbi_database_create(
+        const uintptr_t *profile_pointers,
+        size_t profile_count,
+        plan7_viterbi_database **database,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_viterbi_database_destroy(
+        plan7_viterbi_database **database,
+        char *error,
+        size_t error_size,
+    )
+
+    size_t plan7_viterbi_database_profile_count(
+        const plan7_viterbi_database *database,
+    )
+
+    int plan7_ssv_sequence_batch_postfilter_candidates_many(
+        plan7_ssv_sequence_batch *batch,
+        const plan7_bias_profile *bias_profiles,
+        size_t profile_count,
+        const size_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        size_t candidate_count,
+        const uintptr_t *source_profile_pointers,
+        const plan7_viterbi_database *viterbi_database,
+        plan7_postfilter_result *results,
         size_t result_count,
         char *error,
         size_t error_size,
@@ -539,6 +609,79 @@ def pack_striped_scores(
     return packed_scores
 
 
+cdef class ViterbiProfiles:
+    """Device-resident exact Viterbi profiles for the raw post-filter API."""
+
+    cdef plan7_viterbi_database *_database
+    cdef tuple _owners
+
+    def __cinit__(self):
+        self._database = NULL
+        self._owners = ()
+
+    def __init__(self, profiles):
+        cdef tuple owners = tuple(profiles)
+        cdef vector[uintptr_t] pointers
+        cdef OptimizedProfile profile
+        cdef object value
+        cdef char error[512]
+        cdef int status
+
+        if self._database != NULL:
+            raise RuntimeError("Viterbi profiles are already initialized")
+        pointers.reserve(len(owners))
+        for value in owners:
+            if not isinstance(value, OptimizedProfile):
+                raise TypeError("Viterbi profiles must be OptimizedProfile objects")
+            profile = value
+            pointers.push_back(<uintptr_t> profile._om)
+        error[0] = 0
+        status = plan7_viterbi_database_create(
+            pointers.data() if pointers.size() else NULL,
+            pointers.size(),
+            &self._database,
+            error,
+            sizeof(error),
+        )
+        if status != 0:
+            raise ValueError(error.decode("utf-8", "replace"))
+        self._owners = owners
+
+    def __dealloc__(self):
+        if self._database != NULL:
+            plan7_viterbi_database_destroy(&self._database, NULL, 0)
+
+    def __len__(self):
+        if self._database == NULL:
+            return 0
+        return plan7_viterbi_database_profile_count(self._database)
+
+    @property
+    def closed(self):
+        return self._database == NULL
+
+    def __enter__(self):
+        if self._database == NULL:
+            raise RuntimeError("Viterbi profiles are closed")
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def close(self):
+        cdef char error[512]
+        cdef int status
+        if self._database != NULL:
+            error[0] = 0
+            with nogil:
+                status = plan7_viterbi_database_destroy(
+                    &self._database, error, sizeof(error)
+                )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
+            self._owners = ()
+
+
 cdef class SequenceBatch:
     cdef plan7_ssv_sequence_batch *_batch
     cdef vector[plan7_ssv_result] _results
@@ -551,6 +694,7 @@ cdef class SequenceBatch:
     cdef vector[size_t] _bias_candidate_offsets
     cdef vector[plan7_bias_profile] _bias_profiles
     cdef vector[plan7_bias_result] _bias_results
+    cdef vector[plan7_postfilter_result] _postfilter_results
     cdef vector[uint64_t] _lengths
     cdef size_t _sequence_count
     cdef int _alphabet_size
@@ -1241,6 +1385,179 @@ cdef class SequenceBatch:
             )
         return records, offsets
 
+    cdef size_t _run_postfilter_candidates_many(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+        const uint8_t[::1] packed_bias_profiles,
+        source_profiles,
+        ViterbiProfiles viterbi_profiles,
+    ) except? 0:
+        cdef char error[512]
+        cdef size_t profile_count
+        cdef size_t candidate_count
+        cdef size_t profile_index
+        cdef size_t expected_bias_bytes
+        cdef int status
+        cdef tuple owners = tuple(source_profiles)
+        cdef vector[uintptr_t] source_pointers
+        cdef OptimizedProfile source_profile
+        cdef object value
+
+        if viterbi_profiles._database == NULL:
+            raise RuntimeError("Viterbi profiles are closed")
+        profile_count = self._run_candidates_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+            m_mu,
+            m_lambda,
+            f1,
+        )
+        if plan7_viterbi_database_profile_count(
+            viterbi_profiles._database
+        ) != profile_count:
+            raise ValueError("Viterbi and SSV profile counts differ")
+        if len(owners) != profile_count:
+            raise ValueError("source and SSV profile counts differ")
+        source_pointers.reserve(profile_count)
+        for profile_index in range(profile_count):
+            value = owners[profile_index]
+            if not isinstance(value, OptimizedProfile):
+                raise TypeError(
+                    "source profiles must be OptimizedProfile objects"
+                )
+            if value is not viterbi_profiles._owners[profile_index]:
+                raise ValueError(
+                    "source profile identity differs from Viterbi profile row"
+                )
+            source_profile = value
+            source_pointers.push_back(<uintptr_t> source_profile._om)
+        if profile_count == 0:
+            if packed_bias_profiles.shape[0] != 0:
+                raise ValueError("packed bias profiles have trailing bytes")
+            self._bias_profiles.clear()
+            self._postfilter_results.clear()
+            self._bias_candidate_offsets.resize(1)
+            self._bias_candidate_offsets[0] = 0
+            return 0
+        if profile_count > (<size_t> -1) // sizeof(plan7_bias_profile):
+            raise OverflowError("packed bias profile size overflows size_t")
+        expected_bias_bytes = profile_count * sizeof(plan7_bias_profile)
+        if <size_t> packed_bias_profiles.shape[0] != expected_bias_bytes:
+            raise ValueError("packed bias profile buffer has the wrong size")
+
+        self._bias_profiles.resize(profile_count)
+        memcpy(
+            self._bias_profiles.data(),
+            &packed_bias_profiles[0],
+            expected_bias_bytes,
+        )
+        candidate_count = self._candidate_indices.size()
+        self._postfilter_results.resize(candidate_count)
+        self._bias_candidate_offsets.resize(profile_count + 1)
+        for profile_index in range(profile_count):
+            self._bias_candidate_offsets[profile_index] = (
+                self._candidate_offsets[profile_index]
+            )
+        self._bias_candidate_offsets[profile_count] = candidate_count
+        if candidate_count == 0:
+            return profile_count
+
+        error[0] = 0
+        # Hold the GIL while native code validates live P7_OPROFILE snapshots;
+        # PyHMMER mutation APIs must not race those private-array reads.
+        status = plan7_ssv_sequence_batch_postfilter_candidates_many(
+            self._batch,
+            self._bias_profiles.data(),
+            profile_count,
+            self._bias_candidate_offsets.data(),
+            self._candidate_indices.data(),
+            candidate_count,
+            source_pointers.data(),
+            viterbi_profiles._database,
+            self._postfilter_results.data(),
+            candidate_count,
+            error,
+            sizeof(error),
+        )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        return profile_count
+
+    def postfilter_candidates_many_csr_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+        const uint8_t[::1] packed_bias_profiles,
+        source_profiles,
+        ViterbiProfiles viterbi_profiles,
+    ):
+        """Return version-1 post-filter records and native uint64 row offsets."""
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t candidate_count
+        cdef size_t result_bytes
+        cdef bytearray records
+        cdef uint8_t[::1] record_view
+        cdef carray offsets
+
+        if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
+            raise RuntimeError("array('Q') is not native uint64")
+        if sizeof(plan7_postfilter_result) != PLAN7_POSTFILTER_RECORD_SIZE:
+            raise RuntimeError("post-filter result ABI size mismatch")
+        profile_count = self._run_postfilter_candidates_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+            m_mu,
+            m_lambda,
+            f1,
+            packed_bias_profiles,
+            source_profiles,
+            viterbi_profiles,
+        )
+        candidate_count = self._postfilter_results.size()
+        if candidate_count > (<size_t> -1) // sizeof(plan7_postfilter_result):
+            raise OverflowError("post-filter result size overflows size_t")
+        result_bytes = candidate_count * sizeof(plan7_postfilter_result)
+        records = bytearray(result_bytes)
+        if result_bytes:
+            record_view = records
+            memcpy(
+                &record_view[0], self._postfilter_results.data(), result_bytes
+            )
+        offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
+        for profile_index in range(profile_count + 1):
+            offsets.data.as_ulonglongs[profile_index] = <uint64_t> (
+                self._bias_candidate_offsets[profile_index]
+            )
+        return records, offsets
+
 
 def filter_raw(
     const uint8_t[::1] striped_scores,
@@ -1347,3 +1664,5 @@ BIAS_CUTOFF_ALWAYS_REJECT = PLAN7_BIAS_CUTOFF_ALWAYS_REJECT
 BIAS_CUTOFF_ALWAYS_PASS = PLAN7_BIAS_CUTOFF_ALWAYS_PASS
 BIAS_PROFILE_SIZE = sizeof(plan7_bias_profile)
 BIAS_RESULT_SIZE = sizeof(plan7_bias_result)
+POSTFILTER_RECORD_VERSION = PLAN7_POSTFILTER_RECORD_VERSION
+POSTFILTER_RESULT_SIZE = sizeof(plan7_postfilter_result)

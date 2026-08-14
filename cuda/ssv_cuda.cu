@@ -1,4 +1,5 @@
 #include "ssv_cuda.h"
+#include "postfilter_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -14,13 +15,6 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 
-struct plan7_ssv_f1_profile {
-  plan7_ssv_profile profile;
-  int32_t cutoff_mode;
-  float cutoff_bit_score;
-  uint64_t tjb_offset;
-};
-
 struct plan7_ssv_sequence_batch {
   int device_ordinal;
   int alphabet_size;
@@ -34,6 +28,9 @@ struct plan7_ssv_sequence_batch {
   size_t host_tjb_capacity;
   plan7_ssv_f1_profile *host_f1_profiles;
   size_t host_f1_profile_capacity;
+  uint8_t *host_f1_scores;
+  size_t host_f1_score_capacity;
+  size_t host_f1_score_count;
   plan7_bias_candidate *host_bias_candidates;
   size_t host_bias_candidate_capacity;
   uint8_t *device_residues;
@@ -818,6 +815,7 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   }
   free(batch->host_tjb);
   free(batch->host_f1_profiles);
+  free(batch->host_f1_scores);
   free(batch->host_bias_candidates);
   free(batch->host_tjb_log_terms);
   free(batch->host_bias_log1mp);
@@ -1476,6 +1474,17 @@ plan7_ssv_sequence_batch_f1_mask_many(
       static_cast<plan7_ssv_f1_profile *>(replacement);
     batch->host_f1_profile_capacity = f1_profile_bytes;
   }
+  if (packed_score_count > batch->host_f1_score_capacity) {
+    void *replacement = realloc(batch->host_f1_scores, packed_score_count);
+    if (replacement == nullptr) {
+      set_error(error, error_size, "host fused profile score allocation failed");
+      return -1;
+    }
+    batch->host_f1_scores = static_cast<uint8_t *>(replacement);
+    batch->host_f1_score_capacity = packed_score_count;
+  }
+  memcpy(batch->host_f1_scores, packed_scores, packed_score_count);
+  batch->host_f1_score_count = packed_score_count;
 
   for (size_t profile = 0; profile < profile_count; ++profile) {
     plan7_ssv_f1_profile *f1_profile = &batch->host_f1_profiles[profile];
@@ -1869,6 +1878,257 @@ plan7_ssv_sequence_batch_bias_candidates_many(
                            result_bytes,
                            cudaMemcpyDeviceToHost));
 #undef CUDA_TRY_BIAS
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_postfilter_candidates_many(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  const uintptr_t *source_profile_pointers,
+  const plan7_viterbi_database *viterbi_database,
+  plan7_postfilter_result *results,
+  size_t result_count,
+  char *error,
+  size_t error_size)
+{
+  cudaError_t status;
+  size_t profile_bytes;
+  size_t candidate_bytes;
+  size_t ssv_input_bytes;
+  size_t length_term_bytes;
+  int current_device;
+  int maximum_grid_x;
+
+  if (batch == nullptr) {
+    set_error(error, error_size, "sequence batch is null");
+    return -1;
+  }
+  status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (current_device != batch->device_ordinal) {
+    set_error(error, error_size,
+              "CUDA sequence batch belongs to a different device");
+    return -1;
+  }
+  if (!batch->f1_cache_valid ||
+      profile_count != batch->cached_f1_profile_count) {
+    set_error(error, error_size,
+              "post-filter candidates do not match the cached fused F1 pass");
+    return -1;
+  }
+  if ((profile_count != 0 &&
+       (bias_profiles == nullptr || candidate_offsets == nullptr)) ||
+      (candidate_count != 0 &&
+       (candidate_indices == nullptr || results == nullptr)) ||
+      result_count < candidate_count || viterbi_database == nullptr ||
+      (profile_count != 0 && source_profile_pointers == nullptr)) {
+    set_error(error, error_size, "invalid post-filter candidate buffers");
+    return -1;
+  }
+  if (profile_count == 0) {
+    if (candidate_count != 0 ||
+        plan7_viterbi_database_profile_count(viterbi_database) != 0) {
+      set_error(error, error_size, "post-filter candidates have no profiles");
+      return -1;
+    }
+    return 0;
+  }
+  if (candidate_offsets[0] != 0 ||
+      candidate_offsets[profile_count] != candidate_count) {
+    set_error(error, error_size, "invalid post-filter candidate offsets");
+    return -1;
+  }
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    if (candidate_offsets[profile] > candidate_offsets[profile + 1]) {
+      set_error(error, error_size, "invalid post-filter candidate offsets");
+      return -1;
+    }
+    for (size_t candidate = candidate_offsets[profile];
+         candidate < candidate_offsets[profile + 1]; ++candidate) {
+      if (candidate_indices[candidate] >= batch->sequence_count) {
+        set_error(error, error_size,
+                  "post-filter candidate sequence index is out of range");
+        return -1;
+      }
+    }
+  }
+  if (candidate_count == 0) return 0;
+  if (batch->alphabet_size != 29 ||
+      !batch->host_float_environment_valid ||
+      plan7_bias_environment_attested(nullptr, 0) != 1) {
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      for (size_t candidate = candidate_offsets[profile];
+           candidate < candidate_offsets[profile + 1]; ++candidate) {
+        results[candidate] = {
+          candidate_indices[candidate], NAN, 0, PLAN7_SSV_ENORESULT,
+          PLAN7_BIAS_CPU_REQUIRED, NAN
+        };
+      }
+    }
+    return 0;
+  }
+  if (plan7_viterbi_database_matches_ssv(
+        viterbi_database, batch->host_f1_scores,
+        batch->host_f1_score_count, source_profile_pointers,
+        batch->host_f1_profiles, profile_count,
+        error, error_size) != 0)
+    return -1;
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    if (!validate_bias_profile(&bias_profiles[profile]) ||
+        bias_profiles[profile].scale !=
+          batch->host_f1_profiles[profile].profile.scale ||
+        bias_profiles[profile].cutoff_mode !=
+          batch->host_f1_profiles[profile].cutoff_mode ||
+        (bias_profiles[profile].cutoff_mode == PLAN7_BIAS_CUTOFF_SCORE &&
+         bias_profiles[profile].cutoff_bit_score !=
+           batch->host_f1_profiles[profile].cutoff_bit_score)) {
+      set_error(error, error_size,
+                "bias profile differs from the cached fused F1 profile");
+      return -1;
+    }
+  }
+  if (!checked_product(profile_count, sizeof(plan7_bias_profile),
+                       &profile_bytes) ||
+      !checked_product(candidate_count, sizeof(plan7_bias_candidate),
+                       &candidate_bytes) ||
+      !checked_product(candidate_count, sizeof(plan7_bias_ssv_input),
+                       &ssv_input_bytes) ||
+      !checked_product(batch->sequence_count, sizeof(float),
+                       &length_term_bytes)) {
+    set_error(error, error_size, "post-filter candidate batch size overflow");
+    return -1;
+  }
+  if (candidate_bytes > batch->host_bias_candidate_capacity) {
+    void *replacement = realloc(batch->host_bias_candidates, candidate_bytes);
+    if (replacement == nullptr) {
+      set_error(error, error_size,
+                "host post-filter candidate allocation failed");
+      return -1;
+    }
+    batch->host_bias_candidates =
+      static_cast<plan7_bias_candidate *>(replacement);
+    batch->host_bias_candidate_capacity = candidate_bytes;
+  }
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    for (size_t candidate = candidate_offsets[profile];
+         candidate < candidate_offsets[profile + 1]; ++candidate) {
+      batch->host_bias_candidates[candidate] = {
+        static_cast<uint32_t>(profile), candidate_indices[candidate]
+      };
+    }
+  }
+
+  status = cudaDeviceGetAttribute(
+    &maximum_grid_x, cudaDevAttrMaxGridDimX, current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaDeviceGetAttribute(maximum grid x)", status);
+    return -1;
+  }
+  if (candidate_count > static_cast<size_t>(maximum_grid_x)) {
+    set_error(error, error_size, "sparse SSV candidate grid is too large");
+    return -1;
+  }
+
+  if (grow_device_buffer(&batch->device_bias_profiles,
+                         &batch->device_bias_profile_capacity,
+                         profile_bytes,
+                         "cudaMalloc(post-filter bias profiles)",
+                         "cudaFree(post-filter bias profiles)",
+                         error, error_size) != 0 ||
+      grow_device_buffer(&batch->device_bias_candidates,
+                         &batch->device_bias_candidate_capacity,
+                         candidate_bytes,
+                         "cudaMalloc(post-filter candidates)",
+                         "cudaFree(post-filter candidates)",
+                         error, error_size) != 0 ||
+      grow_device_buffer(&batch->device_bias_ssv_inputs,
+                         &batch->device_bias_ssv_input_capacity,
+                         ssv_input_bytes,
+                         "cudaMalloc(post-filter sparse SSV results)",
+                         "cudaFree(post-filter sparse SSV results)",
+                         error, error_size) != 0 ||
+      grow_device_buffer(&batch->device_bias_logp,
+                         &batch->device_bias_logp_capacity,
+                         length_term_bytes,
+                         "cudaMalloc(post-filter bias length logp)",
+                         "cudaFree(post-filter bias length logp)",
+                         error, error_size) != 0 ||
+      grow_device_buffer(&batch->device_bias_log1mp,
+                         &batch->device_bias_log1mp_capacity,
+                         length_term_bytes,
+                         "cudaMalloc(post-filter bias length log1mp)",
+                         "cudaFree(post-filter bias length log1mp)",
+                         error, error_size) != 0)
+    return -1;
+
+#define CUDA_TRY_POSTFILTER(call)                                             \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, #call, status);                       \
+      return -1;                                                              \
+    }                                                                         \
+  } while (0)
+
+  CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_profiles,
+                                 bias_profiles, profile_bytes,
+                                 cudaMemcpyHostToDevice));
+  CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_candidates,
+                                 batch->host_bias_candidates,
+                                 candidate_bytes, cudaMemcpyHostToDevice));
+  if (!batch->bias_length_terms_device_valid) {
+    CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_logp,
+                                   batch->host_bias_logp,
+                                   length_term_bytes,
+                                   cudaMemcpyHostToDevice));
+    CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_log1mp,
+                                   batch->host_bias_log1mp,
+                                   length_term_bytes,
+                                   cudaMemcpyHostToDevice));
+    batch->bias_length_terms_device_valid = 1;
+  }
+  ssv_bias_candidates_kernel<<<static_cast<unsigned>(candidate_count),
+                               kThreads>>>(
+    batch->device_scores,
+    batch->device_f1_profiles,
+    batch->sequence_count,
+    batch->device_residues,
+    batch->device_offsets,
+    batch->device_tjb,
+    batch->device_bias_candidates,
+    batch->device_bias_ssv_inputs);
+  CUDA_TRY_POSTFILTER(cudaGetLastError());
+  if (plan7_postfilter_candidates_device(
+        viterbi_database,
+        batch->device_residues,
+        batch->device_offsets,
+        batch->host_lengths,
+        batch->sequence_count,
+        batch->device_null_scores,
+        batch->device_scores,
+        batch->device_f1_profiles,
+        batch->device_tjb,
+        batch->device_bias_logp,
+        batch->device_bias_log1mp,
+        batch->device_bias_profiles,
+        batch->device_bias_candidates,
+        batch->host_bias_candidates,
+        batch->device_bias_ssv_inputs,
+        candidate_count,
+        results,
+        error,
+        error_size) != 0)
+    return -1;
+#undef CUDA_TRY_POSTFILTER
   return 0;
 }
 
