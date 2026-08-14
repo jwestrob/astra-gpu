@@ -80,9 +80,11 @@ def _prepare_candidates(
     pairs: tuple[PressedProfilePair, ...],
     batch: SequenceBatch | CandidateBatch,
     pipeline_options: dict[str, Any],
+    postfilter: bool,
 ) -> CandidateBatch:
     if type(batch) is SequenceBatch:
-        candidates = batch.candidate_batch(pairs, F1=pipeline_options.get("F1", 0.02))
+        build = batch.postfilter_batch if postfilter else batch.candidate_batch
+        candidates = build(pairs, F1=pipeline_options.get("F1", 0.02))
         alphabet = batch.alphabet
     elif type(batch) is CandidateBatch:
         candidates = batch
@@ -230,6 +232,7 @@ def hmmsearch(
     batch: SequenceBatch | CandidateBatch,
     *,
     cpus: int = 1,
+    postfilter: bool = False,
     **pipeline_options: Any,
 ) -> Iterator[Any]:
     """Yield candidate-aware HMM searches in supplied query order.
@@ -250,9 +253,11 @@ def hmmsearch(
     until it is exhausted or closed.
     """
     worker_count = _positive_cpus(cpus)
+    if type(postfilter) is not bool:
+        raise TypeError("postfilter must be bool")
     pairs = _pressed_pairs(profile_pairs)
     options = dict(pipeline_options)
-    candidates = _prepare_candidates(pairs, batch, options)
+    candidates = _prepare_candidates(pairs, batch, options, postfilter)
 
     if len(candidates) != len(pairs):
         # This should be guaranteed by CandidateBatch construction, but keep

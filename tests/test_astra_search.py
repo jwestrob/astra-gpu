@@ -17,11 +17,12 @@ from pyhmmer.errors import MissingCutoffs
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 try:
-    from plan7_gpu import _native
+    from plan7_gpu import _native, _pipeline
     from plan7_gpu.adapter import CandidateBatch, SequenceBatch, load_pressed_profiles
     from plan7_gpu.astra_search import hmmsearch
 except ImportError:
     _native = None
+    _pipeline = None
     CandidateBatch = None
     SequenceBatch = None
     load_pressed_profiles = None
@@ -188,6 +189,35 @@ class AstraSearchTests(unittest.TestCase):
             self.assertEqual(hits.Z, 123.0)
             self.assertEqual(hits.domZ, 17.0)
             self.assertEqual(hits.bit_cutoffs, "gathering")
+
+    def test_postfilter_matches_pyhmmer_when_private_seam_is_available(self):
+        if _pipeline is None or not _pipeline._filter_scores_seam_available():
+            self.skipTest("private filter-score seam is unavailable")
+        pairs = self.pairs[:4]
+        option_sets = (
+            {"F1": 0.02},
+            {"F1": 0.02, "bias_filter": False},
+            {"F1": 0.02, "F2": 1.0, "F3": 1.0},
+        )
+        for options in option_sets:
+            for cpus in (1, 2):
+                with self.subTest(options=options, cpus=cpus):
+                    expected = self.reference(
+                        pairs, self.real_targets, cpus=cpus, **options
+                    )
+                    actual = list(
+                        hmmsearch(
+                            pairs,
+                            self.real_batch,
+                            cpus=cpus,
+                            postfilter=True,
+                            **options,
+                        )
+                    )
+                    for expected_hits, actual_hits in zip(
+                        expected, actual, strict=True
+                    ):
+                        self.assert_exact_hits(expected_hits, actual_hits)
 
     def test_precomputed_none_sparse_and_all_rows_match_pyhmmer(self):
         cases = (

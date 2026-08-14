@@ -1,7 +1,9 @@
+import ctypes
 import io
 import json
 import math
 import os
+import platform
 import shutil
 import struct
 import sys
@@ -1187,6 +1189,31 @@ class CudaCandidateBatchTests(unittest.TestCase):
         pipeline.F1 = candidates.F1
         actual = candidates.search(0, pipeline)
         expected = self.pipeline().search_hmm(pair.hmm, self.targets)
+        self.assert_exact_hits(expected, actual)
+
+    @unittest.skipUnless(
+        platform.system() == "Linux" and platform.machine() == "x86_64",
+        "floating-point environment probe is Linux x86_64 specific",
+    )
+    def test_hostile_consumption_float_environment_fails_before_mutation(self):
+        pair = self.pairs[0]
+        with SequenceBatch(self.targets) as sequences:
+            candidates = sequences.candidate_batch([pair])
+
+        libc = ctypes.CDLL(None)
+        libc.fegetround.restype = ctypes.c_int
+        libc.fesetround.argtypes = [ctypes.c_int]
+        original = libc.fegetround()
+        pipeline = self.pipeline()
+        try:
+            self.assertEqual(libc.fesetround(0x400), 0)
+            with self.assertRaisesRegex(RuntimeError, "floating-point"):
+                candidates.search(0, pipeline)
+        finally:
+            self.assertEqual(libc.fesetround(original), 0)
+
+        expected = self.pipeline().search_hmm(pair.hmm, self.targets)
+        actual = candidates.search(0, pipeline)
         self.assert_exact_hits(expected, actual)
 
     def test_custom_background_is_rejected_before_pipeline_mutation(self):

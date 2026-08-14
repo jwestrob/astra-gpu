@@ -371,6 +371,38 @@ def _f1_parameters(profile: Any) -> tuple[float, float, float] | None:
     return m_mu, m_lambda, scale
 
 
+def _pack_postfilter_inputs(
+    background: Any,
+    profiles: list[Any],
+    threshold: float,
+) -> tuple[bytearray, array[float], array[float]] | None:
+    packed_bias = bytearray()
+    m_mu = array("f")
+    m_lambda = array("f")
+    background_frequencies = memoryview(background.residue_frequencies)
+    for profile in profiles:
+        parameters = _f1_parameters(profile)
+        if parameters is None:
+            return None
+        profile_mu, profile_lambda, scale = parameters
+        cutoff_mode, cutoff = _native.f1_cutoff(profile_mu, profile_lambda, threshold)
+        if cutoff_mode == _native.F1_CUTOFF_INVALID:
+            return None
+        packed_bias.extend(
+            _native.pack_bias_profile_raw(
+                background_frequencies,
+                memoryview(profile.compositions),
+                profile.M,
+                scale,
+                cutoff_mode,
+                math.nan if cutoff is None else cutoff,
+            )
+        )
+        m_mu.append(profile_mu)
+        m_lambda.append(profile_lambda)
+    return packed_bias, m_mu, m_lambda
+
+
 def _format_results(raw_results: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
     names = {
         _native.STATUS_OK: "eslOK",
@@ -406,6 +438,7 @@ class _CandidateState:
         "offsets",
         "all_rows",
         "all_targets",
+        "postfilter_records",
         "f1",
     )
 
@@ -418,6 +451,7 @@ class _CandidateState:
         offsets: bytes,
         all_rows: bytes,
         all_targets: bytes,
+        postfilter_records: bytes | None,
         f1: float,
     ) -> None:
         self.pairs = pairs
@@ -427,6 +461,7 @@ class _CandidateState:
         self.offsets = offsets
         self.all_rows = all_rows
         self.all_targets = all_targets
+        self.postfilter_records = postfilter_records
         self.f1 = f1
 
 
@@ -471,6 +506,9 @@ class CandidateBatch:
         """Return the number of targets retained in one bound row."""
         row_index = self._row_index(row)
         state = _candidate_state(self)
+        if state.postfilter_records is not None:
+            offsets = memoryview(state.offsets).cast("Q")
+            return offsets[row_index + 1] - offsets[row_index]
         if state.all_rows[row_index]:
             return len(state.all_targets) // 4
         offsets = memoryview(state.offsets).cast("Q")
@@ -485,9 +523,20 @@ class CandidateBatch:
         row_index = self._row_index(row)
         if type(pipeline) is not pyhmmer.plan7.Pipeline:
             raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+        if not _native.bias_host_environment_attested():
+            raise RuntimeError(
+                "candidate search requires the attested host floating-point environment"
+            )
         candidate_state = _candidate_state(self)
         pair = candidate_state.pairs[row_index]
-        if candidate_state.all_rows[row_index]:
+        postfilter_records = candidate_state.postfilter_records
+        if postfilter_records is not None:
+            offsets = memoryview(candidate_state.offsets).cast("Q")
+            record_size = _native.POSTFILTER_RESULT_SIZE
+            start = offsets[row_index] * record_size
+            stop = offsets[row_index + 1] * record_size
+            candidate_row = memoryview(postfilter_records)[start:stop]
+        elif candidate_state.all_rows[row_index]:
             candidate_row = memoryview(candidate_state.all_targets).cast("I")
         else:
             offsets = memoryview(candidate_state.offsets).cast("Q")
@@ -514,6 +563,15 @@ class CandidateBatch:
                     "hmmpress background"
                 )
             with state.lock:
+                if postfilter_records is not None:
+                    return _pipeline._search_hmm_postfilter_bound(
+                        pipeline,
+                        state.hmm.copy(),
+                        state.optimized_profile,
+                        candidate_state.targets,
+                        candidate_row,
+                        residue_offsets,
+                    )
                 return _pipeline._search_hmm_candidates_bound(
                     pipeline,
                     state.hmm.copy(),
@@ -547,6 +605,8 @@ def _new_candidate_batch(
     all_rows: bytes,
     all_targets: array[int],
     f1: float,
+    *,
+    postfilter_records: bytes | None = None,
 ) -> CandidateBatch:
     candidates = object.__new__(CandidateBatch)
     _CANDIDATE_STATES[candidates] = _CandidateState(
@@ -557,6 +617,7 @@ def _new_candidate_batch(
         offsets.tobytes(),
         all_rows,
         all_targets.tobytes(),
+        postfilter_records,
         f1,
     )
     return candidates
@@ -925,6 +986,91 @@ class SequenceBatch:
             all_rows,
             all_targets,
             threshold,
+        )
+
+    def postfilter_batch(
+        self,
+        profile_pairs: Iterable[PressedProfilePair],
+        F1: float = 0.02,
+    ) -> CandidateBatch:
+        """Bind exact CUDA MSV, bias, and Viterbi records to pressed pairs."""
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        if not _pipeline._filter_scores_seam_available():
+            raise RuntimeError(
+                "post-filter batches require the project-private "
+                "p7_PipelineFromFilterScores HMMER seam"
+            )
+
+        sequence_state = _sequence_state(self)
+        pairs = tuple(profile_pairs)
+        try:
+            threshold = float(F1)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("F1 must be a finite number in [0, 1]") from error
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("F1 must be a finite number in [0, 1]")
+
+        profiles = []
+        states = []
+        for pair in pairs:
+            if type(pair) is not PressedProfilePair:
+                raise TypeError(
+                    "post-filter batches require pairs from load_pressed_profiles"
+                )
+            state = _pair_state(pair)
+            if state.hmm.alphabet != sequence_state.alphabet:
+                raise ValueError("profile and sequence alphabets differ")
+            profiles.append(state.optimized_profile)
+            states.append(state)
+
+        postfilter_records: bytes | None = None
+        unique_locks = {id(state.lock): state.lock for state in states}
+        with ExitStack() as locks:
+            for lock_id in sorted(unique_locks):
+                locks.enter_context(unique_locks[lock_id])
+            with sequence_state.lock:
+                if sequence_state.native.closed:
+                    raise RuntimeError("sequence batch is closed")
+                inputs = None
+                if threshold < 1.0:
+                    background = pyhmmer.plan7.Background(sequence_state.alphabet)
+                    inputs = _pack_postfilter_inputs(background, profiles, threshold)
+                if inputs is None:
+                    indices, offsets, all_rows, all_targets = (
+                        self._candidate_csr_locked(profiles, threshold)
+                    )
+                else:
+                    packed_bias, m_mu, m_lambda = inputs
+                    packed = _pack_profiles(profiles)
+                    with _native.ViterbiProfiles(profiles) as viterbi_profiles:
+                        records, offsets = cast(
+                            tuple[bytearray, array[int]],
+                            sequence_state.native.postfilter_candidates_many_csr_raw(
+                                *packed,
+                                m_mu,
+                                m_lambda,
+                                threshold,
+                                packed_bias,
+                                profiles,
+                                viterbi_profiles,
+                            ),
+                        )
+                    postfilter_records = bytes(records)
+                    indices = array("I")
+                    all_rows = bytes(len(profiles))
+                    all_targets = array("I")
+
+        return _new_candidate_batch(
+            pairs,
+            sequence_state.targets,
+            sequence_state.residue_offsets,
+            indices,
+            offsets,
+            all_rows,
+            all_targets,
+            threshold,
+            postfilter_records=postfilter_records,
         )
 
 
