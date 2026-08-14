@@ -24,7 +24,10 @@ target upload can now be reused across profiles, and the native adapter returns
 only pairs that direct SSV cannot safely reject at HMMER's exact F1 decision.
 Profiles can now be evaluated in batches rather than one kernel launch apiece.
 Length terms and exact binary32 F1 cutoffs are cached for the host gate.
-End-to-end Astra integration remains open; there is no performance claim yet.
+An ABI-pinned private pipeline loop can skip definite rejects while preserving
+HMMER's accounting and exact `TopHits`; it remains private until candidate
+rows are bound to their exact targets, profile, and F1. End-to-end Astra
+integration remains open, and there is no performance claim yet.
 
 ## Layout
 
