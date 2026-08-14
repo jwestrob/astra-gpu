@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "run_status": "pilot",
+  "engine": {
+    "name": "Astra",
+    "version": "astra-hmm 0.1.0",
+    "revision": "966220c15b626626149c37199973818a773d270e",
+    "pyhmmer": "0.12.0"
+  },
+  "host": "node-128-512g-8gpu-1",
+  "allocation": {
+    "cpus_per_task": 32,
+    "cpu_bind": "cores",
+    "memory_bind": "local",
+    "warning": "Shared Slurm node; these timings are not reportable."
+  },
+  "workload": {
+    "database": "installed Astra HydDB",
+    "profiles": 3,
+    "fasta_id": "PLM2_5_b1",
+    "sequences": 300186,
+    "residues": 69453045,
+    "comparisons": 900558
+  },
+  "execution": {
+    "command": "astra search --prot_in <PLM2_5> --installed_hmms HydDB --outdir <unique> --threads N",
+    "warmups_per_point": 1,
+    "replicates_per_point": 3,
+    "timing_scope": "External process wall time, including Astra startup, input parsing, search, TSV writing, and cleanup."
+  },
+  "scientific_output": {
+    "files_compared": 20,
+    "byte_identical": true,
+    "sha256": "a7923850c3ab605f67a8cc3804e6f7cc238ceb824eda2295a86ff73f0405b73b",
+    "tsv_rows_including_header": 577
+  },
+  "scaling": {
+    "1": {
+      "replicates": 3,
+      "wall_seconds": {"median": 9.900396853, "min": 9.872332418, "max": 9.928159226},
+      "max_rss_kib_median": 422912,
+      "speedup_vs_1_thread": 1.0
+    },
+    "4": {
+      "replicates": 3,
+      "wall_seconds": {"median": 8.359325878, "min": 8.346845828, "max": 8.444238286},
+      "max_rss_kib_median": 431104,
+      "speedup_vs_1_thread": 1.1843534990130935
+    },
+    "8": {
+      "replicates": 3,
+      "wall_seconds": {"median": 8.353511576, "min": 8.326280328, "max": 8.396230408},
+      "max_rss_kib_median": 431104,
+      "speedup_vs_1_thread": 1.1851778456193522
+    },
+    "16": {
+      "replicates": 3,
+      "wall_seconds": {"median": 8.369304604, "min": 8.366347882, "max": 8.469925874},
+      "max_rss_kib_median": 431104,
+      "speedup_vs_1_thread": 1.1829413937531004
+    },
+    "32": {
+      "replicates": 3,
+      "wall_seconds": {"median": 8.408598376, "min": 8.320282985, "max": 8.465380041},
+      "max_rss_kib_median": 431104,
+      "speedup_vs_1_thread": 1.177413453502301
+    }
+  }
+}

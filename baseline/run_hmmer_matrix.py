@@ -67,6 +67,8 @@ def main() -> int:
             stdout = args.output_dir / f"{stem}.out"
             stderr = args.output_dir / f"{stem}.err"
             stats = args.output_dir / f"{stem}-stats.json"
+            tblout = args.output_dir / f"{stem}.tblout"
+            domtblout = args.output_dir / f"{stem}.domtblout"
 
             command = [
                 str(RUNNER),
@@ -85,6 +87,10 @@ def main() -> int:
                 "--cpu",
                 str(workers),
                 "--noali",
+                "--tblout",
+                str(tblout),
+                "--domtblout",
+                str(domtblout),
                 str(args.hmm.resolve()),
                 str(args.fasta.resolve()),
             ]

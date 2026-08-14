@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import tempfile
@@ -29,6 +30,18 @@ def normalized_science(summaries: list[dict[str, object]]) -> list[dict[str, obj
     ]
 
 
+def scientific_table_digest(path: Path) -> str:
+    """Hash non-comment HMMER table rows, excluding volatile provenance."""
+    digest = hashlib.sha256()
+    with path.open("rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("#") or not line.strip():
+                continue
+            digest.update(line.rstrip().encode("utf-8"))
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("result_dir", type=Path)
@@ -50,6 +63,9 @@ def main() -> int:
     science_reference = None
     mismatches: list[str] = []
     stats_reference: list[dict[str, object]] | None = None
+    table_reference: dict[str, str] | None = None
+    table_mismatches: list[str] = []
+    table_missing: list[str] = []
     for record in records:
         record_path: Path = record["_path"]
         stats_path = record_path.with_name(record_path.stem + "-stats.json")
@@ -60,6 +76,21 @@ def main() -> int:
             stats_reference = summaries
         elif normalized != science_reference:
             mismatches.append(stats_path.name)
+        table_paths = {
+            "targets": record_path.with_suffix(".tblout"),
+            "domains": record_path.with_suffix(".domtblout"),
+        }
+        if all(path.is_file() for path in table_paths.values()):
+            table_digests = {
+                name: scientific_table_digest(path)
+                for name, path in table_paths.items()
+            }
+            if table_reference is None:
+                table_reference = table_digests
+            elif table_digests != table_reference:
+                table_mismatches.append(record_path.name)
+        else:
+            table_missing.append(record_path.name)
 
     grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
     for record in records:
@@ -116,6 +147,15 @@ def main() -> int:
         "hosts": sorted({record["host"]["hostname"] for record in records}),
         "scientific_summary_equivalent": not mismatches,
         "scientific_summary_mismatches": mismatches,
+        "scientific_tables_present": table_reference is not None,
+        "scientific_table_sha256": table_reference,
+        "scientific_table_equivalent": (
+            None
+            if table_reference is None
+            else not table_mismatches and not table_missing
+        ),
+        "scientific_table_mismatches": table_mismatches,
+        "scientific_table_missing": table_missing if table_reference is not None else [],
         "aggregate_stage_promotions": aggregate_stages,
         "scaling": scaling,
         "warning": "Pilot timings from a shared allocation are not reportable performance results.",
