@@ -1227,9 +1227,9 @@ class CudaCandidateBatchTests(unittest.TestCase):
         state_lock = threading.Lock()
         outcomes = {}
         call_count = 0
-        original_search = _pipeline._search_hmm_candidates
+        original_search = _pipeline._search_hmm_candidates_bound
 
-        def fake_search(pipeline, query, optimized, targets, row):
+        def fake_search(pipeline, query, optimized, targets, row, residue_offsets):
             nonlocal call_count
             with state_lock:
                 call_count += 1
@@ -1253,7 +1253,7 @@ class CudaCandidateBatchTests(unittest.TestCase):
         second_thread = threading.Thread(
             target=invoke, args=("second", second, second_started)
         )
-        _pipeline._search_hmm_candidates = fake_search
+        _pipeline._search_hmm_candidates_bound = fake_search
         try:
             first_thread.start()
             self.assertTrue(first_entered.wait(2.0))
@@ -1270,7 +1270,7 @@ class CudaCandidateBatchTests(unittest.TestCase):
                 first_thread.join(2.0)
             if second_thread.ident is not None:
                 second_thread.join(2.0)
-            _pipeline._search_hmm_candidates = original_search
+            _pipeline._search_hmm_candidates_bound = original_search
             pipeline.F1 = 0.02
 
         self.assertFalse(first_thread.is_alive())

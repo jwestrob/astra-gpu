@@ -9,7 +9,8 @@ loading it against an unsupported private ABI.
 """
 
 from libc.stddef cimport size_t
-from libc.stdint cimport uint32_t
+from libc.stdint cimport uint32_t, uint64_t
+from libc.stdlib cimport free, malloc
 
 from libeasel cimport eslERRBUFSIZE, eslEINVAL, eslERANGE, eslOK
 from libeasel.sq cimport ESL_SQ
@@ -88,11 +89,14 @@ cdef int _search_loop_candidates(
     size_t n_targets,
     const uint32_t* candidate_indexes,
     size_t candidate_count,
+    const uint64_t* residue_offsets,
     P7_TOPHITS* th,
 ) except 1 nogil:
     """Mirror ``Pipeline._search_loop`` while skipping definite rejects."""
     cdef int status
-    cdef size_t candidate_cursor = 0
+    cdef size_t candidate_cursor
+    cdef size_t previous_end = 0
+    cdef size_t target_end
     cdef size_t t
 
     status = p7_pli_NewModel(pli, om, bg)
@@ -101,42 +105,50 @@ cdef int _search_loop_candidates(
     elif status != eslOK:
         raise UnexpectedError(status, "p7_pli_NewModel")
 
-    for t in range(n_targets):
-        # This is exactly p7_pli_NewSeq's accounting for a search pipeline.
-        # Doing it inline avoids a function call for every definite reject.
+    for candidate_cursor in range(candidate_count):
+        t = candidate_indexes[candidate_cursor]
+        target_end = t + 1
+
+        # Advance exactly the p7_pli_NewSeq accounting through this target.
+        # Prefix residue offsets make gaps between candidates O(1), while Z
+        # still has the value HMMER would see at this target's ordinal.
         if not pli.long_targets:
-            pli.nseqs += 1
+            pli.nseqs += target_end - previous_end
             if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
                 pli.Z = pli.nseqs
-        pli.nres += sq[t].n
+        pli.nres += residue_offsets[target_end] - residue_offsets[previous_end]
 
-        if (
-            candidate_cursor < candidate_count
-            and candidate_indexes[candidate_cursor] == t
-        ):
-            # A rejected prefix would have reused any residual workspaces
-            # before this first candidate in HMMER's ordinary target loop.
-            if candidate_cursor == 0 and t != 0:
-                p7_pipeline_Reuse(pli)
-
-            status = p7_bg_SetLength(bg, sq[t].n)
-            if status != eslOK:
-                raise UnexpectedError(status, "p7_bg_SetLength")
-            status = p7_oprofile_ReconfigLength(om, sq[t].n)
-            if status != eslOK:
-                raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
-            status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
-            if status == eslEINVAL:
-                Pipeline._missing_cutoffs(pli, om)
-            elif status == eslERANGE:
-                raise OverflowError(
-                    "numerical overflow in the optimized vector implementation"
-                )
-            elif status != eslOK:
-                raise UnexpectedError(status, "p7_Pipeline")
-            candidate_cursor += 1
-
+        # A rejected prefix would have reused any residual workspaces before
+        # this first candidate in HMMER's ordinary target loop.
+        if candidate_cursor == 0 and t != 0:
             p7_pipeline_Reuse(pli)
+
+        status = p7_bg_SetLength(bg, sq[t].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_bg_SetLength")
+        status = p7_oprofile_ReconfigLength(om, sq[t].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+        status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
+        if status == eslEINVAL:
+            Pipeline._missing_cutoffs(pli, om)
+        elif status == eslERANGE:
+            raise OverflowError(
+                "numerical overflow in the optimized vector implementation"
+            )
+        elif status != eslOK:
+            raise UnexpectedError(status, "p7_Pipeline")
+
+        p7_pipeline_Reuse(pli)
+        previous_end = target_end
+
+    # Account the rejected tail in one step.
+    if previous_end < n_targets:
+        if not pli.long_targets:
+            pli.nseqs += n_targets - previous_end
+            if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
+                pli.Z = pli.nseqs
+        pli.nres += residue_offsets[n_targets] - residue_offsets[previous_end]
 
     # HMMER leaves both models configured for the final target, even when it
     # fails F1. Preserve that state with one configuration for a rejected tail.
@@ -163,6 +175,7 @@ cdef void _validate_inputs(
     HMM query,
     OptimizedProfile optimized_profile,
     DigitalSequenceBlock sequences,
+    bint validate_target_lengths,
 ) except *:
     """Validate every input without mutating the supplied pipeline."""
     if not pipeline.alphabet._eq(query.alphabet):
@@ -184,7 +197,8 @@ cdef void _validate_inputs(
         raise ValueError("HMM and optimized profile metadata differ")
 
     if (
-        sequences._length != 0
+        validate_target_lengths
+        and sequences._length != 0
         and len(sequences.largest()) > HMMER_TARGET_LIMIT
     ):
         raise ValueError(
@@ -199,6 +213,7 @@ cdef TopHits _search_validated(
     OptimizedProfile optimized_profile,
     DigitalSequenceBlock sequences,
     const uint32_t[::1] candidate_indexes,
+    const uint64_t* residue_offsets,
 ):
     cdef const uint32_t* candidate_ptr = NULL
     cdef TopHits hits = TopHits(query)
@@ -217,6 +232,7 @@ cdef TopHits _search_validated(
             sequences._length,
             candidate_ptr,
             <size_t> candidate_indexes.shape[0],
+            residue_offsets,
             hits._th,
         )
         hits._sort_by_key()
@@ -227,6 +243,25 @@ cdef TopHits _search_validated(
     hits._query = query
     hits._empty = False
     return hits
+
+
+cdef void _validate_candidate_indexes(
+    DigitalSequenceBlock sequences,
+    const uint32_t[::1] candidate_indexes,
+) except *:
+    cdef size_t cursor
+    cdef uint32_t index
+    cdef uint32_t previous = 0
+
+    for cursor in range(<size_t> candidate_indexes.shape[0]):
+        index = candidate_indexes[cursor]
+        if index >= sequences._length:
+            raise IndexError(f"candidate index out of range: {index}")
+        if cursor != 0 and index <= previous:
+            raise ValueError(
+                "candidate indexes must be strictly increasing and unique"
+            )
+        previous = index
 
 
 def _search_hmm_candidates(
@@ -244,23 +279,88 @@ def _search_hmm_candidates(
     call returns; the provenance-bound adapter is responsible for enforcing
     that ownership and synchronization contract.
     """
+    cdef uint64_t* residue_offsets = NULL
+    cdef size_t target
+
+    _validate_inputs(pipeline, query, optimized_profile, sequences, True)
+    _validate_candidate_indexes(sequences, candidate_indexes)
+
+    residue_offsets = <uint64_t*> malloc(
+        (sequences._length + 1) * sizeof(uint64_t)
+    )
+    if residue_offsets == NULL:
+        raise MemoryError("target residue-prefix allocation failed")
+    residue_offsets[0] = 0
+    for target in range(sequences._length):
+        residue_offsets[target + 1] = (
+            residue_offsets[target] + sequences._refs[target].n
+        )
+    try:
+        return _search_validated(
+            pipeline,
+            query,
+            optimized_profile,
+            sequences,
+            candidate_indexes,
+            residue_offsets,
+        )
+    finally:
+        free(residue_offsets)
+
+
+def _search_hmm_candidates_bound(
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+    const uint32_t[::1] candidate_indexes,
+    const uint64_t[::1] residue_offsets,
+):
+    """Consume one provenance-bound CSR row and cumulative residue offsets.
+
+    This is a package-private fast path. ``SequenceBatch`` creates both
+    buffers from the same concealed target snapshot and keeps them immutable;
+    callers outside the package cannot establish that provenance safely.
+    """
     cdef size_t cursor
-    cdef uint32_t index
-    cdef uint32_t previous = 0
+    cdef size_t target
+    cdef size_t target_end
+    cdef size_t previous_end = 0
 
-    _validate_inputs(pipeline, query, optimized_profile, sequences)
+    _validate_inputs(pipeline, query, optimized_profile, sequences, False)
+    _validate_candidate_indexes(sequences, candidate_indexes)
+    if residue_offsets.shape[0] != sequences._length + 1:
+        raise ValueError("target residue-prefix length differs from target count")
+    if residue_offsets[0] != 0:
+        raise ValueError("target residue prefix must start at zero")
 
-    # Fully validate the typed CSR row before changing pipeline state.
+    # Validate every prefix entry the sparse loop will dereference. Full
+    # target-by-target validation belongs to SequenceBatch construction.
     for cursor in range(<size_t> candidate_indexes.shape[0]):
-        index = candidate_indexes[cursor]
-        if index >= sequences._length:
-            raise IndexError(f"candidate index out of range: {index}")
-        if cursor != 0 and index <= previous:
-            raise ValueError(
-                "candidate indexes must be strictly increasing and unique"
-            )
-        previous = index
+        target = candidate_indexes[cursor]
+        target_end = target + 1
+        if residue_offsets[target_end] < residue_offsets[previous_end]:
+            raise ValueError("target residue prefix is not monotone")
+        if (
+            residue_offsets[target_end] - residue_offsets[target]
+            != <uint64_t> sequences._refs[target].n
+        ):
+            raise ValueError("target residue prefix differs from target length")
+        previous_end = target_end
+    if residue_offsets[sequences._length] < residue_offsets[previous_end]:
+        raise ValueError("target residue prefix is not monotone")
+    if sequences._length != 0 and (
+        residue_offsets[sequences._length]
+        - residue_offsets[sequences._length - 1]
+        != <uint64_t> sequences._refs[sequences._length - 1].n
+    ):
+        raise ValueError("target residue prefix differs from final target length")
 
     return _search_validated(
-        pipeline, query, optimized_profile, sequences, candidate_indexes
+        pipeline,
+        query,
+        optimized_profile,
+        sequences,
+        candidate_indexes,
+        &residue_offsets[0],
     )

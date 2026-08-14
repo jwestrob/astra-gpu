@@ -72,6 +72,13 @@ class MaskedPipelineTests(unittest.TestCase):
         return array("I", indexes)
 
     @staticmethod
+    def residue_offsets(sequences):
+        offsets = array("Q", [0])
+        for sequence in sequences:
+            offsets.append(offsets[-1] + len(sequence))
+        return offsets
+
+    @staticmethod
     def table_bytes(hits, format):
         output = io.BytesIO()
         hits.write(output, format=format, header=True)
@@ -271,6 +278,56 @@ class MaskedPipelineTests(unittest.TestCase):
         self.assertEqual(actual.searched_sequences, database_size)
         self.assertEqual(actual.searched_residues, self.sequences.total_length())
         self.assertEqual(actual.Z, float(database_size))
+
+    def test_bound_residue_prefix_matches_raw_path_and_validates_inputs(self):
+        hmm = self.hmms[0]
+        offsets = self.residue_offsets(self.sequences)
+        masks = (
+            (),
+            (1, 7, len(self.sequences) - 1),
+            tuple(range(len(self.sequences))),
+        )
+
+        for indexes in masks:
+            with self.subTest(indexes=indexes):
+                expected = _pipeline._search_hmm_candidates(
+                    self.pipeline(),
+                    hmm,
+                    self.optimized_profiles[0].copy(),
+                    self.sequences,
+                    self.candidates(*indexes),
+                )
+                actual = _pipeline._search_hmm_candidates_bound(
+                    self.pipeline(),
+                    hmm,
+                    self.optimized_profiles[0].copy(),
+                    self.sequences,
+                    self.candidates(*indexes),
+                    offsets,
+                )
+                self.assert_exact_hits(expected, actual)
+
+        invalid = array("Q", offsets)
+        invalid[2] += 1
+        pipeline = self.pipeline()
+        with self.assertRaisesRegex(ValueError, "differs from target length"):
+            _pipeline._search_hmm_candidates_bound(
+                pipeline,
+                hmm,
+                self.optimized_profiles[0].copy(),
+                self.sequences,
+                self.candidates(1),
+                invalid,
+            )
+        hits = _pipeline._search_hmm_candidates_bound(
+            pipeline,
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            self.candidates(),
+            offsets,
+        )
+        self.assertEqual(hits.searched_models, 1)
 
     def test_candidate_masks_preserve_auto_and_explicit_search_spaces(self):
         hmm = self.hmms[0]

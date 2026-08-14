@@ -401,6 +401,7 @@ class _CandidateState:
     __slots__ = (
         "pairs",
         "targets",
+        "residue_offsets",
         "indices",
         "offsets",
         "all_rows",
@@ -412,6 +413,7 @@ class _CandidateState:
         self,
         pairs: tuple[PressedProfilePair, ...],
         targets: Any,
+        residue_offsets: bytes,
         indices: bytes,
         offsets: bytes,
         all_rows: bytes,
@@ -420,6 +422,7 @@ class _CandidateState:
     ) -> None:
         self.pairs = pairs
         self.targets = targets
+        self.residue_offsets = residue_offsets
         self.indices = indices
         self.offsets = offsets
         self.all_rows = all_rows
@@ -491,6 +494,7 @@ class CandidateBatch:
             start = offsets[row_index]
             stop = offsets[row_index + 1]
             candidate_row = memoryview(candidate_state.indices).cast("I")[start:stop]
+        residue_offsets = memoryview(candidate_state.residue_offsets).cast("Q")
         from . import _pipeline  # type: ignore[attr-defined]
 
         state = _pair_state(pair)
@@ -510,12 +514,13 @@ class CandidateBatch:
                     "hmmpress background"
                 )
             with state.lock:
-                return _pipeline._search_hmm_candidates(
+                return _pipeline._search_hmm_candidates_bound(
                     pipeline,
                     state.hmm.copy(),
                     state.optimized_profile,
                     candidate_state.targets,
                     candidate_row,
+                    residue_offsets,
                 )
 
 
@@ -536,6 +541,7 @@ def _candidate_state(candidates: CandidateBatch) -> _CandidateState:
 def _new_candidate_batch(
     pairs: tuple[PressedProfilePair, ...],
     targets: Any,
+    residue_offsets: bytes,
     indices: array[int],
     offsets: array[int],
     all_rows: bytes,
@@ -546,6 +552,7 @@ def _new_candidate_batch(
     _CANDIDATE_STATES[candidates] = _CandidateState(
         pairs,
         targets,
+        residue_offsets,
         indices.tobytes(),
         offsets.tobytes(),
         all_rows,
@@ -556,13 +563,20 @@ def _new_candidate_batch(
 
 
 class _SequenceState:
-    __slots__ = ("alphabet", "native", "lock", "targets")
+    __slots__ = ("alphabet", "native", "lock", "targets", "residue_offsets")
 
-    def __init__(self, alphabet: Any, native: Any, targets: Any) -> None:
+    def __init__(
+        self,
+        alphabet: Any,
+        native: Any,
+        targets: Any,
+        residue_offsets: bytes,
+    ) -> None:
         self.alphabet = alphabet
         self.native = native
         self.lock = Lock()
         self.targets = targets
+        self.residue_offsets = residue_offsets
 
 
 _SEQUENCE_STATES: WeakKeyDictionary[Any, _SequenceState] = WeakKeyDictionary()
@@ -609,7 +623,12 @@ class SequenceBatch:
         targets = pyhmmer.easel.DigitalSequenceBlock(alphabet, target_sequences)
 
         native = _native.SequenceBatch(residues, offsets, alphabet.Kp)
-        _SEQUENCE_STATES[self] = _SequenceState(alphabet, native, targets)
+        _SEQUENCE_STATES[self] = _SequenceState(
+            alphabet,
+            native,
+            targets,
+            offsets.tobytes(),
+        )
 
     @property
     def alphabet(self) -> Any:
@@ -900,6 +919,7 @@ class SequenceBatch:
         return _new_candidate_batch(
             pairs,
             sequence_state.targets,
+            sequence_state.residue_offsets,
             indices,
             offsets,
             all_rows,
