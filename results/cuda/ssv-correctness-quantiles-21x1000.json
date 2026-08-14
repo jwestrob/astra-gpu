@@ -8,23 +8,23 @@
     "source": [
       {
         "path": "cuda/ssv_cuda.cu",
-        "sha256": "2ff85e490c8fe258f9e3c70bb115f50615ea71193b9ed5e7860382cf134a506f"
+        "sha256": "5526c4e5dd31e3c982399b2cd2e7bdd56cee1486a83c0b69aa50f44975161e2a"
       },
       {
         "path": "cuda/ssv_cuda.h",
-        "sha256": "25976dae0dbafe03f27419e7f16dcaf9b26b2162c5acc60da455b5f9b9560d6b"
+        "sha256": "11b7a98aa97066948394076c00ecd5f440c29b7e678987dcdfc6951cdfe9e83c"
       },
       {
         "path": "python/plan7_gpu/_native.pyx",
-        "sha256": "a5fd5d0765e40b7aadd418e49d5a78541967f3388214f0d63e7fbe6fe958c4fa"
+        "sha256": "eab5ea0c1feadef9eab4272e073054c8fba5000c801f97a9c4b55107f3504985"
       },
       {
         "path": "python/plan7_gpu/adapter.py",
-        "sha256": "b9a5e43b850affd93bd94285783865c1f3e4390e620f8ac602c79cec69d543c6"
+        "sha256": "3451cc564120141a3b79b841ee693d6cf91820f7c76d00dd0452ccd39bb1d237"
       },
       {
         "path": "python/plan7_gpu/_pipeline.pyx",
-        "sha256": "5f13379568c4bcd34497e6455d05fb45c6c81146e77f604e4f40148f1b81145d"
+        "sha256": "288bfcfa46ddee243cad49a1e542f01e4ce3b1cd7db270f2b66bffb4a147390c"
       },
       {
         "path": "python/plan7_gpu/_abi.py",
@@ -89,6 +89,27 @@
       "target_table_mismatches": 0,
       "domain_table_mismatches": 0,
       "accounting_mismatches": 0
+    },
+    "fused_candidate_mask": {
+      "device_output": "profile_major_one_bit_per_pair",
+      "dense_pair_results_materialized": false,
+      "host_expansion": "ascending_CSR_via_popcount_and_ctz",
+      "workspace": {
+        "pair_dependent_order": "O(profiles*targets/8 + unique_scales*targets + candidates)",
+        "candidate_mask_u32_words_per_buffer": "profiles*ceil(targets/32)",
+        "transition_u8s_per_buffer": "unique_exact_binary32_scales*targets",
+        "host_candidate_index_u32s": "candidates"
+      },
+      "transition_rows_deduplicated_by_exact_scale": true,
+      "nonadjacent_scale_deduplication_checked": true,
+      "word_boundary_target_counts_checked": [31, 32, 33, 63, 64, 65]
+    },
+    "fast_reject_pipeline": {
+      "definite_rejects": "inline_search_accounting_without_p7_Pipeline",
+      "candidate_targets": "unchanged_p7_Pipeline_path",
+      "reject_accounting_preserved": ["nseqs", "automatic_Z", "nres"],
+      "final_target_length_state_preserved": true,
+      "pipeline_reuse_semantics_checked": true
     }
   },
   "f1_gate": {
@@ -103,12 +124,13 @@
     "binary32_cutoff": {
       "scalar_grid_mismatches": 0,
       "numerator_range": [-510, 255],
-      "easel_smallx_nonmonotone_fallback": true
+      "easel_smallx_nonmonotone_action": "fail_closed_all_cpu",
+      "unprovable_cutoff_shared_all_target_row": true
     }
   },
   "additional_checks": {
-    "focused_cuda_tests": 33,
-    "full_tests": 99,
+    "focused_cuda_tests": 40,
+    "full_tests": 124,
     "compact_layout_boundaries": [15, 16, 17, 31, 32, 33],
     "digital_residue_codes_checked": 29,
     "all_lengths_tjb_checked": [0, 100000],
