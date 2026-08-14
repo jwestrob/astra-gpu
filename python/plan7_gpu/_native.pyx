@@ -17,6 +17,12 @@ cdef extern from "ssv_cuda.h" nogil:
         PLAN7_F1_CPU_REQUIRED
         PLAN7_F1_DEFINITE_REJECT
 
+    cdef enum plan7_f1_cutoff_mode:
+        PLAN7_F1_CUTOFF_INVALID
+        PLAN7_F1_CUTOFF_SCORE
+        PLAN7_F1_CUTOFF_ALWAYS_REJECT
+        PLAN7_F1_CUTOFF_ALWAYS_CPU
+
     ctypedef struct plan7_ssv_result:
         uint8_t xE
         uint8_t status
@@ -49,6 +55,22 @@ cdef extern from "ssv_cuda.h" nogil:
         float m_lambda,
         double f1,
         double *ret_p,
+    )
+
+    int plan7_ssv_f1_cutoff(
+        float m_mu,
+        float m_lambda,
+        double f1,
+        float *ret_bit_score,
+    )
+
+    int plan7_ssv_f1_cutoff_decision(
+        uint8_t status,
+        int16_t numerator,
+        uint64_t length,
+        float scale,
+        int cutoff_mode,
+        float cutoff_bit_score,
     )
 
     int plan7_ssv_sequence_batch_create(
@@ -94,6 +116,23 @@ cdef extern from "ssv_cuda.h" nogil:
         size_t profile_count,
         plan7_ssv_result *profile_major_results,
         size_t result_count,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_f1_candidates_many(
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_ssv_result *profile_major_results,
+        size_t result_count,
+        const float *scales,
+        const float *m_mu,
+        const float *m_lambda,
+        size_t profile_count,
+        double f1,
+        const size_t *candidate_offsets,
+        uint32_t *candidate_indices,
+        size_t candidate_index_count,
+        size_t *candidate_counts,
         char *error,
         size_t error_size,
     )
@@ -214,6 +253,9 @@ cdef class SequenceBatch:
     cdef vector[plan7_ssv_result] _results
     cdef vector[plan7_ssv_result] _many_results
     cdef vector[plan7_ssv_profile] _profiles
+    cdef vector[uint32_t] _candidate_indices
+    cdef vector[size_t] _candidate_offsets
+    cdef vector[size_t] _candidate_counts
     cdef vector[uint64_t] _lengths
     cdef size_t _sequence_count
     cdef int _alphabet_size
@@ -498,8 +540,10 @@ cdef class SequenceBatch:
         cdef size_t profile_count
         cdef size_t profile_index
         cdef size_t sequence_index
-        cdef size_t result_index
-        cdef int action
+        cdef size_t result_count
+        cdef size_t candidate_count = 0
+        cdef int status
+        cdef char error[512]
         cdef list candidates
         cdef list output = []
 
@@ -518,22 +562,64 @@ cdef class SequenceBatch:
             constants,
             scales,
         )
+        result_count = profile_count * self._sequence_count
+        self._candidate_counts.resize(profile_count)
+        error[0] = 0
+        with nogil:
+            status = plan7_ssv_sequence_batch_f1_candidates_many(
+                self._batch,
+                self._many_results.data() if result_count else NULL,
+                result_count,
+                &scales[0] if profile_count else NULL,
+                &m_mu[0] if profile_count else NULL,
+                &m_lambda[0] if profile_count else NULL,
+                profile_count,
+                f1,
+                NULL,
+                NULL,
+                0,
+                self._candidate_counts.data() if profile_count else NULL,
+                error,
+                sizeof(error),
+            )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        self._candidate_offsets.resize(profile_count)
+        for profile_index in range(profile_count):
+            self._candidate_offsets[profile_index] = candidate_count
+            if self._candidate_counts[profile_index] > (<size_t> -1) - candidate_count:
+                raise OverflowError("candidate count overflows size_t")
+            candidate_count += self._candidate_counts[profile_index]
+        self._candidate_indices.resize(candidate_count)
+        if candidate_count:
+            error[0] = 0
+            with nogil:
+                status = plan7_ssv_sequence_batch_f1_candidates_many(
+                    self._batch,
+                    self._many_results.data(),
+                    result_count,
+                    &scales[0],
+                    &m_mu[0],
+                    &m_lambda[0],
+                    profile_count,
+                    f1,
+                    self._candidate_offsets.data(),
+                    self._candidate_indices.data(),
+                    candidate_count,
+                    self._candidate_counts.data(),
+                    error,
+                    sizeof(error),
+                )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
         for profile_index in range(profile_count):
             candidates = []
-            for sequence_index in range(self._sequence_count):
-                result_index = profile_index * self._sequence_count + sequence_index
-                action = plan7_ssv_f1_decision(
-                    self._many_results[result_index].status,
-                    self._many_results[result_index].numerator,
-                    self._lengths[sequence_index],
-                    scales[profile_index],
-                    m_mu[profile_index],
-                    m_lambda[profile_index],
-                    f1,
-                    NULL,
+            for sequence_index in range(self._candidate_counts[profile_index]):
+                candidates.append(
+                    self._candidate_indices[
+                        self._candidate_offsets[profile_index] + sequence_index
+                    ]
                 )
-                if action == PLAN7_F1_CPU_REQUIRED:
-                    candidates.append(sequence_index)
             output.append(candidates)
         return output
 
@@ -596,9 +682,41 @@ def f1_decision(
     return action, p
 
 
+def f1_cutoff(float m_mu, float m_lambda, double f1):
+    cdef float cutoff
+    cdef int mode = plan7_ssv_f1_cutoff(m_mu, m_lambda, f1, &cutoff)
+    return mode, cutoff if mode == PLAN7_F1_CUTOFF_SCORE else None
+
+
+def f1_cutoff_decision(
+    int status,
+    int numerator,
+    uint64_t length,
+    float scale,
+    int cutoff_mode,
+    float cutoff_bit_score,
+):
+    if not 0 <= status <= 255:
+        raise ValueError("status must fit in uint8")
+    if not -32768 <= numerator <= 32767:
+        raise ValueError("numerator must fit in int16")
+    return plan7_ssv_f1_cutoff_decision(
+        <uint8_t> status,
+        <int16_t> numerator,
+        length,
+        scale,
+        cutoff_mode,
+        cutoff_bit_score,
+    )
+
+
 STATUS_OK = PLAN7_SSV_OK
 STATUS_ERANGE = PLAN7_SSV_ERANGE
 STATUS_ENORESULT = PLAN7_SSV_ENORESULT
 STATUS_EMPTY = PLAN7_SSV_EMPTY
 F1_CPU_REQUIRED = PLAN7_F1_CPU_REQUIRED
 F1_DEFINITE_REJECT = PLAN7_F1_DEFINITE_REJECT
+F1_CUTOFF_INVALID = PLAN7_F1_CUTOFF_INVALID
+F1_CUTOFF_SCORE = PLAN7_F1_CUTOFF_SCORE
+F1_CUTOFF_ALWAYS_REJECT = PLAN7_F1_CUTOFF_ALWAYS_REJECT
+F1_CUTOFF_ALWAYS_CPU = PLAN7_F1_CUTOFF_ALWAYS_CPU

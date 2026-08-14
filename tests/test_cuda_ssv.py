@@ -178,6 +178,152 @@ class CudaSsvTests(unittest.TestCase):
             self.assertEqual(batch.cpu_candidates(profile, thresholds[1]), [0])
             self.assertEqual(batch.cpu_candidates(profile, thresholds[2]), [0])
 
+    def test_f1_cutoff_matches_scalar_for_all_reachable_numerators(self):
+        profiles = [self.optimized(HMM_20AA), self.optimized(HMM_M1)]
+        lengths = (
+            1,
+            2,
+            3,
+            7,
+            15,
+            16,
+            17,
+            31,
+            32,
+            33,
+            37,
+            127,
+            128,
+            129,
+            255,
+            256,
+            257,
+            1023,
+            4095,
+            9999,
+            65_535,
+            99_999,
+            100_000,
+        )
+        for profile in profiles:
+            mu, lambda_ = profile.evalue_parameters.as_vector()[:2]
+            _, boundary = _native.f1_decision(
+                _native.STATUS_OK, 0, 37, profile.scale_b, mu, lambda_, 0.02
+            )
+            thresholds = (
+                0.0,
+                1e-300,
+                1e-15,
+                math.nextafter(boundary, 0.0),
+                boundary,
+                math.nextafter(boundary, math.inf),
+                0.02,
+                0.5,
+                math.nextafter(1.0, 0.0),
+            )
+            for threshold in thresholds:
+                mode, cutoff = _native.f1_cutoff(mu, lambda_, threshold)
+                self.assertNotEqual(mode, _native.F1_CUTOFF_INVALID)
+                cutoff_value = 0.0 if cutoff is None else cutoff
+                for length in lengths:
+                    for numerator in range(-510, 256):
+                        scalar, _ = _native.f1_decision(
+                            _native.STATUS_OK,
+                            numerator,
+                            length,
+                            profile.scale_b,
+                            mu,
+                            lambda_,
+                            threshold,
+                        )
+                        fast = _native.f1_cutoff_decision(
+                            _native.STATUS_OK,
+                            numerator,
+                            length,
+                            profile.scale_b,
+                            mode,
+                            cutoff_value,
+                        )
+                        if fast != scalar:
+                            self.fail(
+                                f"cutoff mismatch: threshold={threshold!r}, "
+                                f"length={length}, numerator={numerator}"
+                            )
+
+    def test_f1_cutoff_extremes_and_invalid_inputs_fail_closed(self):
+        minimum_subnormal = struct.unpack("=f", struct.pack("=I", 1))[0]
+        mode, cutoff = _native.f1_cutoff(0.0, minimum_subnormal, 0.0)
+        self.assertEqual(mode, _native.F1_CUTOFF_ALWAYS_REJECT)
+        self.assertIsNone(cutoff)
+        mode, cutoff = _native.f1_cutoff(
+            0.0, minimum_subnormal, math.nextafter(1.0, 0.0)
+        )
+        self.assertEqual(mode, _native.F1_CUTOFF_ALWAYS_CPU)
+        self.assertIsNone(cutoff)
+
+        invalid_parameters = (
+            (math.nan, 0.7, 0.02),
+            (math.inf, 0.7, 0.02),
+            (-99999.0, 0.7, 0.02),
+            (0.0, 0.0, 0.02),
+            (0.0, -1.0, 0.02),
+            (0.0, -99999.0, 0.02),
+            (0.0, math.nan, 0.02),
+            (0.0, 0.7, -1.0),
+            (0.0, 0.7, math.nan),
+            (0.0, 0.7, math.inf),
+        )
+        for arguments in invalid_parameters:
+            mode, cutoff = _native.f1_cutoff(*arguments)
+            self.assertEqual(mode, _native.F1_CUTOFF_INVALID)
+            self.assertIsNone(cutoff)
+
+        for arguments in (
+            (_native.STATUS_ENORESULT, 0, 10, 1.0),
+            (_native.STATUS_OK, 0, 0, 1.0),
+            (_native.STATUS_OK, 0, 100_001, 1.0),
+            (_native.STATUS_OK, 0, 10, 0.0),
+            (_native.STATUS_OK, 255, 10, minimum_subnormal),
+            (_native.STATUS_OK, 0, 10, math.nan),
+        ):
+            self.assertEqual(
+                _native.f1_cutoff_decision(
+                    *arguments, _native.F1_CUTOFF_SCORE, math.nan
+                ),
+                _native.F1_CPU_REQUIRED,
+            )
+
+    def test_f1_cutoff_falls_back_at_easel_smallx_jump(self):
+        smallx = 5e-9
+        jump_bottom = 1.0 - math.exp(-smallx)
+        threshold = (jump_bottom + smallx) / 2.0
+        mu = struct.unpack("=f", struct.pack("=f", math.log(smallx)))[0]
+
+        mode, cutoff = _native.f1_cutoff(mu, 1.0, threshold)
+        self.assertEqual(mode, _native.F1_CUTOFF_INVALID)
+        self.assertIsNone(cutoff)
+        self.assertNotEqual(
+            _native.f1_cutoff(mu, 1.0, smallx)[0],
+            _native.F1_CUTOFF_INVALID,
+        )
+
+        profile = self.optimized(HMM_20AA)
+        sequences = self.sequences(profile, ["G", "ACDEX", "G" * 100, ""])
+        parameters = profile.evalue_parameters.as_vector()
+        original_mu = parameters[0]
+        original_lambda = parameters[1]
+        try:
+            parameters[0] = mu
+            parameters[1] = 1.0
+            with SequenceBatch(sequences) as batch:
+                expected = batch.cpu_candidates(profile, threshold)
+                self.assertEqual(
+                    batch.cpu_candidates_many([profile], threshold), [expected]
+                )
+        finally:
+            parameters[0] = original_mu
+            parameters[1] = original_lambda
+
     def test_f1_invalid_inputs_are_conservative(self):
         profile = self.optimized(HMM_20AA)
         sequences = self.sequences(profile, ["G", "ACDEX", ""])

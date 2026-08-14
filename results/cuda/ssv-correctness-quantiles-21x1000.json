@@ -8,15 +8,15 @@
     "source": [
       {
         "path": "cuda/ssv_cuda.cu",
-        "sha256": "8c30f8f87c601353a9f303bddf930e00045cfa19a43ff564bf4d31d98ed5c93a"
+        "sha256": "d48b246f6ddf193cd7f608d74cd769027e1d56aee63e416fc5241d1e2adecaf9"
       },
       {
         "path": "cuda/ssv_cuda.h",
-        "sha256": "fe7025866d2ee897da9cae48a1a9f711c73b495947e1490580471221872f8c6a"
+        "sha256": "ae6c4749dd8bf58a8803d1433bcb19f982a9c657ae635d8ab0f3d3ae4b8c905a"
       },
       {
         "path": "python/plan7_gpu/_native.pyx",
-        "sha256": "0514eb44769bd1771bceb813aac88c5480296beebad182834099e72696e269d3"
+        "sha256": "83de67ac3f23a308fb0bcc182e8046d22af7b8badea0709e3e9715ada11f1494"
       },
       {
         "path": "python/plan7_gpu/adapter.py",
@@ -78,10 +78,15 @@
     "fallback_or_overflow_candidates": 174,
     "decision_mismatches": 0,
     "multi_profile_decision_mismatches": 0,
-    "exact_boundary_probability_hex": "0x1.e726801175503p-1"
+    "exact_boundary_probability_hex": "0x1.e726801175503p-1",
+    "binary32_cutoff": {
+      "scalar_grid_mismatches": 0,
+      "numerator_range": [-510, 255],
+      "easel_smallx_nonmonotone_fallback": true
+    }
   },
   "additional_checks": {
-    "focused_tests": 16,
+    "focused_tests": 19,
     "all_lengths_tjb_checked": [0, 100000],
     "compute_sanitizer": {
       "memcheck_errors": 0,

@@ -7,6 +7,7 @@ extern "C" {
 #include <esl_gumbel.h>
 }
 
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -18,6 +19,8 @@ struct plan7_ssv_sequence_batch {
   int alphabet_size;
   size_t sequence_count;
   uint64_t *host_lengths;
+  float *host_null_scores;
+  float *host_tjb_log_terms;
   uint8_t *host_tjb;
   size_t host_tjb_capacity;
   uint8_t *device_residues;
@@ -233,6 +236,233 @@ checked_product(size_t left, size_t right, size_t *product)
   return true;
 }
 
+bool
+compute_null_score(uint64_t length, float *ret_null_score)
+{
+  float length_f;
+  float p1;
+  float null_score;
+
+  if (length == 0 || length > kMaximumTargetLength ||
+      ret_null_score == nullptr)
+    return false;
+  length_f = static_cast<float>(length);
+  p1 = length_f / static_cast<float>(length + 1);
+  null_score = static_cast<float>(
+    static_cast<double>(length_f) * log(static_cast<double>(p1)) +
+    log(1.0 - static_cast<double>(p1)));
+  if (!isfinite(null_score)) return false;
+  *ret_null_score = null_score;
+  return true;
+}
+
+bool
+compute_bit_score(int16_t numerator,
+                  float null_score,
+                  float scale,
+                  float *ret_bit_score)
+{
+  float score;
+  float delta;
+  float bit_score;
+
+  if (!isfinite(null_score) || !isfinite(scale) || scale <= 0.0f ||
+      ret_bit_score == nullptr)
+    return false;
+  score = static_cast<float>(numerator);
+  score /= scale;
+  score -= 3.0;
+  delta = score - null_score;
+  bit_score = static_cast<float>(
+    static_cast<double>(delta) / eslCONST_LOG2);
+  if (!isfinite(score) || !isfinite(bit_score)) return false;
+  *ret_bit_score = bit_score;
+  return true;
+}
+
+float
+ordered_to_float(uint32_t ordered)
+{
+  const uint32_t bits = (ordered & UINT32_C(0x80000000)) != 0
+                          ? ordered ^ UINT32_C(0x80000000)
+                          : ~ordered;
+  float value;
+  memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+bool
+valid_f1_parameters(float m_mu, float m_lambda, double f1)
+{
+  return isfinite(m_mu) && isfinite(m_lambda) && m_lambda > 0.0f &&
+         m_mu != kEvparamUnset && m_lambda != kEvparamUnset && isfinite(f1) &&
+         f1 >= 0.0 && f1 <= 1.0;
+}
+
+bool
+f1_probability(float bit_score,
+               float m_mu,
+               float m_lambda,
+               double *ret_probability)
+{
+  const double probability = esl_gumbel_surv(
+    static_cast<double>(bit_score), static_cast<double>(m_mu),
+    static_cast<double>(m_lambda));
+  if (!isfinite(probability) || probability < 0.0 || probability > 1.0)
+    return false;
+  *ret_probability = probability;
+  return true;
+}
+
+bool
+uses_smallx_survivor_branch(float bit_score,
+                            float m_mu,
+                            float m_lambda,
+                            bool *ret_uses_smallx)
+{
+  const double y = static_cast<double>(m_lambda) *
+                   (static_cast<double>(bit_score) -
+                    static_cast<double>(m_mu));
+  const double tail_term = exp(-y);
+  if (isnan(tail_term)) return false;
+  *ret_uses_smallx = tail_term < eslSMALLX1;
+  return true;
+}
+
+bool
+f1_branch_is_nonmonotone(float m_mu,
+                         float m_lambda,
+                         double f1,
+                         bool *ret_nonmonotone)
+{
+  constexpr uint32_t kLowestFinite = UINT32_C(0x00800000);
+  constexpr uint32_t kHighestFinite = UINT32_C(0xff7fffff);
+  const double lowest_jump_probability = 1.0 - exp(-eslSMALLX1);
+  bool low_uses_smallx;
+  bool high_uses_smallx;
+  uint32_t low = kLowestFinite;
+  uint32_t high = kHighestFinite;
+
+  *ret_nonmonotone = false;
+  if (f1 < lowest_jump_probability || f1 >= eslSMALLX1) return true;
+  if (!uses_smallx_survivor_branch(-FLT_MAX, m_mu, m_lambda,
+                                   &low_uses_smallx) ||
+      !uses_smallx_survivor_branch(FLT_MAX, m_mu, m_lambda,
+                                   &high_uses_smallx))
+    return false;
+  if (low_uses_smallx == high_uses_smallx) return true;
+  if (low_uses_smallx || !high_uses_smallx) return false;
+
+  while (high - low > 1) {
+    const uint32_t middle = low + (high - low) / 2;
+    bool uses_smallx;
+    if (!uses_smallx_survivor_branch(
+          ordered_to_float(middle), m_mu, m_lambda, &uses_smallx))
+      return false;
+    if (uses_smallx)
+      high = middle;
+    else
+      low = middle;
+  }
+
+  double before_probability;
+  double after_probability;
+  if (!f1_probability(ordered_to_float(low), m_mu, m_lambda,
+                      &before_probability) ||
+      !f1_probability(ordered_to_float(high), m_mu, m_lambda,
+                      &after_probability))
+    return false;
+  *ret_nonmonotone =
+    before_probability <= f1 && after_probability > f1;
+  return true;
+}
+
+int
+derive_f1_cutoff(float m_mu,
+                 float m_lambda,
+                 double f1,
+                 float *ret_bit_score)
+{
+  constexpr uint32_t kLowestFinite = UINT32_C(0x00800000);
+  constexpr uint32_t kHighestFinite = UINT32_C(0xff7fffff);
+  double low_probability;
+  double high_probability;
+  bool branch_is_nonmonotone;
+  uint32_t low = kLowestFinite;
+  uint32_t high = kHighestFinite;
+
+  if (ret_bit_score != nullptr) *ret_bit_score = NAN;
+  if (!valid_f1_parameters(m_mu, m_lambda, f1) ||
+      !f1_probability(-FLT_MAX, m_mu, m_lambda, &low_probability) ||
+      !f1_probability(FLT_MAX, m_mu, m_lambda, &high_probability) ||
+      !f1_branch_is_nonmonotone(m_mu, m_lambda, f1,
+                                &branch_is_nonmonotone) ||
+      branch_is_nonmonotone ||
+      low_probability < high_probability)
+    return PLAN7_F1_CUTOFF_INVALID;
+
+  /* The survivor is nonincreasing for lambda > 0. */
+  if (low_probability <= f1) return PLAN7_F1_CUTOFF_ALWAYS_CPU;
+  if (high_probability > f1) return PLAN7_F1_CUTOFF_ALWAYS_REJECT;
+
+  while (high - low > 1) {
+    const uint32_t middle = low + (high - low) / 2;
+    double probability;
+    if (!f1_probability(ordered_to_float(middle), m_mu, m_lambda,
+                        &probability))
+      return PLAN7_F1_CUTOFF_INVALID;
+    if (probability > low_probability || probability < high_probability)
+      return PLAN7_F1_CUTOFF_INVALID;
+    if (probability > f1) {
+      low = middle;
+      low_probability = probability;
+    } else {
+      high = middle;
+      high_probability = probability;
+    }
+  }
+
+  const float cutoff = ordered_to_float(high);
+  const float predecessor = ordered_to_float(high - 1);
+  double cutoff_probability;
+  double predecessor_probability;
+  if (!isfinite(cutoff) ||
+      !f1_probability(cutoff, m_mu, m_lambda, &cutoff_probability) ||
+      !f1_probability(predecessor, m_mu, m_lambda,
+                      &predecessor_probability) ||
+      predecessor_probability < cutoff_probability ||
+      predecessor_probability <= f1 || cutoff_probability > f1)
+    return PLAN7_F1_CUTOFF_INVALID;
+  if (ret_bit_score != nullptr) *ret_bit_score = cutoff;
+  return PLAN7_F1_CUTOFF_SCORE;
+}
+
+int
+cutoff_decision_with_null_score(uint8_t status,
+                                int16_t numerator,
+                                float null_score,
+                                float scale,
+                                int cutoff_mode,
+                                float cutoff_bit_score)
+{
+  float bit_score;
+  if (status != PLAN7_SSV_OK ||
+      !compute_bit_score(numerator, null_score, scale, &bit_score))
+    return PLAN7_F1_CPU_REQUIRED;
+
+  switch (cutoff_mode) {
+    case PLAN7_F1_CUTOFF_SCORE:
+      if (!isfinite(cutoff_bit_score)) return PLAN7_F1_CPU_REQUIRED;
+      return bit_score < cutoff_bit_score ? PLAN7_F1_DEFINITE_REJECT
+                                          : PLAN7_F1_CPU_REQUIRED;
+    case PLAN7_F1_CUTOFF_ALWAYS_REJECT:
+      return PLAN7_F1_DEFINITE_REJECT;
+    case PLAN7_F1_CUTOFF_ALWAYS_CPU:
+    default:
+      return PLAN7_F1_CPU_REQUIRED;
+  }
+}
+
 template<typename T>
 int
 grow_device_buffer(T **buffer,
@@ -297,10 +527,22 @@ validate_profile(const plan7_ssv_profile *profile,
 }
 
 uint8_t
+compute_tjb_from_log_term(float scale, float log_term)
+{
+  const float cost = -1.0f * roundf(scale * log_term);
+  return cost > 255.0f ? 255 : static_cast<uint8_t>(cost);
+}
+
+float
+compute_tjb_log_term(uint64_t length)
+{
+  return logf(3.0f / static_cast<float>(length + 3));
+}
+
+uint8_t
 compute_tjb(float scale, uint64_t length)
 {
-  float cost = -1.0f * roundf(scale * logf(3.0f / (float) (length + 3)));
-  return cost > 255.0f ? 255 : static_cast<uint8_t>(cost);
+  return compute_tjb_from_log_term(scale, compute_tjb_log_term(length));
 }
 
 int
@@ -354,6 +596,8 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
       first_error = status;
   }
   free(batch->host_tjb);
+  free(batch->host_tjb_log_terms);
+  free(batch->host_null_scores);
   free(batch->host_lengths);
   free(batch);
   if (first_error != cudaSuccess) {
@@ -396,45 +640,48 @@ plan7_ssv_f1_decision(uint8_t status,
                       double f1,
                       double *ret_p)
 {
-  float score;
-  float length_f;
-  float p1;
   float null_score;
-  float delta;
   float bit_score;
   double probability;
 
   if (ret_p != nullptr) *ret_p = NAN;
   if (status != PLAN7_SSV_OK || length == 0 ||
       length > kMaximumTargetLength || !isfinite(scale) || scale <= 0.0f ||
-      !isfinite(m_mu) || !isfinite(m_lambda) || m_lambda <= 0.0f ||
-      m_mu == kEvparamUnset || m_lambda == kEvparamUnset ||
-      !isfinite(f1) || f1 < 0.0 || f1 > 1.0)
+      !valid_f1_parameters(m_mu, m_lambda, f1))
     return PLAN7_F1_CPU_REQUIRED;
 
   /* Preserve HMMER 3.4's float/double evaluation order exactly. */
-  score = static_cast<float>(numerator);
-  score /= scale;
-  score -= 3.0;
-
-  length_f = static_cast<float>(length);
-  p1 = length_f / static_cast<float>(length + 1);
-  null_score = static_cast<float>(
-    static_cast<double>(length_f) * log(static_cast<double>(p1)) +
-    log(1.0 - static_cast<double>(p1)));
-
-  delta = score - null_score;
-  bit_score = static_cast<float>(
-    static_cast<double>(delta) / eslCONST_LOG2);
-  probability = esl_gumbel_surv(static_cast<double>(bit_score),
-                                static_cast<double>(m_mu),
-                                static_cast<double>(m_lambda));
-  if (!isfinite(score) || !isfinite(null_score) || !isfinite(bit_score) ||
-      !isfinite(probability))
+  if (!compute_null_score(length, &null_score) ||
+      !compute_bit_score(numerator, null_score, scale, &bit_score) ||
+      !f1_probability(bit_score, m_mu, m_lambda, &probability))
     return PLAN7_F1_CPU_REQUIRED;
   if (ret_p != nullptr) *ret_p = probability;
   return probability > f1 ? PLAN7_F1_DEFINITE_REJECT
                           : PLAN7_F1_CPU_REQUIRED;
+}
+
+extern "C" int
+plan7_ssv_f1_cutoff(float m_mu,
+                    float m_lambda,
+                    double f1,
+                    float *ret_bit_score)
+{
+  return derive_f1_cutoff(m_mu, m_lambda, f1, ret_bit_score);
+}
+
+extern "C" int
+plan7_ssv_f1_cutoff_decision(uint8_t status,
+                             int16_t numerator,
+                             uint64_t length,
+                             float scale,
+                             int cutoff_mode,
+                             float cutoff_bit_score)
+{
+  float null_score;
+  if (!compute_null_score(length, &null_score))
+    return PLAN7_F1_CPU_REQUIRED;
+  return cutoff_decision_with_null_score(status, numerator, null_score, scale,
+                                         cutoff_mode, cutoff_bit_score);
 }
 
 extern "C" int
@@ -513,14 +760,25 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
   }
   batch->host_lengths =
     static_cast<uint64_t *>(malloc(sequence_count * sizeof(uint64_t)));
+  batch->host_null_scores =
+    static_cast<float *>(malloc(sequence_count * sizeof(float)));
+  batch->host_tjb_log_terms =
+    static_cast<float *>(malloc(sequence_count * sizeof(float)));
   batch->host_tjb = static_cast<uint8_t *>(malloc(sequence_count));
-  if (batch->host_lengths == nullptr || batch->host_tjb == nullptr) {
+  if (batch->host_lengths == nullptr || batch->host_null_scores == nullptr ||
+      batch->host_tjb_log_terms == nullptr || batch->host_tjb == nullptr) {
     set_error(error, error_size, "host sequence metadata allocation failed");
     goto cleanup;
   }
   batch->host_tjb_capacity = sequence_count;
-  for (size_t i = 0; i < sequence_count; ++i)
+  for (size_t i = 0; i < sequence_count; ++i) {
     batch->host_lengths[i] = offsets[i + 1] - offsets[i];
+    if (!compute_null_score(batch->host_lengths[i],
+                            &batch->host_null_scores[i]))
+      batch->host_null_scores[i] = NAN;
+    batch->host_tjb_log_terms[i] =
+      compute_tjb_log_term(batch->host_lengths[i]);
+  }
 
 #define CUDA_TRY(call)                                                        \
   do {                                                                        \
@@ -646,7 +904,8 @@ plan7_ssv_sequence_batch_filter(plan7_ssv_sequence_batch *batch,
                       cudaMemcpyHostToDevice));
   if (!batch->tjb_cache_valid || scale != batch->cached_tjb_scale) {
     for (size_t i = 0; i < batch->sequence_count; ++i)
-      batch->host_tjb[i] = compute_tjb(scale, batch->host_lengths[i]);
+      batch->host_tjb[i] =
+        compute_tjb_from_log_term(scale, batch->host_tjb_log_terms[i]);
     batch->tjb_cache_valid = 0;
     CUDA_TRY(cudaMemcpy(batch->device_tjb, batch->host_tjb,
                         batch->sequence_count, cudaMemcpyHostToDevice));
@@ -811,8 +1070,8 @@ plan7_ssv_sequence_batch_filter_many(
              batch->sequence_count);
     } else {
       for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence)
-        batch->host_tjb[row + sequence] =
-          compute_tjb(profiles[profile].scale, batch->host_lengths[sequence]);
+        batch->host_tjb[row + sequence] = compute_tjb_from_log_term(
+          profiles[profile].scale, batch->host_tjb_log_terms[sequence]);
     }
   }
   batch->tjb_cache_valid = 0;
@@ -837,6 +1096,110 @@ plan7_ssv_sequence_batch_filter_many(
                            result_bytes,
                            cudaMemcpyDeviceToHost));
 #undef CUDA_TRY_MANY
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_f1_candidates_many(
+  const plan7_ssv_sequence_batch *batch,
+  const plan7_ssv_result *profile_major_results,
+  size_t result_count,
+  const float *scales,
+  const float *m_mu,
+  const float *m_lambda,
+  size_t profile_count,
+  double f1,
+  const size_t *candidate_offsets,
+  uint32_t *candidate_indices,
+  size_t candidate_index_count,
+  size_t *candidate_counts,
+  char *error,
+  size_t error_size)
+{
+  size_t cell_count;
+
+  if (batch == nullptr) {
+    set_error(error, error_size, "sequence batch is null");
+    return -1;
+  }
+  if (profile_count == 0) return 0;
+  if (scales == nullptr || m_mu == nullptr || m_lambda == nullptr ||
+      candidate_counts == nullptr) {
+    set_error(error, error_size, "F1 profile buffers are null");
+    return -1;
+  }
+  if ((candidate_offsets == nullptr) != (candidate_indices == nullptr)) {
+    set_error(error, error_size, "F1 candidate output buffers differ");
+    return -1;
+  }
+  if (!checked_product(profile_count, batch->sequence_count, &cell_count)) {
+    set_error(error, error_size, "F1 candidate batch size overflow");
+    return -1;
+  }
+  if (cell_count != 0 &&
+      (profile_major_results == nullptr || result_count < cell_count ||
+       batch->host_lengths == nullptr || batch->host_null_scores == nullptr)) {
+    set_error(error, error_size, "F1 candidate buffer is too short");
+    return -1;
+  }
+  if (candidate_indices != nullptr) {
+    size_t expected_offset = 0;
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      if (candidate_offsets[profile] != expected_offset ||
+          expected_offset > candidate_index_count ||
+          candidate_counts[profile] > candidate_index_count - expected_offset) {
+        set_error(error, error_size, "invalid F1 candidate offsets");
+        return -1;
+      }
+      expected_offset += candidate_counts[profile];
+    }
+    if (expected_offset != candidate_index_count) {
+      set_error(error, error_size, "invalid F1 candidate count");
+      return -1;
+    }
+  }
+
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    float cutoff = NAN;
+    const int cutoff_mode =
+      derive_f1_cutoff(m_mu[profile], m_lambda[profile], f1, &cutoff);
+    size_t candidate_count = 0;
+    const size_t row = profile * batch->sequence_count;
+    const size_t expected_candidate_count = candidate_indices != nullptr
+                                              ? candidate_counts[profile]
+                                              : 0;
+
+    for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence) {
+      const plan7_ssv_result result = profile_major_results[row + sequence];
+      int action;
+      if (cutoff_mode == PLAN7_F1_CUTOFF_INVALID) {
+        action = plan7_ssv_f1_decision(
+          result.status, result.numerator, batch->host_lengths[sequence],
+          scales[profile], m_mu[profile], m_lambda[profile], f1, nullptr);
+      } else {
+        action = cutoff_decision_with_null_score(
+          result.status, result.numerator, batch->host_null_scores[sequence],
+          scales[profile], cutoff_mode, cutoff);
+      }
+      if (action == PLAN7_F1_CPU_REQUIRED) {
+        if (candidate_indices != nullptr) {
+          if (candidate_count >= expected_candidate_count) {
+            set_error(error, error_size, "F1 candidate count changed");
+            return -1;
+          }
+          candidate_indices[candidate_offsets[profile] + candidate_count] =
+            static_cast<uint32_t>(sequence);
+        }
+        ++candidate_count;
+      }
+    }
+    if (candidate_indices != nullptr &&
+        candidate_count != expected_candidate_count) {
+      set_error(error, error_size, "F1 candidate count changed");
+      return -1;
+    }
+    candidate_counts[profile] = candidate_count;
+  }
   return 0;
 }
 

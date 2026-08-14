@@ -20,6 +20,13 @@ enum plan7_f1_action {
   PLAN7_F1_DEFINITE_REJECT = 1
 };
 
+enum plan7_f1_cutoff_mode {
+  PLAN7_F1_CUTOFF_INVALID = 0,
+  PLAN7_F1_CUTOFF_SCORE = 1,
+  PLAN7_F1_CUTOFF_ALWAYS_REJECT = 2,
+  PLAN7_F1_CUTOFF_ALWAYS_CPU = 3
+};
+
 typedef struct {
   uint8_t xE;
   uint8_t status;
@@ -52,6 +59,18 @@ int plan7_ssv_f1_decision(uint8_t status,
                           float m_lambda,
                           double f1,
                           double *ret_p);
+
+int plan7_ssv_f1_cutoff(float m_mu,
+                        float m_lambda,
+                        double f1,
+                        float *ret_bit_score);
+
+int plan7_ssv_f1_cutoff_decision(uint8_t status,
+                                 int16_t numerator,
+                                 uint64_t length,
+                                 float scale,
+                                 int cutoff_mode,
+                                 float cutoff_bit_score);
 
 int plan7_ssv_sequence_batch_create(const uint8_t *residues,
                                     size_t residue_count,
@@ -90,6 +109,22 @@ int plan7_ssv_sequence_batch_filter_many(
   size_t profile_count,
   plan7_ssv_result *profile_major_results,
   size_t result_count,
+  char *error,
+  size_t error_size);
+
+int plan7_ssv_sequence_batch_f1_candidates_many(
+  const plan7_ssv_sequence_batch *batch,
+  const plan7_ssv_result *profile_major_results,
+  size_t result_count,
+  const float *scales,
+  const float *m_mu,
+  const float *m_lambda,
+  size_t profile_count,
+  double f1,
+  const size_t *candidate_offsets,
+  uint32_t *candidate_indices,
+  size_t candidate_index_count,
+  size_t *candidate_counts,
   char *error,
   size_t error_size);
 
