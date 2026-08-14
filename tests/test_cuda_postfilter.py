@@ -185,6 +185,23 @@ class CudaPostfilterTests(unittest.TestCase):
             self.assertGreater(high_water["postfilter_dp_capacity_bytes"], 0)
             self.assertEqual(high_water["postfilter_growth_count"], 9)
             self.assertEqual(high_water["postfilter_run_count"], 1)
+            snapshot = batch.memory_snapshot
+            postfilter_capacities = [
+                value
+                for name, value in snapshot["capacity_bytes"].items()
+                if name.startswith("postfilter_")
+            ]
+            self.assertEqual(
+                sum(postfilter_capacities), high_water["postfilter_device_bytes"]
+            )
+            self.assertEqual(
+                snapshot["capacity_bytes"]["postfilter_dp"],
+                high_water["postfilter_dp_capacity_bytes"],
+            )
+            self.assertEqual(
+                snapshot["persistent_device_bytes"],
+                sum(snapshot["capacity_bytes"].values()),
+            )
 
             second_records, second_offsets = batch.postfilter_candidates_many_csr_raw(
                 *arguments

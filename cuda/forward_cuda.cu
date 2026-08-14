@@ -78,6 +78,10 @@ struct ForwardDeviceProfile {
 
 static_assert(sizeof(ForwardDeviceProfile) == 32,
               "Forward device descriptor must stay cache-compact");
+static_assert(p7O_NTRANS == 8,
+              "Forward transition-row footprint changed");
+static_assert((29 + p7O_NTRANS) * kSubwarp * sizeof(float) == 592,
+              "Forward packed-row footprint changed");
 
 struct ForwardLengthTransitions {
   float move;
@@ -1037,14 +1041,31 @@ extern "C" int plan7_forward_workspace_get_statistics(
     set_error(error, error_size, "invalid Forward workspace statistics");
     return -1;
   }
-  *statistics = {
-      forward_workspace_device_bytes(workspace),
-      static_cast<uint64_t>(workspace->dp_capacity),
-      static_cast<uint64_t>(workspace->xmx_capacity),
-      static_cast<uint64_t>(workspace->gathered_capacity),
-      workspace->growth_count,
-      workspace->event_create_count,
-      workspace->run_count};
+  *statistics = {};
+  statistics->device_bytes = forward_workspace_device_bytes(workspace);
+  statistics->dp_capacity_bytes =
+      static_cast<uint64_t>(workspace->dp_capacity);
+  statistics->xmx_capacity_bytes =
+      static_cast<uint64_t>(workspace->xmx_capacity);
+  statistics->gather_capacity_bytes =
+      static_cast<uint64_t>(workspace->gathered_capacity);
+  statistics->growth_count = workspace->growth_count;
+  statistics->event_create_count = workspace->event_create_count;
+  statistics->run_count = workspace->run_count;
+  const size_t capacities[PLAN7_FORWARD_CAPACITY_COUNT] = {
+      workspace->candidate_profiles_capacity,
+      workspace->candidate_sequences_capacity,
+      workspace->length_transitions_capacity,
+      workspace->dp_offsets_capacity,
+      workspace->x_offsets_capacity,
+      workspace->dp_capacity,
+      workspace->xmx_capacity,
+      workspace->results_capacity,
+      workspace->survivor_candidates_capacity,
+      workspace->survivor_offsets_capacity,
+      workspace->gathered_capacity};
+  for (size_t i = 0; i < PLAN7_FORWARD_CAPACITY_COUNT; ++i)
+    statistics->capacity_bytes[i] = static_cast<uint64_t>(capacities[i]);
   return 0;
 }
 

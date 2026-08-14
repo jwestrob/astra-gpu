@@ -34,6 +34,44 @@ cdef carray _UINT32_ARRAY_TEMPLATE = _array.array("I")
 cdef carray _UINT64_ARRAY_TEMPLATE = _array.array("Q")
 cdef carray _FLOAT_ARRAY_TEMPLATE = _array.array("f")
 
+_DEVICE_CAPACITY_NAMES = (
+    "input_residues",
+    "input_offsets",
+    "input_null_scores",
+    "length_tjb",
+    "results",
+    "compact_scores",
+    "profiles",
+    "f1_profiles",
+    "candidate_words",
+    "bias_profiles",
+    "bias_candidates",
+    "bias_ssv_inputs",
+    "bias_results",
+    "bias_logp",
+    "bias_log1mp",
+    "postfilter_states",
+    "postfilter_bias_inputs",
+    "postfilter_bias_results",
+    "postfilter_viterbi_results",
+    "postfilter_length_transitions",
+    "postfilter_msv_offsets",
+    "postfilter_viterbi_offsets",
+    "postfilter_dp",
+    "postfilter_results",
+    "forward_candidate_profiles",
+    "forward_candidate_sequences",
+    "forward_length_transitions",
+    "forward_dp_offsets",
+    "forward_x_offsets",
+    "forward_dp",
+    "forward_xmx",
+    "forward_results",
+    "forward_survivor_candidates",
+    "forward_survivor_offsets",
+    "forward_gathered",
+)
+
 
 cdef extern from * nogil:
     """
@@ -164,7 +202,75 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t forward_event_create_count
         uint64_t forward_run_count
 
+    ctypedef struct plan7_profile_footprint:
+        uint64_t profile_count
+        uint64_t ssv_device_bytes
+        uint64_t viterbi_device_bytes
+        uint64_t viterbi_exact_rbv_upper_bytes
+        uint64_t forward_device_bytes
+        uint64_t bias_device_bytes
+        uint64_t minimum_device_bytes
+        uint64_t maximum_device_bytes
+
+    ctypedef struct plan7_allocation_simulation:
+        uint64_t peak_additional_bytes
+        uint64_t final_additional_bytes
+        uint64_t final_free_bytes
+        uint64_t growth_count
+        uint64_t first_unfit_index
+        int32_t fits
+        int32_t reserved
+
+    cdef enum plan7_ssv_device_capacity:
+        PLAN7_SSV_DEVICE_CAPACITY_COUNT
+
+    ctypedef struct plan7_ssv_memory_snapshot:
+        int32_t device_ordinal
+        int32_t reserved
+        uint64_t cuda_free_bytes
+        uint64_t cuda_total_bytes
+        uint64_t persistent_device_bytes
+        uint64_t device_capacity_bytes[35]
+
     int plan7_cuda_device_count(char *error, size_t error_size)
+    int plan7_cuda_memory_info(
+        int *device_ordinal,
+        uint64_t *free_bytes,
+        uint64_t *total_bytes,
+        char *error,
+        size_t error_size,
+    )
+    int plan7_validate_device_ordinal(
+        int owner_device,
+        int current_device,
+        char *error,
+        size_t error_size,
+    )
+    int plan7_profile_footprint_compute(
+        const uint32_t *model_lengths,
+        size_t profile_count,
+        plan7_profile_footprint *footprint,
+        char *error,
+        size_t error_size,
+    )
+    int plan7_profile_slice_cell_count(
+        uint64_t profile_count,
+        uint64_t target_count,
+        uint64_t cell_limit,
+        uint64_t *cell_count,
+        char *error,
+        size_t error_size,
+    )
+    int plan7_simulate_allocate_before_free(
+        const uint64_t *current_capacities,
+        const uint64_t *required_capacities,
+        size_t capacity_count,
+        uint64_t free_bytes,
+        uint64_t *final_capacities,
+        plan7_allocation_simulation *simulation,
+        char *error,
+        size_t error_size,
+    )
     int plan7_tjb_for_length(float scale, uint64_t length)
     int plan7_ssv_f1_decision(
         uint8_t status,
@@ -213,6 +319,13 @@ cdef extern from "ssv_cuda.h" nogil:
     int plan7_ssv_sequence_batch_get_workspace_statistics(
         const plan7_ssv_sequence_batch *batch,
         plan7_ssv_workspace_statistics *statistics,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_get_memory_snapshot(
+        const plan7_ssv_sequence_batch *batch,
+        plan7_ssv_memory_snapshot *snapshot,
         char *error,
         size_t error_size,
     )
@@ -684,6 +797,155 @@ def device_count():
     return count
 
 
+def device_memory_info():
+    cdef char error[512]
+    cdef int device_ordinal = -1
+    cdef uint64_t free_bytes = 0
+    cdef uint64_t total_bytes = 0
+    cdef int status
+    error[0] = 0
+    with nogil:
+        status = plan7_cuda_memory_info(
+            &device_ordinal, &free_bytes, &total_bytes, error, sizeof(error)
+        )
+    if status != 0:
+        raise RuntimeError(error.decode("utf-8", "replace"))
+    return {
+        "device_ordinal": device_ordinal,
+        "cuda_free_bytes": free_bytes,
+        "cuda_total_bytes": total_bytes,
+    }
+
+
+def _validate_device_ordinal(int owner_device, int current_device):
+    """Exercise the pure owner/current-device validation seam."""
+    cdef char error[512]
+    cdef int status
+    error[0] = 0
+    status = plan7_validate_device_ordinal(
+        owner_device, current_device, error, sizeof(error)
+    )
+    if status != 0:
+        raise RuntimeError(error.decode("utf-8", "replace"))
+
+
+def profile_footprint(model_lengths):
+    """Return amino profile byte bounds without packing or allocating."""
+    cdef object lengths_array
+    cdef const uint32_t[::1] lengths
+    cdef plan7_profile_footprint footprint
+    cdef char error[512]
+    cdef int status
+    try:
+        lengths_array = _array.array("I", model_lengths)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("model lengths must be unsigned 32-bit integers") from exc
+    lengths = lengths_array
+    error[0] = 0
+    with nogil:
+        status = plan7_profile_footprint_compute(
+            &lengths[0] if lengths.shape[0] else NULL,
+            <size_t> lengths.shape[0],
+            &footprint,
+            error,
+            sizeof(error),
+        )
+    if status != 0:
+        raise ValueError(error.decode("utf-8", "replace"))
+    return {
+        "profile_count": footprint.profile_count,
+        "ssv_device_bytes": footprint.ssv_device_bytes,
+        "viterbi_device_bytes": footprint.viterbi_device_bytes,
+        "viterbi_exact_rbv_upper_bytes": (
+            footprint.viterbi_exact_rbv_upper_bytes
+        ),
+        "forward_device_bytes": footprint.forward_device_bytes,
+        "bias_device_bytes": footprint.bias_device_bytes,
+        "minimum_device_bytes": footprint.minimum_device_bytes,
+        "maximum_device_bytes": footprint.maximum_device_bytes,
+    }
+
+
+def profile_slice_cell_count(
+    uint64_t profile_count,
+    uint64_t target_count,
+    uint64_t cell_limit=100_000_000,
+):
+    """Validate and return the profile-major planner cell count."""
+    cdef uint64_t cell_count = 0
+    cdef char error[512]
+    cdef int status
+    error[0] = 0
+    status = plan7_profile_slice_cell_count(
+        profile_count,
+        target_count,
+        cell_limit,
+        &cell_count,
+        error,
+        sizeof(error),
+    )
+    if status != 0:
+        raise ValueError(error.decode("utf-8", "replace"))
+    return cell_count
+
+
+def simulate_allocate_before_free(
+    current_capacities,
+    required_capacities,
+    uint64_t free_bytes,
+):
+    """Simulate ordered high-water growth by allocate-new, then free-old."""
+    cdef object current_array
+    cdef object required_array
+    cdef carray final_array
+    cdef const uint64_t[::1] current
+    cdef const uint64_t[::1] required
+    cdef uint64_t[::1] final
+    cdef plan7_allocation_simulation simulation
+    cdef char error[512]
+    cdef int status
+    try:
+        current_array = _array.array("Q", current_capacities)
+        required_array = _array.array("Q", required_capacities)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("capacities must be unsigned 64-bit integers") from exc
+    current = current_array
+    required = required_array
+    if current.shape[0] != required.shape[0]:
+        raise ValueError("current and required capacities differ in length")
+    final_array = clone(
+        _UINT64_ARRAY_TEMPLATE, <Py_ssize_t> current.shape[0], zero=False
+    )
+    final = final_array
+    error[0] = 0
+    with nogil:
+        status = plan7_simulate_allocate_before_free(
+            &current[0] if current.shape[0] else NULL,
+            &required[0] if required.shape[0] else NULL,
+            <size_t> current.shape[0],
+            free_bytes,
+            &final[0] if final.shape[0] else NULL,
+            &simulation,
+            error,
+            sizeof(error),
+        )
+    if status != 0:
+        raise ValueError(error.decode("utf-8", "replace"))
+    return {
+        "fits": bool(simulation.fits),
+        "peak_additional_bytes": simulation.peak_additional_bytes,
+        "final_additional_bytes": simulation.final_additional_bytes,
+        "final_free_bytes": (
+            simulation.final_free_bytes if simulation.fits else None
+        ),
+        "growth_count": simulation.growth_count,
+        "first_unfit_index": (
+            None if simulation.fits else simulation.first_unfit_index
+        ),
+        "capacities": tuple(final_array),
+    }
+
+
 def tjb_for_lengths(float scale, const uint64_t[::1] lengths):
     cdef bytearray output = bytearray(lengths.shape[0])
     cdef uint8_t[::1] view = output
@@ -1045,6 +1307,36 @@ cdef class SequenceBatch:
             "forward_growth_count": statistics.forward_growth_count,
             "forward_event_create_count": statistics.forward_event_create_count,
             "forward_run_count": statistics.forward_run_count,
+        }
+
+    @property
+    def memory_snapshot(self):
+        """Return current CUDA availability and persistent device capacities."""
+        cdef plan7_ssv_memory_snapshot snapshot
+        cdef char error[512]
+        cdef int status
+        cdef size_t i
+        cdef dict capacities = {}
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        if len(_DEVICE_CAPACITY_NAMES) != PLAN7_SSV_DEVICE_CAPACITY_COUNT:
+            raise RuntimeError("native device capacity ABI changed")
+        error[0] = 0
+        status = plan7_ssv_sequence_batch_get_memory_snapshot(
+            self._batch, &snapshot, error, sizeof(error)
+        )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        for i in range(PLAN7_SSV_DEVICE_CAPACITY_COUNT):
+            capacities[_DEVICE_CAPACITY_NAMES[i]] = (
+                snapshot.device_capacity_bytes[i]
+            )
+        return {
+            "device_ordinal": snapshot.device_ordinal,
+            "cuda_free_bytes": snapshot.cuda_free_bytes,
+            "cuda_total_bytes": snapshot.cuda_total_bytes,
+            "persistent_device_bytes": snapshot.persistent_device_bytes,
+            "capacity_bytes": capacities,
         }
 
     def __enter__(self):

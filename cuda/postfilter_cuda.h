@@ -40,11 +40,25 @@ typedef struct plan7_postfilter_result {
 typedef struct plan7_viterbi_database plan7_viterbi_database;
 typedef struct plan7_postfilter_workspace plan7_postfilter_workspace;
 
+enum plan7_postfilter_workspace_capacity {
+  PLAN7_POSTFILTER_CAPACITY_STATES = 0,
+  PLAN7_POSTFILTER_CAPACITY_BIAS_INPUTS = 1,
+  PLAN7_POSTFILTER_CAPACITY_BIAS_RESULTS = 2,
+  PLAN7_POSTFILTER_CAPACITY_VITERBI_RESULTS = 3,
+  PLAN7_POSTFILTER_CAPACITY_LENGTH_TRANSITIONS = 4,
+  PLAN7_POSTFILTER_CAPACITY_MSV_OFFSETS = 5,
+  PLAN7_POSTFILTER_CAPACITY_VITERBI_OFFSETS = 6,
+  PLAN7_POSTFILTER_CAPACITY_DP = 7,
+  PLAN7_POSTFILTER_CAPACITY_RESULTS = 8,
+  PLAN7_POSTFILTER_CAPACITY_COUNT = 9
+};
+
 typedef struct plan7_postfilter_workspace_statistics {
   uint64_t device_bytes;
   uint64_t dp_capacity_bytes;
   uint64_t growth_count;
   uint64_t run_count;
+  uint64_t capacity_bytes[PLAN7_POSTFILTER_CAPACITY_COUNT];
 } plan7_postfilter_workspace_statistics;
 
 /* Profiles are retained by the Python owner for this object's lifetime. */

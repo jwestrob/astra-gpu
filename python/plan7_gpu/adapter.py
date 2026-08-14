@@ -775,6 +775,13 @@ class SequenceBatch:
         with state.lock:
             return bool(state.native.closed)
 
+    @property
+    def memory_snapshot(self) -> dict[str, Any]:
+        """Return serialized CUDA availability and device capacities."""
+        state = _sequence_state(self)
+        with state.lock:
+            return cast(dict[str, Any], state.native.memory_snapshot)
+
     def close(self) -> None:
         state = _sequence_state(self)
         with state.lock:

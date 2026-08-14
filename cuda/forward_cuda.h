@@ -60,6 +60,21 @@ typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 typedef struct plan7_forward_output plan7_forward_output;
 typedef struct plan7_forward_workspace plan7_forward_workspace;
 
+enum plan7_forward_workspace_capacity {
+  PLAN7_FORWARD_CAPACITY_CANDIDATE_PROFILES = 0,
+  PLAN7_FORWARD_CAPACITY_CANDIDATE_SEQUENCES = 1,
+  PLAN7_FORWARD_CAPACITY_LENGTH_TRANSITIONS = 2,
+  PLAN7_FORWARD_CAPACITY_DP_OFFSETS = 3,
+  PLAN7_FORWARD_CAPACITY_X_OFFSETS = 4,
+  PLAN7_FORWARD_CAPACITY_DP = 5,
+  PLAN7_FORWARD_CAPACITY_XMX = 6,
+  PLAN7_FORWARD_CAPACITY_RESULTS = 7,
+  PLAN7_FORWARD_CAPACITY_SURVIVOR_CANDIDATES = 8,
+  PLAN7_FORWARD_CAPACITY_SURVIVOR_OFFSETS = 9,
+  PLAN7_FORWARD_CAPACITY_GATHERED = 10,
+  PLAN7_FORWARD_CAPACITY_COUNT = 11
+};
+
 typedef struct plan7_forward_workspace_statistics {
   uint64_t device_bytes;
   uint64_t dp_capacity_bytes;
@@ -68,6 +83,7 @@ typedef struct plan7_forward_workspace_statistics {
   uint64_t growth_count;
   uint64_t event_create_count;
   uint64_t run_count;
+  uint64_t capacity_bytes[PLAN7_FORWARD_CAPACITY_COUNT];
 } plan7_forward_workspace_statistics;
 
 /* Profiles are retained by the Python owner for this object's lifetime. */

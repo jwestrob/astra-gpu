@@ -76,6 +76,78 @@ typedef struct plan7_ssv_workspace_statistics {
   uint64_t forward_run_count;
 } plan7_ssv_workspace_statistics;
 
+/* Requested device bytes for amino-profile packers. The Viterbi exact-RBV
+ * allocation depends on profile contents, so it is reported as an upper
+ * increment alongside minimum/maximum totals. */
+typedef struct plan7_profile_footprint {
+  uint64_t profile_count;
+  uint64_t ssv_device_bytes;
+  uint64_t viterbi_device_bytes;
+  uint64_t viterbi_exact_rbv_upper_bytes;
+  uint64_t forward_device_bytes;
+  uint64_t bias_device_bytes;
+  uint64_t minimum_device_bytes;
+  uint64_t maximum_device_bytes;
+} plan7_profile_footprint;
+
+typedef struct plan7_allocation_simulation {
+  uint64_t peak_additional_bytes;
+  uint64_t final_additional_bytes;
+  uint64_t final_free_bytes;
+  uint64_t growth_count;
+  uint64_t first_unfit_index;
+  int32_t fits;
+  int32_t reserved;
+} plan7_allocation_simulation;
+
+enum plan7_ssv_device_capacity {
+  PLAN7_SSV_CAPACITY_INPUT_RESIDUES = 0,
+  PLAN7_SSV_CAPACITY_INPUT_OFFSETS = 1,
+  PLAN7_SSV_CAPACITY_INPUT_NULL_SCORES = 2,
+  PLAN7_SSV_CAPACITY_LENGTH_TJB = 3,
+  PLAN7_SSV_CAPACITY_RESULTS = 4,
+  PLAN7_SSV_CAPACITY_COMPACT_SCORES = 5,
+  PLAN7_SSV_CAPACITY_PROFILES = 6,
+  PLAN7_SSV_CAPACITY_F1_PROFILES = 7,
+  PLAN7_SSV_CAPACITY_CANDIDATE_WORDS = 8,
+  PLAN7_SSV_CAPACITY_BIAS_PROFILES = 9,
+  PLAN7_SSV_CAPACITY_BIAS_CANDIDATES = 10,
+  PLAN7_SSV_CAPACITY_BIAS_SSV_INPUTS = 11,
+  PLAN7_SSV_CAPACITY_BIAS_RESULTS = 12,
+  PLAN7_SSV_CAPACITY_BIAS_LOGP = 13,
+  PLAN7_SSV_CAPACITY_BIAS_LOG1MP = 14,
+  PLAN7_SSV_CAPACITY_POSTFILTER_STATES = 15,
+  PLAN7_SSV_CAPACITY_POSTFILTER_BIAS_INPUTS = 16,
+  PLAN7_SSV_CAPACITY_POSTFILTER_BIAS_RESULTS = 17,
+  PLAN7_SSV_CAPACITY_POSTFILTER_VITERBI_RESULTS = 18,
+  PLAN7_SSV_CAPACITY_POSTFILTER_LENGTH_TRANSITIONS = 19,
+  PLAN7_SSV_CAPACITY_POSTFILTER_MSV_OFFSETS = 20,
+  PLAN7_SSV_CAPACITY_POSTFILTER_VITERBI_OFFSETS = 21,
+  PLAN7_SSV_CAPACITY_POSTFILTER_DP = 22,
+  PLAN7_SSV_CAPACITY_POSTFILTER_RESULTS = 23,
+  PLAN7_SSV_CAPACITY_FORWARD_CANDIDATE_PROFILES = 24,
+  PLAN7_SSV_CAPACITY_FORWARD_CANDIDATE_SEQUENCES = 25,
+  PLAN7_SSV_CAPACITY_FORWARD_LENGTH_TRANSITIONS = 26,
+  PLAN7_SSV_CAPACITY_FORWARD_DP_OFFSETS = 27,
+  PLAN7_SSV_CAPACITY_FORWARD_X_OFFSETS = 28,
+  PLAN7_SSV_CAPACITY_FORWARD_DP = 29,
+  PLAN7_SSV_CAPACITY_FORWARD_XMX = 30,
+  PLAN7_SSV_CAPACITY_FORWARD_RESULTS = 31,
+  PLAN7_SSV_CAPACITY_FORWARD_SURVIVOR_CANDIDATES = 32,
+  PLAN7_SSV_CAPACITY_FORWARD_SURVIVOR_OFFSETS = 33,
+  PLAN7_SSV_CAPACITY_FORWARD_GATHERED = 34,
+  PLAN7_SSV_DEVICE_CAPACITY_COUNT = 35
+};
+
+typedef struct plan7_ssv_memory_snapshot {
+  int32_t device_ordinal;
+  int32_t reserved;
+  uint64_t cuda_free_bytes;
+  uint64_t cuda_total_bytes;
+  uint64_t persistent_device_bytes;
+  uint64_t device_capacity_bytes[PLAN7_SSV_DEVICE_CAPACITY_COUNT];
+} plan7_ssv_memory_snapshot;
+
 /* Immutable device-input view for sibling CUDA stages. The owning sequence
  * batch must outlive every use of this view. */
 typedef struct plan7_ssv_sequence_batch_view {
@@ -90,6 +162,38 @@ typedef struct plan7_ssv_sequence_batch_view {
 } plan7_ssv_sequence_batch_view;
 
 int plan7_cuda_device_count(char *error, size_t error_size);
+int plan7_cuda_memory_info(int *device_ordinal,
+                           uint64_t *free_bytes,
+                           uint64_t *total_bytes,
+                           char *error,
+                           size_t error_size);
+int plan7_validate_device_ordinal(int owner_device,
+                                  int current_device,
+                                  char *error,
+                                  size_t error_size);
+int plan7_profile_footprint_compute(const uint32_t *model_lengths,
+                                    size_t profile_count,
+                                    plan7_profile_footprint *footprint,
+                                    char *error,
+                                    size_t error_size);
+int plan7_profile_slice_cell_count(uint64_t profile_count,
+                                   uint64_t target_count,
+                                   uint64_t cell_limit,
+                                   uint64_t *cell_count,
+                                   char *error,
+                                   size_t error_size);
+/* Simulate buffers in the caller's real allocation order. Each growth first
+ * allocates the full required capacity and only then releases the old one.
+ * Counts are requested bytes; allocator fragmentation is outside this model. */
+int plan7_simulate_allocate_before_free(
+  const uint64_t *current_capacities,
+  const uint64_t *required_capacities,
+  size_t capacity_count,
+  uint64_t free_bytes,
+  uint64_t *final_capacities,
+  plan7_allocation_simulation *simulation,
+  char *error,
+  size_t error_size);
 int plan7_tjb_for_length(float scale, uint64_t length);
 int plan7_ssv_f1_decision(uint8_t status,
                           int16_t numerator,
@@ -134,6 +238,14 @@ int plan7_ssv_sequence_batch_get_view(
 int plan7_ssv_sequence_batch_get_workspace_statistics(
   const plan7_ssv_sequence_batch *batch,
   plan7_ssv_workspace_statistics *statistics,
+  char *error,
+  size_t error_size);
+
+/* Requested device capacities only; host allocations are intentionally out
+ * of scope. Calls must be serialized with every operation on the batch. */
+int plan7_ssv_sequence_batch_get_memory_snapshot(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_ssv_memory_snapshot *snapshot,
   char *error,
   size_t error_size);
 

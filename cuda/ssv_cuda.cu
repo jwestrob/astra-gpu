@@ -35,8 +35,11 @@ struct plan7_ssv_sequence_batch {
   plan7_bias_candidate *host_bias_candidates;
   size_t host_bias_candidate_capacity;
   uint8_t *device_residues;
+  size_t device_residue_capacity;
   uint64_t *device_offsets;
+  size_t device_offset_capacity;
   float *device_null_scores;
+  size_t device_null_score_capacity;
   float *device_bias_logp;
   size_t device_bias_logp_capacity;
   float *device_bias_log1mp;
@@ -95,7 +98,29 @@ constexpr int kThreads = 256;
 constexpr int kSequencesPerBlock = 4;
 constexpr int kExtraScoreVectors = 17;
 constexpr uint64_t kMaximumTargetLength = 100000;
+constexpr uint64_t kMaximumModelLength = 100000;
 constexpr float kEvparamUnset = -99999.0f;
+
+/* Exact requested device bytes for the current amino-profile packers. The
+ * descriptor and row constants mirror private structs/layouts in
+ * postfilter_cuda.cu and forward_cuda.cu. Their boundary tests are the ABI
+ * tripwire for this allocation-free estimator. */
+constexpr uint64_t kAminoAlphabetSize = 29;
+constexpr uint64_t kViterbiDescriptorBytes = 96;
+constexpr uint64_t kViterbiBytesPerQ = 2368;
+constexpr uint64_t kForwardDescriptorBytes = 32;
+constexpr uint64_t kForwardBytesPerQ = 592;
+constexpr uint64_t kBiasDescriptorBytes = 272;
+static_assert(sizeof(plan7_bias_profile) == kBiasDescriptorBytes,
+              "bias profile footprint changed");
+static_assert(PLAN7_SSV_CAPACITY_POSTFILTER_RESULTS -
+                  PLAN7_SSV_CAPACITY_POSTFILTER_STATES + 1 ==
+                PLAN7_POSTFILTER_CAPACITY_COUNT,
+              "post-filter capacity mapping changed");
+static_assert(PLAN7_SSV_CAPACITY_FORWARD_GATHERED -
+                  PLAN7_SSV_CAPACITY_FORWARD_CANDIDATE_PROFILES + 1 ==
+                PLAN7_FORWARD_CAPACITY_COUNT,
+              "Forward capacity mapping changed");
 
 __device__ __forceinline__ int
 saturating_signed_subtract(int left, int right)
@@ -420,6 +445,22 @@ bool
 checked_product(size_t left, size_t right, size_t *product)
 {
   if (right != 0 && left > SIZE_MAX / right) return false;
+  *product = left * right;
+  return true;
+}
+
+bool
+checked_add_u64(uint64_t left, uint64_t right, uint64_t *sum)
+{
+  if (right > UINT64_MAX - left) return false;
+  *sum = left + right;
+  return true;
+}
+
+bool
+checked_product_u64(uint64_t left, uint64_t right, uint64_t *product)
+{
+  if (right != 0 && left > UINT64_MAX / right) return false;
   *product = left * right;
   return true;
 }
@@ -860,6 +901,201 @@ plan7_cuda_device_count(char *error, size_t error_size)
 }
 
 extern "C" int
+plan7_cuda_memory_info(int *device_ordinal,
+                       uint64_t *free_bytes,
+                       uint64_t *total_bytes,
+                       char *error,
+                       size_t error_size)
+{
+  int current_device = -1;
+  size_t free_value = 0;
+  size_t total_value = 0;
+  cudaError_t status;
+  if (device_ordinal == nullptr || free_bytes == nullptr ||
+      total_bytes == nullptr) {
+    set_error(error, error_size, "CUDA memory information output is null");
+    return -1;
+  }
+  status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  status = cudaMemGetInfo(&free_value, &total_value);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaMemGetInfo", status);
+    return -1;
+  }
+  *device_ordinal = current_device;
+  *free_bytes = static_cast<uint64_t>(free_value);
+  *total_bytes = static_cast<uint64_t>(total_value);
+  return 0;
+}
+
+extern "C" int
+plan7_validate_device_ordinal(int owner_device,
+                              int current_device,
+                              char *error,
+                              size_t error_size)
+{
+  if (owner_device < 0 || current_device < 0) {
+    set_error(error, error_size, "CUDA device ordinal is unavailable");
+    return -1;
+  }
+  if (owner_device != current_device) {
+    set_error(error, error_size,
+              "CUDA sequence batch belongs to a different device");
+    return -1;
+  }
+  return 0;
+}
+
+extern "C" int
+plan7_profile_footprint_compute(const uint32_t *model_lengths,
+                                size_t profile_count,
+                                plan7_profile_footprint *footprint,
+                                char *error,
+                                size_t error_size)
+{
+  plan7_profile_footprint result{};
+  if (footprint == nullptr ||
+      (profile_count != 0 && model_lengths == nullptr)) {
+    set_error(error, error_size, "invalid profile footprint arguments");
+    return -1;
+  }
+  result.profile_count = static_cast<uint64_t>(profile_count);
+  for (size_t i = 0; i < profile_count; ++i) {
+    const uint64_t model_length = model_lengths[i];
+    if (model_length < 1 || model_length > kMaximumModelLength) {
+      set_error(error, error_size, "model length must be in [1, 100000]");
+      return -1;
+    }
+    const uint64_t viterbi_q = (model_length + 31) / 32;
+    const uint64_t forward_raw_q = (model_length + 3) / 4;
+    const uint64_t forward_q = forward_raw_q < 2 ? 2 : forward_raw_q;
+    uint64_t ssv_bytes;
+    uint64_t viterbi_rows;
+    uint64_t viterbi_bytes;
+    uint64_t forward_rows;
+    uint64_t forward_bytes;
+    if (!checked_product_u64(kAminoAlphabetSize, model_length, &ssv_bytes) ||
+        !checked_product_u64(kViterbiBytesPerQ, viterbi_q,
+                             &viterbi_rows) ||
+        !checked_add_u64(kViterbiDescriptorBytes, viterbi_rows,
+                         &viterbi_bytes) ||
+        !checked_product_u64(kForwardBytesPerQ, forward_q,
+                             &forward_rows) ||
+        !checked_add_u64(kForwardDescriptorBytes, forward_rows,
+                         &forward_bytes) ||
+        !checked_add_u64(result.ssv_device_bytes, ssv_bytes,
+                         &result.ssv_device_bytes) ||
+        !checked_add_u64(result.viterbi_device_bytes, viterbi_bytes,
+                         &result.viterbi_device_bytes) ||
+        !checked_add_u64(result.viterbi_exact_rbv_upper_bytes, ssv_bytes,
+                         &result.viterbi_exact_rbv_upper_bytes) ||
+        !checked_add_u64(result.forward_device_bytes, forward_bytes,
+                         &result.forward_device_bytes) ||
+        !checked_add_u64(result.bias_device_bytes, kBiasDescriptorBytes,
+                         &result.bias_device_bytes)) {
+      set_error(error, error_size, "profile footprint size overflow");
+      return -1;
+    }
+  }
+  if (!checked_add_u64(result.ssv_device_bytes,
+                       result.viterbi_device_bytes,
+                       &result.minimum_device_bytes) ||
+      !checked_add_u64(result.minimum_device_bytes,
+                       result.forward_device_bytes,
+                       &result.minimum_device_bytes) ||
+      !checked_add_u64(result.minimum_device_bytes,
+                       result.bias_device_bytes,
+                       &result.minimum_device_bytes) ||
+      !checked_add_u64(result.minimum_device_bytes,
+                       result.viterbi_exact_rbv_upper_bytes,
+                       &result.maximum_device_bytes)) {
+    set_error(error, error_size, "profile footprint total overflow");
+    return -1;
+  }
+  *footprint = result;
+  return 0;
+}
+
+extern "C" int
+plan7_profile_slice_cell_count(uint64_t profile_count,
+                               uint64_t target_count,
+                               uint64_t cell_limit,
+                               uint64_t *cell_count,
+                               char *error,
+                               size_t error_size)
+{
+  uint64_t result;
+  if (cell_count == nullptr) {
+    set_error(error, error_size, "profile slice cell output is null");
+    return -1;
+  }
+  if (!checked_product_u64(profile_count, target_count, &result)) {
+    set_error(error, error_size, "profile slice cell count overflow");
+    return -1;
+  }
+  *cell_count = result;
+  if (result > cell_limit) {
+    set_error(error, error_size, "profile slice exceeds cell limit");
+    return -1;
+  }
+  return 0;
+}
+
+extern "C" int
+plan7_simulate_allocate_before_free(
+  const uint64_t *current_capacities,
+  const uint64_t *required_capacities,
+  size_t capacity_count,
+  uint64_t free_bytes,
+  uint64_t *final_capacities,
+  plan7_allocation_simulation *simulation,
+  char *error,
+  size_t error_size)
+{
+  plan7_allocation_simulation result{};
+  uint64_t net_growth = 0;
+  if (simulation == nullptr ||
+      (capacity_count != 0 &&
+       (current_capacities == nullptr || required_capacities == nullptr ||
+        final_capacities == nullptr))) {
+    set_error(error, error_size, "invalid allocation simulation arguments");
+    return -1;
+  }
+  result.fits = 1;
+  result.first_unfit_index = UINT64_MAX;
+  for (size_t i = 0; i < capacity_count; ++i) {
+    const uint64_t current = current_capacities[i];
+    const uint64_t required = required_capacities[i];
+    final_capacities[i] = current < required ? required : current;
+    if (required <= current) continue;
+
+    uint64_t temporary_bytes;
+    uint64_t next_growth;
+    if (!checked_add_u64(net_growth, required, &temporary_bytes) ||
+        !checked_add_u64(net_growth, required - current, &next_growth)) {
+      set_error(error, error_size, "allocation simulation size overflow");
+      return -1;
+    }
+    if (temporary_bytes > result.peak_additional_bytes)
+      result.peak_additional_bytes = temporary_bytes;
+    if (temporary_bytes > free_bytes && result.fits) {
+      result.fits = 0;
+      result.first_unfit_index = static_cast<uint64_t>(i);
+    }
+    net_growth = next_growth;
+    ++result.growth_count;
+  }
+  result.final_additional_bytes = net_growth;
+  result.final_free_bytes = result.fits ? free_bytes - net_growth : 0;
+  *simulation = result;
+  return 0;
+}
+
+extern "C" int
 plan7_tjb_for_length(float scale, uint64_t length)
 {
   if (!isfinite(scale) || scale <= 0.0f || length > kMaximumTargetLength)
@@ -1045,8 +1281,11 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
 
   CUDA_TRY(cudaMalloc(&batch->device_residues,
                       residue_count == 0 ? 1 : residue_count));
+  batch->device_residue_capacity = residue_count == 0 ? 1 : residue_count;
   CUDA_TRY(cudaMalloc(&batch->device_offsets, offset_bytes));
+  batch->device_offset_capacity = offset_bytes;
   CUDA_TRY(cudaMalloc(&batch->device_null_scores, null_score_bytes));
+  batch->device_null_score_capacity = null_score_bytes;
   CUDA_TRY(cudaMalloc(&batch->device_tjb, sequence_count));
   batch->device_tjb_capacity = sequence_count;
   CUDA_TRY(cudaMalloc(&batch->device_results, result_bytes));
@@ -1179,6 +1418,102 @@ plan7_ssv_sequence_batch_get_workspace_statistics(
     statistics->forward_growth_count = forward.growth_count;
     statistics->forward_event_create_count = forward.event_create_count;
     statistics->forward_run_count = forward.run_count;
+  }
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_get_memory_snapshot(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_ssv_memory_snapshot *snapshot,
+  char *error,
+  size_t error_size)
+{
+  int current_device = -1;
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  cudaError_t status;
+  if (batch == nullptr || snapshot == nullptr) {
+    set_error(error, error_size, "invalid sequence batch memory snapshot");
+    return -1;
+  }
+  memset(snapshot, 0, sizeof(*snapshot));
+  status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (plan7_validate_device_ordinal(batch->device_ordinal, current_device,
+                                    error, error_size) != 0)
+    return -1;
+  status = cudaMemGetInfo(&free_bytes, &total_bytes);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaMemGetInfo", status);
+    return -1;
+  }
+
+  snapshot->device_ordinal = batch->device_ordinal;
+  snapshot->cuda_free_bytes = static_cast<uint64_t>(free_bytes);
+  snapshot->cuda_total_bytes = static_cast<uint64_t>(total_bytes);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_INPUT_RESIDUES] =
+      static_cast<uint64_t>(batch->device_residue_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_INPUT_OFFSETS] =
+      static_cast<uint64_t>(batch->device_offset_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_INPUT_NULL_SCORES] =
+      static_cast<uint64_t>(batch->device_null_score_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_LENGTH_TJB] =
+      static_cast<uint64_t>(batch->device_tjb_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_RESULTS] =
+      static_cast<uint64_t>(batch->device_result_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_COMPACT_SCORES] =
+      static_cast<uint64_t>(batch->device_score_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_PROFILES] =
+      static_cast<uint64_t>(batch->device_profile_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_F1_PROFILES] =
+      static_cast<uint64_t>(batch->device_f1_profile_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_CANDIDATE_WORDS] =
+      static_cast<uint64_t>(batch->device_candidate_word_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_PROFILES] =
+      static_cast<uint64_t>(batch->device_bias_profile_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_CANDIDATES] =
+      static_cast<uint64_t>(batch->device_bias_candidate_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_SSV_INPUTS] =
+      static_cast<uint64_t>(batch->device_bias_ssv_input_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_RESULTS] =
+      static_cast<uint64_t>(batch->device_bias_result_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_LOGP] =
+      static_cast<uint64_t>(batch->device_bias_logp_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_LOG1MP] =
+      static_cast<uint64_t>(batch->device_bias_log1mp_capacity);
+
+  if (batch->postfilter_workspace != nullptr) {
+    plan7_postfilter_workspace_statistics postfilter{};
+    if (plan7_postfilter_workspace_get_statistics(
+          batch->postfilter_workspace, &postfilter, error, error_size) != 0)
+      return -1;
+    for (size_t i = 0; i < PLAN7_POSTFILTER_CAPACITY_COUNT; ++i)
+      snapshot->device_capacity_bytes[
+          PLAN7_SSV_CAPACITY_POSTFILTER_STATES + i] =
+          postfilter.capacity_bytes[i];
+  }
+  if (batch->forward_workspace != nullptr) {
+    plan7_forward_workspace_statistics forward{};
+    if (plan7_forward_workspace_get_statistics(
+          batch->forward_workspace, &forward, error, error_size) != 0)
+      return -1;
+    for (size_t i = 0; i < PLAN7_FORWARD_CAPACITY_COUNT; ++i)
+      snapshot->device_capacity_bytes[
+          PLAN7_SSV_CAPACITY_FORWARD_CANDIDATE_PROFILES + i] =
+          forward.capacity_bytes[i];
+  }
+
+  for (size_t i = 0; i < PLAN7_SSV_DEVICE_CAPACITY_COUNT; ++i) {
+    if (!checked_add_u64(snapshot->persistent_device_bytes,
+                         snapshot->device_capacity_bytes[i],
+                         &snapshot->persistent_device_bytes)) {
+      set_error(error, error_size, "sequence capacity total overflow");
+      return -1;
+    }
   }
   return 0;
 }

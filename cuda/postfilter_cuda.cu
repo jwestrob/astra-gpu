@@ -71,6 +71,13 @@ struct VitProfile {
   uintptr_t alphabet_pointer;
 };
 
+static_assert(sizeof(VitProfile) == 96,
+              "Viterbi descriptor footprint changed");
+static_assert(p7O_NTRANS == 8,
+              "Viterbi transition-row footprint changed");
+static_assert((29 + p7O_NTRANS) * kWarpSize * sizeof(int16_t) == 2368,
+              "Viterbi packed-row footprint changed");
+
 struct VitLengthTransitions {
   int16_t n_move;
   int16_t j_move;
@@ -1244,11 +1251,24 @@ extern "C" int plan7_postfilter_workspace_get_statistics(
     set_error(error, error_size, "invalid post-filter workspace statistics");
     return -1;
   }
-  *statistics = {
-      postfilter_workspace_device_bytes(workspace),
-      static_cast<uint64_t>(workspace->dp_capacity),
-      workspace->growth_count,
-      workspace->run_count};
+  *statistics = {};
+  statistics->device_bytes = postfilter_workspace_device_bytes(workspace);
+  statistics->dp_capacity_bytes =
+      static_cast<uint64_t>(workspace->dp_capacity);
+  statistics->growth_count = workspace->growth_count;
+  statistics->run_count = workspace->run_count;
+  const size_t capacities[PLAN7_POSTFILTER_CAPACITY_COUNT] = {
+      workspace->states_capacity,
+      workspace->bias_inputs_capacity,
+      workspace->bias_results_capacity,
+      workspace->vit_results_capacity,
+      workspace->moves_capacity,
+      workspace->msv_offsets_capacity,
+      workspace->vit_offsets_capacity,
+      workspace->dp_capacity,
+      workspace->results_capacity};
+  for (size_t i = 0; i < PLAN7_POSTFILTER_CAPACITY_COUNT; ++i)
+    statistics->capacity_bytes[i] = static_cast<uint64_t>(capacities[i]);
   return 0;
 }
 

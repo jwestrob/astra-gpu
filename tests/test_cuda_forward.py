@@ -161,6 +161,23 @@ class CudaForwardTests(unittest.TestCase):
             )
             self.assertEqual(high_water["forward_event_create_count"], 2)
             self.assertEqual(high_water["forward_run_count"], 2)
+            snapshot = batch.memory_snapshot
+            forward_capacities = [
+                value
+                for name, value in snapshot["capacity_bytes"].items()
+                if name.startswith("forward_")
+            ]
+            self.assertEqual(
+                sum(forward_capacities), high_water["forward_device_bytes"]
+            )
+            self.assertEqual(
+                snapshot["capacity_bytes"]["forward_dp"],
+                high_water["forward_dp_capacity_bytes"],
+            )
+            self.assertEqual(
+                snapshot["persistent_device_bytes"],
+                sum(snapshot["capacity_bytes"].values()),
+            )
 
             second = batch.forward_candidates_many_raw(*arguments)
             reused = batch.workspace_statistics
