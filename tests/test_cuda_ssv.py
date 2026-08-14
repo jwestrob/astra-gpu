@@ -10,10 +10,11 @@ import pyhmmer
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 try:
-    from plan7_gpu import SequenceBatch, _native, filter_ssv
+    from plan7_gpu import SequenceBatch, _native, cpu_candidates, filter_ssv
 except ImportError:
     SequenceBatch = None
     _native = None
+    cpu_candidates = None
     filter_ssv = None
 
 HMM_20AA = ROOT / "refs" / "src" / "hmmer-3.4" / "testsuite" / "20aa.hmm"
@@ -137,6 +138,117 @@ class CudaSsvTests(unittest.TestCase):
             [result["action"] for result in filter_ssv(profile, sequences)],
             ["threshold_score", "cpu_msv", "cpu_msv", "promote"],
         )
+
+    def test_f1_candidates_retain_every_non_direct_route(self):
+        profile = self.optimized(HMM_20AA)
+        sequences = self.sequences(
+            profile,
+            ["G", "ACDEX", "ACDEX" * 3, "ACDEFGHIKLMNPQRSTVWY", ""],
+        )
+        original_length = profile.L
+        with SequenceBatch(sequences) as batch:
+            self.assertEqual(batch.cpu_candidates(profile), [1, 2, 3, 4])
+            self.assertEqual(cpu_candidates(profile, batch), [1, 2, 3, 4])
+        self.assertEqual(profile.L, original_length)
+
+    def test_f1_exact_p_and_strict_threshold_boundary(self):
+        profile = self.optimized(HMM_20AA)
+        sequence = self.sequences(profile, ["G"])[0]
+        result = filter_ssv(profile, [sequence])[0]
+        parameters = profile.evalue_parameters.as_vector()
+        action, probability = _native.f1_decision(
+            _native.STATUS_OK,
+            result["numerator"],
+            1,
+            profile.scale_b,
+            parameters[0],
+            parameters[1],
+            1.0,
+        )
+        self.assertEqual(action, _native.F1_CPU_REQUIRED)
+        self.assertEqual(probability.hex(), "0x1.e726801175503p-1")
+
+        thresholds = (
+            math.nextafter(probability, 0.0),
+            probability,
+            math.nextafter(probability, math.inf),
+        )
+        with SequenceBatch([sequence]) as batch:
+            self.assertEqual(batch.cpu_candidates(profile, thresholds[0]), [])
+            self.assertEqual(batch.cpu_candidates(profile, thresholds[1]), [0])
+            self.assertEqual(batch.cpu_candidates(profile, thresholds[2]), [0])
+
+    def test_f1_invalid_inputs_are_conservative(self):
+        profile = self.optimized(HMM_20AA)
+        sequences = self.sequences(profile, ["G", "ACDEX", ""])
+        all_indexes = list(range(len(sequences)))
+        with SequenceBatch(sequences) as batch:
+            for threshold in (1.0, -1.0, 1.1, math.nan, math.inf):
+                self.assertEqual(batch.cpu_candidates(profile, threshold), all_indexes)
+
+            parameters = profile.evalue_parameters.as_vector()
+            original_mu = parameters[0]
+            original_lambda = parameters[1]
+            try:
+                parameters[0] = math.nan
+                self.assertEqual(batch.cpu_candidates(profile), all_indexes)
+                parameters[0] = original_mu
+                parameters[1] = -99999.0
+                self.assertEqual(batch.cpu_candidates(profile), all_indexes)
+            finally:
+                parameters[0] = original_mu
+                parameters[1] = original_lambda
+
+        for status in (
+            _native.STATUS_ERANGE,
+            _native.STATUS_ENORESULT,
+            _native.STATUS_EMPTY,
+            254,
+        ):
+            action, probability = _native.f1_decision(
+                status, 0, 10, profile.scale_b, -1.0, 0.7, 0.02
+            )
+            self.assertEqual(action, _native.F1_CPU_REQUIRED)
+            self.assertTrue(math.isnan(probability))
+
+        parameters = profile.evalue_parameters.as_vector()
+        invalid_arguments = (
+            (
+                _native.STATUS_OK,
+                0,
+                0,
+                profile.scale_b,
+                parameters[0],
+                parameters[1],
+                0.02,
+            ),
+            (
+                _native.STATUS_OK,
+                0,
+                100_001,
+                profile.scale_b,
+                parameters[0],
+                parameters[1],
+                0.02,
+            ),
+            (_native.STATUS_OK, 0, 10, 0.0, parameters[0], parameters[1], 0.02),
+            (_native.STATUS_OK, 0, 10, profile.scale_b, -99999.0, parameters[1], 0.02),
+            (_native.STATUS_OK, 0, 10, profile.scale_b, parameters[0], 0.0, 0.02),
+            (_native.STATUS_OK, 0, 10, profile.scale_b, parameters[0], -99999.0, 0.02),
+            (
+                _native.STATUS_OK,
+                0,
+                10,
+                profile.scale_b,
+                parameters[0],
+                parameters[1],
+                math.nan,
+            ),
+        )
+        for arguments in invalid_arguments:
+            action, probability = _native.f1_decision(*arguments)
+            self.assertEqual(action, _native.F1_CPU_REQUIRED)
+            self.assertTrue(math.isnan(probability))
 
     def test_short_long_short_and_ambiguity_codes(self):
         profile = self.optimized(HMM_20AA)

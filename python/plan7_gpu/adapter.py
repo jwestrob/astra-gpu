@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Iterable
+import math
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 
 from . import _native  # type: ignore[attr-defined]
 
@@ -87,20 +88,77 @@ class SequenceBatch:
             if optimized_profile.alphabet != self.alphabet:
                 raise ValueError("profile and sequence alphabets differ")
             scores = memoryview(optimized_profile.sbv).cast("B")
-            return self._native.filter_raw(
-                scores,
-                optimized_profile.sbv.shape[1],
-                optimized_profile.M,
-                optimized_profile.alphabet.Kp,
-                optimized_profile.tbm,
-                optimized_profile.tec,
-                optimized_profile.base_b,
-                optimized_profile.bias_b,
-                optimized_profile.scale_b,
+            return cast(
+                list[tuple[Any, ...]],
+                self._native.filter_raw(
+                    scores,
+                    optimized_profile.sbv.shape[1],
+                    optimized_profile.M,
+                    optimized_profile.alphabet.Kp,
+                    optimized_profile.tbm,
+                    optimized_profile.tec,
+                    optimized_profile.base_b,
+                    optimized_profile.bias_b,
+                    optimized_profile.scale_b,
+                ),
             )
 
     def filter_ssv(self, optimized_profile: Any) -> list[dict[str, Any]]:
         return _format_results(self._filter_raw(optimized_profile))
+
+    def cpu_candidates(self, optimized_profile: Any, F1: float = 0.02) -> list[int]:
+        """Return target indexes that still require HMMER's CPU pipeline.
+
+        Only finite direct-SSV scores with a P-value strictly greater than
+        ``F1`` are omitted. Every fallback, overflow, empty, or invalid case
+        is retained conservatively.
+        """
+        with self._lock:
+            if optimized_profile.alphabet != self.alphabet:
+                raise ValueError("profile and sequence alphabets differ")
+            if self._native.closed:
+                raise RuntimeError("sequence batch is closed")
+
+            try:
+                threshold = float(F1)
+                parameters = optimized_profile.evalue_parameters.as_vector()
+                m_mu = float(parameters[0])
+                m_lambda = float(parameters[1])
+                scale = float(optimized_profile.scale_b)
+            except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+                return list(range(len(self)))
+
+            if (
+                not math.isfinite(threshold)
+                or not 0.0 <= threshold < 1.0
+                or not math.isfinite(m_mu)
+                or not math.isfinite(m_lambda)
+                or not math.isfinite(scale)
+                or m_mu == -99999.0
+                or m_lambda == -99999.0
+                or m_lambda <= 0.0
+                or scale <= 0.0
+            ):
+                return list(range(len(self)))
+
+            scores = memoryview(optimized_profile.sbv).cast("B")
+            return cast(
+                list[int],
+                self._native.cpu_candidates_raw(
+                    scores,
+                    optimized_profile.sbv.shape[1],
+                    optimized_profile.M,
+                    optimized_profile.alphabet.Kp,
+                    optimized_profile.tbm,
+                    optimized_profile.tec,
+                    optimized_profile.base_b,
+                    optimized_profile.bias_b,
+                    scale,
+                    m_mu,
+                    m_lambda,
+                    threshold,
+                ),
+            )
 
 
 def filter_ssv(
@@ -116,3 +174,15 @@ def filter_ssv(
         return sequences.filter_ssv(optimized_profile)
     with SequenceBatch(sequences, alphabet=optimized_profile.alphabet) as batch:
         return batch.filter_ssv(optimized_profile)
+
+
+def cpu_candidates(
+    optimized_profile: Any,
+    sequences: Iterable[Any] | SequenceBatch,
+    F1: float = 0.02,
+) -> list[int]:
+    """Return indexes that cannot be rejected safely by direct CUDA SSV."""
+    if isinstance(sequences, SequenceBatch):
+        return sequences.cpu_candidates(optimized_profile, F1)
+    with SequenceBatch(sequences, alphabet=optimized_profile.alphabet) as batch:
+        return batch.cpu_candidates(optimized_profile, F1)

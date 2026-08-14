@@ -1,3 +1,3 @@
-from .adapter import SequenceBatch, filter_ssv
+from .adapter import SequenceBatch, cpu_candidates, filter_ssv
 
-__all__ = ["SequenceBatch", "filter_ssv"]
+__all__ = ["SequenceBatch", "cpu_candidates", "filter_ssv"]

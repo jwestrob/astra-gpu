@@ -14,6 +14,9 @@ LDLIBS   += -L$(HMMER_ROOT)/src -lhmmer \
 ORACLE_BIN := $(BUILD_DIR)/oracle/msv-oracle
 ORACLE_OBJ := $(BUILD_DIR)/oracle/msv_oracle.o
 PYTHON_EXT_SUFFIX := $(shell $(PYTHON)-config --extension-suffix)
+PYHMMER_LIB_DIR ?= $(shell $(PYTHON) -c 'from pathlib import Path; import pyhmmer; print((Path(pyhmmer.__file__).resolve().parent.parent / "pyhmmer.libs").resolve())')
+PYHMMER_EASEL_INCLUDE ?= $(PYHMMER_LIB_DIR)/include/libeasel
+PYHMMER_EASEL_LIB ?= $(PYHMMER_LIB_DIR)/liblibeasel.so
 CYTHON_CPP := $(BUILD_DIR)/cuda/_native.cpp
 CYTHON_OBJ := $(BUILD_DIR)/cuda/_native.o
 CUDA_OBJ := $(BUILD_DIR)/cuda/ssv_cuda.o
@@ -56,13 +59,17 @@ $(CYTHON_OBJ): $(CYTHON_CPP) cuda/ssv_cuda.h
 	$(CXX) -O3 -g -std=c++17 -fPIC -Wall -Wextra -Icuda \
 		$$($(PYTHON)-config --includes) -c -o $@ $<
 
-$(CUDA_OBJ): cuda/ssv_cuda.cu cuda/ssv_cuda.h
+$(CUDA_OBJ): cuda/ssv_cuda.cu cuda/ssv_cuda.h \
+	$(PYHMMER_EASEL_INCLUDE)/easel.h \
+	$(PYHMMER_EASEL_INCLUDE)/esl_gumbel.h
 	mkdir -p $(@D)
 	$(NVCC) -O3 -g -std=c++17 -Xcompiler=-fPIC $(CUDA_ARCH_FLAGS) \
-		-Icuda -c -o $@ $<
+		-Icuda -I$(PYHMMER_EASEL_INCLUDE) -c -o $@ $<
 
-$(CUDA_MODULE): $(CYTHON_OBJ) $(CUDA_OBJ)
-	$(NVCC) -shared $(CUDA_ARCH_FLAGS) -o $@ $(CYTHON_OBJ) $(CUDA_OBJ)
+$(CUDA_MODULE): $(CYTHON_OBJ) $(CUDA_OBJ) $(PYHMMER_EASEL_LIB)
+	$(NVCC) -shared $(CUDA_ARCH_FLAGS) -o $@ $(CYTHON_OBJ) $(CUDA_OBJ) \
+		-L$(PYHMMER_LIB_DIR) -llibeasel \
+		-Xlinker -rpath -Xlinker $(PYHMMER_LIB_DIR)
 
 test: oracle
 	python3 -m unittest discover -s tests -v

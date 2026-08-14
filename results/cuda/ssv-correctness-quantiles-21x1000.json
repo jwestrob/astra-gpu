@@ -8,21 +8,30 @@
     "source": [
       {
         "path": "cuda/ssv_cuda.cu",
-        "sha256": "733a0c3b4dd02f04c1925bd374068baf03f9149f63bbcccdbd0970ad70949a18"
+        "sha256": "679ece3d430eb02854620a210ebbbfb615c651723a20d9a3f80ec3043d851b36"
       },
       {
         "path": "cuda/ssv_cuda.h",
-        "sha256": "821b044ca4d8fc3bdd7f63bf8c1b83d28beb5d18806ead3081eb0781a5f19076"
+        "sha256": "6ac8b622119f608160ac83b12a49521f695e201ac5c015e0f3ab65ead8e713f9"
       },
       {
         "path": "python/plan7_gpu/_native.pyx",
-        "sha256": "1ae871873d3720d104cbe97f7a0254314c4c0218f967ef60d4545851166f05fa"
+        "sha256": "eba6bd43498d0cf8b27a99e02169600bcd9f672fcdc3752b73803523dff59b36"
       },
       {
         "path": "python/plan7_gpu/adapter.py",
-        "sha256": "9960c13bd10986d58b325f52c0f3a85a41fc5be58bc7e739ad5b78984b37c370"
+        "sha256": "d6c056c56618c131da0d74185db2f1cbd27d555f98dc25355ee4316115c1a6b7"
+      },
+      {
+        "path": "Makefile",
+        "sha256": "7145cd106011ec72af148861c441c15cd843c2e241e2a7c5c0cf0ded32b1964a"
       }
-    ]
+    ],
+    "runtime": {
+      "pyhmmer_version": "0.12.0",
+      "easel_library": "/home/jwestrob/.pyenv/versions/3.12.0/lib/python3.12/site-packages/pyhmmer.libs/liblibeasel.so",
+      "easel_sha256": "597c456d3789cbac044928467e1fa7a62eb1ffba29d7e00fe56f7a174dc93c6e"
+    }
   },
   "hardware": {
     "gpu": "NVIDIA GeForce RTX 2080 Ti",
@@ -56,8 +65,17 @@
     "profile_length_mutations": 0,
     "resident_sequence_batch": true
   },
+  "f1_gate": {
+    "reference": "HMMER_3.4_strict_oracle",
+    "threshold": 0.02,
+    "pairs": 21000,
+    "cpu_candidates": 721,
+    "fallback_or_overflow_candidates": 174,
+    "decision_mismatches": 0,
+    "exact_boundary_probability_hex": "0x1.e726801175503p-1"
+  },
   "additional_checks": {
-    "focused_tests": 11,
+    "focused_tests": 14,
     "all_lengths_tjb_checked": [0, 100000],
     "compute_sanitizer": {
       "memcheck_errors": 0,

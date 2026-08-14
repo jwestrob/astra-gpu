@@ -13,6 +13,10 @@ cdef extern from "ssv_cuda.h" nogil:
         PLAN7_SSV_ENORESULT
         PLAN7_SSV_EMPTY
 
+    cdef enum plan7_f1_action:
+        PLAN7_F1_CPU_REQUIRED
+        PLAN7_F1_DEFINITE_REJECT
+
     ctypedef struct plan7_ssv_result:
         uint8_t xE
         uint8_t status
@@ -25,6 +29,16 @@ cdef extern from "ssv_cuda.h" nogil:
 
     int plan7_cuda_device_count(char *error, size_t error_size)
     int plan7_tjb_for_length(float scale, uint64_t length)
+    int plan7_ssv_f1_decision(
+        uint8_t status,
+        int16_t numerator,
+        uint64_t length,
+        float scale,
+        float m_mu,
+        float m_lambda,
+        double f1,
+        double *ret_p,
+    )
 
     int plan7_ssv_sequence_batch_create(
         const uint8_t *residues,
@@ -142,6 +156,7 @@ def tjb_for_lengths(float scale, const uint64_t[::1] lengths):
 cdef class SequenceBatch:
     cdef plan7_ssv_sequence_batch *_batch
     cdef vector[plan7_ssv_result] _results
+    cdef vector[uint64_t] _lengths
     cdef size_t _sequence_count
     cdef int _alphabet_size
 
@@ -153,6 +168,7 @@ cdef class SequenceBatch:
     ):
         cdef char error[512]
         cdef int status
+        cdef size_t i
 
         self._batch = NULL
         self._sequence_count = 0
@@ -177,6 +193,9 @@ cdef class SequenceBatch:
             raise RuntimeError(error.decode("utf-8", "replace"))
         self._sequence_count = <size_t> offsets.shape[0] - 1
         self._results.resize(self._sequence_count)
+        self._lengths.resize(self._sequence_count)
+        for i in range(self._sequence_count):
+            self._lengths[i] = offsets[i + 1] - offsets[i]
 
     def __dealloc__(self):
         if self._batch != NULL:
@@ -201,7 +220,7 @@ cdef class SequenceBatch:
             if status != 0:
                 raise RuntimeError(error.decode("utf-8", "replace"))
 
-    def filter_raw(
+    cdef int _run_filter(
         self,
         const uint8_t[::1] striped_scores,
         int score_stride,
@@ -212,7 +231,7 @@ cdef class SequenceBatch:
         int base,
         int bias,
         float scale,
-    ):
+    ) except -1:
         cdef char error[512]
         cdef int status
 
@@ -252,7 +271,77 @@ cdef class SequenceBatch:
             )
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
+        return 0
+
+    def filter_raw(
+        self,
+        const uint8_t[::1] striped_scores,
+        int score_stride,
+        int model_length,
+        int alphabet_size,
+        int tbm,
+        int tec,
+        int base,
+        int bias,
+        float scale,
+    ):
+        self._run_filter(
+            striped_scores,
+            score_stride,
+            model_length,
+            alphabet_size,
+            tbm,
+            tec,
+            base,
+            bias,
+            scale,
+        )
         return _format_results(self._results, scale)
+
+    def cpu_candidates_raw(
+        self,
+        const uint8_t[::1] striped_scores,
+        int score_stride,
+        int model_length,
+        int alphabet_size,
+        int tbm,
+        int tec,
+        int base,
+        int bias,
+        float scale,
+        float m_mu,
+        float m_lambda,
+        double f1,
+    ):
+        cdef size_t i
+        cdef int action
+        cdef list output = []
+
+        self._run_filter(
+            striped_scores,
+            score_stride,
+            model_length,
+            alphabet_size,
+            tbm,
+            tec,
+            base,
+            bias,
+            scale,
+        )
+        for i in range(self._sequence_count):
+            action = plan7_ssv_f1_decision(
+                self._results[i].status,
+                self._results[i].numerator,
+                self._lengths[i],
+                scale,
+                m_mu,
+                m_lambda,
+                f1,
+                NULL,
+            )
+            if action == PLAN7_F1_CPU_REQUIRED:
+                output.append(i)
+        return output
 
 
 def filter_raw(
@@ -285,7 +374,37 @@ def filter_raw(
         batch.close()
 
 
+def f1_decision(
+    int status,
+    int numerator,
+    uint64_t length,
+    float scale,
+    float m_mu,
+    float m_lambda,
+    double f1,
+):
+    cdef double p
+    cdef int action
+    if not 0 <= status <= 255:
+        raise ValueError("status must fit in uint8")
+    if not -32768 <= numerator <= 32767:
+        raise ValueError("numerator must fit in int16")
+    action = plan7_ssv_f1_decision(
+        <uint8_t> status,
+        <int16_t> numerator,
+        length,
+        scale,
+        m_mu,
+        m_lambda,
+        f1,
+        &p,
+    )
+    return action, p
+
+
 STATUS_OK = PLAN7_SSV_OK
 STATUS_ERANGE = PLAN7_SSV_ERANGE
 STATUS_ENORESULT = PLAN7_SSV_ENORESULT
 STATUS_EMPTY = PLAN7_SSV_EMPTY
+F1_CPU_REQUIRED = PLAN7_F1_CPU_REQUIRED
+F1_DEFINITE_REJECT = PLAN7_F1_DEFINITE_REJECT

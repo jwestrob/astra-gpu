@@ -5,4 +5,7 @@ adapter accepts the optimized profile and digital sequences already held by
 Astra; it does not load biological files or replace Astra's search pipeline.
 
 `SequenceBatch` packs and uploads targets once, then reuses its CUDA allocations
-across profiles. `filter_ssv(profile, sequences)` remains the one-shot API.
+across profiles. `cpu_candidates(profile, F1)` applies HMMER's exact F1 gate and
+returns indexes that direct SSV cannot safely reject. Fallbacks, overflows,
+empty targets, and invalid parameters are always retained. `filter_ssv`
+remains available for score diagnostics.

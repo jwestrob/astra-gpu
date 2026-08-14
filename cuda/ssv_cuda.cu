@@ -2,6 +2,11 @@
 
 #include <cuda_runtime.h>
 
+extern "C" {
+#include <easel.h>
+#include <esl_gumbel.h>
+}
+
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -33,6 +38,7 @@ namespace {
 constexpr int kThreads = 256;
 constexpr int kExtraScoreVectors = 17;
 constexpr uint64_t kMaximumTargetLength = 100000;
+constexpr float kEvparamUnset = -99999.0f;
 
 __device__ __forceinline__ int
 saturating_signed_subtract(int left, int right)
@@ -247,6 +253,57 @@ plan7_tjb_for_length(float scale, uint64_t length)
   if (!isfinite(scale) || scale <= 0.0f || length > kMaximumTargetLength)
     return -1;
   return compute_tjb(scale, length);
+}
+
+extern "C" int
+plan7_ssv_f1_decision(uint8_t status,
+                      int16_t numerator,
+                      uint64_t length,
+                      float scale,
+                      float m_mu,
+                      float m_lambda,
+                      double f1,
+                      double *ret_p)
+{
+  float score;
+  float length_f;
+  float p1;
+  float null_score;
+  float delta;
+  float bit_score;
+  double probability;
+
+  if (ret_p != nullptr) *ret_p = NAN;
+  if (status != PLAN7_SSV_OK || length == 0 ||
+      length > kMaximumTargetLength || !isfinite(scale) || scale <= 0.0f ||
+      !isfinite(m_mu) || !isfinite(m_lambda) || m_lambda <= 0.0f ||
+      m_mu == kEvparamUnset || m_lambda == kEvparamUnset ||
+      !isfinite(f1) || f1 < 0.0 || f1 > 1.0)
+    return PLAN7_F1_CPU_REQUIRED;
+
+  /* Preserve HMMER 3.4's float/double evaluation order exactly. */
+  score = static_cast<float>(numerator);
+  score /= scale;
+  score -= 3.0;
+
+  length_f = static_cast<float>(length);
+  p1 = length_f / static_cast<float>(length + 1);
+  null_score = static_cast<float>(
+    static_cast<double>(length_f) * log(static_cast<double>(p1)) +
+    log(1.0 - static_cast<double>(p1)));
+
+  delta = score - null_score;
+  bit_score = static_cast<float>(
+    static_cast<double>(delta) / eslCONST_LOG2);
+  probability = esl_gumbel_surv(static_cast<double>(bit_score),
+                                static_cast<double>(m_mu),
+                                static_cast<double>(m_lambda));
+  if (!isfinite(score) || !isfinite(null_score) || !isfinite(bit_score) ||
+      !isfinite(probability))
+    return PLAN7_F1_CPU_REQUIRED;
+  if (ret_p != nullptr) *ret_p = probability;
+  return probability > f1 ? PLAN7_F1_DEFINITE_REJECT
+                          : PLAN7_F1_CPU_REQUIRED;
 }
 
 extern "C" int
