@@ -1,5 +1,7 @@
 import importlib.util
 import io
+import math
+import struct
 import tempfile
 import unittest
 from array import array
@@ -77,6 +79,10 @@ class MaskedPipelineTests(unittest.TestCase):
         for sequence in sequences:
             offsets.append(offsets[-1] + len(sequence))
         return offsets
+
+    @staticmethod
+    def bias_record(index, filtersc, numerator, status, action):
+        return struct.pack("=IfhBB", index, filtersc, numerator, status, action)
 
     @staticmethod
     def table_bytes(hits, format):
@@ -328,6 +334,230 @@ class MaskedPipelineTests(unittest.TestCase):
             offsets,
         )
         self.assertEqual(hits.searched_models, 1)
+
+    def test_all_cpu_bias_records_match_sparse_candidate_pipeline(self):
+        hmm = self.hmms[0]
+        offsets = self.residue_offsets(self.sequences)
+        indexes = (1, 7, len(self.sequences) - 1)
+        records = b"".join(
+            self.bias_record(index, math.nan, 0, 173, 0) for index in indexes
+        )
+        expected = _pipeline._search_hmm_candidates_bound(
+            self.pipeline(),
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            self.candidates(*indexes),
+            offsets,
+        )
+        actual = _pipeline._search_hmm_bias_bound(
+            self.pipeline(),
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            records,
+            offsets,
+        )
+        self.assert_exact_hits(expected, actual)
+
+    def test_direct_bias_symbol_failure_precedes_pipeline_mutation(self):
+        if _pipeline._filter_scores_seam_available():
+            self.skipTest("private filter-score seam is available")
+        hmm = self.hmms[0]
+        offsets = self.residue_offsets(self.sequences)
+        pipeline = self.pipeline()
+        direct = self.bias_record(0, 0.0, 0, 0, 1)
+
+        with self.assertRaisesRegex(RuntimeError, "p7_PipelineFromFilterScores"):
+            _pipeline._search_hmm_bias_bound(
+                pipeline,
+                hmm,
+                self.optimized_profiles[0].copy(),
+                self.sequences,
+                direct,
+                offsets,
+            )
+
+        hits = _pipeline._search_hmm_bias_bound(
+            pipeline,
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            b"",
+            offsets,
+        )
+        self.assertEqual(hits.searched_models, 1)
+
+    def test_invalid_bias_rows_fail_before_pipeline_mutation(self):
+        hmm = self.hmms[0]
+        offsets = self.residue_offsets(self.sequences)
+
+        def cpu(index):
+            return self.bias_record(index, math.nan, 0, 255, 0)
+
+        invalid_rows = (
+            (b"\0", "trailing bytes"),
+            (cpu(0) + cpu(0), "strictly increasing"),
+            (cpu(1) + cpu(0), "strictly increasing"),
+            (cpu(len(self.sequences)), "out of range"),
+            (self.bias_record(0, 0.0, 0, 0, 3), "unknown.*action"),
+            (self.bias_record(0, 0.0, 0, 16, 1), "eslOK"),
+            (self.bias_record(0, math.nan, 0, 0, 2), "finite filter"),
+        )
+        for records, message in invalid_rows:
+            with self.subTest(message=message):
+                pipeline = self.pipeline()
+                with self.assertRaisesRegex((IndexError, ValueError), message):
+                    _pipeline._search_hmm_bias_bound(
+                        pipeline,
+                        hmm,
+                        self.optimized_profiles[0].copy(),
+                        self.sequences,
+                        records,
+                        offsets,
+                    )
+                hits = _pipeline._search_hmm_bias_bound(
+                    pipeline,
+                    hmm,
+                    self.optimized_profiles[0].copy(),
+                    self.sequences,
+                    b"",
+                    offsets,
+                )
+                self.assertEqual(hits.searched_models, 1)
+
+        invalid_offsets = array("Q", offsets)
+        invalid_offsets[2] += 1
+        pipeline = self.pipeline()
+        with self.assertRaisesRegex(ValueError, "differs from target length"):
+            _pipeline._search_hmm_bias_bound(
+                pipeline,
+                hmm,
+                self.optimized_profiles[0].copy(),
+                self.sequences,
+                cpu(1),
+                invalid_offsets,
+            )
+        hits = _pipeline._search_hmm_bias_bound(
+            pipeline,
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            b"",
+            offsets,
+        )
+        self.assertEqual(hits.searched_models, 1)
+
+    def test_empty_target_cannot_claim_a_direct_bias_result(self):
+        hmm = self.hmms[0]
+        empty = pyhmmer.easel.TextSequence(name=b"empty", sequence="").digitize(
+            self.alphabet
+        )
+        targets = pyhmmer.easel.DigitalSequenceBlock(self.alphabet, [empty])
+        with self.assertRaisesRegex(ValueError, "empty target"):
+            _pipeline._search_hmm_bias_bound(
+                self.pipeline(),
+                hmm,
+                self.optimized_profiles[0].copy(),
+                targets,
+                self.bias_record(0, 0.0, 0, 0, 1),
+                array("Q", [0, 0]),
+            )
+
+    def test_bias_bridge_requires_exact_pipeline_and_contiguous_bytes(self):
+        hmm = self.hmms[0]
+        offsets = self.residue_offsets(self.sequences)
+        record = self.bias_record(0, math.nan, 0, 255, 0)
+
+        with self.assertRaisesRegex(TypeError, "exactly pyhmmer.plan7.Pipeline"):
+            _pipeline._search_hmm_bias_bound(
+                pyhmmer.plan7.LongTargetsPipeline(pyhmmer.easel.Alphabet.dna()),
+                hmm,
+                self.optimized_profiles[0].copy(),
+                self.sequences,
+                record,
+                offsets,
+            )
+        with self.assertRaises((BufferError, TypeError, ValueError)):
+            _pipeline._search_hmm_bias_bound(
+                self.pipeline(),
+                hmm,
+                self.optimized_profiles[0].copy(),
+                self.sequences,
+                list(record),
+                offsets,
+            )
+        with self.assertRaises((BufferError, TypeError, ValueError)):
+            _pipeline._search_hmm_bias_bound(
+                self.pipeline(),
+                hmm,
+                self.optimized_profiles[0].copy(),
+                self.sequences,
+                memoryview(record * 2)[::2],
+                offsets,
+            )
+
+    def test_patched_bias_continuation_matches_ordinary_pipeline(self):
+        if not _pipeline._filter_scores_seam_available():
+            self.skipTest("private filter-score seam is unavailable")
+        hmm = self.hmms[1]
+        optimized = self.optimized_profiles[1].copy()
+        oracle_pipeline = self.pipeline(F1=1.0)
+        offsets = self.residue_offsets(self.sequences)
+        records = []
+        direct_actions = set()
+
+        for index, sequence in enumerate(self.sequences):
+            optimized.L = len(sequence)
+            score = optimized.ssv_filter(sequence)
+            if score is None or not math.isfinite(score):
+                records.append(self.bias_record(index, math.nan, 0, 255, 0))
+                continue
+            numerator = round((score + 3.0) * optimized.scale_b)
+            reconstructed = struct.unpack(
+                "=f",
+                struct.pack(
+                    "=f",
+                    struct.unpack("=f", struct.pack("=f", float(numerator)))[0]
+                    / optimized.scale_b
+                    - 3.0,
+                ),
+            )[0]
+            if struct.pack("=f", reconstructed) != struct.pack("=f", score):
+                records.append(self.bias_record(index, math.nan, 0, 255, 0))
+                continue
+            filtersc_bits = _pipeline._bias_filter_score_bits(
+                oracle_pipeline, optimized, sequence
+            )
+            filtersc = struct.unpack("=f", struct.pack("=I", filtersc_bits))[0]
+            action = 1 + index % 2
+            direct_actions.add(action)
+            records.append(self.bias_record(index, filtersc, numerator, 0, action))
+
+        self.assertEqual(direct_actions, {1, 2})
+        records = b"".join(records)
+        option_sets = (
+            {"F1": 1.0, "bias_filter": True},
+            {"F1": 1.0, "bias_filter": False},
+            {"F1": 0.02, "bias_filter": True},
+            {"F1": 1.0, "F2": 1.0, "F3": 1.0, "bias_filter": False},
+        )
+        saw_post_f2 = False
+        for options in option_sets:
+            with self.subTest(**options):
+                expected = self.pipeline(**options).search_hmm(hmm, self.sequences)
+                actual = _pipeline._search_hmm_bias_bound(
+                    self.pipeline(**options),
+                    hmm,
+                    self.optimized_profiles[1].copy(),
+                    self.sequences,
+                    records,
+                    offsets,
+                )
+                self.assert_exact_hits(expected, actual)
+                state = actual.__getstate__()["pipeline"]
+                saw_post_f2 = saw_post_f2 or state["n_past_vit"] > 0
+        self.assertTrue(saw_post_f2)
 
     def test_candidate_masks_preserve_auto_and_explicit_search_spaces(self):
         hmm = self.hmms[0]
