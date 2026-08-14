@@ -9,7 +9,6 @@ from itertools import zip_longest
 import math
 import operator
 from pathlib import Path
-import stat
 import struct
 from threading import Lock
 from typing import Any, NamedTuple, cast
@@ -19,8 +18,6 @@ import pyhmmer
 
 from . import _native  # type: ignore[attr-defined]
 
-
-_PRESSED_SUFFIXES = ("h3m", "h3i", "h3f", "h3p")
 _MISSING = object()
 _PIPELINE_LEASES_LOCK = Lock()
 
@@ -97,25 +94,6 @@ class _PairState:
         self.lock = Lock()
 
 
-def _pressed_stat_token(base: Path) -> _PressedStatToken:
-    token = []
-    for suffix in _PRESSED_SUFFIXES:
-        path = Path(f"{base}.{suffix}")
-        file_stat = path.stat()
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError(f"pressed database member is not a regular file: {path}")
-        token.append(
-            _FileStat(
-                file_stat.st_dev,
-                file_stat.st_ino,
-                file_stat.st_size,
-                file_stat.st_mtime_ns,
-                file_stat.st_ctime_ns,
-            )
-        )
-    return _PressedStatToken(*token)
-
-
 def _background_fingerprint(background: Any) -> bytes:
     frequencies = memoryview(background.residue_frequencies)
     if frequencies.format != "f" or frequencies.ndim != 1:
@@ -128,6 +106,28 @@ def _optimized_profile_bytes(profile: Any) -> tuple[bytes, bytes]:
     profile_output = io.BytesIO()
     profile.write(filter_output, profile_output)
     return filter_output.getvalue(), profile_output.getvalue()
+
+
+def _verify_pressed_profile(
+    hmm: Any,
+    optimized_profile: Any,
+    canonical_background: Any,
+    pipeline_module: Any,
+) -> bool:
+    reference_profile = hmm.to_profile(
+        canonical_background, L=optimized_profile.L
+    ).to_optimized()
+    for offset_name in ("model", "filter", "profile"):
+        setattr(
+            reference_profile.offsets,
+            offset_name,
+            getattr(optimized_profile.offsets, offset_name),
+        )
+    return pipeline_module._oprofiles_equal_hmmer(
+        reference_profile, optimized_profile
+    ) and _optimized_profile_bytes(reference_profile) == _optimized_profile_bytes(
+        optimized_profile
+    )
 
 
 @dataclass(
@@ -190,82 +190,107 @@ def _new_pressed_profile_pair(
     return pair
 
 
-def load_pressed_profiles(path: str | Path) -> tuple[PressedProfilePair, ...]:
-    """Load a pressed HMM database as provenance-bound lockstep pairs."""
-    from . import _pipeline  # type: ignore[attr-defined]
+def load_pressed_profiles(
+    path: str | Path,
+    *,
+    manifest: str | Path | None = None,
+) -> tuple[PressedProfilePair, ...]:
+    """Load a pressed HMM database as provenance-bound lockstep pairs.
+
+    ``manifest`` is an unsigned trust anchor and must come from a trusted
+    source, such as this repository's reviewed ``results/pressed`` records.
+    """
+    from .pressed_manifest import (
+        _pinned_pressed_database,
+        validate_pressed_manifest,
+    )
 
     base = Path(path).resolve(strict=False)
     amino_alphabet = pyhmmer.easel.Alphabet.amino()
-    before = _pressed_stat_token(base)
+    manifest_validation = None
+    if manifest is not None:
+        manifest_validation = validate_pressed_manifest(base, manifest)
+        if manifest_validation.canonical_base != base:
+            raise ValueError("pressed manifest canonical database mismatch")
+        pipeline_module = None
+    else:
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        pipeline_module = _pipeline
     pairs = []
-    with (
-        pyhmmer.plan7.HMMFile(base) as hmm_file,
-        pyhmmer.plan7.HMMPressedFile(base) as optimized_file,
-    ):
-        for ordinal, (hmm, optimized_profile) in enumerate(
-            zip_longest(hmm_file, optimized_file, fillvalue=_MISSING)
+    with _pinned_pressed_database(base) as (pinned_base, pinned_token):
+        before = _PressedStatToken(*(_FileStat(*member) for member in pinned_token))
+        if (
+            manifest_validation is not None
+            and pinned_token != manifest_validation.stat_token
         ):
-            if hmm is _MISSING:
-                raise ValueError(
-                    "pressed optimized-profile stream has more models than HMM stream"
-                )
-            if optimized_profile is _MISSING:
-                raise ValueError(
-                    "pressed HMM stream has more models than optimized-profile stream"
-                )
-            hmm = cast(pyhmmer.plan7.HMM, hmm)
-            optimized_profile = cast(pyhmmer.plan7.OptimizedProfile, optimized_profile)
-            if hmm.alphabet != amino_alphabet:
-                raise ValueError(
-                    "bound candidate search only supports amino-acid profiles"
-                )
-            if (
-                hmm.alphabet != optimized_profile.alphabet
-                or hmm.M != optimized_profile.M
-                or hmm.name != optimized_profile.name
-                or hmm.accession != optimized_profile.accession
-                or hmm.consensus != optimized_profile.consensus
+            raise RuntimeError(
+                "pressed database changed after its manifest was validated"
+            )
+        with (
+            pyhmmer.plan7.HMMFile(pinned_base) as hmm_file,
+            pyhmmer.plan7.HMMPressedFile(pinned_base) as optimized_file,
+        ):
+            for ordinal, (hmm, optimized_profile) in enumerate(
+                zip_longest(hmm_file, optimized_file, fillvalue=_MISSING)
             ):
-                raise ValueError(
-                    f"pressed HMM/profile identity mismatch at ordinal {ordinal}"
+                if hmm is _MISSING:
+                    raise ValueError(
+                        "pressed optimized-profile stream has more models than HMM stream"
+                    )
+                if optimized_profile is _MISSING:
+                    raise ValueError(
+                        "pressed HMM stream has more models than optimized-profile stream"
+                    )
+                hmm = cast(pyhmmer.plan7.HMM, hmm)
+                optimized_profile = cast(
+                    pyhmmer.plan7.OptimizedProfile, optimized_profile
                 )
-            canonical_background = pyhmmer.plan7.Background(hmm.alphabet)
-            reference_profile = hmm.to_profile(
-                canonical_background, L=optimized_profile.L
-            ).to_optimized()
-            for offset_name in ("model", "filter", "profile"):
-                setattr(
-                    reference_profile.offsets,
-                    offset_name,
-                    getattr(optimized_profile.offsets, offset_name),
-                )
-            if not _pipeline._oprofiles_equal_hmmer(
-                reference_profile, optimized_profile
-            ) or _optimized_profile_bytes(
-                reference_profile
-            ) != _optimized_profile_bytes(optimized_profile):
-                raise ValueError(
-                    f"pressed HMM/profile score mismatch at ordinal {ordinal}"
-                )
-            pairs.append(
-                _new_pressed_profile_pair(
+                if hmm.alphabet != amino_alphabet:
+                    raise ValueError(
+                        "bound candidate search only supports amino-acid profiles"
+                    )
+                if (
+                    hmm.alphabet != optimized_profile.alphabet
+                    or hmm.M != optimized_profile.M
+                    or hmm.name != optimized_profile.name
+                    or hmm.accession != optimized_profile.accession
+                    or hmm.consensus != optimized_profile.consensus
+                ):
+                    raise ValueError(
+                        f"pressed HMM/profile identity mismatch at ordinal {ordinal}"
+                    )
+                canonical_background = pyhmmer.plan7.Background(hmm.alphabet)
+                if manifest_validation is None and not _verify_pressed_profile(
                     hmm,
                     optimized_profile,
-                    base,
-                    ordinal,
-                    before,
-                    _CutoffSnapshot(
-                        hmm.cutoffs.gathering,
-                        hmm.cutoffs.noise,
-                        hmm.cutoffs.trusted,
-                    ),
-                    _background_fingerprint(canonical_background),
+                    canonical_background,
+                    pipeline_module,
+                ):
+                    raise ValueError(
+                        f"pressed HMM/profile score mismatch at ordinal {ordinal}"
+                    )
+                pairs.append(
+                    _new_pressed_profile_pair(
+                        hmm,
+                        optimized_profile,
+                        base,
+                        ordinal,
+                        before,
+                        _CutoffSnapshot(
+                            hmm.cutoffs.gathering,
+                            hmm.cutoffs.noise,
+                            hmm.cutoffs.trusted,
+                        ),
+                        _background_fingerprint(canonical_background),
+                    )
                 )
-            )
 
-    after = _pressed_stat_token(base)
-    if after != before:
-        raise RuntimeError("pressed database changed while it was being loaded")
+    if (
+        manifest_validation is not None
+        and len(pairs) != manifest_validation.model_count
+    ):
+        raise ValueError("pressed profile count does not match the validated manifest")
     return tuple(pairs)
 
 

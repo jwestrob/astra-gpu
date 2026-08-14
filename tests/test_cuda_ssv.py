@@ -1,11 +1,14 @@
 import io
+import json
 import math
+import os
 import shutil
 import struct
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from array import array
 from pathlib import Path
 
@@ -32,6 +35,7 @@ try:
         _sequence_native,
     )
     from plan7_gpu._abi import pyhmmer_abi_fingerprint
+    import plan7_gpu.pressed_manifest as pressed_manifest
 except ImportError:
     SequenceBatch = None
     _native = None
@@ -47,6 +51,7 @@ except ImportError:
     _pair_state = None
     _sequence_native = None
     pyhmmer_abi_fingerprint = None
+    pressed_manifest = None
 
 HMM_20AA = ROOT / "refs" / "src" / "hmmer-3.4" / "testsuite" / "20aa.hmm"
 HMM_M1 = ROOT / "refs" / "src" / "hmmer-3.4" / "testsuite" / "M1.hmm"
@@ -785,6 +790,8 @@ class CudaCandidateBatchTests(unittest.TestCase):
             with pyhmmer.plan7.HMMFile(path) as hmm_file:
                 hmms.extend(hmm_file)
         pyhmmer.hmmer.hmmpress(hmms, cls.pressed_base)
+        cls.manifest_path = Path(cls._temporary.name) / "globins.manifest.json"
+        pressed_manifest.create_pressed_manifest(cls.pressed_base, cls.manifest_path)
         cls.pairs = load_pressed_profiles(cls.pressed_base)
         cls.alphabet = cls.pairs[0].hmm.alphabet
         with pyhmmer.easel.SequenceFile(
@@ -813,6 +820,14 @@ class CudaCandidateBatchTests(unittest.TestCase):
         output = io.BytesIO()
         hmm.write(output, binary=True)
         return output.getvalue()
+
+    def copy_pressed_database(self, label):
+        directory = Path(self._temporary.name) / self._testMethodName / label
+        directory.mkdir(parents=True)
+        base = directory / self.pressed_base.name
+        for suffix in pressed_manifest.PRESSED_SUFFIXES:
+            shutil.copy2(f"{self.pressed_base}.{suffix}", f"{base}.{suffix}")
+        return base
 
     def assert_exact_hits(self, expected, actual):
         fields = (
@@ -861,6 +876,199 @@ class CudaCandidateBatchTests(unittest.TestCase):
         expected_second = expected_pipeline.search_hmm(pair.hmm, self.targets)
         actual_second = candidates.search(0, actual_pipeline)
         self.assert_exact_hits(expected_second, actual_second)
+
+    def test_manifest_fast_path_skips_rebuild_and_is_exact(self):
+        with mock.patch(
+            "plan7_gpu.adapter._verify_pressed_profile",
+            side_effect=AssertionError("manifest path rebuilt a profile"),
+        ):
+            fast_pairs = load_pressed_profiles(
+                self.pressed_base, manifest=self.manifest_path
+            )
+
+        self.assertEqual(len(fast_pairs), len(self.pairs))
+        for expected, observed in zip(self.pairs, fast_pairs, strict=True):
+            self.assertEqual(expected.canonical_base, observed.canonical_base)
+            self.assertEqual(expected.ordinal, observed.ordinal)
+            self.assertEqual(expected.stat_token, observed.stat_token)
+            self.assertIs(type(expected.stat_token), type(observed.stat_token))
+            self.assertEqual(expected.cutoffs, observed.cutoffs)
+            self.assertEqual(self.hmm_bytes(expected.hmm), self.hmm_bytes(observed.hmm))
+
+        pair = fast_pairs[0]
+        with SequenceBatch(self.targets) as sequences:
+            full_candidates = sequences.candidate_batch([self.pairs[0]])
+            fast_candidates = sequences.candidate_batch([pair])
+        full_state = _candidate_state(full_candidates)
+        fast_state = _candidate_state(fast_candidates)
+        self.assertEqual(full_state.all_rows, fast_state.all_rows)
+        self.assertEqual(full_state.indices, fast_state.indices)
+        self.assertEqual(full_state.offsets, fast_state.offsets)
+        self.assertEqual(full_state.all_targets, fast_state.all_targets)
+        self.assertEqual(
+            fast_candidates.candidate_count(0),
+            full_candidates.candidate_count(0),
+        )
+        expected = self.pipeline().search_hmm(pair.hmm, self.targets)
+        actual = fast_candidates.search(0, self.pipeline())
+        self.assert_exact_hits(expected, actual)
+
+    def test_manifest_corruption_wrong_database_and_count_fail_closed(self):
+        directory = Path(self._temporary.name) / self._testMethodName
+        directory.mkdir()
+
+        corrupt_manifest = directory / "corrupt.json"
+        corrupt_manifest.write_bytes(b"{not valid JSON")
+        with self.assertRaises(pressed_manifest.PressedManifestError):
+            load_pressed_profiles(self.pressed_base, manifest=corrupt_manifest)
+
+        wrong_base = directory / "wrong" / self.pressed_base.name
+        wrong_base.parent.mkdir()
+        pyhmmer.hmmer.hmmpress([self.pairs[-1].hmm], wrong_base)
+        wrong_manifest = directory / "wrong.manifest.json"
+        pressed_manifest.create_pressed_manifest(wrong_base, wrong_manifest)
+        with self.assertRaisesRegex(
+            pressed_manifest.PressedManifestError, "(?:size|SHA256) mismatch"
+        ):
+            load_pressed_profiles(self.pressed_base, manifest=wrong_manifest)
+
+        count_manifest = directory / "count.manifest.json"
+        count_data = json.loads(self.manifest_path.read_text(encoding="ascii"))
+        count_data["database"]["model_count"] += 1
+        count_data["verification"]["models_compared"] += 1
+        count_manifest.write_text(
+            json.dumps(count_data, indent=2, sort_keys=True) + "\n",
+            encoding="ascii",
+        )
+        with self.assertRaisesRegex(ValueError, "profile count"):
+            load_pressed_profiles(self.pressed_base, manifest=count_manifest)
+
+    def test_manifest_validation_to_load_token_drift_fails_before_open(self):
+        copied_base = self.copy_pressed_database("drift")
+        original_validate = pressed_manifest.validate_pressed_manifest
+
+        def validate_then_drift(database, manifest, **options):
+            validation = original_validate(database, manifest, **options)
+            member = Path(f"{database}.h3m")
+            metadata = member.stat()
+            os.utime(
+                member,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+            )
+            return validation
+
+        with (
+            mock.patch.object(
+                pressed_manifest,
+                "validate_pressed_manifest",
+                side_effect=validate_then_drift,
+            ),
+            mock.patch.object(
+                pyhmmer.plan7,
+                "HMMFile",
+                side_effect=AssertionError("database opened after token drift"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "changed after.*validated"),
+        ):
+            load_pressed_profiles(copied_base, manifest=self.manifest_path)
+
+    def test_pinned_loader_ignores_parent_symlink_target_swap(self):
+        perturbed_hmms = [pair.hmm for pair in self.pairs]
+        perturbed = perturbed_hmms[0]
+        row = perturbed.match_emissions[1]
+        source, destination = sorted(range(len(row)), key=row.__getitem__)[:2]
+        epsilon = min(float(row[source]) / 2.0, 1e-4)
+        row[source] -= epsilon
+        row[destination] += epsilon
+        perturbed.renormalize()
+        self.assertEqual(perturbed.consensus, self.pairs[0].hmm.consensus)
+        self.assertNotEqual(
+            self.hmm_bytes(perturbed), self.hmm_bytes(self.pairs[0].hmm)
+        )
+
+        original_hmm_file = pyhmmer.plan7.HMMFile
+        original_pressed_file = pyhmmer.plan7.HMMPressedFile
+        options = {
+            "without-manifest": {},
+            "with-manifest": {"manifest": self.manifest_path},
+        }
+        for label, load_options in options.items():
+            with self.subTest(label):
+                victim_base = self.copy_pressed_database(label)
+                root = victim_base.parent.parent
+                perturbed_directory = root / f"{label}-perturbed"
+                perturbed_directory.mkdir()
+                perturbed_base = perturbed_directory / victim_base.name
+                pyhmmer.hmmer.hmmpress(perturbed_hmms, perturbed_base)
+                parked_directory = root / f"{label}-parked"
+                victim_directory = victim_base.parent
+                swapped = False
+
+                def swap_parent_then_open(path, *args, **kwargs):
+                    nonlocal swapped
+                    if not swapped:
+                        os.rename(victim_directory, parked_directory)
+                        os.symlink(
+                            perturbed_directory,
+                            victim_directory,
+                            target_is_directory=True,
+                        )
+                        swapped = True
+                    return original_hmm_file(path, *args, **kwargs)
+
+                def restore_parent():
+                    if victim_directory.is_symlink():
+                        victim_directory.unlink()
+                        os.rename(parked_directory, victim_directory)
+
+                class RestoreAfterPressedRead:
+                    def __init__(self, inner):
+                        self.inner = inner
+
+                    def __enter__(self):
+                        return self.inner.__enter__()
+
+                    def __exit__(self, *args):
+                        try:
+                            return self.inner.__exit__(*args)
+                        finally:
+                            restore_parent()
+
+                def open_pressed(path, *args, **kwargs):
+                    return RestoreAfterPressedRead(
+                        original_pressed_file(path, *args, **kwargs)
+                    )
+
+                try:
+                    with (
+                        mock.patch.object(
+                            pyhmmer.plan7,
+                            "HMMFile",
+                            side_effect=swap_parent_then_open,
+                        ),
+                        mock.patch.object(
+                            pyhmmer.plan7,
+                            "HMMPressedFile",
+                            side_effect=open_pressed,
+                        ),
+                    ):
+                        observed = load_pressed_profiles(victim_base, **load_options)
+                finally:
+                    restore_parent()
+
+                self.assertTrue(swapped)
+                self.assertEqual(len(observed), len(self.pairs))
+                self.assertEqual(
+                    tuple(self.hmm_bytes(pair.hmm) for pair in observed),
+                    tuple(self.hmm_bytes(pair.hmm) for pair in self.pairs),
+                )
+                self.assertNotEqual(
+                    self.hmm_bytes(observed[0].hmm),
+                    self.hmm_bytes(perturbed),
+                )
+                self.assertTrue(
+                    all(pair.canonical_base == victim_base for pair in observed)
+                )
 
     def test_f1_and_row_mismatches_fail_before_pipeline_mutation(self):
         pair = self.pairs[0]
