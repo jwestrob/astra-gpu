@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 
 from scripts.summarize_oracle import OracleSummaryError, summarize
 
@@ -22,6 +23,7 @@ def comparison(index: int, agreement: bool = True) -> dict[str, object]:
                 "status": agreement,
                 "score_bits": agreement,
                 "xE_u8": agreement,
+                "xE_required": True,
             },
         },
         "scalar_full_msv": {"status": "eslOK"},
@@ -70,6 +72,7 @@ class SummarizeOracleTests(unittest.TestCase):
         self.assertEqual(result["public_vs_full_msv"]["score_bit_mismatches"], 1)
         self.assertEqual(result["scalar_ssv"]["statuses"], {"eslOK": 2})
         self.assertEqual(result["scalar_ssv"]["xE_u8_mismatches"], 0)
+        self.assertEqual(result["scalar_ssv"]["required_xE_u8_mismatches"], 0)
 
     def test_rejects_disagreement_with_terminal_summary(self) -> None:
         self.write(
@@ -81,6 +84,24 @@ class SummarizeOracleTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(OracleSummaryError, "mismatch count"):
             summarize(self.path)
+
+    def test_overflow_raw_maximum_is_diagnostic(self) -> None:
+        record = comparison(0)
+        scalar_ssv = cast(dict[str, object], record["scalar_ssv"])
+        agreement = cast(dict[str, bool], scalar_ssv["agreement"])
+        agreement["xE_u8"] = False
+        agreement["xE_required"] = False
+        self.write(
+            [
+                {"record": "metadata"},
+                record,
+                {"record": "summary", "comparisons": 1, "mismatches": 0},
+            ]
+        )
+        result = summarize(self.path)
+        self.assertEqual(result["mismatches"], 0)
+        self.assertEqual(result["scalar_ssv"]["xE_u8_mismatches"], 1)
+        self.assertEqual(result["scalar_ssv"]["required_xE_u8_mismatches"], 0)
 
     def test_accepts_pipeline_skipped_empty_sequence(self) -> None:
         self.write(

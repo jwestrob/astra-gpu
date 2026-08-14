@@ -557,6 +557,7 @@ main(int argc, char **argv)
       int scalar_ssv_status_agreement;
       int scalar_ssv_score_agreement;
       int scalar_ssv_xe_agreement;
+      int scalar_ssv_xe_required;
       int full_status_agreement;
       int full_score_agreement;
       int pass;
@@ -588,6 +589,10 @@ main(int argc, char **argv)
       scalar_ssv_score_agreement = float_bits_equal(ssv_score, scalar_ssv_result.score);
       scalar_ssv_xe_agreement =
         (get_xE(sequence->dsq, length, optimized) == scalar_ssv_result.xe);
+      /* Once SSV has entered an overflow/uncertain region, its internal xE
+       * is not part of the public result and traversal-equivalent recurrences
+       * may retain different maxima. Finite direct scores still require it. */
+      scalar_ssv_xe_required = (ssv_status == eslOK);
 
       path = msv_path(ssv_status, public_status);
       full_status_agreement = (public_status == scalar.status);
@@ -610,7 +615,7 @@ main(int argc, char **argv)
       }
       if (!status_agreement || !score_agreement ||
           !scalar_ssv_status_agreement || !scalar_ssv_score_agreement ||
-          !scalar_ssv_xe_agreement)
+          (scalar_ssv_xe_required && !scalar_ssv_xe_agreement))
         mismatches++;
       comparisons++;
 
@@ -638,10 +643,12 @@ main(int argc, char **argv)
       printf("},\"scalar_ssv\":{\"status\":\"%s\",\"xE_u8\":%u,\"score\":",
              status_name(scalar_ssv_result.status), (unsigned int) scalar_ssv_result.xe);
       print_float_value(scalar_ssv_result.score);
-      printf(",\"agreement\":{\"status\":%s,\"score_bits\":%s,\"xE_u8\":%s}",
+      printf(",\"agreement\":{\"status\":%s,\"score_bits\":%s,\"xE_u8\":%s,"
+             "\"xE_required\":%s}",
              scalar_ssv_status_agreement ? "true" : "false",
              scalar_ssv_score_agreement ? "true" : "false",
-             scalar_ssv_xe_agreement ? "true" : "false");
+             scalar_ssv_xe_agreement ? "true" : "false",
+             scalar_ssv_xe_required ? "true" : "false");
       printf("},\"public_msv\":{\"status\":\"%s\",\"score\":", status_name(public_status));
       print_float_value(public_score);
       printf("},\"scalar_full_msv\":{\"status\":\"%s\",\"xJ_u8\":%u,\"overflow_row\":%d,\"overflow_xE_u8\":%u,\"score\":",

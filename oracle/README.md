@@ -4,8 +4,10 @@
 `p7_MSVFilter()` and independent scalar implementations of both its signed-byte
 SSV and unsigned-byte full-MSV recurrences. The scalar paths unpack profile
 costs but do not call or copy the striped SIMD recurrences. Strict mode checks
-the scalar SSV status, score bits, and raw maximum on every pair; on an
-`eslENORESULT` fallback it also checks the scalar full-MSV result. The
+the scalar SSV status and score bits on every pair, plus the raw maximum on
+finite direct results; on an `eslENORESULT` fallback it also checks the scalar
+full-MSV result. Maxima after entering an overflow/uncertain region are kept as
+diagnostics because they are not part of SSV's public result. The
 `public_vs_full_msv` fields remain available as diagnostics because SSV may
 return a documented conservative overestimate of literal full MSV. Therefore,
 a GPU that computes only literal full MSV cannot be assumed bit-identical to

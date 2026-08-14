@@ -142,6 +142,7 @@
     "status_mismatches": 0
   },
   "scalar_ssv": {
+    "required_xE_u8_mismatches": 0,
     "score_bit_mismatches": 0,
     "status_mismatches": 0,
     "statuses": {
@@ -159,6 +160,6 @@
   "skipped": {},
   "source": {
     "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/oracle/hmm-quantiles-protein-quantiles-21x52.jsonl",
-    "sha256": "b39ea91edcc726335c04a0e79601be7161f5faae287063eea80f2d7f85779a2e"
+    "sha256": "e90c9727fa046c2803c6d35b46897d0a773d69d4de3dee19c685969f80b5ef21"
   }
 }

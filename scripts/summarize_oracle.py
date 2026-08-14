@@ -47,6 +47,7 @@ def summarize(path: Path) -> dict[str, object]:
     scalar_ssv_status_mismatches = 0
     scalar_ssv_score_mismatches = 0
     scalar_ssv_xe_mismatches = 0
+    scalar_ssv_required_xe_mismatches = 0
     passes = 0
 
     with path.open("rb") as handle:
@@ -82,10 +83,17 @@ def summarize(path: Path) -> dict[str, object]:
                     scalar_ssv_status_mismatches += not scalar_ssv_agreement["status"]
                     scalar_ssv_score_mismatches += not scalar_ssv_agreement["score_bits"]
                     scalar_ssv_xe_mismatches += not scalar_ssv_agreement["xE_u8"]
+                    scalar_ssv_required_xe_mismatches += (
+                        scalar_ssv_agreement.get("xE_required", True)
+                        and not scalar_ssv_agreement["xE_u8"]
+                    )
                     scalar_ssv_mismatch = (
                         not scalar_ssv_agreement["status"]
                         or not scalar_ssv_agreement["score_bits"]
-                        or not scalar_ssv_agreement["xE_u8"]
+                        or (
+                            scalar_ssv_agreement.get("xE_required", True)
+                            and not scalar_ssv_agreement["xE_u8"]
+                        )
                     )
                 agreement = record["agreement"]
                 agreement_references[str(agreement.get("reference", "legacy"))] += 1
@@ -148,6 +156,7 @@ def summarize(path: Path) -> dict[str, object]:
             "status_mismatches": scalar_ssv_status_mismatches,
             "score_bit_mismatches": scalar_ssv_score_mismatches,
             "xE_u8_mismatches": scalar_ssv_xe_mismatches,
+            "required_xE_u8_mismatches": scalar_ssv_required_xe_mismatches,
         },
         "passes_F1": passes,
         "msv_paths": dict(sorted(paths.items())),
