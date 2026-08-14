@@ -1,0 +1,91 @@
+{
+  "created_at_utc": "2026-08-14T12:49:58.445339Z",
+  "database": {
+    "artifacts": {
+      "h3f": {
+        "filename": "KOFAM.h3f",
+        "sha256": "71097769b4392b55d55ce4cdf5b9624614a8c8108e1bcea6393e930cd1c7bbe4",
+        "size_bytes": 1186762272
+      },
+      "h3i": {
+        "filename": "KOFAM.h3i",
+        "sha256": "4c60adb8cc057571a9c4cc14f32f019b47898b40534a562a2fa56dae56697175",
+        "size_bytes": 918063
+      },
+      "h3m": {
+        "filename": "KOFAM.h3m",
+        "sha256": "674e7c7b4aefa30393995f0f91c211d822fa0b79bb313f232ebf7f37d871302d",
+        "size_bytes": 3171683747
+      },
+      "h3p": {
+        "filename": "KOFAM.h3p",
+        "sha256": "1af92cd96d48ed953a9da38e63a71d460b7797f5254b81d58ab31d3cffe37883",
+        "size_bytes": 3720988324
+      }
+    },
+    "base_name": "KOFAM",
+    "model_count": 27816,
+    "stat_token": {
+      "h3f": {
+        "ctime_ns": 1786031447073760287,
+        "device": 87,
+        "inode": 3713185463665398594,
+        "mtime_ns": 1786031447073760287,
+        "size": 1186762272
+      },
+      "h3i": {
+        "ctime_ns": 1786031446912403495,
+        "device": 87,
+        "inode": 15401081548415574183,
+        "mtime_ns": 1786031446912403495,
+        "size": 918063
+      },
+      "h3m": {
+        "ctime_ns": 1786031447502524493,
+        "device": 87,
+        "inode": 7464376903321810490,
+        "mtime_ns": 1786031447502524493,
+        "size": 3171683747
+      },
+      "h3p": {
+        "ctime_ns": 1786031448007539702,
+        "device": 87,
+        "inode": 2363711448966185908,
+        "mtime_ns": 1786031448007539702,
+        "size": 3720988324
+      }
+    }
+  },
+  "schema": "plan7-gpu-pressed-profile-manifest",
+  "schema_version": 1,
+  "tool": {
+    "audit_algorithm": "canonical-hmmpress-serialized-oprofile-v1",
+    "name": "plan7_gpu.pressed_manifest",
+    "platform": {
+      "byteorder": "little",
+      "machine": "x86_64",
+      "pointer_bits": 64,
+      "system": "Linux"
+    },
+    "private_abi": {
+      "algorithm": "plan7-gpu-pyhmmer-private-abi-v1",
+      "sha256": "169ae774dc6336f4941af349065e6138f4eb2922485606a59ca2dc3ab94d30ff"
+    },
+    "pyhmmer_version": "0.12.0",
+    "python": {
+      "implementation": "CPython",
+      "version": "3.12.0"
+    },
+    "source": {
+      "filename": "pressed_manifest.py",
+      "sha256": "0f8f0e00fe66d131f642d637183596eac4940f154e05985319854f7092faec82"
+    },
+    "version": 1
+  },
+  "verification": {
+    "comparison": "exact serialized h3f and h3p bytes after pressed-offset normalization",
+    "models_compared": 27816,
+    "reference": "HMM.to_profile(default Background, L=pressed L)",
+    "result": "passed"
+  }
+}
