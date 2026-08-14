@@ -16,12 +16,11 @@ threshold logic, downstream HMMER pipeline, or result formatting.
 
 ## Status
 
-The correctness oracle agrees with pristine HMMER on the initial 11,145
-comparisons and covers all four SSV/fallback outcomes. Direct measurements in
-Astra show that stage one is about 45% of wall time for the PFAM pilot but only
-26% for HydDB, so GPU use must be workload-selective. The GPU target is the
-public SSV-first behavior, not generic full MSV. No GPU performance claim
-exists yet.
+The first CUDA SSV kernel matches HMMER's public status and score on 21,000
+real profile/sequence pairs and passes CUDA memory checking. Direct Astra
+measurements put stage one at about 45% of wall time for the PFAM pilot but
+only 26% for HydDB, so GPU use must be workload-selective. Host packing and
+end-to-end Astra integration remain open; there is no performance claim yet.
 
 ## Layout
 
