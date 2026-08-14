@@ -61,6 +61,19 @@ struct plan7_postfilter_result;
 
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 
+/* Immutable device-input view for sibling CUDA stages. The owning sequence
+ * batch must outlive every use of this view. */
+typedef struct plan7_ssv_sequence_batch_view {
+  int device_ordinal;
+  int alphabet_size;
+  int host_float_environment_valid;
+  size_t sequence_count;
+  const uint64_t *host_lengths;
+  const uint8_t *device_residues;
+  const uint64_t *device_offsets;
+  uint64_t input_device_bytes;
+} plan7_ssv_sequence_batch_view;
+
 int plan7_cuda_device_count(char *error, size_t error_size);
 int plan7_tjb_for_length(float scale, uint64_t length);
 int plan7_ssv_f1_decision(uint8_t status,
@@ -96,6 +109,12 @@ int plan7_ssv_sequence_batch_create(const uint8_t *residues,
 int plan7_ssv_sequence_batch_destroy(plan7_ssv_sequence_batch **batch,
                                      char *error,
                                      size_t error_size);
+
+int plan7_ssv_sequence_batch_get_view(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_ssv_sequence_batch_view *view,
+  char *error,
+  size_t error_size);
 
 int plan7_ssv_sequence_batch_filter(plan7_ssv_sequence_batch *batch,
                                     const uint8_t *striped_scores,

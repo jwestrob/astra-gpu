@@ -1,7 +1,7 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
 
 from libc.stddef cimport size_t
-from libc.stdint cimport int16_t, int32_t, uintptr_t, uint8_t, uint32_t, uint64_t
+from libc.stdint cimport int16_t, int32_t, uintptr_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.math cimport isfinite
 from libc.string cimport memcpy
 from cpython.array cimport array as carray, clone
@@ -32,6 +32,7 @@ if _runtime_abi_sha256 != PYHMMER_PRIVATE_ABI_SHA256:
 
 cdef carray _UINT32_ARRAY_TEMPLATE = _array.array("I")
 cdef carray _UINT64_ARRAY_TEMPLATE = _array.array("Q")
+cdef carray _FLOAT_ARRAY_TEMPLATE = _array.array("f")
 
 
 cdef extern from * nogil:
@@ -344,6 +345,130 @@ cdef extern from "postfilter_cuda.h" nogil:
     )
 
 
+cdef extern from "forward_cuda.h" nogil:
+    cdef enum plan7_forward_abi:
+        PLAN7_FORWARD_RECORD_VERSION
+        PLAN7_FORWARD_RECORD_SIZE
+        PLAN7_FORWARD_MAX_GATHERED_BYTES
+
+    cdef enum plan7_forward_action:
+        PLAN7_FORWARD_CPU_REQUIRED
+        PLAN7_FORWARD_DEFINITE_REJECT
+        PLAN7_FORWARD_DEFINITE_PASS
+
+    cdef enum plan7_forward_status:
+        PLAN7_FORWARD_OK
+        PLAN7_FORWARD_ERANGE
+        PLAN7_FORWARD_ENORESULT
+        PLAN7_FORWARD_EMPTY
+
+    ctypedef struct plan7_forward_result:
+        uint32_t sequence_index
+        float fwdsc
+        uint8_t status
+        uint8_t action
+        uint16_t reserved
+
+    ctypedef struct plan7_forward_statistics:
+        uint64_t generation_f3_bits
+        uint64_t candidate_count
+        uint64_t survivor_count
+        uint64_t work_cells
+        uint64_t dp_workspace_bytes
+        uint64_t xmx_workspace_bytes
+        uint64_t gather_workspace_bytes
+        uint64_t gathered_xmx_bytes
+        uint64_t output_byte_limit
+        uint64_t output_cap_fallback_count
+        float kernel_milliseconds
+        float classification_milliseconds
+        float gather_milliseconds
+        float download_milliseconds
+        float total_milliseconds
+
+    ctypedef struct plan7_forward_database:
+        pass
+
+    ctypedef struct plan7_forward_output:
+        pass
+
+    int plan7_forward_database_create(
+        const uintptr_t *profile_pointers,
+        size_t profile_count,
+        plan7_forward_database **database,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_forward_database_destroy(
+        plan7_forward_database **database,
+        char *error,
+        size_t error_size,
+    )
+
+    size_t plan7_forward_database_profile_count(
+        const plan7_forward_database *database,
+    )
+
+    uint64_t plan7_forward_database_device_bytes(
+        const plan7_forward_database *database,
+    )
+
+    float plan7_forward_database_pack_milliseconds(
+        const plan7_forward_database *database,
+    )
+
+    float plan7_forward_database_upload_milliseconds(
+        const plan7_forward_database *database,
+    )
+
+    int plan7_forward_run(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const uintptr_t *source_profile_pointers,
+        size_t profile_count,
+        const uint64_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        const float *filter_scores,
+        size_t candidate_count,
+        double f3,
+        uint64_t gathered_byte_budget,
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_forward_output_destroy(
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    size_t plan7_forward_output_result_count(
+        const plan7_forward_output *output,
+    )
+
+    const plan7_forward_result *plan7_forward_output_results(
+        const plan7_forward_output *output,
+    )
+
+    const uint64_t *plan7_forward_output_special_offsets(
+        const plan7_forward_output *output,
+    )
+
+    size_t plan7_forward_output_special_count(
+        const plan7_forward_output *output,
+    )
+
+    const float *plan7_forward_output_specials(
+        const plan7_forward_output *output,
+    )
+
+    const plan7_forward_statistics *plan7_forward_output_statistics(
+        const plan7_forward_output *output,
+    )
+
+
 cdef union float_bits:
     float value
     uint32_t bits
@@ -610,7 +735,11 @@ def pack_striped_scores(
 
 
 cdef class ViterbiProfiles:
-    """Device-resident exact Viterbi profiles for the raw post-filter API."""
+    """Device-resident exact Viterbi profiles for the raw post-filter API.
+
+    Operations must not overlap each other or ``close``. Concurrent ``close``
+    calls are safe.
+    """
 
     cdef plan7_viterbi_database *_database
     cdef tuple _owners
@@ -669,20 +798,120 @@ cdef class ViterbiProfiles:
         self.close()
 
     def close(self):
+        cdef plan7_viterbi_database *database = NULL
         cdef char error[512]
-        cdef int status
+        cdef int status = 0
         if self._database != NULL:
+            database = self._database
+            self._database = NULL
+            self._owners = ()
             error[0] = 0
             with nogil:
                 status = plan7_viterbi_database_destroy(
-                    &self._database, error, sizeof(error)
+                    &database, error, sizeof(error)
                 )
             if status != 0:
                 raise RuntimeError(error.decode("utf-8", "replace"))
+
+
+cdef class ForwardProfiles:
+    """Device-resident exact Forward profiles for F3 classification.
+
+    Operations must not overlap each other or ``close``. Concurrent ``close``
+    calls are safe.
+    """
+
+    cdef plan7_forward_database *_database
+    cdef tuple _owners
+
+    def __cinit__(self):
+        self._database = NULL
+        self._owners = ()
+
+    def __init__(self, profiles):
+        cdef tuple owners = tuple(profiles)
+        cdef vector[uintptr_t] pointers
+        cdef OptimizedProfile profile
+        cdef object value
+        cdef char error[512]
+        cdef int status
+
+        if self._database != NULL:
+            raise RuntimeError("Forward profiles are already initialized")
+        pointers.reserve(len(owners))
+        for value in owners:
+            if not isinstance(value, OptimizedProfile):
+                raise TypeError("Forward profiles must be OptimizedProfile objects")
+            profile = value
+            pointers.push_back(<uintptr_t> profile._om)
+        error[0] = 0
+        # Keep the GIL while native code takes its exact private-array snapshot.
+        status = plan7_forward_database_create(
+            pointers.data() if pointers.size() else NULL,
+            pointers.size(),
+            &self._database,
+            error,
+            sizeof(error),
+        )
+        if status != 0:
+            raise ValueError(error.decode("utf-8", "replace"))
+        self._owners = owners
+
+    def __dealloc__(self):
+        if self._database != NULL:
+            plan7_forward_database_destroy(&self._database, NULL, 0)
+
+    def __len__(self):
+        if self._database == NULL:
+            return 0
+        return plan7_forward_database_profile_count(self._database)
+
+    @property
+    def closed(self):
+        return self._database == NULL
+
+    @property
+    def statistics(self):
+        if self._database == NULL:
+            raise RuntimeError("Forward profiles are closed")
+        return {
+            "device_bytes": plan7_forward_database_device_bytes(self._database),
+            "pack_ms": plan7_forward_database_pack_milliseconds(self._database),
+            "upload_ms": plan7_forward_database_upload_milliseconds(self._database),
+        }
+
+    def __enter__(self):
+        if self._database == NULL:
+            raise RuntimeError("Forward profiles are closed")
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def close(self):
+        cdef plan7_forward_database *database = NULL
+        cdef char error[512]
+        cdef int status = 0
+        if self._database != NULL:
+            database = self._database
+            self._database = NULL
             self._owners = ()
+            error[0] = 0
+            with nogil:
+                status = plan7_forward_database_destroy(
+                    &database, error, sizeof(error)
+                )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
 
 
 cdef class SequenceBatch:
+    """Device-resident target batch for raw CUDA operations.
+
+    Operations must not overlap each other or ``close``. Concurrent ``close``
+    calls are safe.
+    """
+
     cdef plan7_ssv_sequence_batch *_batch
     cdef vector[plan7_ssv_result] _results
     cdef vector[plan7_ssv_result] _many_results
@@ -756,16 +985,19 @@ cdef class SequenceBatch:
         self.close()
 
     def close(self):
-        cdef char error[512]
-        cdef int status
+        cdef plan7_ssv_sequence_batch *batch = NULL
+        cdef char ssv_error[512]
+        cdef int ssv_status = 0
         if self._batch != NULL:
-            error[0] = 0
+            batch = self._batch
+            self._batch = NULL
+            ssv_error[0] = 0
             with nogil:
-                status = plan7_ssv_sequence_batch_destroy(
-                    &self._batch, error, sizeof(error)
+                ssv_status = plan7_ssv_sequence_batch_destroy(
+                    &batch, ssv_error, sizeof(ssv_error)
                 )
-            if status != 0:
-                raise RuntimeError(error.decode("utf-8", "replace"))
+        if ssv_status != 0:
+            raise RuntimeError(ssv_error.decode("utf-8", "replace"))
 
     cdef int _run_filter(
         self,
@@ -1385,6 +1617,166 @@ cdef class SequenceBatch:
             )
         return records, offsets
 
+    def forward_candidates_many_raw(
+        self,
+        const uint64_t[::1] candidate_offsets,
+        const uint32_t[::1] candidate_indices,
+        const float[::1] filter_scores,
+        double f3,
+        source_profiles,
+        ForwardProfiles forward_profiles,
+        uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
+    ):
+        """Classify F3 and return only passing parser special-state rows."""
+        cdef char error[512]
+        cdef int status
+        cdef size_t profile_count
+        cdef size_t candidate_count = <size_t> candidate_indices.shape[0]
+        cdef size_t result_count
+        cdef size_t result_bytes
+        cdef size_t special_count
+        cdef size_t special_bytes
+        cdef size_t profile_index
+        cdef tuple owners = tuple(source_profiles)
+        cdef vector[uintptr_t] source_pointers
+        cdef OptimizedProfile source_profile
+        cdef object value
+        cdef plan7_forward_output *output = NULL
+        cdef const plan7_forward_result *native_results
+        cdef const uint64_t *native_offsets
+        cdef const float *native_specials
+        cdef const plan7_forward_statistics *native_statistics
+        cdef bytearray records
+        cdef uint8_t[::1] record_view
+        cdef carray offsets
+        cdef carray specials
+        cdef dict statistics
+
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        if forward_profiles._database == NULL:
+            raise RuntimeError("Forward profiles are closed")
+        if candidate_offsets.shape[0] == 0:
+            raise ValueError("candidate offsets must contain an initial zero")
+        profile_count = <size_t> candidate_offsets.shape[0] - 1
+        if <size_t> filter_scores.shape[0] != candidate_count:
+            raise ValueError("Forward candidate score lengths differ")
+        if len(owners) != profile_count:
+            raise ValueError("source and Forward profile counts differ")
+        if plan7_forward_database_profile_count(
+            forward_profiles._database
+        ) != profile_count:
+            raise ValueError("Forward profile and candidate row counts differ")
+        source_pointers.reserve(profile_count)
+        for profile_index in range(profile_count):
+            value = owners[profile_index]
+            if not isinstance(value, OptimizedProfile):
+                raise TypeError(
+                    "source profiles must be OptimizedProfile objects"
+                )
+            if value is not forward_profiles._owners[profile_index]:
+                raise ValueError(
+                    "source profile identity differs from Forward profile row"
+                )
+            source_profile = value
+            source_pointers.push_back(<uintptr_t> source_profile._om)
+        if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
+            raise RuntimeError("array('Q') is not native uint64")
+        if _FLOAT_ARRAY_TEMPLATE.itemsize != sizeof(float):
+            raise RuntimeError("array('f') is not native float32")
+        if sizeof(plan7_forward_result) != PLAN7_FORWARD_RECORD_SIZE:
+            raise RuntimeError("Forward result ABI size mismatch")
+
+        error[0] = 0
+        # Keep the GIL while native code validates live private profile arrays.
+        status = plan7_forward_run(
+            forward_profiles._database,
+            self._batch,
+            source_pointers.data() if profile_count else NULL,
+            profile_count,
+            &candidate_offsets[0],
+            &candidate_indices[0] if candidate_count else NULL,
+            &filter_scores[0] if candidate_count else NULL,
+            candidate_count,
+            f3,
+            gathered_byte_budget,
+            &output,
+            error,
+            sizeof(error),
+        )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        try:
+            result_count = plan7_forward_output_result_count(output)
+            if result_count != candidate_count:
+                raise RuntimeError("Forward result count changed")
+            if result_count > (<size_t> -1) // sizeof(plan7_forward_result):
+                raise OverflowError("Forward result size overflows size_t")
+            result_bytes = result_count * sizeof(plan7_forward_result)
+            records = bytearray(result_bytes)
+            native_results = plan7_forward_output_results(output)
+            if result_bytes:
+                if native_results == NULL:
+                    raise RuntimeError("Forward result storage is null")
+                record_view = records
+                memcpy(&record_view[0], native_results, result_bytes)
+
+            native_offsets = plan7_forward_output_special_offsets(output)
+            if native_offsets == NULL:
+                raise RuntimeError("Forward special offsets are null")
+            offsets = clone(_UINT64_ARRAY_TEMPLATE, result_count + 1, False)
+            memcpy(
+                offsets.data.as_ulonglongs,
+                native_offsets,
+                (result_count + 1) * sizeof(uint64_t),
+            )
+
+            special_count = plan7_forward_output_special_count(output)
+            if special_count > (<size_t> -1) // sizeof(float):
+                raise OverflowError("Forward special matrix size overflows size_t")
+            special_bytes = special_count * sizeof(float)
+            specials = clone(_FLOAT_ARRAY_TEMPLATE, special_count, False)
+            native_specials = plan7_forward_output_specials(output)
+            if special_bytes:
+                if native_specials == NULL:
+                    raise RuntimeError("Forward special matrix is null")
+                memcpy(
+                    specials.data.as_floats,
+                    native_specials,
+                    special_bytes,
+                )
+
+            native_statistics = plan7_forward_output_statistics(output)
+            if native_statistics == NULL:
+                raise RuntimeError("Forward statistics are null")
+            statistics = {
+                "generation_f3_bits": native_statistics.generation_f3_bits,
+                "candidate_count": native_statistics.candidate_count,
+                "survivor_count": native_statistics.survivor_count,
+                "work_cells": native_statistics.work_cells,
+                "dp_workspace_bytes": native_statistics.dp_workspace_bytes,
+                "xmx_workspace_bytes": native_statistics.xmx_workspace_bytes,
+                "gather_workspace_bytes": (
+                    native_statistics.gather_workspace_bytes
+                ),
+                "gathered_xmx_bytes": native_statistics.gathered_xmx_bytes,
+                "output_byte_limit": native_statistics.output_byte_limit,
+                "output_cap_fallback_count": (
+                    native_statistics.output_cap_fallback_count
+                ),
+                "kernel_ms": native_statistics.kernel_milliseconds,
+                "classification_ms": (
+                    native_statistics.classification_milliseconds
+                ),
+                "gather_ms": native_statistics.gather_milliseconds,
+                "download_ms": native_statistics.download_milliseconds,
+                "total_ms": native_statistics.total_milliseconds,
+            }
+            return records, offsets, specials, statistics
+        finally:
+            if output != NULL:
+                plan7_forward_output_destroy(&output, NULL, 0)
+
     cdef size_t _run_postfilter_candidates_many(
         self,
         const uint8_t[::1] packed_scores,
@@ -1666,3 +2058,13 @@ BIAS_PROFILE_SIZE = sizeof(plan7_bias_profile)
 BIAS_RESULT_SIZE = sizeof(plan7_bias_result)
 POSTFILTER_RECORD_VERSION = PLAN7_POSTFILTER_RECORD_VERSION
 POSTFILTER_RESULT_SIZE = sizeof(plan7_postfilter_result)
+FORWARD_RECORD_VERSION = PLAN7_FORWARD_RECORD_VERSION
+FORWARD_RESULT_SIZE = sizeof(plan7_forward_result)
+FORWARD_MAX_GATHERED_BYTES = PLAN7_FORWARD_MAX_GATHERED_BYTES
+FORWARD_CPU_REQUIRED = PLAN7_FORWARD_CPU_REQUIRED
+FORWARD_DEFINITE_REJECT = PLAN7_FORWARD_DEFINITE_REJECT
+FORWARD_DEFINITE_PASS = PLAN7_FORWARD_DEFINITE_PASS
+FORWARD_STATUS_OK = PLAN7_FORWARD_OK
+FORWARD_STATUS_ERANGE = PLAN7_FORWARD_ERANGE
+FORWARD_STATUS_ENORESULT = PLAN7_FORWARD_ENORESULT
+FORWARD_STATUS_EMPTY = PLAN7_FORWARD_EMPTY

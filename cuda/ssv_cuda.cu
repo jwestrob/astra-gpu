@@ -66,6 +66,7 @@ struct plan7_ssv_sequence_batch {
   int f1_cache_valid;
   int bias_length_terms_device_valid;
   int host_float_environment_valid;
+  uint64_t input_device_bytes;
 };
 
 static_assert(sizeof(plan7_ssv_result) == 6,
@@ -966,7 +967,8 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
   if (!checked_product(offset_count, sizeof(*offsets), &offset_bytes) ||
       !checked_product(sequence_count, sizeof(plan7_ssv_result),
                        &result_bytes) ||
-      !checked_product(sequence_count, sizeof(float), &null_score_bytes)) {
+      !checked_product(sequence_count, sizeof(float), &null_score_bytes) ||
+      (residue_count == 0 ? 1 : residue_count) > SIZE_MAX - offset_bytes) {
     set_error(error, error_size, "sequence batch size overflow");
     return -1;
   }
@@ -1043,6 +1045,8 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
                       cudaMemcpyHostToDevice));
   CUDA_TRY(cudaMemcpy(batch->device_null_scores, batch->host_null_scores,
                       null_score_bytes, cudaMemcpyHostToDevice));
+  batch->input_device_bytes = static_cast<uint64_t>(
+      (residue_count == 0 ? 1 : residue_count) + offset_bytes);
   *batch_out = batch;
   rc = 0;
 
@@ -1066,6 +1070,35 @@ plan7_ssv_sequence_batch_destroy(plan7_ssv_sequence_batch **batch_out,
   batch = *batch_out;
   *batch_out = nullptr;
   return destroy_sequence_batch(batch, error, error_size);
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_get_view(const plan7_ssv_sequence_batch *batch,
+                                  plan7_ssv_sequence_batch_view *view,
+                                  char *error,
+                                  size_t error_size)
+{
+  if (batch == nullptr || view == nullptr) {
+    set_error(error, error_size, "sequence batch view argument is null");
+    return -1;
+  }
+  memset(view, 0, sizeof(*view));
+  if (batch->sequence_count != 0 &&
+      (batch->host_lengths == nullptr || batch->device_residues == nullptr ||
+       batch->device_offsets == nullptr)) {
+    set_error(error, error_size, "sequence batch input storage is null");
+    return -1;
+  }
+  view->device_ordinal = batch->device_ordinal;
+  view->alphabet_size = batch->alphabet_size;
+  view->host_float_environment_valid =
+    batch->host_float_environment_valid;
+  view->sequence_count = batch->sequence_count;
+  view->host_lengths = batch->host_lengths;
+  view->device_residues = batch->device_residues;
+  view->device_offsets = batch->device_offsets;
+  view->input_device_bytes = batch->input_device_bytes;
+  return 0;
 }
 
 extern "C" int

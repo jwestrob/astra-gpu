@@ -1,0 +1,1382 @@
+#include "forward_cuda.h"
+
+#include "bias_cuda.h"
+#include "ssv_cuda.h"
+
+#include <cuda_runtime.h>
+
+extern "C" {
+#include <easel.h>
+#include <esl_exponential.h>
+#include <hmmer.h>
+#include <impl_sse/impl_sse.h>
+}
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <thread>
+#include <vector>
+
+static_assert(sizeof(float) == 4,
+              "Forward CUDA requires binary32 float");
+static_assert(sizeof(plan7_forward_result) == PLAN7_FORWARD_RECORD_SIZE,
+              "Forward result ABI size changed");
+static_assert(offsetof(plan7_forward_result, sequence_index) == 0 &&
+              offsetof(plan7_forward_result, fwdsc) == 4 &&
+              offsetof(plan7_forward_result, status) == 8 &&
+              offsetof(plan7_forward_result, action) == 9 &&
+              offsetof(plan7_forward_result, reserved) == 10,
+              "Forward result ABI layout changed");
+
+namespace {
+
+constexpr int kThreads = 256;
+constexpr int kSubwarp = 4;
+constexpr int kCandidatesPerWarp = 1;
+constexpr int kWarpsPerBlock = kThreads / 32;
+constexpr int kCandidatesPerBlock =
+    kCandidatesPerWarp * kWarpsPerBlock;
+constexpr int kGatherThreads = 256;
+constexpr uint64_t kMaximumModelLength = 100000;
+constexpr uint64_t kDpWorkspaceByteLimit = UINT64_C(256) << 20;
+constexpr uint64_t kXmxWorkspaceByteLimit = UINT64_C(512) << 20;
+constexpr uint64_t kGatheredOutputByteLimit =
+    PLAN7_FORWARD_MAX_GATHERED_BYTES;
+constexpr double kLog2 = 0.69314718055994529;
+static_assert(kGatheredOutputByteLimit % sizeof(float) == 0);
+
+struct ForwardProfile {
+  uint64_t emission_offset;
+  uint64_t transition_offset;
+  uint32_t q;
+  uint32_t model_length;
+  float e_move;
+  float e_loop;
+  float f_tau;
+  float f_lambda;
+  float nj;
+  int32_t mode;
+  uintptr_t alphabet_pointer;
+};
+
+struct ForwardDeviceProfile {
+  uint64_t emission_offset;
+  uint64_t transition_offset;
+  uint32_t q;
+  uint32_t model_length;
+  float e_move;
+  float e_loop;
+};
+
+static_assert(sizeof(ForwardDeviceProfile) == 32,
+              "Forward device descriptor must stay cache-compact");
+
+struct ForwardLengthTransitions {
+  float move;
+  float loop;
+};
+
+struct ForwardKernelResult {
+  int32_t status;
+  uint32_t score_bits;
+};
+
+union FloatBits {
+  float value;
+  uint32_t bits;
+};
+
+union DoubleBits {
+  double value;
+  uint64_t bits;
+};
+
+void set_error(char *error, size_t error_size, const char *message) {
+  if (error != nullptr && error_size != 0)
+    std::snprintf(error, error_size, "%s", message);
+}
+
+void set_cuda_error(char *error, size_t error_size, const char *operation,
+                    cudaError_t status) {
+  if (error != nullptr && error_size != 0)
+    std::snprintf(error, error_size, "%s: %s", operation,
+                  cudaGetErrorString(status));
+}
+
+bool checked_add(uint64_t left, uint64_t right, uint64_t *sum) {
+  if (right > UINT64_MAX - left) return false;
+  *sum = left + right;
+  return true;
+}
+
+bool checked_multiply(uint64_t left, uint64_t right, uint64_t *product) {
+  if (left != 0 && right > UINT64_MAX / left) return false;
+  *product = left * right;
+  return true;
+}
+
+bool checked_bytes(size_t count, size_t item_size, size_t *bytes) {
+  if (item_size != 0 && count > SIZE_MAX / item_size) return false;
+  *bytes = count * item_size;
+  return true;
+}
+
+bool aligned_vector_address(const void *allocation, uintptr_t *address) {
+  const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
+  if (raw == 0 || raw > UINTPTR_MAX - 15) return false;
+  *address = (raw + 15) & ~static_cast<uintptr_t>(15);
+  return true;
+}
+
+bool device_allocation_on(const void *pointer, int device_ordinal) {
+  if (pointer == nullptr) return false;
+  cudaPointerAttributes attributes{};
+  const cudaError_t status = cudaPointerGetAttributes(&attributes, pointer);
+  if (status != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return attributes.type == cudaMemoryTypeDevice &&
+         attributes.device == device_ordinal;
+}
+
+bool valid_profile_storage(const P7_OPROFILE *profile) {
+  if (profile == nullptr || profile->abc == nullptr ||
+      profile->abc->type != eslAMINO || profile->abc->K != 20 ||
+      profile->abc->Kp != 29 || profile->M < 1 ||
+      profile->M > static_cast<int>(kMaximumModelLength) ||
+      profile->allocM < profile->M ||
+      profile->allocM > static_cast<int>(kMaximumModelLength) ||
+      profile->allocQ4 != p7O_NQF(profile->allocM) ||
+      profile->allocQ4 < p7O_NQF(profile->M) ||
+      profile->rfv == nullptr || profile->tfv == nullptr ||
+      profile->rfv_mem == nullptr || profile->tfv_mem == nullptr)
+    return false;
+
+  uintptr_t rfv_base;
+  uintptr_t tfv_base;
+  if (!aligned_vector_address(profile->rfv_mem, &rfv_base) ||
+      !aligned_vector_address(profile->tfv_mem, &tfv_base) ||
+      reinterpret_cast<uintptr_t>(profile->tfv) != tfv_base)
+    return false;
+  const size_t row_stride = static_cast<size_t>(profile->allocQ4);
+  for (int residue = 0; residue < profile->abc->Kp; ++residue) {
+    const uintptr_t expected = rfv_base +
+        static_cast<size_t>(residue) * row_stride * sizeof(__m128);
+    if (profile->rfv[residue] == nullptr ||
+        reinterpret_cast<uintptr_t>(profile->rfv[residue]) != expected)
+      return false;
+  }
+  return true;
+}
+
+bool valid_forward_specials(const P7_OPROFILE *profile) {
+  if ((profile->mode != p7_LOCAL && profile->mode != p7_UNILOCAL) ||
+      (profile->nj != 0.0f && profile->nj != 1.0f))
+    return false;
+  if (profile->nj == 0.0f)
+    return profile->xf[p7O_E][p7O_MOVE] == 1.0f &&
+           profile->xf[p7O_E][p7O_LOOP] == 0.0f;
+  return profile->xf[p7O_E][p7O_MOVE] == 0.5f &&
+         profile->xf[p7O_E][p7O_LOOP] == 0.5f;
+}
+
+bool valid_probability_rows(const P7_OPROFILE *profile) {
+  const int q_count = p7O_NQF(profile->M);
+  for (int residue = 0; residue < profile->abc->Kp; ++residue) {
+    const auto *values = reinterpret_cast<const float *>(profile->rfv[residue]);
+    for (int cell = 0; cell < q_count * kSubwarp; ++cell)
+      if (!std::isfinite(values[cell]) || values[cell] < 0.0f) return false;
+  }
+  const auto *transitions = reinterpret_cast<const float *>(profile->tfv);
+  for (int cell = 0; cell < q_count * p7O_NTRANS * kSubwarp; ++cell)
+    if (!std::isfinite(transitions[cell]) || transitions[cell] < 0.0f)
+      return false;
+  return true;
+}
+
+ForwardLengthTransitions length_transitions_for(
+    const ForwardProfile &profile, int length) {
+  const float numerator = 2.0f + profile.nj;
+  const float denominator =
+      static_cast<float>(length) + 2.0f + profile.nj;
+  const float move = numerator / denominator;
+  return {move, 1.0f - move};
+}
+
+__device__ __forceinline__ float add_rn(float left, float right) {
+  return __fadd_rn(left, right);
+}
+
+__device__ __forceinline__ float mul_rn(float left, float right) {
+  return __fmul_rn(left, right);
+}
+
+__device__ __forceinline__ float subwarp_shift_right(float value,
+                                                     unsigned mask,
+                                                     int sublane) {
+  const float shifted = __shfl_up_sync(mask, value, 1, kSubwarp);
+  return sublane == 0 ? 0.0f : shifted;
+}
+
+__device__ __forceinline__ float sse_horizontal_sum(float value,
+                                                    unsigned mask,
+                                                    int sublane) {
+  float rotated = __shfl_sync(mask, value, (sublane + 1) & 3, kSubwarp);
+  value = add_rn(value, rotated);
+  rotated = __shfl_sync(mask, value, (sublane + 2) & 3, kSubwarp);
+  value = add_rn(value, rotated);
+  return __shfl_sync(mask, value, 0, kSubwarp);
+}
+
+__global__ void forward_kernel(
+    const uint8_t *residues, const uint64_t *sequence_offsets,
+    const ForwardDeviceProfile *profiles, const float *emissions,
+    const float *transitions, const uint32_t *candidate_profiles,
+    const uint32_t *candidate_sequences,
+    const ForwardLengthTransitions *length_transitions,
+    const uint64_t *dp_offsets, const uint64_t *x_offsets,
+    size_t candidate_begin, size_t tile_count, uint64_t tile_dp_begin,
+    uint64_t tile_x_begin, float *dp_storage, float *xmx_storage,
+    ForwardKernelResult *results) {
+  const int lane = threadIdx.x & 31;
+  const int warp_in_block = threadIdx.x >> 5;
+  const int candidate_in_warp = lane >> 2;
+  const int sublane = lane & 3;
+  if (candidate_in_warp >= kCandidatesPerWarp) return;
+  const size_t tile_candidate =
+      static_cast<size_t>(blockIdx.x) * kCandidatesPerBlock +
+      warp_in_block * kCandidatesPerWarp + candidate_in_warp;
+  if (tile_candidate >= tile_count) return;
+  const size_t candidate = candidate_begin + tile_candidate;
+  const unsigned subwarp_mask = 0xFU << (candidate_in_warp * kSubwarp);
+
+  const uint32_t profile_index = candidate_profiles[candidate];
+  const uint32_t sequence_index = candidate_sequences[candidate];
+  const ForwardDeviceProfile profile = profiles[profile_index];
+  const int q_count = static_cast<int>(profile.q);
+  const uint64_t sequence_start = sequence_offsets[sequence_index];
+  const int sequence_length = static_cast<int>(
+      sequence_offsets[sequence_index + 1] - sequence_start);
+  const ForwardLengthTransitions length = length_transitions[candidate];
+  float *mmx = dp_storage + dp_offsets[candidate] - tile_dp_begin;
+  float *imx = mmx + static_cast<uint64_t>(q_count) * kSubwarp;
+  float *dmx = imx + static_cast<uint64_t>(q_count) * kSubwarp;
+
+  for (int q = 0; q < q_count; ++q) {
+    mmx[q * kSubwarp + sublane] = 0.0f;
+    imx[q * kSubwarp + sublane] = 0.0f;
+    dmx[q * kSubwarp + sublane] = 0.0f;
+  }
+
+  float xN = 1.0f;
+  float xJ = 0.0f;
+  float xB = length.move;
+  float xC = 0.0f;
+  float totscale = 0.0f;
+  float *xmx = xmx_storage + x_offsets[candidate] - tile_x_begin;
+  if (sublane == 0) {
+    xmx[p7X_E] = 0.0f;
+    xmx[p7X_N] = 1.0f;
+    xmx[p7X_J] = 0.0f;
+    xmx[p7X_B] = length.move;
+    xmx[p7X_C] = 0.0f;
+    xmx[p7X_SCALE] = 1.0f;
+  }
+
+  for (int i = 0; i < sequence_length; ++i) {
+    const unsigned residue = residues[sequence_start + i];
+    const uint64_t emission_base = profile.emission_offset +
+        static_cast<uint64_t>(residue) * q_count * kSubwarp;
+    float dcv = 0.0f;
+    float xEv = 0.0f;
+    float mpv = subwarp_shift_right(
+        mmx[(q_count - 1) * kSubwarp + sublane], subwarp_mask, sublane);
+    float dpv = subwarp_shift_right(
+        dmx[(q_count - 1) * kSubwarp + sublane], subwarp_mask, sublane);
+    float ipv = subwarp_shift_right(
+        imx[(q_count - 1) * kSubwarp + sublane], subwarp_mask, sublane);
+
+    for (int q = 0; q < q_count; ++q) {
+      const uint64_t transition_base = profile.transition_offset +
+          static_cast<uint64_t>(q) * p7O_NTRANS * kSubwarp + sublane;
+      float value = mul_rn(
+          xB, transitions[transition_base + p7O_BM * kSubwarp]);
+      value = add_rn(value, mul_rn(
+          mpv, transitions[transition_base + p7O_MM * kSubwarp]));
+      value = add_rn(value, mul_rn(
+          ipv, transitions[transition_base + p7O_IM * kSubwarp]));
+      value = add_rn(value, mul_rn(
+          dpv, transitions[transition_base + p7O_DM * kSubwarp]));
+      value = mul_rn(
+          value, emissions[emission_base + q * kSubwarp + sublane]);
+      xEv = add_rn(xEv, value);
+
+      const float old_m = mmx[q * kSubwarp + sublane];
+      const float old_i = imx[q * kSubwarp + sublane];
+      const float old_d = dmx[q * kSubwarp + sublane];
+      mmx[q * kSubwarp + sublane] = value;
+      dmx[q * kSubwarp + sublane] = dcv;
+      dcv = mul_rn(
+          value, transitions[transition_base + p7O_MD * kSubwarp]);
+      float insert = mul_rn(
+          old_m, transitions[transition_base + p7O_MI * kSubwarp]);
+      insert = add_rn(insert, mul_rn(
+          old_i, transitions[transition_base + p7O_II * kSubwarp]));
+      imx[q * kSubwarp + sublane] = insert;
+      mpv = old_m;
+      ipv = old_i;
+      dpv = old_d;
+    }
+
+    dcv = subwarp_shift_right(dcv, subwarp_mask, sublane);
+    dmx[sublane] = 0.0f;
+    for (int q = 0; q < q_count; ++q) {
+      const uint64_t transition_base = profile.transition_offset +
+          static_cast<uint64_t>(q) * p7O_NTRANS * kSubwarp + sublane;
+      const float updated = add_rn(dcv, dmx[q * kSubwarp + sublane]);
+      dmx[q * kSubwarp + sublane] = updated;
+      dcv = mul_rn(
+          updated, transitions[transition_base + p7O_DD * kSubwarp]);
+    }
+    for (int pass = 1; pass < 4; ++pass) {
+      dcv = subwarp_shift_right(dcv, subwarp_mask, sublane);
+      bool any_change = false;
+      for (int q = 0; q < q_count; ++q) {
+        const uint64_t transition_base = profile.transition_offset +
+            static_cast<uint64_t>(q) * p7O_NTRANS * kSubwarp + sublane;
+        const float current = dmx[q * kSubwarp + sublane];
+        const float updated = add_rn(dcv, current);
+        any_change = any_change || updated > current;
+        dmx[q * kSubwarp + sublane] = updated;
+        dcv = mul_rn(
+            dcv, transitions[transition_base + p7O_DD * kSubwarp]);
+      }
+      if (profile.model_length >= 100 &&
+          __any_sync(subwarp_mask, any_change) == 0)
+        break;
+    }
+
+    for (int q = 0; q < q_count; ++q)
+      xEv = add_rn(dmx[q * kSubwarp + sublane], xEv);
+    float xE = sse_horizontal_sum(xEv, subwarp_mask, sublane);
+
+    xN = mul_rn(xN, length.loop);
+    xC = add_rn(mul_rn(xC, length.loop), mul_rn(xE, profile.e_move));
+    xJ = add_rn(mul_rn(xJ, length.loop), mul_rn(xE, profile.e_loop));
+    xB = add_rn(mul_rn(xJ, length.move), mul_rn(xN, length.move));
+
+    if (xE > 1.0e4f) {
+      xN = __fdiv_rn(xN, xE);
+      xC = __fdiv_rn(xC, xE);
+      xJ = __fdiv_rn(xJ, xE);
+      xB = __fdiv_rn(xB, xE);
+      const float inverse = __fdiv_rn(1.0f, xE);
+      for (int q = 0; q < q_count; ++q) {
+        mmx[q * kSubwarp + sublane] =
+            mul_rn(mmx[q * kSubwarp + sublane], inverse);
+        dmx[q * kSubwarp + sublane] =
+            mul_rn(dmx[q * kSubwarp + sublane], inverse);
+        imx[q * kSubwarp + sublane] =
+            mul_rn(imx[q * kSubwarp + sublane], inverse);
+      }
+      if (sublane == 0) {
+        totscale = static_cast<float>(
+            static_cast<double>(totscale) + log(static_cast<double>(xE)));
+        xmx[(i + 1) * p7X_NXCELLS + p7X_SCALE] = xE;
+      }
+      xE = 1.0f;
+    } else if (sublane == 0) {
+      xmx[(i + 1) * p7X_NXCELLS + p7X_SCALE] = 1.0f;
+    }
+    if (sublane == 0) {
+      xmx[(i + 1) * p7X_NXCELLS + p7X_E] = xE;
+      xmx[(i + 1) * p7X_NXCELLS + p7X_N] = xN;
+      xmx[(i + 1) * p7X_NXCELLS + p7X_J] = xJ;
+      xmx[(i + 1) * p7X_NXCELLS + p7X_B] = xB;
+      xmx[(i + 1) * p7X_NXCELLS + p7X_C] = xC;
+    }
+  }
+
+  if (sublane == 0) {
+    ForwardKernelResult result{};
+    result.status = eslOK;
+    FloatBits score{};
+    if (isnan(xC) || (sequence_length > 0 && xC == 0.0f) || isinf(xC)) {
+      result.status = eslERANGE;
+      score.bits = UINT32_C(0x7fc00000);
+    } else {
+      const float terminal = mul_rn(xC, length.move);
+      score.value = static_cast<float>(
+          static_cast<double>(totscale) + log(static_cast<double>(terminal)));
+    }
+    result.score_bits = score.bits;
+    results[candidate] = result;
+  }
+}
+
+__global__ void gather_specials_kernel(
+    const float *tile_xmx, const uint64_t *global_x_offsets,
+    const uint32_t *survivor_candidates,
+    const uint64_t *survivor_output_offsets, size_t survivor_count,
+    uint64_t tile_x_begin, float *gathered) {
+  const size_t survivor = static_cast<size_t>(blockIdx.x);
+  if (survivor >= survivor_count) return;
+  const uint32_t candidate = survivor_candidates[survivor];
+  const uint64_t input_begin =
+      global_x_offsets[candidate] - tile_x_begin;
+  const uint64_t input_end =
+      global_x_offsets[static_cast<size_t>(candidate) + 1] - tile_x_begin;
+  const uint64_t output_begin = survivor_output_offsets[survivor];
+  const uint64_t cell_count = input_end - input_begin;
+  for (uint64_t cell = threadIdx.x; cell < cell_count;
+       cell += blockDim.x)
+    gathered[output_begin + cell] = tile_xmx[input_begin + cell];
+}
+
+struct RunBuffers {
+  uint32_t *candidate_profiles = nullptr;
+  uint32_t *candidate_sequences = nullptr;
+  ForwardLengthTransitions *length_transitions = nullptr;
+  uint64_t *dp_offsets = nullptr;
+  uint64_t *x_offsets = nullptr;
+  float *dp = nullptr;
+  float *xmx = nullptr;
+  ForwardKernelResult *results = nullptr;
+  uint32_t *survivor_candidates = nullptr;
+  uint64_t *survivor_offsets = nullptr;
+  float *gathered = nullptr;
+  cudaEvent_t begin_event = nullptr;
+  cudaEvent_t end_event = nullptr;
+
+  ~RunBuffers() {
+    if (end_event != nullptr) cudaEventDestroy(end_event);
+    if (begin_event != nullptr) cudaEventDestroy(begin_event);
+    cudaFree(gathered);
+    cudaFree(survivor_offsets);
+    cudaFree(survivor_candidates);
+    cudaFree(results);
+    cudaFree(xmx);
+    cudaFree(dp);
+    cudaFree(x_offsets);
+    cudaFree(dp_offsets);
+    cudaFree(length_transitions);
+    cudaFree(candidate_sequences);
+    cudaFree(candidate_profiles);
+  }
+};
+
+}  // namespace
+
+struct plan7_forward_database {
+  int device_ordinal;
+  int alphabet_size;
+  std::vector<ForwardProfile> host_profiles;
+  std::vector<ForwardDeviceProfile> host_device_profiles;
+  std::vector<uintptr_t> source_profile_pointers;
+  std::vector<float> host_emissions;
+  std::vector<float> host_transitions;
+  ForwardDeviceProfile *device_profiles;
+  float *device_emissions;
+  float *device_transitions;
+  uint64_t device_bytes;
+  float pack_milliseconds;
+  float upload_milliseconds;
+};
+
+struct plan7_forward_output {
+  std::vector<plan7_forward_result> results;
+  std::vector<uint64_t> special_offsets;
+  std::vector<float> specials;
+  plan7_forward_statistics statistics;
+};
+
+namespace {
+
+bool live_profile_matches_snapshot(const plan7_forward_database *database,
+                                   size_t profile_index) {
+  const auto *source = reinterpret_cast<const P7_OPROFILE *>(
+      database->source_profile_pointers[profile_index]);
+  const ForwardProfile &descriptor = database->host_profiles[profile_index];
+  if (!valid_profile_storage(source) || !valid_forward_specials(source) ||
+      !valid_probability_rows(source) ||
+      source->abc->Kp != database->alphabet_size ||
+      reinterpret_cast<uintptr_t>(source->abc) !=
+          descriptor.alphabet_pointer ||
+      source->M != static_cast<int>(descriptor.model_length) ||
+      source->mode != descriptor.mode || source->nj != descriptor.nj ||
+      source->xf[p7O_E][p7O_MOVE] != descriptor.e_move ||
+      source->xf[p7O_E][p7O_LOOP] != descriptor.e_loop ||
+      source->evparam[p7_FTAU] != descriptor.f_tau ||
+      source->evparam[p7_FLAMBDA] != descriptor.f_lambda)
+    return false;
+
+  const size_t q_count = descriptor.q;
+  const size_t row_bytes = q_count * kSubwarp * sizeof(float);
+  for (int residue = 0; residue < source->abc->Kp; ++residue) {
+    const float *snapshot = database->host_emissions.data() +
+        descriptor.emission_offset +
+        static_cast<uint64_t>(residue) * q_count * kSubwarp;
+    if (std::memcmp(source->rfv[residue], snapshot, row_bytes) != 0)
+      return false;
+  }
+  for (size_t q = 0; q < q_count; ++q) {
+    for (int transition = p7O_BM; transition <= p7O_II;
+         ++transition) {
+      const auto *source_values = reinterpret_cast<const float *>(
+          source->tfv + q * 7 + transition);
+      const float *snapshot = database->host_transitions.data() +
+          descriptor.transition_offset +
+          (q * p7O_NTRANS + transition) * kSubwarp;
+      if (std::memcmp(source_values, snapshot,
+                      kSubwarp * sizeof(float)) != 0)
+        return false;
+    }
+    const auto *source_dd = reinterpret_cast<const float *>(
+        source->tfv + 7 * q_count + q);
+    const float *snapshot_dd = database->host_transitions.data() +
+        descriptor.transition_offset +
+        (q * p7O_NTRANS + p7O_DD) * kSubwarp;
+    if (std::memcmp(source_dd, snapshot_dd,
+                    kSubwarp * sizeof(float)) != 0)
+      return false;
+  }
+  return true;
+}
+
+void free_database_device(plan7_forward_database *database) {
+  if (database == nullptr) return;
+  cudaFree(database->device_transitions);
+  cudaFree(database->device_emissions);
+  cudaFree(database->device_profiles);
+  database->device_transitions = nullptr;
+  database->device_emissions = nullptr;
+  database->device_profiles = nullptr;
+}
+
+}  // namespace
+
+extern "C" int plan7_forward_database_create(
+    const uintptr_t *profile_pointers, size_t profile_count,
+    plan7_forward_database **database, char *error, size_t error_size) {
+  if (database == nullptr || *database != nullptr ||
+      (profile_count != 0 && profile_pointers == nullptr)) {
+    set_error(error, error_size, "invalid Forward database arguments");
+    return -1;
+  }
+  if (profile_count > UINT32_MAX) {
+    set_error(error, error_size, "Forward profile count exceeds uint32");
+    return -1;
+  }
+  int current_device = -1;
+  cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+
+  std::unique_ptr<plan7_forward_database> created(
+      new (std::nothrow) plan7_forward_database{});
+  if (!created) {
+    set_error(error, error_size, "Forward database allocation failed");
+    return -1;
+  }
+  created->device_ordinal = current_device;
+  created->alphabet_size = -1;
+  created->device_profiles = nullptr;
+  created->device_emissions = nullptr;
+  created->device_transitions = nullptr;
+  created->device_bytes = 0;
+  created->pack_milliseconds = 0.0f;
+  created->upload_milliseconds = 0.0f;
+
+  const auto pack_begin = std::chrono::steady_clock::now();
+  try {
+    created->host_profiles.resize(profile_count);
+    created->host_device_profiles.resize(profile_count);
+    if (profile_count != 0)
+      created->source_profile_pointers.assign(
+          profile_pointers, profile_pointers + profile_count);
+  } catch (...) {
+    set_error(error, error_size, "Forward descriptor allocation failed");
+    return -1;
+  }
+
+  uint64_t emission_total = 0;
+  uint64_t transition_total = 0;
+  for (size_t profile_index = 0; profile_index < profile_count;
+       ++profile_index) {
+    const auto *source = reinterpret_cast<const P7_OPROFILE *>(
+        profile_pointers[profile_index]);
+    if (!valid_profile_storage(source) || !valid_forward_specials(source) ||
+        !valid_probability_rows(source)) {
+      set_error(error, error_size, "invalid optimized Forward profile");
+      return -1;
+    }
+    if (created->alphabet_size < 0)
+      created->alphabet_size = source->abc->Kp;
+    else if (created->alphabet_size != source->abc->Kp) {
+      set_error(error, error_size, "Forward profile alphabets differ");
+      return -1;
+    }
+    const uint64_t q_count = static_cast<uint64_t>(p7O_NQF(source->M));
+    uint64_t emission_count;
+    uint64_t transition_count;
+    if (!checked_multiply(static_cast<uint64_t>(source->abc->Kp),
+                          q_count * kSubwarp, &emission_count) ||
+        !checked_multiply(q_count,
+                          p7O_NTRANS * kSubwarp, &transition_count) ||
+        !checked_add(emission_total, emission_count, &emission_total) ||
+        !checked_add(transition_total, transition_count,
+                     &transition_total) ||
+        emission_total > SIZE_MAX || transition_total > SIZE_MAX) {
+      set_error(error, error_size, "Forward packed profile size overflow");
+      return -1;
+    }
+    created->host_profiles[profile_index] = {
+      emission_total - emission_count,
+      transition_total - transition_count,
+      static_cast<uint32_t>(q_count),
+      static_cast<uint32_t>(source->M),
+      source->xf[p7O_E][p7O_MOVE],
+      source->xf[p7O_E][p7O_LOOP],
+      source->evparam[p7_FTAU],
+      source->evparam[p7_FLAMBDA],
+      source->nj,
+      source->mode,
+      reinterpret_cast<uintptr_t>(source->abc)
+    };
+    created->host_device_profiles[profile_index] = {
+      emission_total - emission_count,
+      transition_total - transition_count,
+      static_cast<uint32_t>(q_count),
+      static_cast<uint32_t>(source->M),
+      source->xf[p7O_E][p7O_MOVE],
+      source->xf[p7O_E][p7O_LOOP]
+    };
+  }
+  try {
+    created->host_emissions.resize(static_cast<size_t>(emission_total));
+    created->host_transitions.resize(static_cast<size_t>(transition_total));
+  } catch (...) {
+    set_error(error, error_size, "Forward packed data allocation failed");
+    return -1;
+  }
+
+  std::atomic<size_t> next_profile{0};
+  std::atomic<unsigned> completed_workers{0};
+  const unsigned thread_count = static_cast<unsigned>(std::min<size_t>(
+      16, std::max<size_t>(1, profile_count)));
+  auto worker = [&]() {
+    while (true) {
+      const size_t profile_index =
+          next_profile.fetch_add(1, std::memory_order_relaxed);
+      if (profile_index >= profile_count) break;
+      const auto *source = reinterpret_cast<const P7_OPROFILE *>(
+          profile_pointers[profile_index]);
+      const ForwardProfile descriptor =
+          created->host_profiles[profile_index];
+      const int q_count = static_cast<int>(descriptor.q);
+      for (int residue = 0; residue < source->abc->Kp; ++residue) {
+        const auto *source_values =
+            reinterpret_cast<const float *>(source->rfv[residue]);
+        float *destination = created->host_emissions.data() +
+            descriptor.emission_offset +
+            static_cast<uint64_t>(residue) * q_count * kSubwarp;
+        std::memcpy(destination, source_values,
+                    static_cast<size_t>(q_count) * kSubwarp * sizeof(float));
+      }
+      for (int q = 0; q < q_count; ++q) {
+        for (int transition = p7O_BM; transition <= p7O_II;
+             ++transition) {
+          const auto *source_values = reinterpret_cast<const float *>(
+              source->tfv + q * 7 + transition);
+          float *destination = created->host_transitions.data() +
+              descriptor.transition_offset +
+              (static_cast<uint64_t>(q) * p7O_NTRANS + transition) *
+                  kSubwarp;
+          std::memcpy(destination, source_values,
+                      kSubwarp * sizeof(float));
+        }
+        const auto *source_dd = reinterpret_cast<const float *>(
+            source->tfv + 7 * q_count + q);
+        float *destination_dd = created->host_transitions.data() +
+            descriptor.transition_offset +
+            (static_cast<uint64_t>(q) * p7O_NTRANS + p7O_DD) * kSubwarp;
+        std::memcpy(destination_dd, source_dd,
+                    kSubwarp * sizeof(float));
+      }
+    }
+    completed_workers.fetch_add(1, std::memory_order_release);
+  };
+  std::vector<std::thread> workers;
+  bool worker_failure = false;
+  try {
+    workers.reserve(thread_count);
+    for (unsigned thread = 0; thread < thread_count; ++thread)
+      workers.emplace_back(worker);
+  } catch (...) {
+    worker_failure = true;
+  }
+  for (auto &thread : workers) {
+    try {
+      thread.join();
+    } catch (...) {
+      worker_failure = true;
+      if (thread.joinable()) thread.detach();
+    }
+  }
+  while (completed_workers.load(std::memory_order_acquire) < workers.size())
+    std::this_thread::yield();
+  if (worker_failure || workers.size() != thread_count) {
+    set_error(error, error_size, "Forward profile worker launch failed");
+    return -1;
+  }
+  created->pack_milliseconds = std::chrono::duration<float, std::milli>(
+      std::chrono::steady_clock::now() - pack_begin).count();
+
+  size_t profile_bytes;
+  size_t emission_bytes;
+  size_t transition_bytes;
+  if (!checked_bytes(profile_count, sizeof(ForwardDeviceProfile),
+                     &profile_bytes) ||
+      !checked_bytes(created->host_emissions.size(), sizeof(float),
+                     &emission_bytes) ||
+      !checked_bytes(created->host_transitions.size(), sizeof(float),
+                     &transition_bytes)) {
+    set_error(error, error_size, "Forward device allocation size overflow");
+    return -1;
+  }
+  const auto upload_begin = std::chrono::steady_clock::now();
+#define CUDA_CREATE(call)                                                     \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, #call, status);                       \
+      free_database_device(created.get());                                   \
+      return -1;                                                              \
+    }                                                                         \
+  } while (0)
+  if (profile_count != 0) {
+    CUDA_CREATE(cudaMalloc(&created->device_profiles, profile_bytes));
+    CUDA_CREATE(cudaMalloc(&created->device_emissions, emission_bytes));
+    CUDA_CREATE(cudaMalloc(&created->device_transitions, transition_bytes));
+    CUDA_CREATE(cudaMemcpy(created->device_profiles,
+                           created->host_device_profiles.data(), profile_bytes,
+                           cudaMemcpyHostToDevice));
+    CUDA_CREATE(cudaMemcpy(created->device_emissions,
+                           created->host_emissions.data(), emission_bytes,
+                           cudaMemcpyHostToDevice));
+    CUDA_CREATE(cudaMemcpy(created->device_transitions,
+                           created->host_transitions.data(), transition_bytes,
+                           cudaMemcpyHostToDevice));
+    CUDA_CREATE(cudaDeviceSynchronize());
+  }
+#undef CUDA_CREATE
+  created->device_bytes = static_cast<uint64_t>(profile_bytes) +
+                          static_cast<uint64_t>(emission_bytes) +
+                          static_cast<uint64_t>(transition_bytes);
+  created->upload_milliseconds = std::chrono::duration<float, std::milli>(
+      std::chrono::steady_clock::now() - upload_begin).count();
+  *database = created.release();
+  return 0;
+}
+
+extern "C" int plan7_forward_database_destroy(
+    plan7_forward_database **database, char *error, size_t error_size) {
+  if (database == nullptr) {
+    set_error(error, error_size, "Forward database handle is null");
+    return -1;
+  }
+  plan7_forward_database *value = *database;
+  *database = nullptr;
+  if (value == nullptr) return 0;
+
+  cudaError_t first_error = cudaSuccess;
+  cudaError_t status;
+  int original_device = -1;
+  bool restore_device = false;
+  bool device_ready = true;
+  status = cudaGetDevice(&original_device);
+  if (status == cudaSuccess && original_device != value->device_ordinal) {
+    status = cudaSetDevice(value->device_ordinal);
+    if (status == cudaSuccess)
+      restore_device = true;
+    else {
+      first_error = status;
+      device_ready = false;
+    }
+  } else if (status != cudaSuccess) {
+    status = cudaSetDevice(value->device_ordinal);
+    if (status != cudaSuccess) {
+      first_error = status;
+      device_ready = false;
+    }
+  }
+#define CUDA_DESTROY(pointer)                                                 \
+  do {                                                                        \
+    if (device_ready) {                                                       \
+      status = cudaFree(pointer);                                             \
+      if (status != cudaSuccess && first_error == cudaSuccess)                \
+        first_error = status;                                                 \
+    }                                                                         \
+  } while (0)
+  CUDA_DESTROY(value->device_transitions);
+  CUDA_DESTROY(value->device_emissions);
+  CUDA_DESTROY(value->device_profiles);
+#undef CUDA_DESTROY
+  if (restore_device) {
+    status = cudaSetDevice(original_device);
+    if (status != cudaSuccess && first_error == cudaSuccess)
+      first_error = status;
+  }
+  delete value;
+  if (first_error != cudaSuccess) {
+    set_cuda_error(error, error_size, "destroy Forward database", first_error);
+    return -1;
+  }
+  return 0;
+}
+
+extern "C" size_t plan7_forward_database_profile_count(
+    const plan7_forward_database *database) {
+  return database == nullptr ? 0 : database->host_profiles.size();
+}
+
+extern "C" uint64_t plan7_forward_database_device_bytes(
+    const plan7_forward_database *database) {
+  return database == nullptr ? 0 : database->device_bytes;
+}
+
+extern "C" float plan7_forward_database_pack_milliseconds(
+    const plan7_forward_database *database) {
+  return database == nullptr ? 0.0f : database->pack_milliseconds;
+}
+
+extern "C" float plan7_forward_database_upload_milliseconds(
+    const plan7_forward_database *database) {
+  return database == nullptr ? 0.0f : database->upload_milliseconds;
+}
+
+extern "C" int plan7_forward_run(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  if (output == nullptr || *output != nullptr || database == nullptr ||
+      batch == nullptr ||
+      (profile_count != 0 &&
+       (source_profile_pointers == nullptr || candidate_offsets == nullptr)) ||
+      (candidate_count != 0 &&
+       (candidate_indices == nullptr || filter_scores == nullptr)) ||
+      database->host_profiles.size() != profile_count) {
+    set_error(error, error_size, "invalid Forward run arguments");
+    return -1;
+  }
+  if (profile_count == 0 && candidate_count != 0) {
+    set_error(error, error_size, "Forward candidates have no profiles");
+    return -1;
+  }
+  if (candidate_count > UINT32_MAX) {
+    set_error(error, error_size, "Forward candidate count exceeds uint32");
+    return -1;
+  }
+  if (profile_count != 0 &&
+      (candidate_offsets[0] != 0 ||
+       candidate_offsets[profile_count] != candidate_count)) {
+    set_error(error, error_size, "invalid Forward candidate offsets");
+    return -1;
+  }
+
+  plan7_ssv_sequence_batch_view batch_view{};
+  if (plan7_ssv_sequence_batch_get_view(
+          batch, &batch_view, error, error_size) != 0)
+    return -1;
+
+  int current_device = -1;
+  cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (current_device != database->device_ordinal ||
+      current_device != batch_view.device_ordinal) {
+    set_error(error, error_size,
+              "Forward inputs belong to a different CUDA device");
+    return -1;
+  }
+  if ((profile_count != 0 &&
+       (!device_allocation_on(database->device_profiles, current_device) ||
+        !device_allocation_on(database->device_emissions, current_device) ||
+        !device_allocation_on(database->device_transitions,
+                              current_device))) ||
+      (batch_view.sequence_count != 0 &&
+       (!device_allocation_on(batch_view.device_residues, current_device) ||
+        !device_allocation_on(batch_view.device_offsets, current_device)))) {
+    set_error(error, error_size, "Forward input device pointer is invalid");
+    return -1;
+  }
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    if (candidate_offsets[profile] > candidate_offsets[profile + 1]) {
+      set_error(error, error_size, "invalid Forward candidate offsets");
+      return -1;
+    }
+    if (source_profile_pointers[profile] !=
+            database->source_profile_pointers[profile] ||
+        !live_profile_matches_snapshot(database, profile)) {
+      set_error(error, error_size,
+                "Forward database does not match the source profile row");
+      return -1;
+    }
+  }
+
+  std::unique_ptr<plan7_forward_output> created(
+      new (std::nothrow) plan7_forward_output{});
+  if (!created) {
+    set_error(error, error_size, "Forward output allocation failed");
+    return -1;
+  }
+  try {
+    created->results.resize(candidate_count);
+    created->special_offsets.assign(candidate_count + 1, 0);
+  } catch (...) {
+    set_error(error, error_size, "Forward output allocation failed");
+    return -1;
+  }
+  created->statistics = {};
+  DoubleBits generation_f3{};
+  generation_f3.value = f3;
+  const uint64_t output_byte_limit =
+      std::min(gathered_byte_budget, kGatheredOutputByteLimit) &
+      ~static_cast<uint64_t>(sizeof(float) - 1);
+  created->statistics.generation_f3_bits = generation_f3.bits;
+  created->statistics.candidate_count = candidate_count;
+  created->statistics.output_byte_limit = output_byte_limit;
+
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    for (uint64_t candidate64 = candidate_offsets[profile];
+         candidate64 < candidate_offsets[profile + 1]; ++candidate64) {
+      const size_t candidate = static_cast<size_t>(candidate64);
+      const uint32_t sequence = candidate_indices[candidate];
+      if (sequence >= batch_view.sequence_count) {
+        set_error(error, error_size,
+                  "Forward candidate sequence index is out of range");
+        return -1;
+      }
+      created->results[candidate] = {
+        sequence, NAN, PLAN7_FORWARD_ENORESULT,
+        PLAN7_FORWARD_CPU_REQUIRED, 0
+      };
+    }
+  }
+  if (candidate_count == 0) {
+    *output = created.release();
+    return 0;
+  }
+  if (!std::isfinite(f3) || f3 < 0.0 || batch_view.alphabet_size != 29 ||
+      !batch_view.host_float_environment_valid ||
+      plan7_bias_environment_attested(nullptr, 0) != 1) {
+    *output = created.release();
+    return 0;
+  }
+
+  std::vector<uint32_t> host_candidate_profiles;
+  std::vector<uint32_t> host_candidate_sequences;
+  std::vector<ForwardLengthTransitions> host_length_transitions;
+  std::vector<uint64_t> host_dp_offsets;
+  std::vector<uint64_t> host_x_offsets;
+  std::vector<size_t> tile_boundaries;
+  uint64_t maximum_dp_cells = 0;
+  uint64_t maximum_x_cells = 0;
+  size_t maximum_tile_count = 0;
+  try {
+    host_candidate_profiles.resize(candidate_count);
+    host_candidate_sequences.resize(candidate_count);
+    host_length_transitions.resize(candidate_count);
+    host_dp_offsets.assign(candidate_count + 1, 0);
+    host_x_offsets.assign(candidate_count + 1, 0);
+    tile_boundaries.push_back(0);
+  } catch (...) {
+    set_error(error, error_size, "Forward host workspace allocation failed");
+    return -1;
+  }
+
+  uint64_t work_cells = 0;
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    for (uint64_t candidate64 = candidate_offsets[profile];
+         candidate64 < candidate_offsets[profile + 1]; ++candidate64) {
+      const size_t candidate = static_cast<size_t>(candidate64);
+      const uint32_t sequence = candidate_indices[candidate];
+      const ForwardProfile &descriptor = database->host_profiles[profile];
+      const uint64_t length = batch_view.host_lengths[sequence];
+      uint64_t dp_cells;
+      uint64_t x_cells;
+      uint64_t candidate_work;
+      if (!checked_multiply(descriptor.q, 3 * kSubwarp, &dp_cells) ||
+          !checked_multiply(length + 1, p7X_NXCELLS, &x_cells) ||
+          !checked_multiply(descriptor.model_length, length,
+                            &candidate_work) ||
+          !checked_add(host_dp_offsets[candidate], dp_cells,
+                       &host_dp_offsets[candidate + 1]) ||
+          !checked_add(host_x_offsets[candidate], x_cells,
+                       &host_x_offsets[candidate + 1]) ||
+          !checked_add(work_cells, candidate_work, &work_cells)) {
+        set_error(error, error_size, "Forward work size overflow");
+        return -1;
+      }
+      host_candidate_profiles[candidate] = static_cast<uint32_t>(profile);
+      host_candidate_sequences[candidate] = sequence;
+      host_length_transitions[candidate] = length_transitions_for(
+          descriptor, static_cast<int>(length));
+    }
+  }
+  created->statistics.work_cells = work_cells;
+
+  const uint64_t dp_cell_limit =
+      kDpWorkspaceByteLimit / sizeof(float);
+  const uint64_t x_cell_limit =
+      kXmxWorkspaceByteLimit / sizeof(float);
+  for (size_t begin = 0; begin < candidate_count;) {
+    size_t end = begin + 1;
+    if (host_dp_offsets[end] - host_dp_offsets[begin] > dp_cell_limit ||
+        host_x_offsets[end] - host_x_offsets[begin] > x_cell_limit) {
+      set_error(error, error_size,
+                "one Forward row exceeds the workspace cap");
+      return -1;
+    }
+    while (end < candidate_count &&
+           host_dp_offsets[end + 1] - host_dp_offsets[begin] <=
+               dp_cell_limit &&
+           host_x_offsets[end + 1] - host_x_offsets[begin] <=
+               x_cell_limit)
+      ++end;
+    maximum_dp_cells = std::max(
+        maximum_dp_cells,
+        host_dp_offsets[end] - host_dp_offsets[begin]);
+    maximum_x_cells = std::max(
+        maximum_x_cells,
+        host_x_offsets[end] - host_x_offsets[begin]);
+    maximum_tile_count = std::max(maximum_tile_count, end - begin);
+    try {
+      tile_boundaries.push_back(end);
+    } catch (...) {
+      set_error(error, error_size,
+                "Forward tile boundary allocation failed");
+      return -1;
+    }
+    begin = end;
+  }
+  created->statistics.dp_workspace_bytes =
+      maximum_dp_cells * sizeof(float);
+  created->statistics.xmx_workspace_bytes =
+      maximum_x_cells * sizeof(float);
+
+  size_t candidate_bytes;
+  size_t length_transition_bytes;
+  size_t offset_bytes;
+  size_t result_bytes;
+  size_t dp_bytes;
+  size_t xmx_bytes;
+  size_t survivor_candidate_bytes;
+  size_t survivor_offset_bytes;
+  if (!checked_bytes(candidate_count, sizeof(uint32_t),
+                     &candidate_bytes) ||
+      !checked_bytes(candidate_count, sizeof(ForwardLengthTransitions),
+                     &length_transition_bytes) ||
+      !checked_bytes(candidate_count + 1, sizeof(uint64_t), &offset_bytes) ||
+      !checked_bytes(candidate_count, sizeof(ForwardKernelResult),
+                     &result_bytes) ||
+      maximum_dp_cells > SIZE_MAX / sizeof(float) ||
+      maximum_x_cells > SIZE_MAX / sizeof(float) ||
+      !checked_bytes(maximum_tile_count, sizeof(uint32_t),
+                     &survivor_candidate_bytes) ||
+      !checked_bytes(maximum_tile_count + 1, sizeof(uint64_t),
+                     &survivor_offset_bytes)) {
+    set_error(error, error_size, "Forward device workspace size overflow");
+    return -1;
+  }
+  dp_bytes = static_cast<size_t>(maximum_dp_cells) * sizeof(float);
+  xmx_bytes = static_cast<size_t>(maximum_x_cells) * sizeof(float);
+  created->statistics.gather_workspace_bytes =
+      static_cast<uint64_t>(xmx_bytes) + survivor_candidate_bytes +
+      survivor_offset_bytes;
+
+  int maximum_grid_x = 0;
+  status = cudaDeviceGetAttribute(
+      &maximum_grid_x, cudaDevAttrMaxGridDimX, current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaDeviceGetAttribute(maximum grid x)", status);
+    return -1;
+  }
+
+  RunBuffers buffers;
+#define CUDA_RUN(call)                                                        \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, #call, status);                       \
+      return -1;                                                              \
+    }                                                                         \
+  } while (0)
+  CUDA_RUN(cudaMalloc(&buffers.candidate_profiles, candidate_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.candidate_sequences, candidate_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.length_transitions,
+                      length_transition_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.dp_offsets, offset_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.x_offsets, offset_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.dp, dp_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.xmx, xmx_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.results, result_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.survivor_candidates,
+                      survivor_candidate_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.survivor_offsets, survivor_offset_bytes));
+  CUDA_RUN(cudaMalloc(&buffers.gathered, xmx_bytes));
+  CUDA_RUN(cudaMemcpy(buffers.candidate_profiles,
+                      host_candidate_profiles.data(),
+                      candidate_bytes, cudaMemcpyHostToDevice));
+  CUDA_RUN(cudaMemcpy(buffers.candidate_sequences,
+                      host_candidate_sequences.data(),
+                      candidate_bytes, cudaMemcpyHostToDevice));
+  CUDA_RUN(cudaMemcpy(buffers.length_transitions,
+                      host_length_transitions.data(),
+                      length_transition_bytes, cudaMemcpyHostToDevice));
+  CUDA_RUN(cudaMemcpy(buffers.dp_offsets, host_dp_offsets.data(),
+                      offset_bytes, cudaMemcpyHostToDevice));
+  CUDA_RUN(cudaMemcpy(buffers.x_offsets, host_x_offsets.data(),
+                      offset_bytes, cudaMemcpyHostToDevice));
+  CUDA_RUN(cudaEventCreate(&buffers.begin_event));
+  CUDA_RUN(cudaEventCreate(&buffers.end_event));
+
+  std::vector<ForwardKernelResult> host_kernel_results;
+  std::vector<uint32_t> host_survivor_candidates;
+  std::vector<uint64_t> host_survivor_offsets;
+  try {
+    host_kernel_results.resize(candidate_count);
+    host_survivor_candidates.reserve(maximum_tile_count);
+    host_survivor_offsets.reserve(maximum_tile_count + 1);
+  } catch (...) {
+    set_error(error, error_size, "Forward host result allocation failed");
+    return -1;
+  }
+
+  const auto total_begin = std::chrono::steady_clock::now();
+  uint64_t gathered_cells = 0;
+  bool output_cap_exhausted = false;
+  for (size_t tile = 0; tile + 1 < tile_boundaries.size(); ++tile) {
+    const size_t begin = tile_boundaries[tile];
+    const size_t end = tile_boundaries[tile + 1];
+    const size_t tile_count = end - begin;
+    const size_t blocks =
+        (tile_count + kCandidatesPerBlock - 1) / kCandidatesPerBlock;
+    if (blocks > static_cast<size_t>(maximum_grid_x)) {
+      set_error(error, error_size, "Forward candidate grid is too large");
+      return -1;
+    }
+    CUDA_RUN(cudaEventRecord(buffers.begin_event));
+    forward_kernel<<<static_cast<unsigned>(blocks), kThreads>>>(
+        batch_view.device_residues, batch_view.device_offsets,
+        database->device_profiles, database->device_emissions,
+        database->device_transitions, buffers.candidate_profiles,
+        buffers.candidate_sequences,
+        buffers.length_transitions, buffers.dp_offsets, buffers.x_offsets,
+        begin, tile_count, host_dp_offsets[begin], host_x_offsets[begin],
+        buffers.dp, buffers.xmx, buffers.results);
+    CUDA_RUN(cudaGetLastError());
+    CUDA_RUN(cudaEventRecord(buffers.end_event));
+    CUDA_RUN(cudaEventSynchronize(buffers.end_event));
+    float elapsed = 0.0f;
+    CUDA_RUN(cudaEventElapsedTime(
+        &elapsed, buffers.begin_event, buffers.end_event));
+    created->statistics.kernel_milliseconds += elapsed;
+
+    const auto download_begin = std::chrono::steady_clock::now();
+    CUDA_RUN(cudaMemcpy(host_kernel_results.data() + begin,
+                        buffers.results + begin,
+                        tile_count * sizeof(ForwardKernelResult),
+                        cudaMemcpyDeviceToHost));
+    created->statistics.download_milliseconds +=
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - download_begin).count();
+
+    const auto classification_begin = std::chrono::steady_clock::now();
+    host_survivor_candidates.clear();
+    host_survivor_offsets.clear();
+    host_survivor_offsets.push_back(0);
+    uint64_t tile_gathered_cells = 0;
+    for (size_t candidate = begin; candidate < end; ++candidate) {
+      created->special_offsets[candidate] = gathered_cells;
+      const ForwardProfile &profile =
+          database->host_profiles[host_candidate_profiles[candidate]];
+      const ForwardKernelResult kernel_result =
+          host_kernel_results[candidate];
+      plan7_forward_result &result = created->results[candidate];
+      result.status = static_cast<uint8_t>(kernel_result.status);
+      FloatBits fwdsc{};
+      fwdsc.bits = kernel_result.score_bits;
+      if (kernel_result.status == eslOK &&
+          batch_view.host_lengths[host_candidate_sequences[candidate]] != 0 &&
+          std::isfinite(fwdsc.value) &&
+          std::isfinite(filter_scores[candidate]) &&
+          std::isfinite(profile.f_tau) &&
+          std::isfinite(profile.f_lambda) && profile.f_lambda > 0.0f) {
+        result.fwdsc = fwdsc.value;
+        const float difference = fwdsc.value - filter_scores[candidate];
+        const float bit_score = static_cast<float>(
+            static_cast<double>(difference) / kLog2);
+        const double probability = esl_exp_surv(
+            bit_score, profile.f_tau, profile.f_lambda);
+        if (probability > f3) {
+          result.action = PLAN7_FORWARD_DEFINITE_REJECT;
+        } else {
+          const uint64_t x_cells =
+              host_x_offsets[candidate + 1] - host_x_offsets[candidate];
+          const uint64_t output_cell_limit =
+              output_byte_limit / sizeof(float);
+          if (output_cap_exhausted ||
+              x_cells > output_cell_limit - gathered_cells) {
+            result.action = PLAN7_FORWARD_CPU_REQUIRED;
+            output_cap_exhausted = true;
+            ++created->statistics.output_cap_fallback_count;
+          } else if (!checked_add(tile_gathered_cells, x_cells,
+                           &tile_gathered_cells) ||
+                     !checked_add(gathered_cells, x_cells,
+                                  &gathered_cells) ||
+                     gathered_cells > SIZE_MAX) {
+            set_error(error, error_size,
+                      "Forward gathered matrix size overflow");
+            return -1;
+          } else {
+            result.action = PLAN7_FORWARD_DEFINITE_PASS;
+            host_survivor_candidates.push_back(
+                static_cast<uint32_t>(candidate));
+            host_survivor_offsets.push_back(tile_gathered_cells);
+            ++created->statistics.survivor_count;
+          }
+        }
+      } else if (batch_view.host_lengths[
+                     host_candidate_sequences[candidate]] == 0) {
+        result.status = PLAN7_FORWARD_EMPTY;
+      }
+      created->special_offsets[candidate + 1] = gathered_cells;
+    }
+    created->statistics.classification_milliseconds +=
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - classification_begin).count();
+
+    const size_t survivor_count = host_survivor_candidates.size();
+    if (survivor_count == 0) continue;
+    if (survivor_count > static_cast<size_t>(maximum_grid_x) ||
+        tile_gathered_cells > maximum_x_cells) {
+      set_error(error, error_size, "Forward gather grid or size is invalid");
+      return -1;
+    }
+    const size_t old_special_count =
+        created->specials.size();
+    if (tile_gathered_cells > SIZE_MAX - old_special_count) {
+      set_error(error, error_size, "Forward special matrix size overflow");
+      return -1;
+    }
+    try {
+      created->specials.resize(
+          old_special_count + static_cast<size_t>(tile_gathered_cells));
+    } catch (...) {
+      set_error(error, error_size,
+                "Forward special matrix allocation failed");
+      return -1;
+    }
+    CUDA_RUN(cudaMemcpy(buffers.survivor_candidates,
+                        host_survivor_candidates.data(),
+                        survivor_count * sizeof(uint32_t),
+                        cudaMemcpyHostToDevice));
+    CUDA_RUN(cudaMemcpy(buffers.survivor_offsets,
+                        host_survivor_offsets.data(),
+                        (survivor_count + 1) * sizeof(uint64_t),
+                        cudaMemcpyHostToDevice));
+    CUDA_RUN(cudaEventRecord(buffers.begin_event));
+    gather_specials_kernel<<<static_cast<unsigned>(survivor_count),
+                             kGatherThreads>>>(
+        buffers.xmx, buffers.x_offsets, buffers.survivor_candidates,
+        buffers.survivor_offsets, survivor_count, host_x_offsets[begin],
+        buffers.gathered);
+    CUDA_RUN(cudaGetLastError());
+    CUDA_RUN(cudaEventRecord(buffers.end_event));
+    CUDA_RUN(cudaEventSynchronize(buffers.end_event));
+    elapsed = 0.0f;
+    CUDA_RUN(cudaEventElapsedTime(
+        &elapsed, buffers.begin_event, buffers.end_event));
+    created->statistics.gather_milliseconds += elapsed;
+    const auto gather_download_begin = std::chrono::steady_clock::now();
+    CUDA_RUN(cudaMemcpy(created->specials.data() + old_special_count,
+                        buffers.gathered,
+                        static_cast<size_t>(tile_gathered_cells) *
+                            sizeof(float),
+                        cudaMemcpyDeviceToHost));
+    created->statistics.download_milliseconds +=
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - gather_download_begin).count();
+  }
+#undef CUDA_RUN
+  created->statistics.gathered_xmx_bytes =
+      gathered_cells * sizeof(float);
+  created->statistics.total_milliseconds =
+      std::chrono::duration<float, std::milli>(
+          std::chrono::steady_clock::now() - total_begin).count();
+  *output = created.release();
+  return 0;
+}
+
+extern "C" int plan7_forward_output_destroy(
+    plan7_forward_output **output, char *error, size_t error_size) {
+  if (output == nullptr) {
+    set_error(error, error_size, "Forward output handle is null");
+    return -1;
+  }
+  delete *output;
+  *output = nullptr;
+  return 0;
+}
+
+extern "C" size_t plan7_forward_output_result_count(
+    const plan7_forward_output *output) {
+  return output == nullptr ? 0 : output->results.size();
+}
+
+extern "C" const plan7_forward_result *plan7_forward_output_results(
+    const plan7_forward_output *output) {
+  return output == nullptr || output->results.empty()
+      ? nullptr : output->results.data();
+}
+
+extern "C" const uint64_t *plan7_forward_output_special_offsets(
+    const plan7_forward_output *output) {
+  return output == nullptr || output->special_offsets.empty()
+      ? nullptr : output->special_offsets.data();
+}
+
+extern "C" size_t plan7_forward_output_special_count(
+    const plan7_forward_output *output) {
+  return output == nullptr ? 0 : output->specials.size();
+}
+
+extern "C" const float *plan7_forward_output_specials(
+    const plan7_forward_output *output) {
+  return output == nullptr || output->specials.empty()
+      ? nullptr : output->specials.data();
+}
+
+extern "C" const plan7_forward_statistics *
+plan7_forward_output_statistics(const plan7_forward_output *output) {
+  return output == nullptr ? nullptr : &output->statistics;
+}
