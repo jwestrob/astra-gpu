@@ -12,7 +12,7 @@ from libc.stddef cimport size_t
 from libc.math cimport isfinite, isnan
 from libc.stdint cimport int16_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
-from libc.string cimport memcpy
+from libc.string cimport memcmp, memcpy
 
 from libeasel cimport eslCONST_LOG2, eslERRBUFSIZE, eslEINVAL, eslERANGE, eslOK
 from libeasel.sq cimport ESL_SQ
@@ -172,6 +172,39 @@ cdef union _float_bits:
 cdef union _double_bits:
     double value
     uint64_t bits
+
+
+cdef class _SealedPostfilterBatch:
+    """Opaque, lifetime-pinned continuation data validated as one batch."""
+
+    cdef bint _ready
+    cdef tuple _queries
+    cdef tuple _optimized_profiles
+    cdef DigitalSequenceBlock _sequences
+    cdef const uint8_t[::1] _postfilter_records
+    cdef const uint64_t[::1] _postfilter_offsets
+    cdef const uint64_t[::1] _residue_offsets
+    cdef const uint8_t[::1] _forward_records
+    cdef const uint64_t[::1] _forward_offsets
+    cdef const uint64_t[::1] _special_offsets
+    cdef const float[::1] _specials
+    cdef const uint8_t[::1] _row_has_external
+    cdef const uint8_t[::1] _background_fingerprint
+    cdef double _f1
+    cdef uint64_t _generation_f2_bits
+    cdef uint64_t _generation_f3_bits
+    cdef bint _generation_bias_filter
+    cdef _pipeline_from_filter_scores_f _filter_scores_seam
+    cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam
+
+    def __cinit__(self):
+        self._ready = False
+
+    def __repr__(self):
+        return "<opaque sealed post-filter batch>"
+
+    def __reduce__(self):
+        raise TypeError("sealed post-filter batches cannot be pickled")
 
 
 cdef _pipeline_from_filter_scores_f _filter_scores_seam_cache = NULL
@@ -1652,6 +1685,425 @@ def _validate_forward_batch_bound(
             special_offsets[forward_start:forward_stop + 1],
             specials,
         )
+
+
+cdef void _validate_sealed_pair(
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+) except *:
+    if not query.alphabet._eq(optimized_profile.alphabet):
+        raise AlphabetMismatch(query.alphabet, optimized_profile.alphabet)
+    if not query.alphabet._eq(sequences.alphabet):
+        raise AlphabetMismatch(query.alphabet, sequences.alphabet)
+    if query._hmm.M != optimized_profile._om.M:
+        raise ValueError(
+            "HMM and optimized profile model lengths differ: "
+            f"{query._hmm.M} != {optimized_profile._om.M}"
+        )
+    if (
+        query.name != optimized_profile.name
+        or query.accession != optimized_profile.accession
+    ):
+        raise ValueError("HMM and optimized profile metadata differ")
+
+
+cdef void _validate_sealed_residue_offsets(
+    DigitalSequenceBlock sequences,
+    const uint64_t[::1] residue_offsets,
+) except *:
+    cdef size_t target
+
+    if residue_offsets.shape[0] != sequences._length + 1:
+        raise ValueError("target residue-prefix length differs from target count")
+    if residue_offsets[0] != 0:
+        raise ValueError("target residue prefix must start at zero")
+    for target in range(sequences._length):
+        if sequences._refs[target].n > HMMER_TARGET_LIMIT:
+            raise ValueError("target exceeds HMMER's protein limit")
+        if residue_offsets[target + 1] < residue_offsets[target]:
+            raise ValueError("target residue prefix is not monotone")
+        if (
+            residue_offsets[target + 1] - residue_offsets[target]
+            != <uint64_t> sequences._refs[target].n
+        ):
+            raise ValueError("target residue prefix differs from target length")
+
+
+cdef object _immutable_owned_view(object value, str expected_format):
+    """Return a one-dimensional native view whose ultimate owner is bytes."""
+    cdef object view = memoryview(value)
+    cdef object owner
+
+    if view.ndim != 1 or not view.c_contiguous:
+        raise ValueError("sealed buffers must be one-dimensional and contiguous")
+    if view.format != expected_format:
+        raise TypeError(
+            f"sealed buffer format {view.format!r} is not {expected_format!r}"
+        )
+    owner = view.obj
+    while type(owner) is memoryview:
+        owner = owner.obj
+    if type(owner) is bytes and view.readonly:
+        return view
+    return memoryview(view.cast("B").tobytes()).cast(expected_format)
+
+
+def _seal_postfilter_batch_bound(
+    queries,
+    optimized_profiles,
+    DigitalSequenceBlock sequences,
+    postfilter_records,
+    postfilter_offsets,
+    residue_offsets,
+    double f1,
+    background_fingerprint,
+    forward_records=None,
+    forward_offsets=None,
+    special_offsets=None,
+    specials=None,
+    expected_forward_indices=None,
+    uint64_t generation_f2_bits=0,
+    uint64_t generation_f3_bits=0,
+    generation_bias_filter=False,
+):
+    """Seal one already-owned post-filter batch after one complete validation.
+
+    This private factory's HMM, profile, and target arguments must come from
+    the adapter's hidden registries while its pair and sequence locks are
+    held. It defensively freezes every caller buffer before validating it.
+    The returned object exposes neither those buffers nor native pointers;
+    the provenance adapter keeps the matching pair and pipeline locks around
+    every search.
+    """
+    cdef tuple query_tuple = tuple(queries)
+    cdef tuple profile_tuple = tuple(optimized_profiles)
+    cdef object postfilter_owner = _immutable_owned_view(
+        postfilter_records, "B"
+    )
+    cdef object postfilter_offset_owner = _immutable_owned_view(
+        postfilter_offsets, "Q"
+    )
+    cdef object residue_offset_owner = _immutable_owned_view(
+        residue_offsets, "Q"
+    )
+    cdef object background_owner = _immutable_owned_view(
+        background_fingerprint, "B"
+    )
+    cdef const uint8_t[::1] postfilter_view = postfilter_owner
+    cdef const uint64_t[::1] postfilter_offset_view = postfilter_offset_owner
+    cdef const uint64_t[::1] residue_offset_view = residue_offset_owner
+    cdef const uint8_t[::1] background_view = background_owner
+    cdef size_t profile_count
+    cdef size_t profile_index
+    cdef size_t postfilter_count
+    cdef size_t postfilter_start
+    cdef size_t postfilter_stop
+    cdef size_t forward_count
+    cdef size_t forward_start
+    cdef size_t forward_stop
+    cdef size_t forward_cursor
+    cdef _forward_result forward_record
+    cdef bint has_direct = False
+    cdef bint has_forward_storage
+    cdef bint row_has_external
+    cdef bytearray external_rows
+    cdef object empty_forward_records
+    cdef object empty_forward_offsets
+    cdef object empty_special_offsets
+    cdef object empty_specials
+    cdef const uint8_t[::1] forward_view
+    cdef const uint64_t[::1] forward_offset_view
+    cdef const uint64_t[::1] special_offset_view
+    cdef const float[::1] special_view
+    cdef const uint32_t[::1] expected_forward_view
+    cdef _SealedPostfilterBatch sealed
+    cdef _pipeline_from_filter_scores_f filter_scores_seam = NULL
+    cdef _pipeline_from_filter_and_forward_scores_f forward_scores_seam = NULL
+
+    if postfilter_offset_view.shape[0] == 0:
+        raise ValueError("post-filter row offsets need an initial zero")
+    profile_count = <size_t> postfilter_offset_view.shape[0] - 1
+    if len(query_tuple) != profile_count:
+        raise ValueError("HMM count differs from post-filter row count")
+    if len(profile_tuple) != profile_count:
+        raise ValueError(
+            "optimized-profile count differs from post-filter row count"
+        )
+    if postfilter_offset_view[0] != 0:
+        raise ValueError("post-filter row offsets must start at zero")
+    if <size_t> postfilter_view.shape[0] % sizeof(_postfilter_result) != 0:
+        raise ValueError("post-filter result storage has trailing bytes")
+    postfilter_count = (
+        <size_t> postfilter_view.shape[0] // sizeof(_postfilter_result)
+    )
+    if postfilter_offset_view[profile_count] != postfilter_count:
+        raise ValueError("post-filter row offsets do not span result storage")
+    if not isfinite(f1) or f1 < 0.0 or f1 > 1.0:
+        raise ValueError("sealed F1 must be a finite number in [0, 1]")
+    if background_view.shape[0] != (
+        (<size_t> sequences.alphabet.K + 1) * sizeof(float)
+    ):
+        raise ValueError("canonical background fingerprint has the wrong size")
+    if type(generation_bias_filter) is not bool:
+        raise TypeError("generation bias filter must be bool")
+
+    _validate_sealed_residue_offsets(sequences, residue_offset_view)
+
+    has_forward_storage = any(
+        value is not None
+        for value in (forward_records, forward_offsets, special_offsets, specials)
+    )
+    if has_forward_storage and any(
+        value is None
+        for value in (forward_records, forward_offsets, special_offsets, specials)
+    ):
+        raise ValueError("Forward storage must be supplied as one complete batch")
+    if has_forward_storage:
+        forward_view = _immutable_owned_view(forward_records, "B")
+        forward_offset_view = _immutable_owned_view(forward_offsets, "Q")
+        special_offset_view = _immutable_owned_view(special_offsets, "Q")
+        special_view = _immutable_owned_view(specials, "f")
+    else:
+        empty_forward_records = b""
+        empty_forward_offsets = bytes((profile_count + 1) * sizeof(uint64_t))
+        empty_special_offsets = bytes(sizeof(uint64_t))
+        empty_specials = b""
+        forward_view = empty_forward_records
+        forward_offset_view = memoryview(empty_forward_offsets).cast("Q")
+        special_offset_view = memoryview(empty_special_offsets).cast("Q")
+        special_view = memoryview(empty_specials).cast("f")
+
+    if expected_forward_indices is not None:
+        if not has_forward_storage:
+            raise ValueError(
+                "expected Forward indexes require complete Forward storage"
+            )
+        expected_forward_view = expected_forward_indices
+
+    if forward_offset_view.shape[0] != profile_count + 1:
+        raise ValueError("Forward row-offset count differs from post-filter rows")
+    if forward_offset_view[0] != 0:
+        raise ValueError("Forward row offsets must start at zero")
+    if <size_t> forward_view.shape[0] % sizeof(_forward_result) != 0:
+        raise ValueError("Forward result storage has trailing bytes")
+    forward_count = <size_t> forward_view.shape[0] // sizeof(_forward_result)
+    if forward_offset_view[profile_count] != forward_count:
+        raise ValueError("Forward row offsets do not span result storage")
+    if special_offset_view.shape[0] != forward_count + 1:
+        raise ValueError("Forward special-offset count differs from result count")
+    if special_offset_view[0] != 0:
+        raise ValueError("Forward global special offsets must start at zero")
+    if special_offset_view[forward_count] != <uint64_t> special_view.shape[0]:
+        raise ValueError("Forward special offsets do not span matrix storage")
+    if expected_forward_indices is not None:
+        if expected_forward_view.shape[0] != forward_count:
+            raise ValueError("Forward result count differs from selected inputs")
+        for forward_cursor in range(forward_count):
+            memcpy(
+                &forward_record,
+                &forward_view[forward_cursor * sizeof(_forward_result)],
+                sizeof(_forward_result),
+            )
+            if forward_record.sequence_index != expected_forward_view[forward_cursor]:
+                raise ValueError("Forward result order differs from selected inputs")
+
+    external_rows = bytearray(profile_count)
+    for profile_index in range(profile_count):
+        if type(query_tuple[profile_index]) is not _pyhmmer.plan7.HMM:
+            raise TypeError("sealed queries must be exactly pyhmmer.plan7.HMM")
+        if (
+            type(profile_tuple[profile_index])
+            is not _pyhmmer.plan7.OptimizedProfile
+        ):
+            raise TypeError(
+                "sealed profiles must be exactly pyhmmer.plan7.OptimizedProfile"
+            )
+        _validate_sealed_pair(
+            <HMM> query_tuple[profile_index],
+            <OptimizedProfile> profile_tuple[profile_index],
+            sequences,
+        )
+
+        postfilter_start = <size_t> postfilter_offset_view[profile_index]
+        postfilter_stop = <size_t> postfilter_offset_view[profile_index + 1]
+        if (
+            postfilter_start > postfilter_stop
+            or postfilter_stop > postfilter_count
+        ):
+            raise ValueError("post-filter row offsets are not monotone")
+        if _validate_postfilter_records(
+            <OptimizedProfile> profile_tuple[profile_index],
+            sequences,
+            postfilter_view[
+                postfilter_start * sizeof(_postfilter_result):
+                postfilter_stop * sizeof(_postfilter_result)
+            ],
+        ):
+            has_direct = True
+
+        forward_start = <size_t> forward_offset_view[profile_index]
+        forward_stop = <size_t> forward_offset_view[profile_index + 1]
+        if forward_start > forward_stop or forward_stop > forward_count:
+            raise ValueError("Forward row offsets are not monotone")
+        row_has_external = _validate_forward_augmentation(
+            sequences,
+            postfilter_view[
+                postfilter_start * sizeof(_postfilter_result):
+                postfilter_stop * sizeof(_postfilter_result)
+            ],
+            forward_view[
+                forward_start * sizeof(_forward_result):
+                forward_stop * sizeof(_forward_result)
+            ],
+            special_offset_view[forward_start:forward_stop + 1],
+            special_view,
+        )
+        external_rows[profile_index] = <uint8_t> row_has_external
+
+    if has_direct:
+        filter_scores_seam = _cached_filter_scores_seam()
+        if filter_scores_seam == NULL:
+            raise RuntimeError(
+                "direct post-filter records require the project-private "
+                "p7_PipelineFromFilterScores HMMER seam"
+            )
+    if has_forward_storage:
+        forward_scores_seam = _cached_filter_and_forward_scores_seam()
+
+    sealed = _SealedPostfilterBatch()
+    sealed._queries = query_tuple
+    sealed._optimized_profiles = profile_tuple
+    sealed._sequences = sequences
+    sealed._postfilter_records = postfilter_view
+    sealed._postfilter_offsets = postfilter_offset_view
+    sealed._residue_offsets = residue_offset_view
+    sealed._forward_records = forward_view
+    sealed._forward_offsets = forward_offset_view
+    sealed._special_offsets = special_offset_view
+    sealed._specials = special_view
+    sealed._row_has_external = bytes(external_rows)
+    sealed._background_fingerprint = background_view
+    sealed._f1 = f1
+    sealed._generation_f2_bits = generation_f2_bits
+    sealed._generation_f3_bits = generation_f3_bits
+    sealed._generation_bias_filter = generation_bias_filter
+    sealed._filter_scores_seam = filter_scores_seam
+    sealed._forward_scores_seam = forward_scores_seam
+    sealed._ready = True
+    return sealed
+
+
+cdef bint _sealed_background_matches(
+    _SealedPostfilterBatch sealed,
+    Pipeline pipeline,
+) noexcept nogil:
+    cdef size_t frequency_bytes = (
+        <size_t> pipeline.background._bg.abc.K * sizeof(float)
+    )
+    if sealed._background_fingerprint.shape[0] != frequency_bytes + sizeof(float):
+        return False
+    if memcmp(
+        &sealed._background_fingerprint[0],
+        pipeline.background._bg.f,
+        frequency_bytes,
+    ) != 0:
+        return False
+    return memcmp(
+        &sealed._background_fingerprint[frequency_bytes],
+        &pipeline.background._bg.omega,
+        sizeof(float),
+    ) == 0
+
+
+def _search_hmm_sealed_postfilter_bound(
+    sealed_object,
+    Py_ssize_t row,
+    Pipeline pipeline,
+):
+    """Search one row whose complete immutable batch was already validated."""
+    cdef _SealedPostfilterBatch sealed
+    cdef HMM query
+    cdef OptimizedProfile optimized_profile
+    cdef size_t postfilter_start
+    cdef size_t postfilter_stop
+    cdef size_t forward_start
+    cdef size_t forward_stop
+    cdef _double_bits live_f2
+    cdef _double_bits live_f3
+    cdef bint use_forward
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    if type(pipeline) is not _pyhmmer.plan7.Pipeline:
+        raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+    if row < 0 or row >= len(sealed._queries):
+        raise IndexError("sealed post-filter row out of range")
+    if not pipeline.alphabet._eq(sealed._sequences.alphabet):
+        raise AlphabetMismatch(pipeline.alphabet, sealed._sequences.alphabet)
+    if pipeline._pli.F1 != sealed._f1:
+        raise ValueError(
+            f"pipeline F1 {pipeline.F1!r} does not match "
+            f"candidate F1 {sealed._f1!r}"
+        )
+    if not _sealed_background_matches(sealed, pipeline):
+        raise ValueError(
+            "pipeline background does not match the canonical hmmpress background"
+        )
+
+    # Make the query copy before any pipeline mutation. Each successful call
+    # consequently owns an independent TopHits.query, even when a row is reused.
+    query = (<HMM> sealed._queries[row]).copy()
+    optimized_profile = <OptimizedProfile> sealed._optimized_profiles[row]
+    postfilter_start = <size_t> sealed._postfilter_offsets[row]
+    postfilter_stop = <size_t> sealed._postfilter_offsets[row + 1]
+    forward_start = <size_t> sealed._forward_offsets[row]
+    forward_stop = <size_t> sealed._forward_offsets[row + 1]
+
+    live_f2.value = pipeline._pli.F2
+    live_f3.value = pipeline._pli.F3
+    use_forward = (
+        sealed._row_has_external[row]
+        and sealed._forward_scores_seam != NULL
+        and live_f2.bits == sealed._generation_f2_bits
+        and live_f3.bits == sealed._generation_f3_bits
+        and pipeline._pli.do_biasfilter == sealed._generation_bias_filter
+    )
+    if not use_forward:
+        return _search_postfilter_validated(
+            pipeline,
+            query,
+            optimized_profile,
+            sealed._sequences,
+            sealed._postfilter_records[
+                postfilter_start * sizeof(_postfilter_result):
+                postfilter_stop * sizeof(_postfilter_result)
+            ],
+            &sealed._residue_offsets[0],
+            sealed._filter_scores_seam,
+        )
+    return _search_postfilter_forward_validated(
+        pipeline,
+        query,
+        optimized_profile,
+        sealed._sequences,
+        sealed._postfilter_records[
+            postfilter_start * sizeof(_postfilter_result):
+            postfilter_stop * sizeof(_postfilter_result)
+        ],
+        sealed._forward_records[
+            forward_start * sizeof(_forward_result):
+            forward_stop * sizeof(_forward_result)
+        ],
+        sealed._special_offsets[forward_start:forward_stop + 1],
+        sealed._specials,
+        &sealed._residue_offsets[0],
+        sealed._filter_scores_seam,
+        sealed._forward_scores_seam,
+    )
 
 
 def _search_hmm_candidates(

@@ -1,7 +1,9 @@
 import importlib.util
+import gc
 import io
 import json
 import math
+import pickle
 import subprocess
 import struct
 import sys
@@ -98,6 +100,12 @@ class MaskedPipelineTests(unittest.TestCase):
     @staticmethod
     def double_bits(value):
         return struct.unpack("=Q", struct.pack("=d", value))[0]
+
+    @staticmethod
+    def background_fingerprint(background):
+        return memoryview(background.residue_frequencies).cast("B").tobytes() + (
+            struct.pack("=f", background.omega)
+        )
 
     @staticmethod
     def table_bytes(hits, format):
@@ -582,6 +590,213 @@ print(json.dumps(after_repeat, sort_keys=True))
                 expected_indices,
                 special_offsets,
                 specials,
+            )
+
+    def test_sealed_cpu_batch_is_exact_reusable_opaque_and_lifetime_pinned(self):
+        hmm = self.hmms[0]
+        optimized = self.optimized_profiles[0].copy()
+        residue_offsets = self.residue_offsets(self.sequences)
+        records = b"".join(
+            self.postfilter_record(index, math.nan, 0, 255, 0, math.nan)
+            for index in range(len(self.sequences))
+        )
+        row_offsets = array("Q", [0, len(self.sequences)])
+        background = pyhmmer.plan7.Background(self.alphabet)
+        fingerprint = self.background_fingerprint(background)
+        sealed = _pipeline._seal_postfilter_batch_bound(
+            (hmm,),
+            (optimized,),
+            self.sequences,
+            records,
+            row_offsets,
+            residue_offsets,
+            0.02,
+            fingerprint,
+        )
+
+        # The seal owns all search inputs; dropping the construction views does
+        # not affect later reuse.
+        del optimized, records, row_offsets, residue_offsets, background, fingerprint
+        gc.collect()
+
+        expected = self.pipeline().search_hmm(hmm, self.sequences)
+        first = _pipeline._search_hmm_sealed_postfilter_bound(
+            sealed, 0, self.pipeline()
+        )
+        second = _pipeline._search_hmm_sealed_postfilter_bound(
+            sealed, 0, self.pipeline()
+        )
+        self.assert_exact_hits(expected, first)
+        self.assert_exact_hits(expected, second)
+        self.assertIsNot(first.query, second.query)
+        self.assertIsNot(first.query, hmm)
+        original_name = hmm.name
+        first.query.name = b"mutated-result-query"
+        self.assertEqual(second.query.name, original_name)
+        self.assertEqual(hmm.name, original_name)
+        self.assertFalse(hasattr(sealed, "_queries"))
+        with self.assertRaises(AttributeError):
+            sealed.records = b""
+        with self.assertRaisesRegex(TypeError, "cannot be pickled"):
+            pickle.dumps(sealed)
+
+    def test_sealed_live_mismatch_fails_before_pipeline_mutation(self):
+        hmm = self.hmms[0]
+        residue_offsets = self.residue_offsets(self.sequences)
+        records = b"".join(
+            self.postfilter_record(index, math.nan, 0, 255, 0, math.nan)
+            for index in range(len(self.sequences))
+        )
+        background = pyhmmer.plan7.Background(self.alphabet)
+        sealed = _pipeline._seal_postfilter_batch_bound(
+            (hmm,),
+            (self.optimized_profiles[0].copy(),),
+            self.sequences,
+            records,
+            array("Q", [0, len(self.sequences)]),
+            residue_offsets,
+            0.02,
+            self.background_fingerprint(background),
+        )
+        pipeline = self.pipeline(F1=0.5)
+        with self.assertRaisesRegex(ValueError, "does not match candidate F1"):
+            _pipeline._search_hmm_sealed_postfilter_bound(sealed, 0, pipeline)
+
+        expected = self.pipeline(F1=0.5).search_hmm(hmm, self.sequences)
+        actual = pipeline.search_hmm(hmm, self.sequences)
+        self.assert_exact_hits(expected, actual)
+
+        background_mismatch = self.pipeline()
+        background_mismatch.background.residue_frequencies[0] += 0.01
+        with self.assertRaisesRegex(ValueError, "canonical hmmpress background"):
+            _pipeline._search_hmm_sealed_postfilter_bound(
+                sealed, 0, background_mismatch
+            )
+
+    def test_seal_freezes_all_retained_caller_buffers(self):
+        hmm = self.hmms[0]
+        records = bytearray(
+            b"".join(
+                self.postfilter_record(index, math.nan, 0, 255, 0, math.nan)
+                for index in range(len(self.sequences))
+            )
+        )
+        row_offsets = array("Q", [0, len(self.sequences)])
+        residue_offsets = self.residue_offsets(self.sequences)
+        background = pyhmmer.plan7.Background(self.alphabet)
+        fingerprint = bytearray(self.background_fingerprint(background))
+        sealed = _pipeline._seal_postfilter_batch_bound(
+            (hmm,),
+            (self.optimized_profiles[0].copy(),),
+            self.sequences,
+            records,
+            row_offsets,
+            residue_offsets,
+            0.02,
+            fingerprint,
+        )
+
+        records[:4] = struct.pack("=I", len(self.sequences) - 1)
+        row_offsets[1] = 0
+        residue_offsets[1] = 0
+        fingerprint[0] ^= 0xFF
+
+        expected = self.pipeline().search_hmm(hmm, self.sequences)
+        actual = _pipeline._search_hmm_sealed_postfilter_bound(
+            sealed, 0, self.pipeline()
+        )
+        self.assert_exact_hits(expected, actual)
+
+    def test_sealed_forward_row_matches_validated_continuation(self):
+        if not _pipeline._filter_and_forward_scores_seam_available():
+            self.skipTest("private Forward-score seam is unavailable")
+        target = 1
+        hmm = self.hmms[0]
+        postfilter = self.postfilter_record(target, 0.0, 0, 0, 2, 0.0)
+        forward = self.forward_record(target, -7.0, 0, 1)
+        mutable_forward = bytearray(forward)
+        forward_offsets = array("Q", [0, 1])
+        special_offsets = array("Q", [0, 0])
+        specials = array("f")
+        residue_offsets = self.residue_offsets(self.sequences)
+        generation_f2_bits = self.double_bits(1.0)
+        generation_f3_bits = self.double_bits(1e-5)
+        background = pyhmmer.plan7.Background(self.alphabet)
+        sealed = _pipeline._seal_postfilter_batch_bound(
+            (hmm,),
+            (self.optimized_profiles[0].copy(),),
+            self.sequences,
+            postfilter,
+            array("Q", [0, 1]),
+            residue_offsets,
+            1.0,
+            self.background_fingerprint(background),
+            forward_records=mutable_forward,
+            forward_offsets=forward_offsets,
+            special_offsets=special_offsets,
+            specials=specials,
+            expected_forward_indices=array("I", [target]),
+            generation_f2_bits=generation_f2_bits,
+            generation_f3_bits=generation_f3_bits,
+            generation_bias_filter=True,
+        )
+        mutable_forward[9] = 0
+        forward_offsets[1] = 0
+        options = {"F1": 1.0, "F2": 1.0, "F3": 1e-5}
+        expected = _pipeline._search_hmm_postfilter_forward_bound(
+            self.pipeline(**options),
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            postfilter,
+            forward,
+            array("Q", [0, 0]),
+            array("f"),
+            residue_offsets,
+            generation_f2_bits,
+            generation_f3_bits,
+            True,
+        )
+        actual = _pipeline._search_hmm_sealed_postfilter_bound(
+            sealed, 0, self.pipeline(**options)
+        )
+        self.assert_exact_hits(expected, actual)
+
+        fallback_options = dict(options, F3=math.nextafter(1e-5, 0.0))
+        expected_fallback = _pipeline._search_hmm_postfilter_bound(
+            self.pipeline(**fallback_options),
+            hmm,
+            self.optimized_profiles[0].copy(),
+            self.sequences,
+            postfilter,
+            residue_offsets,
+        )
+        actual_fallback = _pipeline._search_hmm_sealed_postfilter_bound(
+            sealed, 0, self.pipeline(**fallback_options)
+        )
+        self.assert_exact_hits(expected_fallback, actual_fallback)
+
+    def test_seal_rejects_malformed_global_row_maps(self):
+        background = pyhmmer.plan7.Background(self.alphabet)
+        arguments = (
+            (self.hmms[0],),
+            (self.optimized_profiles[0].copy(),),
+            self.sequences,
+            self.postfilter_record(1, 0.0, 0, 0, 2, 0.0),
+            array("Q", [0, 1]),
+            self.residue_offsets(self.sequences),
+            1.0,
+            self.background_fingerprint(background),
+        )
+        with self.assertRaisesRegex(ValueError, "order differs"):
+            _pipeline._seal_postfilter_batch_bound(
+                *arguments,
+                forward_records=self.forward_record(1, -7.0, 0, 1),
+                forward_offsets=array("Q", [0, 1]),
+                special_offsets=array("Q", [0, 0]),
+                specials=array("f"),
+                expected_forward_indices=array("I", [2]),
+                generation_bias_filter=True,
             )
 
     def test_ok_cpu_forward_cap_fallback_uses_original_continuation(self):

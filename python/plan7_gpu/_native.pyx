@@ -5,6 +5,8 @@ from libc.stdint cimport int16_t, int32_t, uintptr_t, uint8_t, uint16_t, uint32_
 from libc.math cimport isfinite
 from libc.string cimport memcpy
 from cpython.array cimport array as carray, clone
+from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
+from cpython.pyport cimport PY_SSIZE_T_MAX
 from libcpp.vector cimport vector
 from pyhmmer.plan7 cimport OptimizedProfile
 
@@ -1997,6 +1999,7 @@ cdef class SequenceBatch:
         cdef size_t candidate_count = <size_t> candidate_indices.shape[0]
         cdef size_t result_count
         cdef size_t result_bytes
+        cdef size_t offset_bytes
         cdef size_t special_count
         cdef size_t special_bytes
         cdef size_t profile_index
@@ -2009,10 +2012,11 @@ cdef class SequenceBatch:
         cdef const uint64_t *native_offsets
         cdef const float *native_specials
         cdef const plan7_forward_statistics *native_statistics
-        cdef bytearray records
-        cdef uint8_t[::1] record_view
-        cdef carray offsets
-        cdef carray specials
+        cdef bytes records
+        cdef bytes offset_storage
+        cdef bytes special_storage
+        cdef object offsets
+        cdef object specials
         cdef dict statistics
 
         if self._batch == NULL:
@@ -2076,38 +2080,53 @@ cdef class SequenceBatch:
             if result_count > (<size_t> -1) // sizeof(plan7_forward_result):
                 raise OverflowError("Forward result size overflows size_t")
             result_bytes = result_count * sizeof(plan7_forward_result)
-            records = bytearray(result_bytes)
+            if result_bytes > <size_t> PY_SSIZE_T_MAX:
+                raise OverflowError("Forward result size exceeds Python limits")
+            records = PyBytes_FromStringAndSize(NULL, result_bytes)
             native_results = plan7_forward_output_results(output)
             if result_bytes:
                 if native_results == NULL:
                     raise RuntimeError("Forward result storage is null")
-                record_view = records
-                memcpy(&record_view[0], native_results, result_bytes)
+                memcpy(PyBytes_AS_STRING(records), native_results, result_bytes)
 
             native_offsets = plan7_forward_output_special_offsets(output)
             if native_offsets == NULL:
                 raise RuntimeError("Forward special offsets are null")
-            offsets = clone(_UINT64_ARRAY_TEMPLATE, result_count + 1, False)
-            memcpy(
-                offsets.data.as_ulonglongs,
-                native_offsets,
-                (result_count + 1) * sizeof(uint64_t),
+            if result_count > (
+                <size_t> PY_SSIZE_T_MAX // sizeof(uint64_t)
+            ) - 1:
+                raise OverflowError("Forward special offsets exceed Python limits")
+            offset_bytes = (result_count + 1) * sizeof(uint64_t)
+            offset_storage = PyBytes_FromStringAndSize(
+                NULL,
+                offset_bytes,
             )
+            memcpy(
+                PyBytes_AS_STRING(offset_storage),
+                native_offsets,
+                offset_bytes,
+            )
+            offsets = memoryview(offset_storage).cast("Q")
 
             special_count = plan7_forward_output_special_count(output)
             if special_count > (<size_t> -1) // sizeof(float):
                 raise OverflowError("Forward special matrix size overflows size_t")
             special_bytes = special_count * sizeof(float)
-            specials = clone(_FLOAT_ARRAY_TEMPLATE, special_count, False)
+            if special_bytes > <size_t> PY_SSIZE_T_MAX:
+                raise OverflowError(
+                    "Forward special matrix size exceeds Python limits"
+                )
+            special_storage = PyBytes_FromStringAndSize(NULL, special_bytes)
             native_specials = plan7_forward_output_specials(output)
             if special_bytes:
                 if native_specials == NULL:
                     raise RuntimeError("Forward special matrix is null")
                 memcpy(
-                    specials.data.as_floats,
+                    PyBytes_AS_STRING(special_storage),
                     native_specials,
                     special_bytes,
                 )
+            specials = memoryview(special_storage).cast("f")
 
             native_statistics = plan7_forward_output_statistics(output)
             if native_statistics == NULL:

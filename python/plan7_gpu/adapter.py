@@ -471,6 +471,7 @@ class _CandidateState:
         "all_targets",
         "postfilter_records",
         "forward",
+        "sealed_postfilter",
         "f1",
     )
 
@@ -485,6 +486,7 @@ class _CandidateState:
         all_targets: bytes,
         postfilter_records: bytes | None,
         forward: _ForwardAugmentation | None,
+        sealed_postfilter: Any | None,
         f1: float,
     ) -> None:
         self.pairs = pairs
@@ -496,6 +498,7 @@ class _CandidateState:
         self.all_targets = all_targets
         self.postfilter_records = postfilter_records
         self.forward = forward
+        self.sealed_postfilter = sealed_postfilter
         self.f1 = f1
 
 
@@ -563,6 +566,19 @@ class CandidateBatch:
             )
         candidate_state = _candidate_state(self)
         pair = candidate_state.pairs[row_index]
+        sealed_postfilter = candidate_state.sealed_postfilter
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        state = _pair_state(pair)
+        if sealed_postfilter is not None:
+            with _lease_pipeline(pipeline):
+                with state.lock:
+                    return _pipeline._search_hmm_sealed_postfilter_bound(
+                        sealed_postfilter,
+                        row_index,
+                        pipeline,
+                    )
+
         postfilter_records = candidate_state.postfilter_records
         forward = candidate_state.forward
         forward_row = None
@@ -594,10 +610,6 @@ class CandidateBatch:
             stop = offsets[row_index + 1]
             candidate_row = memoryview(candidate_state.indices).cast("I")[start:stop]
         residue_offsets = memoryview(candidate_state.residue_offsets).cast("Q")
-        from . import _pipeline  # type: ignore[attr-defined]
-
-        state = _pair_state(pair)
-
         with _lease_pipeline(pipeline):
             if float(pipeline.F1) != candidate_state.f1:
                 raise ValueError(
@@ -677,6 +689,7 @@ def _new_candidate_batch(
     *,
     postfilter_records: bytes | None = None,
     forward: _ForwardAugmentation | None = None,
+    sealed_postfilter: Any | None = None,
 ) -> CandidateBatch:
     candidates = object.__new__(CandidateBatch)
     _CANDIDATE_STATES[candidates] = _CandidateState(
@@ -689,6 +702,7 @@ def _new_candidate_batch(
         all_targets.tobytes(),
         postfilter_records,
         forward,
+        sealed_postfilter,
         f1,
     )
     return candidates
@@ -1130,6 +1144,8 @@ class SequenceBatch:
 
         postfilter_records: bytes | None = None
         forward: _ForwardAugmentation | None = None
+        sealed_postfilter: Any | None = None
+        seal_factory = getattr(_pipeline, "_seal_postfilter_batch_bound", None)
         unique_locks = {id(state.lock): state.lock for state in states}
         with ExitStack() as locks:
             for lock_id in sorted(unique_locks):
@@ -1212,16 +1228,17 @@ class SequenceBatch:
                                 raise RuntimeError(
                                     "Forward result count differs from input"
                                 )
-                            _pipeline._validate_forward_batch_bound(
-                                sequence_state.targets,
-                                memoryview(postfilter_records),
-                                memoryview(offsets),
-                                memoryview(forward_records),
-                                memoryview(forward_row_offsets),
-                                memoryview(forward_indices),
-                                memoryview(special_offsets),
-                                memoryview(specials),
-                            )
+                            if seal_factory is None:
+                                _pipeline._validate_forward_batch_bound(
+                                    sequence_state.targets,
+                                    memoryview(postfilter_records),
+                                    memoryview(offsets),
+                                    memoryview(forward_records),
+                                    memoryview(forward_row_offsets),
+                                    memoryview(forward_indices),
+                                    memoryview(special_offsets),
+                                    memoryview(specials),
+                                )
                             forward = _ForwardAugmentation(
                                 bytes(forward_records),
                                 forward_row_offsets,
@@ -1234,6 +1251,39 @@ class SequenceBatch:
                     indices = array("I")
                     all_rows = bytes(len(profiles))
                     all_targets = array("I")
+                    if seal_factory is not None:
+                        canonical_background = _background_fingerprint(background)
+                        if any(
+                            state.background_fingerprint != canonical_background
+                            for state in states
+                        ):
+                            raise ValueError(
+                                "pressed profiles do not share the canonical "
+                                "hmmpress background"
+                            )
+                        seal_options: dict[str, Any] = {}
+                        if forward is not None:
+                            seal_options = {
+                                "forward_records": memoryview(forward.records),
+                                "forward_offsets": forward.row_offsets,
+                                "special_offsets": forward.special_offsets,
+                                "specials": forward.specials,
+                                "expected_forward_indices": memoryview(forward_indices),
+                                "generation_f2_bits": forward.f2_bits,
+                                "generation_f3_bits": forward.f3_bits,
+                                "generation_bias_filter": forward.bias_filter,
+                            }
+                        sealed_postfilter = seal_factory(
+                            tuple(state.hmm for state in states),
+                            tuple(profiles),
+                            sequence_state.targets,
+                            memoryview(postfilter_records),
+                            memoryview(offsets),
+                            memoryview(sequence_state.residue_offsets).cast("Q"),
+                            threshold,
+                            memoryview(canonical_background),
+                            **seal_options,
+                        )
 
         return _new_candidate_batch(
             pairs,
@@ -1245,7 +1295,10 @@ class SequenceBatch:
             all_targets,
             threshold,
             postfilter_records=postfilter_records,
-            forward=forward,
+            # The seal owns frozen Forward storage; retain the Python wrapper
+            # only for the stock-extension fallback path.
+            forward=forward if sealed_postfilter is None else None,
+            sealed_postfilter=sealed_postfilter,
         )
 
 

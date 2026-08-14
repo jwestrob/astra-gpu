@@ -138,6 +138,16 @@ class CudaForwardTests(unittest.TestCase):
             )
             smaller = batch.forward_candidates_many_raw(*smaller_arguments)
             self.assertEqual(len(smaller[0]), _native.FORWARD_RESULT_SIZE)
+            self.assertIs(type(smaller[0]), bytes)
+            for buffer in smaller[1:3]:
+                self.assertIs(type(buffer), memoryview)
+                self.assertTrue(buffer.readonly)
+                self.assertIs(type(buffer.obj), bytes)
+            with self.assertRaises(TypeError):
+                smaller[1][0] = 0
+            if len(smaller[2]):
+                with self.assertRaises(TypeError):
+                    smaller[2][0] = 0.0
             low_water = batch.workspace_statistics
             self.assertEqual(low_water["forward_growth_count"], 11)
             self.assertEqual(low_water["forward_event_create_count"], 2)

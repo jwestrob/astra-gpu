@@ -1,5 +1,4 @@
 import io
-import math
 import random
 import struct
 import sys
@@ -264,16 +263,27 @@ class AstraSearchTests(unittest.TestCase):
             )
 
         self.assertEqual(calls, [(pairs, 0.5, 1.0, 1.0, True)])
-        forward = _candidate_state(built[0]).forward
-        self.assertIsNotNone(forward)
-        self.assertTrue(
-            any(
-                status == 0 and action == 0 and math.isfinite(fwdsc)
-                for _, fwdsc, status, action, _ in struct.iter_unpack(
-                    "=IfBBH", forward.records
+        state = _candidate_state(built[0])
+        self.assertIsNotNone(state.sealed_postfilter)
+        self.assertIsNone(state.forward)
+        self.assert_exact_hits(expected[0], actual[0])
+
+    def test_missing_seal_factory_keeps_validated_fallback(self):
+        if _pipeline is None or not _pipeline._filter_scores_seam_available():
+            self.skipTest("exact post-filter continuation is unavailable")
+        pairs = self.pairs[2:3]
+        options = {"F1": 0.5, "F2": 1.0, "F3": 1.0}
+        expected = self.reference(pairs, self.synthetic_targets, **options)
+        with mock.patch.object(_pipeline, "_seal_postfilter_batch_bound", new=None):
+            actual = list(
+                hmmsearch(
+                    pairs,
+                    self.synthetic_batch,
+                    cpus=1,
+                    postfilter=True,
+                    **options,
                 )
             )
-        )
         self.assert_exact_hits(expected[0], actual[0])
 
     def test_candidate_search_consumes_real_forward_augmentation(self):
@@ -291,15 +301,10 @@ class AstraSearchTests(unittest.TestCase):
         with SequenceBatch(self.synthetic_targets) as batch:
             candidates = batch._postfilter_forward_batch(pairs, 0.5, 1.0, 1.0, True)
         state = _candidate_state(candidates)
-        self.assertIsNotNone(state.forward)
-        self.assertTrue(
-            any(
-                state.forward.row_offsets[row] != state.forward.row_offsets[row + 1]
-                for row in range(len(pairs))
-            )
-        )
+        self.assertIsNotNone(state.sealed_postfilter)
+        self.assertIsNone(state.forward)
         expected = self.reference(pairs, self.synthetic_targets, **options)
-        original = _pipeline._search_hmm_postfilter_forward_bound
+        original = _pipeline._search_hmm_sealed_postfilter_bound
         calls = []
 
         def observed(*args):
@@ -308,7 +313,7 @@ class AstraSearchTests(unittest.TestCase):
 
         with mock.patch.object(
             _pipeline,
-            "_search_hmm_postfilter_forward_bound",
+            "_search_hmm_sealed_postfilter_bound",
             new=observed,
         ):
             actual = list(hmmsearch(pairs, candidates, cpus=2, **options))
