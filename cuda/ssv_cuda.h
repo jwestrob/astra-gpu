@@ -103,7 +103,7 @@ int plan7_ssv_sequence_batch_filter(plan7_ssv_sequence_batch *batch,
 
 int plan7_ssv_sequence_batch_filter_many(
   plan7_ssv_sequence_batch *batch,
-  const uint8_t *packed_striped_scores,
+  const uint8_t *packed_scores,
   size_t packed_score_count,
   const plan7_ssv_profile *profiles,
   size_t profile_count,

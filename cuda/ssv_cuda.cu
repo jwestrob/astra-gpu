@@ -66,6 +66,7 @@ saturating_signed_subtract(int left, int right)
   return value > INT8_MAX ? INT8_MAX : (value < INT8_MIN ? INT8_MIN : value);
 }
 
+template<bool CompactScores>
 __device__ __forceinline__ void
 ssv_filter_block(const uint8_t *scores,
                  int score_stride,
@@ -102,10 +103,15 @@ ssv_filter_block(const uint8_t *scores,
 
     while (i < length && k < model_length) {
       const unsigned residue = residues[start + static_cast<uint64_t>(i)];
-      const int q = k % Q;
-      const int lane = k / Q;
-      const unsigned raw_cost =
-        scores[static_cast<size_t>(residue) * score_stride + 16 * q + lane];
+      unsigned raw_cost;
+      if constexpr (CompactScores) {
+        raw_cost = scores[static_cast<size_t>(k) * score_stride + residue];
+      } else {
+        const int q = k % Q;
+        const int lane = k / Q;
+        raw_cost =
+          scores[static_cast<size_t>(residue) * score_stride + 16 * q + lane];
+      }
       const int cost = raw_cost < 128 ? static_cast<int>(raw_cost)
                                      : static_cast<int>(raw_cost) - 256;
       value = saturating_signed_subtract(value, cost);
@@ -175,9 +181,9 @@ ssv_kernel(const uint8_t *scores,
 {
   __shared__ unsigned maxima[kThreads];
   const size_t sequence = static_cast<size_t>(blockIdx.x);
-  ssv_filter_block(scores, score_stride, model_length, residues, offsets,
-                   sequence, tjb[sequence], tbm, tec, base, bias,
-                   &results[sequence], maxima);
+  ssv_filter_block<false>(scores, score_stride, model_length, residues, offsets,
+                          sequence, tjb[sequence], tbm, tec, base, bias,
+                          &results[sequence], maxima);
 }
 
 __global__ void
@@ -197,7 +203,7 @@ ssv_many_kernel(const uint8_t *packed_scores,
 
   if (threadIdx.x == 0) profile_descriptor = profiles[profile];
   __syncthreads();
-  ssv_filter_block(
+  ssv_filter_block<true>(
     packed_scores + profile_descriptor.score_offset,
     profile_descriptor.score_stride,
     profile_descriptor.model_length,
@@ -494,11 +500,12 @@ grow_device_buffer(T **buffer,
 }
 
 bool
-validate_profile(const plan7_ssv_profile *profile,
-                 int alphabet_size,
-                 size_t packed_score_count,
-                 char *error,
-                 size_t error_size)
+validate_compact_profile(const plan7_ssv_profile *profile,
+                         int alphabet_size,
+                         size_t packed_score_count,
+                         size_t expected_offset,
+                         char *error,
+                         size_t error_size)
 {
   size_t expected_score_count;
 
@@ -508,19 +515,16 @@ validate_profile(const plan7_ssv_profile *profile,
     set_error(error, error_size, "invalid packed profile dimensions or scale");
     return false;
   }
-  const int Q = profile->model_length < 17
-                  ? 2
-                  : (profile->model_length + 15) / 16;
-  const int minimum_stride = 16 * (Q + kExtraScoreVectors);
-  if (profile->score_stride < minimum_stride ||
-      !checked_product(static_cast<size_t>(profile->score_stride),
+  if (profile->score_stride != alphabet_size ||
+      !checked_product(static_cast<size_t>(profile->model_length),
                        static_cast<size_t>(alphabet_size),
                        &expected_score_count) ||
       profile->score_count != expected_score_count ||
-      profile->score_offset > packed_score_count ||
+      profile->score_offset != expected_offset ||
+      expected_offset > packed_score_count ||
       profile->score_count >
-        static_cast<uint64_t>(packed_score_count - profile->score_offset)) {
-    set_error(error, error_size, "invalid packed profile score range");
+        static_cast<uint64_t>(packed_score_count - expected_offset)) {
+    set_error(error, error_size, "invalid compact profile score range");
     return false;
   }
   return true;
@@ -928,7 +932,7 @@ plan7_ssv_sequence_batch_filter(plan7_ssv_sequence_batch *batch,
 extern "C" int
 plan7_ssv_sequence_batch_filter_many(
   plan7_ssv_sequence_batch *batch,
-  const uint8_t *packed_striped_scores,
+  const uint8_t *packed_scores,
   size_t packed_score_count,
   const plan7_ssv_profile *profiles,
   size_t profile_count,
@@ -945,6 +949,7 @@ plan7_ssv_sequence_batch_filter_many(
   int current_device;
   int maximum_grid_x;
   int maximum_grid_y;
+  size_t expected_score_offset = 0;
 
   if (batch == nullptr) {
     set_error(error, error_size, "sequence batch is null");
@@ -981,14 +986,21 @@ plan7_ssv_sequence_batch_filter_many(
     set_error(error, error_size, "multi-profile CUDA grid is too large");
     return -1;
   }
-  if (packed_striped_scores == nullptr || profiles == nullptr) {
+  if (packed_scores == nullptr || profiles == nullptr) {
     set_error(error, error_size, "packed profile buffers are null");
     return -1;
   }
-  for (size_t profile = 0; profile < profile_count; ++profile)
-    if (!validate_profile(&profiles[profile], batch->alphabet_size,
-                          packed_score_count, error, error_size))
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    if (!validate_compact_profile(
+          &profiles[profile], batch->alphabet_size, packed_score_count,
+          expected_score_offset, error, error_size))
       return -1;
+    expected_score_offset += static_cast<size_t>(profiles[profile].score_count);
+  }
+  if (expected_score_offset != packed_score_count) {
+    set_error(error, error_size, "compact profile scores have trailing bytes");
+    return -1;
+  }
 
   if (!checked_product(profile_count, batch->sequence_count, &cell_count) ||
       !checked_product(cell_count, sizeof(plan7_ssv_result), &result_bytes) ||
@@ -1055,7 +1067,7 @@ plan7_ssv_sequence_batch_filter_many(
   } while (0)
 
   CUDA_TRY_MANY(cudaMemcpy(batch->device_scores,
-                           packed_striped_scores,
+                           packed_scores,
                            packed_score_count,
                            cudaMemcpyHostToDevice));
   CUDA_TRY_MANY(cudaMemcpy(batch->device_profiles,

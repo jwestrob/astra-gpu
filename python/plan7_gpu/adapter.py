@@ -20,23 +20,39 @@ class _PackedProfiles(NamedTuple):
 
 
 def _pack_profiles(profiles: list[Any]) -> _PackedProfiles:
-    scores = bytearray()
+    striped_score_buffers = []
+    striped_score_strides = array("i")
     score_offsets = array("Q")
     score_counts = array("Q")
     score_strides = array("i")
     model_lengths = array("i")
     constants = bytearray()
     scales = array("f")
+    score_offset = 0
 
     for profile in profiles:
-        striped_scores = memoryview(profile.sbv).cast("B")
-        score_offsets.append(len(scores))
-        score_counts.append(len(striped_scores))
-        score_strides.append(profile.sbv.shape[1])
+        alphabet_size = profile.alphabet.Kp
+        score_count = profile.M * alphabet_size
+        striped_score_buffers.append(memoryview(profile.sbv).cast("B"))
+        striped_score_strides.append(profile.sbv.shape[1])
+        score_offsets.append(score_offset)
+        score_counts.append(score_count)
+        score_strides.append(alphabet_size)
         model_lengths.append(profile.M)
         constants.extend((profile.tbm, profile.tec, profile.base_b, profile.bias_b))
         scales.append(profile.scale_b)
-        scores.extend(striped_scores)
+        score_offset += score_count
+
+    scores = (
+        _native.pack_striped_scores(
+            striped_score_buffers,
+            striped_score_strides,
+            model_lengths,
+            profiles[0].alphabet.Kp,
+        )
+        if profiles
+        else bytearray()
+    )
 
     return _PackedProfiles(
         scores,

@@ -11,14 +11,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 try:
     from plan7_gpu import SequenceBatch, _native, cpu_candidates, filter_ssv
+    from plan7_gpu.adapter import _pack_profiles
 except ImportError:
     SequenceBatch = None
     _native = None
     cpu_candidates = None
     filter_ssv = None
+    _pack_profiles = None
 
 HMM_20AA = ROOT / "refs" / "src" / "hmmer-3.4" / "testsuite" / "20aa.hmm"
 HMM_M1 = ROOT / "refs" / "src" / "hmmer-3.4" / "testsuite" / "M1.hmm"
+HMM_STRIPE_BOUNDARIES = ROOT / "results" / "datasets" / "pfam-stripe-boundaries.hmm"
 
 
 def float32_bits(value):
@@ -472,6 +475,105 @@ class CudaSsvTests(unittest.TestCase):
                 list(reversed(expected_candidates)),
             )
         self.assertEqual([profile.L for profile in profiles], original_lengths)
+
+    def test_compact_many_matches_striped_at_model_boundaries(self):
+        with pyhmmer.plan7.HMMFile(HMM_STRIPE_BOUNDARIES) as hmm_file:
+            hmms = list(hmm_file)
+        self.assertEqual([hmm.M for hmm in hmms], [15, 16, 17, 31, 32, 33])
+        profiles = [
+            hmm.to_profile(pyhmmer.plan7.Background(hmm.alphabet), L=100).to_optimized()
+            for hmm in hmms
+        ]
+        symbols = profiles[0].alphabet.symbols
+        sequences = self.sequences(
+            profiles[0],
+            [symbols, symbols[::-1], symbols[::2] + symbols[1::2]],
+        )
+        self.assertEqual(
+            sorted({code for sequence in sequences for code in sequence.sequence}),
+            list(range(profiles[0].alphabet.Kp)),
+        )
+        expected_results = [filter_ssv(profile, sequences) for profile in profiles]
+        expected_candidates = [
+            cpu_candidates(profile, sequences) for profile in profiles
+        ]
+
+        with SequenceBatch(sequences) as batch:
+            self.assertEqual(batch.filter_ssv_many(profiles), expected_results)
+            self.assertEqual(batch.cpu_candidates_many(profiles), expected_candidates)
+
+    def test_compact_profile_packing_and_range_validation(self):
+        profiles = [
+            self.optimized(HMM_M1),
+            self.optimized(HMM_20AA),
+            self.optimized(HMM_M1),
+        ]
+        packed = _pack_profiles(profiles)
+        expected = bytearray()
+        expected_offsets = []
+        for profile in profiles:
+            expected_offsets.append(len(expected))
+            striped = memoryview(profile.sbv)
+            q_count = max(2, (profile.M + 15) // 16)
+            for k in range(profile.M):
+                column = 16 * (k % q_count) + k // q_count
+                expected.extend(
+                    striped[residue, column] for residue in range(profile.alphabet.Kp)
+                )
+
+        self.assertEqual(packed.scores, expected)
+        self.assertEqual(packed.score_offsets.tolist(), expected_offsets)
+        self.assertEqual(
+            packed.score_counts.tolist(),
+            [profile.M * profile.alphabet.Kp for profile in profiles],
+        )
+        self.assertEqual(
+            packed.score_strides.tolist(),
+            [profile.alphabet.Kp for profile in profiles],
+        )
+
+        sequences = self.sequences(profiles[0], ["G", "ACDEX"])
+        with SequenceBatch(sequences) as batch:
+            bad_offsets = array("Q", packed.score_offsets)
+            bad_offsets[0] = 1
+            with self.assertRaisesRegex(
+                RuntimeError, "invalid compact profile score range"
+            ):
+                batch._native.filter_many_raw(
+                    packed.scores,
+                    bad_offsets,
+                    packed.score_counts,
+                    packed.score_strides,
+                    packed.model_lengths,
+                    packed.constants,
+                    packed.scales,
+                )
+
+            bad_strides = array("i", packed.score_strides)
+            bad_strides[0] += 1
+            with self.assertRaisesRegex(
+                RuntimeError, "invalid compact profile score range"
+            ):
+                batch._native.filter_many_raw(
+                    packed.scores,
+                    packed.score_offsets,
+                    packed.score_counts,
+                    bad_strides,
+                    packed.model_lengths,
+                    packed.constants,
+                    packed.scales,
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "trailing bytes"):
+                batch._native.filter_many_raw(
+                    packed.scores + b"\0",
+                    packed.score_offsets,
+                    packed.score_counts,
+                    packed.score_strides,
+                    packed.model_lengths,
+                    packed.constants,
+                    packed.scales,
+                )
 
     def test_multi_profile_empty_and_invalid_parameter_cases(self):
         profiles = [self.optimized(HMM_20AA), self.optimized(HMM_M1)]

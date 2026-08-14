@@ -110,7 +110,7 @@ cdef extern from "ssv_cuda.h" nogil:
 
     int plan7_ssv_sequence_batch_filter_many(
         plan7_ssv_sequence_batch *batch,
-        const uint8_t *packed_striped_scores,
+        const uint8_t *packed_scores,
         size_t packed_score_count,
         const plan7_ssv_profile *profiles,
         size_t profile_count,
@@ -246,6 +246,75 @@ def tjb_for_lengths(float scale, const uint64_t[::1] lengths):
             value = plan7_tjb_for_length(scale, lengths[i])
             view[i] = <uint8_t> value
     return output
+
+
+def pack_striped_scores(
+    list striped_score_buffers,
+    const int32_t[::1] score_strides,
+    const int32_t[::1] model_lengths,
+    int alphabet_size,
+):
+    """Transpose striped HMMER scores into compact ``[k][residue]`` rows."""
+    cdef size_t profile_count = <size_t> len(striped_score_buffers)
+    cdef size_t profile_index
+    cdef size_t model_length
+    cdef size_t profile_score_count
+    cdef size_t total_score_count = 0
+    cdef size_t output_offset = 0
+    cdef size_t k
+    cdef int residue
+    cdef int q_count
+    cdef int column
+    cdef int score_stride
+    cdef const uint8_t[::1] striped_scores
+    cdef bytearray packed_scores
+    cdef uint8_t[::1] packed_view
+
+    if alphabet_size < 1:
+        raise ValueError("alphabet size must be positive")
+    if (
+        <size_t> score_strides.shape[0] != profile_count
+        or <size_t> model_lengths.shape[0] != profile_count
+    ):
+        raise ValueError("profile score metadata lengths differ")
+
+    for profile_index in range(profile_count):
+        if not 1 <= model_lengths[profile_index] <= 100_000:
+            raise ValueError("invalid model length")
+        model_length = <size_t> model_lengths[profile_index]
+        if model_length > (<size_t> -1) // <size_t> alphabet_size:
+            raise OverflowError("compact profile score count overflows size_t")
+        profile_score_count = model_length * <size_t> alphabet_size
+        if profile_score_count > (<size_t> -1) - total_score_count:
+            raise OverflowError("packed profile score count overflows size_t")
+        total_score_count += profile_score_count
+
+    packed_scores = bytearray(total_score_count)
+    packed_view = packed_scores
+    for profile_index in range(profile_count):
+        striped_scores = striped_score_buffers[profile_index]
+        score_stride = score_strides[profile_index]
+        model_length = <size_t> model_lengths[profile_index]
+        q_count = max(2, (model_lengths[profile_index] + 15) // 16)
+        if score_stride < 16 * (q_count + 17):
+            raise ValueError("striped score stride is too short")
+        if (
+            <size_t> score_stride > (<size_t> -1) // <size_t> alphabet_size
+            or <size_t> striped_scores.shape[0]
+            != <size_t> score_stride * <size_t> alphabet_size
+        ):
+            raise ValueError("striped score buffer has the wrong size")
+        with nogil:
+            for k in range(model_length):
+                column = 16 * (<int> k % q_count) + <int> k // q_count
+                for residue in range(alphabet_size):
+                    packed_view[
+                        output_offset + k * <size_t> alphabet_size + residue
+                    ] = striped_scores[
+                        <size_t> residue * <size_t> score_stride + column
+                    ]
+        output_offset += model_length * <size_t> alphabet_size
+    return packed_scores
 
 
 cdef class SequenceBatch:
