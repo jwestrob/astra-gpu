@@ -1,0 +1,612 @@
+{
+  "aggregate": {
+    "files": 5,
+    "length": {
+      "max": 10125,
+      "mean": 233.32216180408878,
+      "min": 20,
+      "quantiles": {
+        "p0": 20,
+        "p1": 27,
+        "p10": 63,
+        "p100": 10125,
+        "p25": 108,
+        "p50": 193,
+        "p75": 318,
+        "p90": 439,
+        "p99": 839
+      }
+    },
+    "quantile_records": {
+      "p0": {
+        "dataset_id": "PLM2_5_b1",
+        "header_sha256": "de561eb65c61c2c5f0f9e9b86ba7d13b67b27c8c5e14ea0bec3544c2ecc827ae",
+        "identifier": "PLM2_5_b1_jun17_scaffold_822_1",
+        "length": 20,
+        "ordinal_in_file": 18774,
+        "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+      },
+      "p1": {
+        "dataset_id": "ERMLT890",
+        "header_sha256": "e232b58298be63779c4bd428ea10fb3443a2a6c218f59af975c78cdd6e86ac19",
+        "identifier": "ERMLT890_scaffold_69838_3",
+        "length": 27,
+        "ordinal_in_file": 104818,
+        "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+      },
+      "p10": {
+        "dataset_id": "ERMLT890",
+        "header_sha256": "dceb16ffe0c548d380c0c3ffa7f6dcd0b9dedfbae192f9316b0e1a5ce00a3abc",
+        "identifier": "ERMLT890_scaffold_52954_1",
+        "length": 63,
+        "ordinal_in_file": 284543,
+        "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+      },
+      "p100": {
+        "dataset_id": "HR_Shumway",
+        "header_sha256": "3e834627b2b1b93cf998189d7cd11f5f1e54b1bd9f0b6ec97b4fac4a7c04d8f8",
+        "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_126_9",
+        "length": 10125,
+        "ordinal_in_file": 7382,
+        "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+      },
+      "p25": {
+        "dataset_id": "PLM2_5_b1",
+        "header_sha256": "b36aaf8b6cc7867cdf90b2d02d904257479c10cb84f1504a099447f8fe697e17",
+        "identifier": "PLM2_5_b1_jun17_scaffold_38846_2",
+        "length": 108,
+        "ordinal_in_file": 170589,
+        "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+      },
+      "p50": {
+        "dataset_id": "HR_Copper",
+        "header_sha256": "0c01db1b008daf0b8e7ede80bcc6489fd81e812490b7a6265b2925680948f2e3",
+        "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_39999_2",
+        "length": 193,
+        "ordinal_in_file": 178380,
+        "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+      },
+      "p75": {
+        "dataset_id": "ERMLT890",
+        "header_sha256": "d5fef6ba977c04729dd117a30ae8524ec4294a71ef6bbdbedf7b13aa2b2d7eb0",
+        "identifier": "ERMLT890_scaffold_17804_2",
+        "length": 318,
+        "ordinal_in_file": 15403,
+        "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+      },
+      "p90": {
+        "dataset_id": "HR_Shumway",
+        "header_sha256": "ad24128313dc6abb9e7263923c13c256ac06707f2a0a615c5ee4ee1c7d1905b4",
+        "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_45870_2",
+        "length": 439,
+        "ordinal_in_file": 246810,
+        "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+      },
+      "p99": {
+        "dataset_id": "ERMLT890",
+        "header_sha256": "83eedd2493208957e79225c17b65614da64e2b4b1211468dd93edfa72f552d14",
+        "identifier": "ERMLT890_scaffold_8987_1",
+        "length": 839,
+        "ordinal_in_file": 242952,
+        "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+      }
+    },
+    "residues": 420548964,
+    "sequences": 1802439
+  },
+  "captured_at_utc": "2026-08-14T08:33:12.918707+00:00",
+  "files": [
+    {
+      "dataset_id": "PLM2_5_b1",
+      "length": {
+        "max": 5264,
+        "mean": 231.3667026443605,
+        "min": 20,
+        "quantiles": {
+          "p0": 20,
+          "p1": 27,
+          "p10": 62,
+          "p100": 5264,
+          "p25": 107,
+          "p50": 193,
+          "p75": 318,
+          "p90": 435,
+          "p99": 808
+        }
+      },
+      "quantile_records": {
+        "p0": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "de561eb65c61c2c5f0f9e9b86ba7d13b67b27c8c5e14ea0bec3544c2ecc827ae",
+          "identifier": "PLM2_5_b1_jun17_scaffold_822_1",
+          "length": 20,
+          "ordinal_in_file": 18774,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        },
+        "p1": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "b680be286e3f667d7f240474b9b0947d6ce1de22f4b4d4ef3eb60140da664268",
+          "identifier": "PLM2_5_b1_jun17_scaffold_14474_3",
+          "length": 27,
+          "ordinal_in_file": 99085,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        },
+        "p10": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "bae5e972912c33173bc55ffab62cc01e9c3de8831f23b15cb64a4d5c856f0ce2",
+          "identifier": "PLM2_5_b1_jun17_scaffold_191826_1",
+          "length": 62,
+          "ordinal_in_file": 297675,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        },
+        "p100": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "86073aa2d99e9aac20d9af3122c33a11108c66c4d0c558d6e3f42820c9094024",
+          "identifier": "PLM2_5_b1_jun17_scaffold_524_1",
+          "length": 5264,
+          "ordinal_in_file": 14153,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        },
+        "p25": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "8f9ce72b921b6579c68c11e9dd125c324556de434ed39cede896138d10f7559e",
+          "identifier": "PLM2_5_b1_jun17_scaffold_43383_1",
+          "length": 107,
+          "ordinal_in_file": 181335,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        },
+        "p50": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "97e54e37f3e3d1eddd8f828953d2225d0e8422ac340baa57ddcd47e9765ffd37",
+          "identifier": "PLM2_5_b1_jun17_scaffold_28619_5",
+          "length": 193,
+          "ordinal_in_file": 144162,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        },
+        "p75": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "a9ecde5e8bddb3fa81cd74136eda8d8a778a6b47f8f60175f9d3b61370f3ddcc",
+          "identifier": "PLM2_5_b1_jun17_scaffold_39403_1",
+          "length": 318,
+          "ordinal_in_file": 171906,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        },
+        "p90": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "5470ac04d470c573c2295cd88cf24cb4a5dddcc63112bdd438dc33a50d0e542b",
+          "identifier": "PLM2_5_b1_jun17_scaffold_60087_1",
+          "length": 435,
+          "ordinal_in_file": 217620,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        },
+        "p99": {
+          "dataset_id": "PLM2_5_b1",
+          "header_sha256": "c560412fa1c3615b3aa74e97609673582237da4599d589ffd538474eb79a93a0",
+          "identifier": "PLM2_5_b1_jun17_scaffold_295_13",
+          "length": 808,
+          "ordinal_in_file": 9850,
+          "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa"
+        }
+      },
+      "residues": 69453045,
+      "sequences": 300186,
+      "source": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa",
+      "source_mtime_ns": 1518603802259734460,
+      "source_sha256": "eadfb887b8a8a25921cd318d0e278b43f900b05e3dbe0fae7d30233d4932fd04",
+      "source_size_bytes": 112069869
+    },
+    {
+      "dataset_id": "H2a2",
+      "length": {
+        "max": 3724,
+        "mean": 232.41525007088399,
+        "min": 20,
+        "quantiles": {
+          "p0": 20,
+          "p1": 28,
+          "p10": 64,
+          "p100": 3724,
+          "p25": 110,
+          "p50": 195,
+          "p75": 316,
+          "p90": 435,
+          "p99": 814
+        }
+      },
+      "quantile_records": {
+        "p0": {
+          "dataset_id": "H2a2",
+          "header_sha256": "009cd6dd07f5957ad0d76cc81411b35c4efcc4819e5c311f932990326098fb76",
+          "identifier": "H2a2_full_idba_ud_scaffold_424_21",
+          "length": 20,
+          "ordinal_in_file": 15351,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        },
+        "p1": {
+          "dataset_id": "H2a2",
+          "header_sha256": "62503aaa55e55e0984fe3a2b1bd755b56f9fcbd23ba3b1ce22752788f0d62f63",
+          "identifier": "H2a2_full_idba_ud_scaffold_96_1",
+          "length": 28,
+          "ordinal_in_file": 5858,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        },
+        "p10": {
+          "dataset_id": "H2a2",
+          "header_sha256": "0edfc33ec5df28b11fa5694aad472583f485c5b55a6bed0571433b13695c84e8",
+          "identifier": "H2a2_full_idba_ud_scaffold_82763_1",
+          "length": 64,
+          "ordinal_in_file": 301628,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        },
+        "p100": {
+          "dataset_id": "H2a2",
+          "header_sha256": "73179c12469093eed5a19c25f7709be91d32b4d4682723cc8a959a7d9c3c3bac",
+          "identifier": "H2a2_full_idba_ud_scaffold_993_2",
+          "length": 3724,
+          "ordinal_in_file": 25925,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        },
+        "p25": {
+          "dataset_id": "H2a2",
+          "header_sha256": "d8fed3ea4860a4002e451d631d1fa6b40086e95af6af5df725a14e7b24dc3902",
+          "identifier": "H2a2_full_idba_ud_scaffold_217780_1",
+          "length": 110,
+          "ordinal_in_file": 384089,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        },
+        "p50": {
+          "dataset_id": "H2a2",
+          "header_sha256": "4672428e6eb7dbc46c253e1905676d0ad22558a942c51e6074e1ccb56b80d4b3",
+          "identifier": "H2a2_full_idba_ud_scaffold_8966_3",
+          "length": 195,
+          "ordinal_in_file": 89766,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        },
+        "p75": {
+          "dataset_id": "H2a2",
+          "header_sha256": "8ce7504b84406e983d5747533908b64344d24b5cd14a718b9dd5c519bbb7271f",
+          "identifier": "H2a2_full_idba_ud_scaffold_7349_4",
+          "length": 316,
+          "ordinal_in_file": 80550,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        },
+        "p90": {
+          "dataset_id": "H2a2",
+          "header_sha256": "2b6885f4b440a26c0a5e2ca5f54b2c1b7fc3d79de2318dfe883916942e7f374d",
+          "identifier": "H2a2_full_idba_ud_scaffold_2013_1",
+          "length": 435,
+          "ordinal_in_file": 38981,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        },
+        "p99": {
+          "dataset_id": "H2a2",
+          "header_sha256": "c5776497837e5198c483617ce5176d4e2dc45964338bd00fabd4a0462ed24ffd",
+          "identifier": "H2a2_full_idba_ud_scaffold_2673_1",
+          "length": 814,
+          "ordinal_in_file": 45817,
+          "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa"
+        }
+      },
+      "residues": 89347627,
+      "sequences": 384431,
+      "source": "/groups/banfield/projects/environmental/EastRiver/Vegtype/assembly.d/H2a2/H2a2_full_idba_ud/H2a2_full_scaffold_min1000.fa.genes.faa",
+      "source_mtime_ns": 1511567058794793244,
+      "source_sha256": "3d161e157dd0f4797c1528930da372335c2f7d4da730449af7fe9f367512e929",
+      "source_size_bytes": 117957813
+    },
+    {
+      "dataset_id": "ERMLT890",
+      "length": {
+        "max": 8725,
+        "mean": 239.0273738704225,
+        "min": 20,
+        "quantiles": {
+          "p0": 20,
+          "p1": 27,
+          "p10": 63,
+          "p100": 8725,
+          "p25": 109,
+          "p50": 199,
+          "p75": 327,
+          "p90": 448,
+          "p99": 874
+        }
+      },
+      "quantile_records": {
+        "p0": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "06c47ce6423f532ec8013ab1be80d2a9455705ebf4a0c3ea4534a17db31952ce",
+          "identifier": "ERMLT890_scaffold_13958_6",
+          "length": 20,
+          "ordinal_in_file": 302,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        },
+        "p1": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "022e0e9c83c8534d40203d6fdfe9a91336d0e2ea9c755b8d881a911b443ba18b",
+          "identifier": "ERMLT890_scaffold_81487_2",
+          "length": 27,
+          "ordinal_in_file": 129346,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        },
+        "p10": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "6e6b11d7f9f94d12242df61f87341efb64e49b3f74651a5dfd6b16d6c1c7f2da",
+          "identifier": "ERMLT890_scaffold_79918_2",
+          "length": 63,
+          "ordinal_in_file": 135260,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        },
+        "p100": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "3dbeff6882d05a6f98095454ed9480fbd91cd392dea2afb9f6b5c5f38c854768",
+          "identifier": "ERMLT890_curated_scaffold_585_1",
+          "length": 8725,
+          "ordinal_in_file": 348076,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        },
+        "p25": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "e4d85b2fc6eeb145fbd467e6e5a0cb182f7bd09c26504ad4d4d6a5d38d078784",
+          "identifier": "ERMLT890_scaffold_66511_1",
+          "length": 109,
+          "ordinal_in_file": 96586,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        },
+        "p50": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "2b818af861bf30000471cd20257773c92da014356832eba685943124dfba3b64",
+          "identifier": "ERMLT890_scaffold_86338_2",
+          "length": 199,
+          "ordinal_in_file": 132534,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        },
+        "p75": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "b36b7c48fb6ce163b4bfb4c0d452bbc8cfedfa4005d6717d9e6a8dd03d601688",
+          "identifier": "ERMLT890_scaffold_32085_2",
+          "length": 327,
+          "ordinal_in_file": 7068,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        },
+        "p90": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "57db051a088805d8ce541f4b15b30a34b5c4e99f846117b757f8698be01106d0",
+          "identifier": "ERMLT890_scaffold_1596_8",
+          "length": 448,
+          "ordinal_in_file": 201239,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        },
+        "p99": {
+          "dataset_id": "ERMLT890",
+          "header_sha256": "5243854b3dd0386082534580075ae3822a110a92b8862c13e0e7b52e0226ed81",
+          "identifier": "ERMLT890_curated_scaffold_13597_1",
+          "length": 874,
+          "ordinal_in_file": 309087,
+          "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa"
+        }
+      },
+      "residues": 83294108,
+      "sequences": 348471,
+      "source": "/groups/banfield/projects/environmental/EastRiver/riparian/assemblies_for_missing_samples/ERMLT890.contigs.fa.genes.faa",
+      "source_mtime_ns": 1665957353840021957,
+      "source_sha256": "558a011f6a404236b5fa317c31ceb5ebf04e153532bad3d7c6d227bd9e75d94b",
+      "source_size_bytes": 131119396
+    },
+    {
+      "dataset_id": "HR_Copper",
+      "length": {
+        "max": 7817,
+        "mean": 232.05792626443525,
+        "min": 20,
+        "quantiles": {
+          "p0": 20,
+          "p1": 27,
+          "p10": 64,
+          "p100": 7817,
+          "p25": 108,
+          "p50": 193,
+          "p75": 314,
+          "p90": 433,
+          "p99": 832
+        }
+      },
+      "quantile_records": {
+        "p0": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "e8a1527b95535ad87cd84ade2af146cfec925477e30c022b4eb47807f57d422e",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_398_17",
+          "length": 20,
+          "ordinal_in_file": 14286,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        },
+        "p1": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "f36f7eb1d28f8a59a95b8c27b077f6ea1ed011232612b43451a8b5426b35e6c5",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_28422_1",
+          "length": 27,
+          "ordinal_in_file": 148241,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        },
+        "p10": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "bdd8b57559c685e90e13d768b1a218916603717c39142e3f8ad3702e6b68d5f6",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_4657_13",
+          "length": 64,
+          "ordinal_in_file": 55104,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        },
+        "p100": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "953438bb270dca89c30d342b00c1ad61652b937a31afbf2359a86c6e4828141f",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_104_3",
+          "length": 7817,
+          "ordinal_in_file": 6876,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        },
+        "p25": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "fb6621f0de04d70361135dbfe168b850ef618f69d2235a42aa54aad601a2edb4",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_42648_2",
+          "length": 108,
+          "ordinal_in_file": 184666,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        },
+        "p50": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "6c4ea99fd1e50d9071b4067b498637befba5be6f979d5386172386df85120961",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_12553_3",
+          "length": 193,
+          "ordinal_in_file": 95013,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        },
+        "p75": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "e6c67fed5cda13a0d5097caa410835b3ae49d1388789bad30c49a3e276c7f62d",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_10752_7",
+          "length": 314,
+          "ordinal_in_file": 87186,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        },
+        "p90": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "23492d25aa75ea21243cd27935a8adfa84838e230ca4f2218bbf0aaa723e3e7d",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_90_4",
+          "length": 433,
+          "ordinal_in_file": 6273,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        },
+        "p99": {
+          "dataset_id": "HR_Copper",
+          "header_sha256": "4260b1be86cf1d7aa8bc022d5d12fc8d1436d7d9d27cd4c43da1fda18e471756",
+          "identifier": "EastRiver_08_16_2020_HR_Copper_scaffold_137_56",
+          "length": 832,
+          "ordinal_in_file": 7944,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa"
+        }
+      },
+      "residues": 71396566,
+      "sequences": 307667,
+      "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_16_2020_HR_Copper_idba_ud/EastRiver_08_16_2020_HR_Copper_scaffold_min1000.fa.genes.faa",
+      "source_mtime_ns": 1611366097804346561,
+      "source_sha256": "849ce9835716e3aa774196c343374f9dfccaa23fdf2b131ad0791febee3511ca",
+      "source_size_bytes": 119516184
+    },
+    {
+      "dataset_id": "HR_Shumway",
+      "length": {
+        "max": 10125,
+        "mean": 231.88505124717338,
+        "min": 20,
+        "quantiles": {
+          "p0": 20,
+          "p1": 27,
+          "p10": 62,
+          "p100": 10125,
+          "p25": 104,
+          "p50": 188,
+          "p75": 315,
+          "p90": 444,
+          "p99": 865
+        }
+      },
+      "quantile_records": {
+        "p0": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "4acfb3a36e955b4604e3b7c3a52c956e5b9756381cf53601e4621ba9be4b3a76",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_187_1",
+          "length": 20,
+          "ordinal_in_file": 9934,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        },
+        "p1": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "931f7df8b8d7f50109109842e3bc9c460d8f8dd879d19e666548bc854cafc8ed",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_38318_4",
+          "length": 27,
+          "ordinal_in_file": 225733,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        },
+        "p10": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "c5ce2d49efeae4d1d970d2805fab6edadcc7fdc0c66799b96be63b27ef8374c1",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_71209_1",
+          "length": 62,
+          "ordinal_in_file": 308894,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        },
+        "p100": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "3e834627b2b1b93cf998189d7cd11f5f1e54b1bd9f0b6ec97b4fac4a7c04d8f8",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_126_9",
+          "length": 10125,
+          "ordinal_in_file": 7382,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        },
+        "p25": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "d936dd930fd840d23cc3b3a41f49c07bd1c38eed0affcc5dea95bb204380c298",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_140731_2",
+          "length": 104,
+          "ordinal_in_file": 446605,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        },
+        "p50": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "9fa1e8129c134e220c7b5df114a3b57d75a691fb128d6167402244e5d21b98ad",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_77815_2",
+          "length": 188,
+          "ordinal_in_file": 323654,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        },
+        "p75": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "e6209d2ea5752cd632ca1fe74e0fc3312b9c0bb9bced40135441f6f752dfcefa",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_627_8",
+          "length": 315,
+          "ordinal_in_file": 23112,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        },
+        "p90": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "598030cabda4dd7c5a8cd82658e2a77bc5ee41fa979cea2a02512566fd767797",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_56331_2",
+          "length": 444,
+          "ordinal_in_file": 273801,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        },
+        "p99": {
+          "dataset_id": "HR_Shumway",
+          "header_sha256": "39872bc1e2f140c43ad7ccc76074642d531308b94e680ca4f5f327a0069bc4a8",
+          "identifier": "EastRiver_08_14_2020_HR_Shumway_scaffold_411_20",
+          "length": 865,
+          "ordinal_in_file": 17439,
+          "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa"
+        }
+      },
+      "residues": 107057618,
+      "sequences": 461684,
+      "source": "/groups/banfield/projects/environmental/EastRiver/2020/assembly.d/EastRiver_08_14_2020_HR_Shumway_idba_ud/EastRiver_08_14_2020_HR_Shumway_scaffold_min1000.fa.genes.faa",
+      "source_mtime_ns": 1611367021755211342,
+      "source_sha256": "dcf7be3d4da7e59e06c342a8a2169c53eca6249a56f6561f0497c27630e371ff",
+      "source_size_bytes": 180157328
+    }
+  ],
+  "quantile_method": "index=round(q*(n-1)); records ordered by length, then manifest file order, then zero-based ordinal",
+  "quantiles": [
+    "p0",
+    "p1",
+    "p10",
+    "p25",
+    "p50",
+    "p75",
+    "p90",
+    "p99",
+    "p100"
+  ],
+  "schema_version": 1,
+  "source_manifest": {
+    "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/datasets.json",
+    "sha256": "7cea71deede1c6fb494531d3851a2f842fa56e034c3db612a3533f2bb6800c07"
+  }
+}
