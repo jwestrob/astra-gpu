@@ -1,4 +1,7 @@
 {
+  "agreement_references": {
+    "ssv": 45
+  },
   "comparisons": 45,
   "coverage": {
     "distinct_sequence_indexes": 45,
@@ -37,12 +40,17 @@
   "public_statuses": {
     "eslERANGE": 45
   },
+  "public_vs_full_msv": {
+    "score_bit_mismatches": 0,
+    "status_mismatches": 0
+  },
   "scalar_statuses": {
     "eslERANGE": 45
   },
   "schema_version": 1,
+  "skipped": {},
   "source": {
     "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/baseline/oracle-globins45.jsonl",
-    "sha256": "ab5020e653750f3bfdb35c6d39533a8fdc8a37e5961f22f148e77914467ca029"
+    "sha256": "0e570b187e61c63e92971084ee9ce9ca9a9799c73005c2ccfbb54a7d09f3eb29"
   }
 }

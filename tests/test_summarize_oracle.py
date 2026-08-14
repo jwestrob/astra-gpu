@@ -18,7 +18,12 @@ def comparison(index: int, agreement: bool = True) -> dict[str, object]:
         "public_msv": {"status": "eslOK"},
         "scalar_full_msv": {"status": "eslOK"},
         "pass_F1": index == 0,
-        "agreement": {"status": agreement, "score_bits": agreement},
+        "agreement": {
+            "reference": "ssv",
+            "status": agreement,
+            "score_bits": agreement,
+            "public_vs_full_msv": {"status": True, "score_bits": index == 0},
+        },
     }
 
 
@@ -53,6 +58,8 @@ class SummarizeOracleTests(unittest.TestCase):
         )
         self.assertEqual(result["coverage"]["distinct_tjb_b"], 2)
         self.assertEqual(result["models"]["model"], {"M": 17, "comparisons": 2})
+        self.assertEqual(result["agreement_references"], {"ssv": 2})
+        self.assertEqual(result["public_vs_full_msv"]["score_bit_mismatches"], 1)
 
     def test_rejects_disagreement_with_terminal_summary(self) -> None:
         self.write(

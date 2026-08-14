@@ -442,8 +442,12 @@ main(int argc, char **argv)
       double probability;
       int ssv_status;
       int public_status;
+      const char *path;
+      const char *agreement_reference;
       int status_agreement;
       int score_agreement;
+      int full_status_agreement;
+      int full_score_agreement;
       int pass;
       int length;
 
@@ -468,8 +472,25 @@ main(int argc, char **argv)
       public_status = p7_MSVFilter(sequence->dsq, length, optimized, matrix, &public_score);
       scalar = scalar_full_msv(sequence->dsq, length, optimized, emissions);
 
-      status_agreement = (public_status == scalar.status);
-      score_agreement = float_bits_equal(public_score, scalar.score);
+      path = msv_path(ssv_status, public_status);
+      full_status_agreement = (public_status == scalar.status);
+      full_score_agreement = float_bits_equal(public_score, scalar.score);
+      /* p7_MSVFilter() returns a direct SSV result unless SSV says
+       * eslENORESULT. SSV can safely overestimate literal full MSV, so the
+       * scalar recurrence is the strict reference only on the fallback. */
+      if (ssv_status == eslENORESULT) {
+        agreement_reference = "scalar_full_msv";
+        status_agreement = full_status_agreement;
+        score_agreement = full_score_agreement;
+      } else {
+        agreement_reference = "ssv";
+        status_agreement = (public_status == ssv_status);
+        score_agreement = float_bits_equal(public_score, ssv_score);
+      }
+      if (strcmp(path, "unexpected") == 0) {
+        status_agreement = 0;
+        score_agreement = 0;
+      }
       if (!status_agreement || !score_agreement) mismatches++;
       comparisons++;
 
@@ -492,7 +513,7 @@ main(int argc, char **argv)
              (unsigned int) optimized->bias_b);
       print_float_value(optimized->scale_b);
       printf("},\"msv_path\":\"%s\",\"ssv\":{\"status\":\"%s\",\"score\":",
-             msv_path(ssv_status, public_status), status_name(ssv_status));
+             path, status_name(ssv_status));
       print_float_value(ssv_score);
       printf("},\"public_msv\":{\"status\":\"%s\",\"score\":", status_name(public_status));
       print_float_value(public_score);
@@ -506,9 +527,14 @@ main(int argc, char **argv)
       print_float_value(bit_score);
       fputs(",\"P\":", stdout);
       print_double_value(probability);
-      printf(",\"pass_F1\":%s,\"agreement\":{\"status\":%s,\"score_bits\":%s}}\n",
-             pass ? "true" : "false", status_agreement ? "true" : "false",
-             score_agreement ? "true" : "false");
+      printf(",\"pass_F1\":%s,\"agreement\":{\"reference\":\"%s\","
+             "\"status\":%s,\"score_bits\":%s,"
+             "\"public_vs_full_msv\":{\"status\":%s,\"score_bits\":%s}}}\n",
+             pass ? "true" : "false", agreement_reference,
+             status_agreement ? "true" : "false",
+             score_agreement ? "true" : "false",
+             full_status_agreement ? "true" : "false",
+             full_score_agreement ? "true" : "false");
       p7_omx_Reuse(matrix);
     }
 

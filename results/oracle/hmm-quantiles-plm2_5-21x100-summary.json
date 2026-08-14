@@ -1,4 +1,8 @@
 {
+  "agreement_references": {
+    "scalar_full_msv": 19,
+    "ssv": 2081
+  },
   "comparisons": 2100,
   "coverage": {
     "distinct_sequence_indexes": 100,
@@ -134,13 +138,18 @@
     "eslERANGE": 2,
     "eslOK": 2098
   },
+  "public_vs_full_msv": {
+    "score_bit_mismatches": 0,
+    "status_mismatches": 0
+  },
   "scalar_statuses": {
     "eslERANGE": 2,
     "eslOK": 2098
   },
   "schema_version": 1,
+  "skipped": {},
   "source": {
     "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/oracle/hmm-quantiles-plm2_5-21x100.jsonl",
-    "sha256": "7627b73beb0ccdc8f0cc6405f65711309497953f2a4e4ab7e7b1a9d4331d7961"
+    "sha256": "c485d5d43397da86743e78cccb528feb6e07737c754b40dd8979341ac4083b08"
   }
 }

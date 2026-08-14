@@ -33,6 +33,7 @@ def summarize(path: Path) -> dict[str, object]:
     paths: Counter[str] = Counter()
     public_statuses: Counter[str] = Counter()
     scalar_statuses: Counter[str] = Counter()
+    agreement_references: Counter[str] = Counter()
     skipped: Counter[str] = Counter()
     models: dict[str, dict[str, int]] = {}
     sequence_indexes: set[int] = set()
@@ -40,6 +41,8 @@ def summarize(path: Path) -> dict[str, object]:
     tjb_values: set[int] = set()
     comparisons = 0
     mismatches = 0
+    public_vs_full_status_mismatches = 0
+    public_vs_full_score_mismatches = 0
     passes = 0
 
     with path.open("rb") as handle:
@@ -68,8 +71,13 @@ def summarize(path: Path) -> dict[str, object]:
                 public_statuses[str(record["public_msv"]["status"])] += 1
                 scalar_statuses[str(record["scalar_full_msv"]["status"])] += 1
                 agreement = record["agreement"]
+                agreement_references[str(agreement.get("reference", "legacy"))] += 1
                 if not agreement["status"] or not agreement["score_bits"]:
                     mismatches += 1
+                full_agreement = agreement.get("public_vs_full_msv")
+                if full_agreement is not None:
+                    public_vs_full_status_mismatches += not full_agreement["status"]
+                    public_vs_full_score_mismatches += not full_agreement["score_bits"]
                 passes += bool(record["pass_F1"])
                 name = str(record["model_name"])
                 model = models.setdefault(name, {"M": int(record["M"]), "comparisons": 0})
@@ -109,6 +117,11 @@ def summarize(path: Path) -> dict[str, object]:
         "oracle_metadata": metadata,
         "comparisons": comparisons,
         "mismatches": mismatches,
+        "agreement_references": dict(sorted(agreement_references.items())),
+        "public_vs_full_msv": {
+            "status_mismatches": public_vs_full_status_mismatches,
+            "score_bit_mismatches": public_vs_full_score_mismatches,
+        },
         "passes_F1": passes,
         "msv_paths": dict(sorted(paths.items())),
         "public_statuses": dict(sorted(public_statuses.items())),

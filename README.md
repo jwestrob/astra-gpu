@@ -16,9 +16,11 @@ scientifically exact MSV accelerator demonstrates useful end-to-end speedup.
 
 ## Status
 
-Reference-oracle and stage-timing phase. The independent scalar byte-MSV
-recurrence agrees bit-for-bit with pristine HMMER on the initial 11,145 real
-and upstream tutorial comparisons, covering all four SSV/fallback outcomes.
+Reference-oracle and stage-timing phase. The oracle's route-specific reference
+agrees bit-for-bit with pristine HMMER on the initial 11,145 real and upstream
+tutorial comparisons, covering all four SSV/fallback outcomes. Direct SSV may
+conservatively overestimate literal full MSV, so the GPU target must preserve
+the public SSV-first behavior rather than assume the two scores are identical.
 This is an initial result, not a completed correctness gate. No CUDA code or
 GPU performance claim exists yet. See [`handoff.md`](handoff.md) for the
 project brief and gates.

@@ -1,4 +1,8 @@
 {
+  "agreement_references": {
+    "scalar_full_msv": 8,
+    "ssv": 2992
+  },
   "comparisons": 3000,
   "coverage": {
     "distinct_sequence_indexes": 1000,
@@ -64,13 +68,18 @@
     "eslERANGE": 2,
     "eslOK": 2998
   },
+  "public_vs_full_msv": {
+    "score_bit_mismatches": 0,
+    "status_mismatches": 0
+  },
   "scalar_statuses": {
     "eslERANGE": 2,
     "eslOK": 2998
   },
   "schema_version": 1,
+  "skipped": {},
   "source": {
     "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/oracle/hyddb-plm2_5-3x1000.jsonl",
-    "sha256": "11785ecca62cf80fb554d06c4e1c85bcd3c9d5c19983d0d2c8cdc261c83559d2"
+    "sha256": "b9fa9b2f1e3f0edc52158483720b10e2c98d703202e192a6b217bbb6eaea2180"
   }
 }

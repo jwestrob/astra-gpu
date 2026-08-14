@@ -4,7 +4,13 @@
 `p7_MSVFilter()` and an independent scalar implementation of the full
 unsigned-byte MSV recurrence. The scalar path uses only the unstriped emission
 cost array extracted from the optimized profile; it does not call or copy the
-striped SIMD recurrence.
+striped SIMD recurrence. On a direct SSV result, strict agreement compares the
+public API with the separately invoked SSV filter. On an `eslENORESULT` SSV
+fallback, it compares the public API with the scalar full-MSV result. The
+`public_vs_full_msv` fields remain available as diagnostics because SSV may
+return a documented conservative overestimate of literal full MSV. Therefore,
+a GPU that computes only literal full MSV cannot be assumed bit-identical to
+the public SSV-first API on every input.
 
 Build and run the small upstream fixture:
 
@@ -34,11 +40,15 @@ mismatches. Together they cover `ssv_ok`, `ssv_erange`,
 17,019, exact SIMD stripe boundaries at 15/16/17 and 31/32/33, real sequence
 lengths 32 through 1,718, and 17 observed values of the length-dependent
 `tjb_b` transition. Unit fixtures additionally exercise B/J/Z/X/U/O ambiguity
-codes, nonresidues, empty targets, and the 100,000-residue pipeline limit.
+codes, nonresidues, empty targets, the 100,000-residue pipeline limit,
+short/long/short reconfiguration, adjacent `tjb_b` quantization changes,
+the SSV overflow-certainty switch at begin baselines 128/127, exact and
+neighboring-double F1 thresholds, deterministic output, and all four
+direct-SSV/full-MSV fallback and overflow routes.
 
-CUDA remains gated on transition quantization boundaries, threshold-neighbor
-sweeps, controlled overflow fixtures, actual pipeline tracing, and end-to-end
-output/counter equivalence.
+CUDA remains gated on actual pipeline tracing and end-to-end output/counter
+equivalence. Broader randomized arithmetic fuzzing remains useful hardening,
+but is not a substitute for those pipeline gates.
 
 Build and smoke-test it from the repository root with `make test`. The output
 is JSON Lines: metadata, one comparison record per nonempty model/sequence
@@ -48,6 +58,7 @@ produce comparison records. The summary reports them separately as
 `skipped_empty`.
 
 `--max-models 0` and `--max-seqs 0` mean unlimited. `--F1` must be a finite
-probability in `[0,1]`; `--strict` returns failure if the scalar and public
-HMMER MSV status or score bits disagree. Like HMMER's protein comparison
-pipeline, the oracle rejects targets longer than 100,000 residues.
+probability in `[0,1]`; `--strict` returns failure if the public result
+differs from its direct-SSV or fallback full-MSV reference. Like HMMER's
+protein comparison pipeline, the oracle rejects targets longer than 100,000
+residues.
