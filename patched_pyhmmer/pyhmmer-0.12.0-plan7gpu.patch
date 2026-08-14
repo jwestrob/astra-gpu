@@ -1,0 +1,211 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -5,7 +5,7 @@
+ 
+ [project]
+ name = "pyhmmer"
+-version = "0.12.0"
++version = "0.12.0+plan7gpu.0"
+ description = "Cython bindings and Python interface to HMMER3."
+ readme = "README.md"
+ requires-python = ">=3.7"
+--- a/include/libhmmer/p7_pipeline.pxd
++++ b/include/libhmmer/p7_pipeline.pxd
+@@ -43,6 +43,11 @@
+         p7_STRAND_BOTTOMONLY = 1
+         p7_STRAND_BOTH = 2
+ 
++    cdef enum p7_pipeline_vitmode_e:
++        p7_VIT_NONE = 0
++        p7_VIT_EXTERNAL = 1
++        p7_VIT_CPU = 2
++
+     # ctypedef p7_pipeline_s P7_PIPELINE
+     ctypedef struct P7_PIPELINE:
+         P7_OMX* oxf
+@@ -128,6 +133,8 @@
+     int p7_pli_NewModelThresholds(P7_PIPELINE *pli, const P7_OPROFILE *om)
+     int p7_pli_NewSeq            (P7_PIPELINE *pli, const ESL_SQ *sq)
+     int p7_Pipeline              (P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th)
++    int p7_PipelineFromMSV       (P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th, float usc)
++    int p7_PipelineFromFilterScores(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th, float usc, float filtersc, p7_pipeline_vitmode_e vitmode, float vfsc)
+     int p7_Pipeline_LongTarget   (
+         P7_PIPELINE* pli,
+         P7_OPROFILE* om,
+--- a/vendor/hmmer/src/hmmer.h
++++ b/vendor/hmmer/src/hmmer.h
+@@ -1814,6 +1814,16 @@
+ extern int fm_getOccCount     (const FM_DATA *fm, const FM_CFG *cfg, int pos, uint8_t c);
+ extern int fm_getOccCountLT   (const FM_DATA *fm, const FM_CFG *cfg, int pos, uint8_t c, uint32_t *cnteq, uint32_t *cntlt);
+ 
+-#endif /*P7_HMMERH_INCLUDED*/
++/* Additive plan7-gpu entry points are kept at EOF because PyHMMER applies
++ * line-number-sensitive patches to the upstream HMMER header at build time. */
++enum p7_pipeline_vitmode_e {
++  p7_VIT_NONE     = 0,
++  p7_VIT_EXTERNAL = 1,
++  p7_VIT_CPU      = 2
++};
+ 
++extern int p7_PipelineFromMSV(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th, float usc);
++extern int p7_PipelineFromFilterScores(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th,
++                                       float usc, float filtersc, enum p7_pipeline_vitmode_e vitmode, float vfsc);
+ 
++#endif /*P7_HMMERH_INCLUDED*/
+--- a/vendor/hmmer/src/p7_pipeline.c
++++ b/vendor/hmmer/src/p7_pipeline.c
+@@ -693,42 +693,91 @@
+  *            and handle normal errors appropriately, which we haven't 
+  *            been careful enough about. [SRE H9/4]
+  */
++static int
++pipeline_post_msv(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
++                  float usc, float nullsc, double P, int filtersc_is_external, float filtersc,
++                  enum p7_pipeline_vitmode_e vitmode, float vfsc);
++static int
++pipeline_post_f2(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
++                 float nullsc, float filtersc);
++
+ int
+ p7_Pipeline(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist)
+ {
+-  P7_HIT          *hit     = NULL;     /* ptr to the current hit output data      */
+-  float            usc, vfsc, fwdsc;   /* filter scores                           */
+-  float            filtersc;           /* HMM null filter score                   */
+-  float            nullsc;             /* null model score                        */
+-  float            seqbias;  
+-  float            seq_score;          /* the corrected per-seq bit score */
+-  float            sum_score;           /* the corrected reconstruction score for the seq */
+-  float            pre_score, pre2_score; /* uncorrected bit scores for seq */
+-  double           P;                /* P-value of a hit */
+-  double           lnP;              /* log P-value of a hit */
+-  int              Ld;               /* # of residues in envelopes */
+-  int              d;
+-  int              status;
+-  
+-  if (sq->n == 0) return eslOK;    /* silently skip length 0 seqs; they'd cause us all sorts of weird problems */
++  float  nullsc;
++  float  seq_score;
++  float  usc;
++  double P;
++
++  if (sq->n == 0) return eslOK;
+   if (sq->n > 100000) ESL_EXCEPTION(eslETYPE, "Target sequence length > 100K, over comparison pipeline limit.\n(Did you mean to use nhmmer/nhmmscan?)");
+ 
+-  p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);    /* expand the one-row omx if needed */
++  p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);
++  p7_bg_NullOne(bg, sq->dsq, sq->n, &nullsc);
++  p7_MSVFilter(sq->dsq, sq->n, om, pli->oxf, &usc);
++  seq_score = (usc - nullsc) / eslCONST_LOG2;
++  P = esl_gumbel_surv(seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
++  if (P > pli->F1) return eslOK;
++
++  return pipeline_post_msv(pli, om, bg, sq, ntsq, hitlist, usc, nullsc, P, FALSE, 0.0f, p7_VIT_CPU, 0.0f);
++}
+ 
+-  /* Base null model score (we could calculate this in NewSeq(), for a scan pipeline) */
+-  p7_bg_NullOne  (bg, sq->dsq, sq->n, &nullsc);
++/* p7_PipelineFromMSV() continues the comparison pipeline from an externally
++ * computed MSV score. The score is rechecked against F1 before any pipeline
++ * counters are changed. */
++int
++p7_PipelineFromMSV(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist, float usc)
++{
++  float  nullsc;
++  float  seq_score;
++  double P;
+ 
+-  /* First level filter: the MSV filter, multihit with <om> */
+-  p7_MSVFilter(sq->dsq, sq->n, om, pli->oxf, &usc);
++  if (sq->n == 0) return eslOK;
++  if (sq->n > 100000) ESL_EXCEPTION(eslETYPE, "Target sequence length > 100K, over comparison pipeline limit.\n(Did you mean to use nhmmer/nhmmscan?)");
++
++  p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);
++  p7_bg_NullOne(bg, sq->dsq, sq->n, &nullsc);
++  seq_score = (usc - nullsc) / eslCONST_LOG2;
++  P = esl_gumbel_surv(seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
++  if (P > pli->F1) return eslOK;
++
++  return pipeline_post_msv(pli, om, bg, sq, ntsq, hitlist, usc, nullsc, P, FALSE, 0.0f, p7_VIT_CPU, 0.0f);
++}
++
++int
++p7_PipelineFromFilterScores(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
++                            float usc, float filtersc, enum p7_pipeline_vitmode_e vitmode, float vfsc)
++{
++  float  nullsc;
++  float  seq_score;
++  double P;
++
++  if (pli->mode != p7_SEARCH_SEQS) return eslEINVAL;
++  if (sq->n == 0) return eslOK;
++  if (sq->n > 100000) ESL_EXCEPTION(eslETYPE, "Target sequence length > 100K, over comparison pipeline limit.\n(Did you mean to use nhmmer/nhmmscan?)");
++
++  p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);
++  p7_bg_NullOne(bg, sq->dsq, sq->n, &nullsc);
+   seq_score = (usc - nullsc) / eslCONST_LOG2;
+-  P = esl_gumbel_surv(seq_score,  om->evparam[p7_MMU],  om->evparam[p7_MLAMBDA]);
++  P = esl_gumbel_surv(seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
+   if (P > pli->F1) return eslOK;
++
++  return pipeline_post_msv(pli, om, bg, sq, ntsq, hitlist, usc, nullsc, P, TRUE, filtersc, vitmode, vfsc);
++}
++
++static int
++pipeline_post_msv(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
++                  float usc, float nullsc, double P, int filtersc_is_external, float filtersc,
++                  enum p7_pipeline_vitmode_e vitmode, float vfsc)
++{
++  float            seq_score;
++  int              status;
+   pli->n_past_msv++;
+ 
+   /* biased composition HMM filtering */
+   if (pli->do_biasfilter)
+     {
+-      p7_bg_FilterScore(bg, sq->dsq, sq->n, &filtersc);
++      if (! filtersc_is_external) p7_bg_FilterScore(bg, sq->dsq, sq->n, &filtersc);
+       seq_score = (usc - filtersc) / eslCONST_LOG2;
+       P = esl_gumbel_surv(seq_score,  om->evparam[p7_MMU],  om->evparam[p7_MLAMBDA]);
+       if (P > pli->F1) return eslOK;
+@@ -747,13 +796,33 @@
+   /* Second level filter: ViterbiFilter(), multihit with <om> */
+   if (P > pli->F2)
+     {
+-      p7_ViterbiFilter(sq->dsq, sq->n, om, pli->oxf, &vfsc);  
++      if      (vitmode == p7_VIT_CPU)      p7_ViterbiFilter(sq->dsq, sq->n, om, pli->oxf, &vfsc);
++      else if (vitmode != p7_VIT_EXTERNAL) return eslEINVAL;
+       seq_score = (vfsc-filtersc) / eslCONST_LOG2;
+       P  = esl_gumbel_surv(seq_score,  om->evparam[p7_VMU],  om->evparam[p7_VLAMBDA]);
+       if (P > pli->F2) return eslOK;
+     }
+   pli->n_past_vit++;
+ 
++  return pipeline_post_f2(pli, om, bg, sq, ntsq, hitlist, nullsc, filtersc);
++}
++
++static int
++pipeline_post_f2(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
++                 float nullsc, float filtersc)
++{
++  P7_HIT          *hit     = NULL;
++  float            fwdsc;
++  float            seqbias;
++  float            seq_score;
++  float            sum_score;
++  float            pre_score, pre2_score;
++  double           P;
++  double           lnP;
++  int              Ld;
++  int              d;
++  int              status;
++
+ 
+   /* Parse it with Forward and obtain its real Forward score. */
+   p7_ForwardParser(sq->dsq, sq->n, om, pli->oxf, &fwdsc);
+@@ -2075,5 +2144,3 @@
+ }
+ #endif /*p7PIPELINE_EXAMPLE2*/
+ /*--------------- end, scan mode (HMM db) example ---------------*/
+-
+-
