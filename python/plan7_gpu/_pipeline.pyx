@@ -22,10 +22,10 @@ from libhmmer.p7_bg cimport P7_BG, p7_bg_SetLength
 from libhmmer.p7_pipeline cimport (
     P7_PIPELINE,
     p7_SEARCH_SEQS,
+    p7_ZSETBY_NTARGETS,
     p7_Pipeline,
     p7_pipeline_Reuse,
     p7_pli_NewModel,
-    p7_pli_NewSeq,
 )
 from libhmmer.p7_tophits cimport P7_TOPHITS
 
@@ -102,22 +102,29 @@ cdef int _search_loop_candidates(
         raise UnexpectedError(status, "p7_pli_NewModel")
 
     for t in range(n_targets):
-        # Every target must reach NewSeq so nseq/nres and automatic Z match a
-        # normal HMMER search, including targets definitely rejected by GPU F1.
-        status = p7_pli_NewSeq(pli, sq[t])
-        if status != eslOK:
-            raise UnexpectedError(status, "p7_pli_NewSeq")
-        status = p7_bg_SetLength(bg, sq[t].n)
-        if status != eslOK:
-            raise UnexpectedError(status, "p7_bg_SetLength")
-        status = p7_oprofile_ReconfigLength(om, sq[t].n)
-        if status != eslOK:
-            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+        # This is exactly p7_pli_NewSeq's accounting for a search pipeline.
+        # Doing it inline avoids a function call for every definite reject.
+        if not pli.long_targets:
+            pli.nseqs += 1
+            if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
+                pli.Z = pli.nseqs
+        pli.nres += sq[t].n
 
         if (
             candidate_cursor < candidate_count
             and candidate_indexes[candidate_cursor] == t
         ):
+            # A rejected prefix would have reused any residual workspaces
+            # before this first candidate in HMMER's ordinary target loop.
+            if candidate_cursor == 0 and t != 0:
+                p7_pipeline_Reuse(pli)
+
+            status = p7_bg_SetLength(bg, sq[t].n)
+            if status != eslOK:
+                raise UnexpectedError(status, "p7_bg_SetLength")
+            status = p7_oprofile_ReconfigLength(om, sq[t].n)
+            if status != eslOK:
+                raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
             status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
             if status == eslEINVAL:
                 Pipeline._missing_cutoffs(pli, om)
@@ -129,7 +136,23 @@ cdef int _search_loop_candidates(
                 raise UnexpectedError(status, "p7_Pipeline")
             candidate_cursor += 1
 
-        # Keep the same per-target lifecycle for candidates and rejects.
+            p7_pipeline_Reuse(pli)
+
+    # HMMER leaves both models configured for the final target, even when it
+    # fails F1. Preserve that state with one configuration for a rejected tail.
+    if (
+        n_targets != 0
+        and (
+            candidate_count == 0
+            or candidate_indexes[candidate_count - 1] != n_targets - 1
+        )
+    ):
+        status = p7_bg_SetLength(bg, sq[n_targets - 1].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_bg_SetLength")
+        status = p7_oprofile_ReconfigLength(om, sq[n_targets - 1].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
         p7_pipeline_Reuse(pli)
 
     return 0

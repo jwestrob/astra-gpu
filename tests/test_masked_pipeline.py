@@ -146,6 +146,21 @@ class MaskedPipelineTests(unittest.TestCase):
             "searched_sequences",
             "strand",
         )
+        pipeline_fields = (
+            "Z_setby",
+            "domZ_setby",
+            "n_past_msv",
+            "n_past_bias",
+            "n_past_vit",
+            "n_past_fwd",
+            "pos_past_msv",
+            "pos_past_bias",
+            "pos_past_vit",
+            "pos_past_fwd",
+            "mode",
+            "W",
+        )
+        pipeline_state = hits.__getstate__()["pipeline"]
 
         hit_states = []
         for hit in hits:
@@ -167,6 +182,7 @@ class MaskedPipelineTests(unittest.TestCase):
             )
         return (
             tuple(getattr(hits, name) for name in top_fields),
+            tuple(pipeline_state[name] for name in pipeline_fields),
             hits.is_sorted(by="key"),
             len(hits.reported),
             len(hits.included),
@@ -256,13 +272,146 @@ class MaskedPipelineTests(unittest.TestCase):
         self.assertEqual(actual.searched_residues, self.sequences.total_length())
         self.assertEqual(actual.Z, float(database_size))
 
+    def test_candidate_masks_preserve_auto_and_explicit_search_spaces(self):
+        hmm = self.hmms[0]
+        database_size = len(self.sequences)
+        masks = (
+            (),
+            (1, 7, database_size // 2),
+            tuple(range(database_size)),
+        )
+        search_spaces = (
+            {},
+            {"Z": 97},
+            {"domZ": 11},
+            {"Z": 97, "domZ": 11},
+        )
+
+        for indexes in masks:
+            subset = pyhmmer.easel.DigitalSequenceBlock(
+                self.alphabet, [self.sequences[index] for index in indexes]
+            )
+            for options in search_spaces:
+                with self.subTest(indexes=indexes, options=options):
+                    reference_options = dict(options)
+                    reference_options.setdefault("Z", database_size)
+                    expected = self.pipeline(**reference_options).search_hmm(
+                        hmm, subset
+                    )
+                    actual = _pipeline._search_hmm_candidates(
+                        self.pipeline(**options),
+                        hmm,
+                        self.optimized_profiles[0].copy(),
+                        self.sequences,
+                        self.candidates(*indexes),
+                    )
+
+                    self.assertEqual(
+                        self.table_bytes(actual, "targets"),
+                        self.table_bytes(expected, "targets"),
+                    )
+                    self.assertEqual(
+                        self.table_bytes(actual, "domains"),
+                        self.table_bytes(expected, "domains"),
+                    )
+                    self.assertEqual(actual.Z, float(options.get("Z", database_size)))
+                    self.assertEqual(actual.domZ, expected.domZ)
+                    self.assertEqual(actual.searched_sequences, database_size)
+                    self.assertEqual(
+                        actual.searched_residues, self.sequences.total_length()
+                    )
+
+    def test_skipped_empty_rejects_match_complete_pipeline_state(self):
+        hmm = self.hmms[0]
+        empties = [
+            pyhmmer.easel.TextSequence(
+                name=f"empty-{index}".encode(), sequence=""
+            ).digitize(self.alphabet)
+            for index in range(3)
+        ]
+        targets = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet,
+            [empties[0], self.sequences[0], empties[1], self.sequences[1], empties[2]],
+        )
+
+        for options in ({}, {"Z": 97}, {"domZ": 11}, {"Z": 97, "domZ": 11}):
+            with self.subTest(options=options):
+                expected = self.pipeline(**options).search_hmm(hmm, targets)
+                actual = _pipeline._search_hmm_candidates(
+                    self.pipeline(**options),
+                    hmm,
+                    self.optimized_profiles[0].copy(),
+                    targets,
+                    self.candidates(1, 3),
+                )
+                self.assert_exact_hits(expected, actual)
+
+    def test_rejected_tail_preserves_final_model_lengths(self):
+        hmm = self.hmms[0]
+        last_length = len(self.sequences[-1])
+        expected_transition = array("f", [last_length / (last_length + 1)])[0]
+        expected_optimized = self.optimized_profiles[0].copy()
+        expected_optimized.L = last_length
+
+        for indexes in ((), (0,), tuple(range(len(self.sequences)))):
+            with self.subTest(indexes=indexes):
+                pipeline = self.pipeline()
+                optimized = self.optimized_profiles[0].copy()
+                _pipeline._search_hmm_candidates(
+                    pipeline,
+                    hmm,
+                    optimized,
+                    self.sequences,
+                    self.candidates(*indexes),
+                )
+                self.assertEqual(optimized.L, last_length)
+                self.assertTrue(
+                    _pipeline._oprofiles_equal_hmmer(expected_optimized, optimized)
+                )
+                self.assertEqual(
+                    pipeline.background.transition_probability,
+                    expected_transition,
+                )
+
+    def test_final_empty_member_preserves_zero_model_lengths(self):
+        hmm = self.hmms[0]
+        empty = pyhmmer.easel.TextSequence(name=b"empty", sequence="").digitize(
+            self.alphabet
+        )
+        targets = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [self.sequences[0], empty]
+        )
+        expected_optimized = self.optimized_profiles[0].copy()
+        expected_optimized.L = 0
+
+        for indexes in ((), (0,), (0, 1)):
+            with self.subTest(indexes=indexes):
+                pipeline = self.pipeline()
+                optimized = self.optimized_profiles[0].copy()
+                _pipeline._search_hmm_candidates(
+                    pipeline,
+                    hmm,
+                    optimized,
+                    targets,
+                    self.candidates(*indexes),
+                )
+                self.assertEqual(optimized.L, 0)
+                self.assertTrue(
+                    _pipeline._oprofiles_equal_hmmer(expected_optimized, optimized)
+                )
+                self.assertEqual(pipeline.background.transition_probability, 0.0)
+
     def test_empty_target_block_still_registers_the_model(self):
         hmm = self.hmms[0]
         empty = pyhmmer.easel.DigitalSequenceBlock(self.alphabet)
+        pipeline = self.pipeline()
+        optimized = self.optimized_profiles[0].copy()
+        initial_length = optimized.L
+        initial_transition = pipeline.background.transition_probability
         hits = _pipeline._search_hmm_candidates(
-            self.pipeline(),
+            pipeline,
             hmm,
-            self.optimized_profiles[0].copy(),
+            optimized,
             empty,
             self.candidates(),
         )
@@ -272,6 +421,8 @@ class MaskedPipelineTests(unittest.TestCase):
         self.assertEqual(hits.searched_sequences, 0)
         self.assertEqual(hits.searched_residues, 0)
         self.assertEqual(hits.Z, 0.0)
+        self.assertEqual(optimized.L, initial_length)
+        self.assertEqual(pipeline.background.transition_probability, initial_transition)
 
     def test_explicit_z_and_domz_survive_all_rejects(self):
         hits = _pipeline._search_hmm_candidates(
@@ -329,6 +480,45 @@ class MaskedPipelineTests(unittest.TestCase):
         self.assertEqual(self.semantic_state(actual_first), first_state)
         self.assertEqual(self.table_bytes(actual_first, "targets"), first_targets)
         self.assertEqual(self.table_bytes(actual_first, "domains"), first_domains)
+
+    def test_rejected_then_sparse_pipeline_reuse_without_clear(self):
+        hmm = self.hmms[0]
+        optimized = self.optimized_profiles[0].copy()
+        pipeline = self.pipeline()
+        database_size = len(self.sequences)
+        total_length = self.sequences.total_length()
+
+        rejected = _pipeline._search_hmm_candidates(
+            pipeline, hmm, optimized, self.sequences, self.candidates()
+        )
+        rejected_state = self.semantic_state(rejected)
+
+        indexes = (1, 7, database_size // 2)
+        subset = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [self.sequences[index] for index in indexes]
+        )
+        expected = self.pipeline(Z=database_size).search_hmm(hmm, subset)
+        actual = _pipeline._search_hmm_candidates(
+            pipeline,
+            hmm,
+            optimized,
+            self.sequences,
+            self.candidates(*indexes),
+        )
+
+        self.assertEqual(
+            self.table_bytes(actual, "targets"),
+            self.table_bytes(expected, "targets"),
+        )
+        self.assertEqual(
+            self.table_bytes(actual, "domains"),
+            self.table_bytes(expected, "domains"),
+        )
+        self.assertEqual(actual.searched_models, 2)
+        self.assertEqual(actual.searched_nodes, 2 * hmm.M)
+        self.assertEqual(actual.searched_sequences, database_size)
+        self.assertEqual(actual.searched_residues, 2 * total_length)
+        self.assertEqual(self.semantic_state(rejected), rejected_state)
 
     def test_embedded_empty_target_matches_pyhmmer_or_is_accounted_when_rejected(self):
         hmm = self.hmms[0]
