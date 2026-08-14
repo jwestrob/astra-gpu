@@ -126,6 +126,21 @@ ctypedef int (*_pipeline_from_filter_scores_f)(
     float,
 ) noexcept nogil
 
+ctypedef int (*_pipeline_from_filter_and_forward_scores_f)(
+    P7_PIPELINE*,
+    P7_OPROFILE*,
+    P7_BG*,
+    const ESL_SQ*,
+    const ESL_SQ*,
+    P7_TOPHITS*,
+    float,
+    float,
+    float,
+    float,
+    const float*,
+    uint64_t,
+) noexcept nogil
+
 
 cdef union _float_bits:
     float value
@@ -210,6 +225,37 @@ def _filter_scores_seam_available():
     cdef _pipeline_from_filter_scores_f seam
     with nogil:
         seam = _resolve_filter_scores_seam()
+    return seam != NULL
+
+
+cdef _pipeline_from_filter_and_forward_scores_f _resolve_filter_and_forward_scores_seam() noexcept nogil:
+    cdef Dl_info info
+    cdef Dl_info symbol_info
+    cdef void* handle
+    cdef void* symbol
+
+    if dladdr(<const void*> p7_Pipeline, &info) == 0 or info.dli_fname == NULL:
+        return NULL
+    handle = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_NOW)
+    if handle == NULL:
+        return NULL
+    symbol = dlsym(handle, "p7_PipelineFromFilterAndForwardScores")
+    if (
+        symbol == NULL
+        or dladdr(symbol, &symbol_info) == 0
+        or symbol_info.dli_fbase != info.dli_fbase
+    ):
+        dlclose(handle)
+        return NULL
+    dlclose(handle)
+    return <_pipeline_from_filter_and_forward_scores_f> symbol
+
+
+def _filter_and_forward_scores_seam_available():
+    """Return whether the exact external-Forward seam is loaded."""
+    cdef _pipeline_from_filter_and_forward_scores_f seam
+    with nogil:
+        seam = _resolve_filter_and_forward_scores_seam()
     return seam != NULL
 
 

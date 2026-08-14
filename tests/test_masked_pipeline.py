@@ -438,6 +438,12 @@ class MaskedPipelineTests(unittest.TestCase):
         )
         self.assertEqual(hits.searched_models, 1)
 
+    def test_forward_score_seam_tracks_private_hmmer(self):
+        if _pipeline._filter_scores_seam_available():
+            self.assertTrue(_pipeline._filter_and_forward_scores_seam_available())
+        else:
+            self.assertFalse(_pipeline._filter_and_forward_scores_seam_available())
+
     def test_invalid_postfilter_rows_fail_before_pipeline_mutation(self):
         offsets = self.residue_offsets(self.sequences)
 

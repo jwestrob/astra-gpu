@@ -15,8 +15,9 @@ Every PyHMMER extension and `plan7_gpu._pipeline` must resolve the same physical
 
 The patch is additive: it does not change a public struct layout. It factors the
 existing comparison pipeline into shared post-MSV and post-F2 cores, exports
-`p7_PipelineFromMSV` and `p7_PipelineFromFilterScores`, and installs matching
-Cython declarations. The post-F2 entry is search-mode only.
+`p7_PipelineFromMSV`, `p7_PipelineFromFilterScores`, and
+`p7_PipelineFromFilterAndForwardScores`, and installs matching Cython
+declarations. The latter two entries are search-mode only.
 
 `p7_VIT_EXTERNAL` supplies an exact Viterbi score. `p7_VIT_CPU` is the
 fail-closed fallback for accelerator `eslERANGE` or `eslENORESULT`.
@@ -24,6 +25,13 @@ fail-closed fallback for accelerator `eslERANGE` or `eslENORESULT`.
 Viterbi (`P <= F2`). The seam rechecks F1/F2 and updates HMMER's survivor
 counters itself. With bias filtering disabled, the supplied `filtersc` is
 ignored and HMMER uses `nullsc`.
+
+The Forward seam replays all four filter gates. F3 rejects require no matrix;
+F3 survivors require exactly `6 * (L + 1)` binary32 E/N/J/B/C/SCALE cells. It
+checks the special-state recurrences, reconstructs HMMER's `totscale` and
+Forward score bit-for-bit, then imports the matrix for the unchanged Backward
+and domain workflow. Invalid payloads and unattested host floating-point modes
+fail before survivor counters or workspaces change.
 
 ## Build and test
 
@@ -46,9 +54,10 @@ private ABI fingerprint changes and intentionally forces `_pipeline` to be
 rebuilt. Regenerate pressed manifests after switching wheels.
 
 The test compares ordinary stock and patched PyHMMER byte-for-byte, then checks
-both entry points, stage counters, bias and F2 rejects, Viterbi elision,
-ERANGE/ENORESULT fallback, `--nobias`, required symbols, and that only one HMMER
-and one Easel library are mapped.
+all three entry points, stage counters, F1/F2/F3 rejects, Viterbi elision,
+ERANGE/ENORESULT fallback, `--nobias`, malformed Forward payloads, required
+symbols, a real Forward rescaling case, and that only one HMMER and one Easel
+library are mapped.
 
 For the installed `plan7_gpu._pipeline`, use a relative runpath
 `$ORIGIN/../pyhmmer.libs`; never retain the current absolute development

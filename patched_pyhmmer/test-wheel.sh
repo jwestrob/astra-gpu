@@ -62,7 +62,10 @@ $compiler \
   "$work/seam_probe.c"
 
 defined_symbols=$(nm -D --defined-only "$library_dir/liblibhmmer.so")
-for symbol in p7_PipelineFromMSV p7_PipelineFromFilterScores; do
+for symbol in \
+  p7_PipelineFromMSV \
+  p7_PipelineFromFilterScores \
+  p7_PipelineFromFilterAndForwardScores; do
   if ! rg -q "[[:space:]]${symbol}$" <<<"$defined_symbols"; then
     echo "patched HMMER library is missing $symbol" >&2
     exit 1

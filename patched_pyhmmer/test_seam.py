@@ -76,6 +76,35 @@ def compare(
         assert counters(standard) == expected_counters, label
 
 
+def compare_forward(
+    label: str,
+    hmm,
+    sequences,
+    options: dict,
+    omit_forward_matrix: bool = False,
+    expected_counters: tuple[int, ...] | None = None,
+) -> None:
+    standard = plan7.Pipeline(hmm.alphabet, **options).search_hmm(
+        hmm,
+        sequences,
+    )
+    optimized = hmm.to_profile(
+        plan7.Background(hmm.alphabet),
+        L=400,
+    ).to_optimized()
+    resumed = seam_probe.search_forward(
+        plan7.Pipeline(hmm.alphabet, **options),
+        hmm,
+        optimized,
+        sequences,
+        omit_forward_matrix,
+    )
+    assert tables(standard) == tables(resumed), label
+    assert counters(standard) == counters(resumed), label
+    if expected_counters is not None:
+        assert counters(standard) == expected_counters, label
+
+
 def check_one_library() -> None:
     mapped = Path("/proc/self/maps").read_text().splitlines()
     for library in ("liblibhmmer.so", "liblibeasel.so"):
@@ -152,8 +181,105 @@ def main() -> None:
         expected_counters=(1, 1, 1, 1),
     )
 
+    hmm, sequences = load("Thioesterase.hmm", 1992)
+    compare_forward("external Forward", hmm, sequences, {})
+    compare_forward(
+        "external Forward no-bias",
+        hmm,
+        sequences,
+        {"bias_filter": False},
+    )
+    compare_forward(
+        "F3 reject without matrix",
+        hmm,
+        sequences,
+        {"F1": 1.0, "F2": 1.0, "F3": -1.0},
+        omit_forward_matrix=True,
+        expected_counters=(1, 1, 1, 0),
+    )
+    compare_forward(
+        "F3 negative-infinity reject without matrix",
+        hmm,
+        sequences,
+        {"F1": 1.0, "F2": 1.0, "F3": float("-inf")},
+        omit_forward_matrix=True,
+        expected_counters=(1, 1, 1, 0),
+    )
+    for label, threshold in (
+        ("F3 NaN with matrix", float("nan")),
+        ("F3 positive infinity with matrix", float("inf")),
+    ):
+        compare_forward(
+            label,
+            hmm,
+            sequences,
+            {"F1": 1.0, "F2": 1.0, "F3": threshold},
+        )
+        try:
+            seam_probe.search_forward(
+                plan7.Pipeline(
+                    hmm.alphabet,
+                    F1=1.0,
+                    F2=1.0,
+                    F3=threshold,
+                ),
+                hmm,
+                hmm.to_profile(
+                    plan7.Background(hmm.alphabet),
+                    L=400,
+                ).to_optimized(),
+                sequences,
+                True,
+            )
+        except RuntimeError as error:
+            assert str(error) == f"HMMER status {seam_probe.HMMER_EINVAL}"
+        else:
+            raise AssertionError(f"{label} accepted a missing matrix")
+
+    optimized = hmm.to_profile(
+        plan7.Background(hmm.alphabet),
+        L=400,
+    ).to_optimized()
+    amino_acids = "ACDEFGHIKLMNPQRSTVWY"
+    rescale_text = "".join(
+        residue if index % 20 < 8 else amino_acids[index % 20]
+        for index, residue in enumerate(hmm.consensus.upper())
+    )
+    rescale_sequence = easel.TextSequence(
+        name=b"rescale",
+        sequence=rescale_text,
+    ).digitize(hmm.alphabet)
+    rescale_sequences = easel.DigitalSequenceBlock(
+        hmm.alphabet,
+        [rescale_sequence],
+    )
+    assert (
+        seam_probe.forward_rescale_count(
+            plan7.Pipeline(hmm.alphabet),
+            optimized.copy(),
+            rescale_sequences,
+        )
+        == 1
+    )
+    compare_forward(
+        "external Forward with rescaling",
+        hmm,
+        rescale_sequences,
+        {},
+    )
+    for corruption in range(6):
+        status, changed = seam_probe.invalid_forward_status(
+            plan7.Pipeline(hmm.alphabet),
+            hmm,
+            optimized.copy(),
+            sequences,
+            corruption,
+        )
+        assert status == seam_probe.HMMER_EINVAL, corruption
+        assert not changed, corruption
+
     check_one_library()
-    print("patched PyHMMER seam parity: 4 full searches + 7 seam cases")
+    print("patched PyHMMER seam parity: 4 full searches + 21 seam cases")
 
 
 if __name__ == "__main__":
