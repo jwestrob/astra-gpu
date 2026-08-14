@@ -22,13 +22,12 @@
       "note": "The shared interactive host had fixed-port collisions in the two hmmpgmd daemon tests; the complete unmodified suite passed in a Slurm allocation."
     }
   },
-  "pyhmmer": {
-    "version": "0.12.1",
-    "python": "3.11.15",
-    "installer": "uv 0.11.6",
-    "dependencies": {
-      "psutil": "7.2.2"
-    },
-    "environment": "env/pyhmmer-0.12.1"
+  "astra": {
+    "version": "astra-hmm 0.1.0",
+    "revision": "966220c15b626626149c37199973818a773d270e",
+    "python": "3.12.0",
+    "pyhmmer_dependency": "0.12.0",
+    "executable": "/home/jwestrob/.pyenv/versions/3.12.0/bin/astra",
+    "source": "/groups/banfield/users/jwestrob/astra"
   }
 }

@@ -3,8 +3,9 @@
 ## Purpose
 
 Measure scientific equivalence and end-to-end value of a hybrid HMMER 3.4
-accelerator. Kernel GCUPS is diagnostic; wall-clock speedup against optimized
-multicore HMMER/PyHMMER on the same hardware is the decision metric.
+accelerator. Kernel GCUPS is diagnostic; wall-clock speedup against the
+existing Astra application on the same hardware is the decision metric.
+Pristine HMMER remains the semantic oracle and component-timing reference.
 
 ## Immutable provenance
 
@@ -14,7 +15,8 @@ Every run records:
 - exact command, working directory, environment controls, and exit status;
 - HMM/FASTA canonical path, byte size, modification time, SHA-256, record
   count, residue count, profile count, and total profile states;
-- HMMER/PyHMMER/Astra version and Git revision where applicable; and
+- HMMER/Astra version and Git revision, including Astra's recorded PyHMMER
+  dependency; and
 - warm-up policy, replicate index, output path, and output byte count.
 
 The initial corpus is frozen in `results/datasets.json`. Database upgrades are
@@ -49,15 +51,14 @@ This corpus measures the CPU downstream bottleneck after GPU filtering.
 
 ## Execution baselines
 
-- pristine HMMER 3.4 `hmmsearch` built by `scripts/build_hmmer.sh`;
-- PyHMMER 0.12.1 in `env/pyhmmer-0.12.1`;
-- current Astra at its recorded revision; and
+- current Astra at its recorded revision (application baseline);
+- pristine HMMER 3.4 `hmmsearch` built by `scripts/build_hmmer.sh`
+  (semantic and stage-timing reference); and
 - hybrid builds, only after their correctness gate passes.
 
 Primary CPU counts are 1, 4, 8, 16, 32, and the maximum allocated physical
-cores. SMT is a separate experiment. HMMER CLI and PyHMMER/Astra scheduling
-must be reported independently because they distribute multiple queries
-differently.
+cores. SMT is a separate experiment. HMMER CLI and Astra results are reported
+independently because they are different measurement layers.
 
 Each reported point uses one warm-up and at least three measured replicates
 when practical. Compute-only and end-to-end I/O runs are distinct. Reported

@@ -1,0 +1,301 @@
+{
+  "amdahl_speedup_if_msv_accelerated": {
+    "formula": "1 / ((1 - f) + f / acceleration)",
+    "using_median_f_e2e": {
+      "100x": 1.3999859580726852,
+      "10x": 1.35086530768,
+      "infinite": 1.405665214106968
+    },
+    "using_median_f_pipeline": {
+      "100x": 1.4762660943022814,
+      "10x": 1.4150009161418255,
+      "infinite": 1.4834024000330124
+    }
+  },
+  "application_baseline": {
+    "name": "Astra",
+    "role": "application_baseline",
+    "summary": "results/baseline/pilot-astra-hyddb-plm2_5-summary.json",
+    "summary_sha256": "faa27e3013bb7e11f6b523b03e713e64f1c6e07d7a87f42fa66ac769c4083c88"
+  },
+  "counts_per_replicate": {
+    "classic_fallbacks": 2328,
+    "clock_errors": 0,
+    "fallback_status": {
+      "erange": 366,
+      "ok": 1962,
+      "other": 0
+    },
+    "passed": {
+      "bias": 23499,
+      "forward": 1058,
+      "msv": 26517,
+      "viterbi": 3468
+    },
+    "queries": 3,
+    "ssv_attempts": 900558,
+    "ssv_status": {
+      "erange": 0,
+      "noresult": 2328,
+      "ok": 898230,
+      "other": 0
+    },
+    "target_comparisons": 900558,
+    "target_residues": 208359135
+  },
+  "dataset_id": "hyddb-plm2_5",
+  "immutable_provenance": {
+    "query_hmm": {
+      "path": "/groups/banfield/users/jwestrob/.config/Astra/HydDB/HydDB_all_MM2022.hmm",
+      "sha256": "65c092838948289f481afabda88aa3b02ee94910cc3d137c6fed966deffb70da"
+    },
+    "target_fasta": {
+      "path": "/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa",
+      "sha256": "eadfb887b8a8a25921cd318d0e278b43f900b05e3dbe0fae7d30233d4932fd04"
+    },
+    "timed_executable_from_run_json": {
+      "path": "refs/install/hmmer-3.4-stage-timing/bin/hmmsearch",
+      "sha256": "655f56205f9f5da8bf227ac8b35c7d8a948e7fc2b3360e378e8558925f4ccbdd"
+    },
+    "timing_patch": {
+      "path": "baseline/patches/hmmer-3.4-stage-timing.patch",
+      "sha256": "8397b9793cec0c930acd27ffadd173353e975294784c3db3ad3a8d15be2b617d"
+    }
+  },
+  "input_provenance": [
+    {
+      "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate1",
+      "run_json": "results/baseline/pilot-stage-timing-hyddb-plm2_5/hyddb-plm2_5-hmmer-stage-cpu0-replicate1.json",
+      "run_json_sha256": "9c294acff889872b9c33490507a9729bd487b5352f02af121bc4803c779ffe18",
+      "timing_tsv": "results/baseline/pilot-stage-timing-hyddb-plm2_5/hyddb-plm2_5-hmmer-stage-cpu0-replicate1.tsv",
+      "timing_tsv_sha256": "b93abd87b2dc81539a17162dbe0df7a472b48a39da683e05327d031007a0a022"
+    },
+    {
+      "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate2",
+      "run_json": "results/baseline/pilot-stage-timing-hyddb-plm2_5/hyddb-plm2_5-hmmer-stage-cpu0-replicate2.json",
+      "run_json_sha256": "55a329da84ff9ab8f9b265ead3a4dc5b061c7bd1aa64a699fa0bc4958f43217d",
+      "timing_tsv": "results/baseline/pilot-stage-timing-hyddb-plm2_5/hyddb-plm2_5-hmmer-stage-cpu0-replicate2.tsv",
+      "timing_tsv_sha256": "66c55763cbb32858384e533eb3f7709850c554f0429b69f186fa6e8a6b554610"
+    },
+    {
+      "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate3",
+      "run_json": "results/baseline/pilot-stage-timing-hyddb-plm2_5/hyddb-plm2_5-hmmer-stage-cpu0-replicate3.json",
+      "run_json_sha256": "cb806aa89df2291ff77a2428fdee1238edfd358d980cdbacbbe81fc4d72f358e",
+      "timing_tsv": "results/baseline/pilot-stage-timing-hyddb-plm2_5/hyddb-plm2_5-hmmer-stage-cpu0-replicate3.tsv",
+      "timing_tsv_sha256": "d1333c9d8d30e137cb0fc8742d966e3c5ca7314ec4ec1be01777c0386d1d2f83"
+    }
+  ],
+  "measurement": {
+    "accelerated_stage": "msv_public",
+    "clock": "CLOCK_MONOTONIC_RAW",
+    "cpu_workers": 0,
+    "f_e2e_definition": "msv_public / external process wall time",
+    "f_pipeline_definition": "msv_public / pipeline_total",
+    "hosts": [
+      "node-128-512g-8gpu-1"
+    ],
+    "observer_overhead": {
+      "calibration_applied": false,
+      "implication": "Instrumented f_e2e is diagnostic and likely biased high; do not treat it as a calibrated production fraction.",
+      "pilot_observed_fraction_range": [
+        0.03,
+        0.05
+      ]
+    },
+    "replicates": 3,
+    "run_status": "pilot",
+    "timing_semantics": "Serial elapsed time; nested stages are not additive."
+  },
+  "medians": {
+    "external_wall_seconds": 8.949398237,
+    "f_e2e": 0.28859305191292717,
+    "f_pipeline": 0.3258740851587233,
+    "stage_seconds": {
+      "backward_parser": 0.571077931,
+      "bias_filter": 0.105128098,
+      "domain_workflow": 2.217525396,
+      "forward_parser": 1.269121593,
+      "msv_classic_fallback": 0.014833766,
+      "msv_public": 2.58273415,
+      "msv_ssv_attempt": 2.515579861,
+      "null1": 0.037357501,
+      "pipeline_total": 7.925558575,
+      "target_reconfig": 0.042935267,
+      "viterbi_filter": 1.034496184
+    }
+  },
+  "rates": {
+    "fallback": {
+      "definition": "msv_classic_fallback / msv_ssv_attempt",
+      "median": 0.002585063927031907,
+      "per_replicate": [
+        0.002585063927031907,
+        0.002585063927031907,
+        0.002585063927031907
+      ]
+    },
+    "passes": {
+      "bias": {
+        "definition": "passed_bias / target_sequences",
+        "median": 0.026093821830465113,
+        "per_replicate": [
+          0.026093821830465113,
+          0.026093821830465113,
+          0.026093821830465113
+        ]
+      },
+      "forward": {
+        "definition": "passed_forward / target_sequences",
+        "median": 0.0011748271627146725,
+        "per_replicate": [
+          0.0011748271627146725,
+          0.0011748271627146725,
+          0.0011748271627146725
+        ]
+      },
+      "msv": {
+        "definition": "passed_msv / target_sequences",
+        "median": 0.029445077385354415,
+        "per_replicate": [
+          0.029445077385354415,
+          0.029445077385354415,
+          0.029445077385354415
+        ]
+      },
+      "viterbi": {
+        "definition": "passed_viterbi / target_sequences",
+        "median": 0.003850945746970212,
+        "per_replicate": [
+          0.003850945746970212,
+          0.003850945746970212,
+          0.003850945746970212
+        ]
+      }
+    }
+  },
+  "reference_engine": {
+    "name": "pristine HMMER",
+    "role": "semantic_and_stage_timing_oracle",
+    "version": "3.4"
+  },
+  "replicate_measurements": [
+    {
+      "external_wall_seconds": 8.969693096,
+      "f_e2e": 0.28943374117869597,
+      "f_pipeline": 0.32666148748361523,
+      "host": "node-128-512g-8gpu-1",
+      "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate1",
+      "run_index": 1,
+      "stage_seconds": {
+        "backward_parser": 0.576795018,
+        "bias_filter": 0.105128098,
+        "domain_workflow": 2.217525396,
+        "forward_parser": 1.270122315,
+        "msv_classic_fallback": 0.014833766,
+        "msv_public": 2.59613183,
+        "msv_ssv_attempt": 2.529454914,
+        "null1": 0.037375319,
+        "pipeline_total": 7.947468341,
+        "target_reconfig": 0.042935267,
+        "viterbi_filter": 1.038521521
+      }
+    },
+    {
+      "external_wall_seconds": 8.949398237,
+      "f_e2e": 0.28859305191292717,
+      "f_pipeline": 0.3258740851587233,
+      "host": "node-128-512g-8gpu-1",
+      "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate2",
+      "run_index": 2,
+      "stage_seconds": {
+        "backward_parser": 0.571077931,
+        "bias_filter": 0.106423271,
+        "domain_workflow": 2.217939505,
+        "forward_parser": 1.269121593,
+        "msv_classic_fallback": 0.014851331,
+        "msv_public": 2.58273415,
+        "msv_ssv_attempt": 2.515579861,
+        "null1": 0.037357501,
+        "pipeline_total": 7.925558575,
+        "target_reconfig": 0.043347123,
+        "viterbi_filter": 1.034496184
+      }
+    },
+    {
+      "external_wall_seconds": 8.876353339,
+      "f_e2e": 0.2879567354275643,
+      "f_pipeline": 0.32497862567224656,
+      "host": "node-128-512g-8gpu-1",
+      "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate3",
+      "run_index": 3,
+      "stage_seconds": {
+        "backward_parser": 0.569171956,
+        "bias_filter": 0.103957094,
+        "domain_workflow": 2.204512855,
+        "forward_parser": 1.261234399,
+        "msv_classic_fallback": 0.014716514,
+        "msv_public": 2.55600573,
+        "msv_ssv_attempt": 2.490068121,
+        "null1": 0.037206996,
+        "pipeline_total": 7.865150284,
+        "target_reconfig": 0.042526596,
+        "viterbi_filter": 1.028159903
+      }
+    }
+  ],
+  "role": "reference_oracle_stage_timing",
+  "schema_version": 1,
+  "scientific_output": {
+    "all_equal_to_pristine": true,
+    "normalization": "Exclude comment/blank lines; strip trailing whitespace.",
+    "pristine": {
+      "domains": {
+        "path": "results/baseline/pilot-stage-timing-hyddb-plm2_5/hyddb-plm2_5-hmmer-pristine-cpu0-reference.domtblout",
+        "rows": 1092,
+        "sha256": "a8b3673fbd38f8fa86372b8b8d68e9982819871a13331460e7e9d7e2468254f4"
+      },
+      "targets": {
+        "path": "results/baseline/pilot-stage-timing-hyddb-plm2_5/hyddb-plm2_5-hmmer-pristine-cpu0-reference.tblout",
+        "rows": 996,
+        "sha256": "6f584bbadd6b06c658184a0fdf0a67842676e3c4b907bd5af36e0e0f1145655f"
+      }
+    },
+    "required_equal": true,
+    "timed_replicates": [
+      {
+        "domains": {
+          "rows": 1092,
+          "sha256": "a8b3673fbd38f8fa86372b8b8d68e9982819871a13331460e7e9d7e2468254f4"
+        },
+        "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate1",
+        "targets": {
+          "rows": 996,
+          "sha256": "6f584bbadd6b06c658184a0fdf0a67842676e3c4b907bd5af36e0e0f1145655f"
+        }
+      },
+      {
+        "domains": {
+          "rows": 1092,
+          "sha256": "a8b3673fbd38f8fa86372b8b8d68e9982819871a13331460e7e9d7e2468254f4"
+        },
+        "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate2",
+        "targets": {
+          "rows": 996,
+          "sha256": "6f584bbadd6b06c658184a0fdf0a67842676e3c4b907bd5af36e0e0f1145655f"
+        }
+      },
+      {
+        "domains": {
+          "rows": 1092,
+          "sha256": "a8b3673fbd38f8fa86372b8b8d68e9982819871a13331460e7e9d7e2468254f4"
+        },
+        "label": "hyddb-plm2_5-hmmer-stage-cpu0-replicate3",
+        "targets": {
+          "rows": 996,
+          "sha256": "6f584bbadd6b06c658184a0fdf0a67842676e3c4b907bd5af36e0e0f1145655f"
+        }
+      }
+    ]
+  },
+  "warning": "Pilot/reference timing from a shared-node allocation; not reportable performance data. The timing observer added roughly 3-5% in pilot checks, so f_e2e is diagnostic and likely biased high. Astra, not pristine HMMER, is the application baseline."
+}

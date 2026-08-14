@@ -1,0 +1,833 @@
+--- a/src/Makefile.in
++++ b/src/Makefile.in
+@@ -97,6 +97,7 @@
+ 	hmmerfm-exactmatch.o
+ 
+ HDRS =  hmmer.h \
++	p7_stage_timing.h \
+ 	cachedb.h \
+ 	p7_gbands.h \
+ 	p7_gmxb.h \
+--- a/src/hmmer.h
++++ b/src/hmmer.h
+@@ -818,6 +818,45 @@
+ } P7_HMM_WINDOWLIST;
+ 
+ 
++/* Optional, opt-in stage timing for the protein search pipeline.
++ * Counts and elapsed times are accumulated per P7_PIPELINE, so threaded
++ * searches can merge them without contended atomics in the hot path.
++ */
++enum p7_stage_e {
++  p7STAGE_RECONFIG = 0,
++  p7STAGE_PIPELINE,
++  p7STAGE_NULL1,
++  p7STAGE_MSV_PUBLIC,
++  p7STAGE_MSV_SSV,
++  p7STAGE_MSV_FALLBACK,
++  p7STAGE_BIAS,
++  p7STAGE_VITERBI,
++  p7STAGE_FORWARD_PARSER,
++  p7STAGE_BACKWARD_PARSER,
++  p7STAGE_DOMAIN,
++  p7STAGE_N
++};
++
++typedef struct p7_stage_counter_s {
++  uint64_t calls;
++  uint64_t elapsed_ns;
++} P7_STAGE_COUNTER;
++
++typedef struct p7_stage_timing_s {
++  int              enabled;
++  P7_STAGE_COUNTER stage[p7STAGE_N];
++
++  uint64_t clock_errors;
++  uint64_t ssv_status_ok;
++  uint64_t ssv_status_erange;
++  uint64_t ssv_status_noresult;
++  uint64_t ssv_status_other;
++  uint64_t fallback_status_ok;
++  uint64_t fallback_status_erange;
++  uint64_t fallback_status_other;
++} P7_STAGE_TIMING;
++
++
+ 
+ /*****************************************************************
+  * 14. Choice of vector implementation.
+@@ -1251,6 +1290,9 @@
+ 
+   P7_HMMFILE   *hfp;		/* COPY of open HMM database (if scan mode) */
+   char          errbuf[eslERRBUFSIZE];
++
++  /* Optional benchmark-only timing. Appended to preserve existing field offsets. */
++  P7_STAGE_TIMING stage_timing;
+ } P7_PIPELINE;
+ 
+ 
+@@ -1635,6 +1677,7 @@
+ extern int          p7_pipeline_Reuse  (P7_PIPELINE *pli);
+ extern void         p7_pipeline_Destroy(P7_PIPELINE *pli);
+ extern int          p7_pipeline_Merge  (P7_PIPELINE *p1, P7_PIPELINE *p2);
++extern int          p7_pipeline_EnableStageTiming(P7_PIPELINE *pli);
+ 
+ extern int p7_pli_ExtendAndMergeWindows (P7_OPROFILE *om, const P7_SCOREDATA *msvdata, P7_HMM_WINDOWLIST *windowlist, float pct_overlap);
+ extern int p7_pli_TargetReportable  (P7_PIPELINE *pli, float score,     double lnP);
+@@ -1655,6 +1698,8 @@
+ 
+ 
+ extern int p7_pli_Statistics(FILE *ofp, P7_PIPELINE *pli, ESL_STOPWATCH *w);
++extern int p7_pli_StageTimingHeader(FILE *ofp);
++extern int p7_pli_StageTiming(FILE *ofp, const P7_PIPELINE *pli, uint64_t query_index, const char *query_name);
+ 
+ 
+ /* p7_prior.c */
+@@ -1815,5 +1860,3 @@
+ extern int fm_getOccCountLT   (const FM_DATA *fm, const FM_CFG *cfg, int pos, uint8_t c, uint32_t *cnteq, uint32_t *cntlt);
+ 
+ #endif /*P7_HMMERH_INCLUDED*/
+-
+-
+--- a/src/hmmsearch.c
++++ b/src/hmmsearch.c
+@@ -32,6 +32,7 @@
+ #endif 
+ 
+ #include "hmmer.h"
++#include "p7_stage_timing.h"
+ 
+ typedef struct {
+ #ifdef HMMER_THREADS
+@@ -57,6 +58,12 @@
+ #define MPIOPTS     NULL
+ #endif
+ 
++#ifdef HMMER_MPI
++#define TIMINGINCOMP "--mpi"
++#else
++#define TIMINGINCOMP NULL
++#endif
++
+ static ESL_OPTIONS options[] = {
+   /* name           type      default  env  range     toggles   reqs   incomp              help                                                      docgroup*/
+   { "-h",           eslARG_NONE,   FALSE, NULL, NULL,    NULL,  NULL,  NULL,            "show brief help on version and usage",                         1 },
+@@ -114,6 +121,7 @@
+   { "--restrictdb_stkey", eslARG_STRING, "0",  NULL, NULL,    NULL,  NULL,  NULL,       "Search starts at the sequence with name <s> (not with MPI)",     99 },
+   { "--restrictdb_n",eslARG_INT,        "-1",  NULL, NULL,    NULL,  NULL,  NULL,       "Search <j> target sequences (starting at --restrictdb_stkey)",   99 },
+   { "--ssifile",    eslARG_STRING,       NULL, NULL, NULL,    NULL,  NULL,  NULL,       "restrictdb_x values require ssi file. Override default to <s>",  99 },
++  { "--stage-timing", eslARG_OUTFILE,     NULL, NULL, NULL,    NULL,  NULL, TIMINGINCOMP, "write machine-readable pipeline stage timings to <f>",           99 },
+ 
+   {  0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+ };
+@@ -140,6 +148,7 @@
+ 
+ static int  serial_master(ESL_GETOPTS *go, struct cfg_s *cfg);
+ static int  serial_loop  (WORKER_INFO *info, ESL_SQFILE *dbfp, int n_targetseqs);
++static void pipeline_sequence(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, ESL_SQ *sq, P7_TOPHITS *th);
+ 
+ #ifdef HMMER_THREADS
+ #define BLOCK_SIZE 1000
+@@ -354,6 +363,7 @@
+   FILE            *tblfp    = NULL;              /* output stream for tabular per-seq (--tblout)    */
+   FILE            *domtblfp = NULL;              /* output stream for tabular per-dom (--domtblout) */
+   FILE            *pfamtblfp= NULL;              /* output stream for pfam tabular output (--pfamtblout)    */
++  FILE            *timingfp = NULL;              /* machine-readable stage timing output            */
+   P7_HMMFILE      *hfp      = NULL;              /* open input HMM file                             */
+   ESL_SQFILE      *dbfp     = NULL;              /* open input sequence file                        */
+   P7_HMM          *hmm      = NULL;              /* one HMM query                                   */
+@@ -417,6 +427,12 @@
+   if (esl_opt_IsOn(go, "--tblout"))    { if ((tblfp    = fopen(esl_opt_GetString(go, "--tblout"),    "w")) == NULL)  esl_fatal("Failed to open tabular per-seq output file %s for writing\n", esl_opt_GetString(go, "--tblout")); }
+   if (esl_opt_IsOn(go, "--domtblout")) { if ((domtblfp = fopen(esl_opt_GetString(go, "--domtblout"), "w")) == NULL)  esl_fatal("Failed to open tabular per-dom output file %s for writing\n", esl_opt_GetString(go, "--domtblout")); }
+   if (esl_opt_IsOn(go, "--pfamtblout")){ if ((pfamtblfp = fopen(esl_opt_GetString(go, "--pfamtblout"), "w")) == NULL)  esl_fatal("Failed to open pfam-style tabular output file %s for writing\n", esl_opt_GetString(go, "--pfamtblout")); }
++  if (esl_opt_IsOn(go, "--stage-timing"))
++    {
++      if ((timingfp = fopen(esl_opt_GetString(go, "--stage-timing"), "w")) == NULL)
++        esl_fatal("Failed to open stage timing output file %s for writing\n", esl_opt_GetString(go, "--stage-timing"));
++      p7_pli_StageTimingHeader(timingfp);
++    }
+ 
+ #ifdef HMMER_THREADS
+   /* initialize thread data */
+@@ -500,6 +516,7 @@
+         info[i].th  = p7_tophits_Create();
+         info[i].om  = p7_oprofile_Clone(om);
+         info[i].pli = p7_pipeline_Create(go, om->M, 100, FALSE, p7_SEARCH_SEQS); /* L_hint = 100 is just a dummy for now */
++        if (timingfp != NULL) p7_pipeline_EnableStageTiming(info[i].pli);
+         status = p7_pli_NewModel(info[i].pli, info[i].om, info[i].bg);
+         if (status == eslEINVAL) p7_Fail(info->pli->errbuf);
+ 
+@@ -550,6 +567,7 @@
+   
+       esl_stopwatch_Stop(w);
+       p7_pli_Statistics(ofp, info->pli, w);
++      if (timingfp != NULL) p7_pli_StageTiming(timingfp, info->pli, nquery, hmm->name);
+       if (fprintf(ofp, "//\n") < 0) ESL_EXCEPTION_SYS(eslEWRITE, "write failed");
+ 
+       /* Output the results in an MSA (-A option) */
+@@ -626,6 +644,7 @@
+   if (tblfp)         fclose(tblfp);
+   if (domtblfp)      fclose(domtblfp);
+   if (pfamtblfp)     fclose(pfamtblfp);
++  if (timingfp)      fclose(timingfp);
+ 
+   return eslOK;
+ 
+@@ -1215,11 +1234,7 @@
+ 	    {
+ 	      length = dbsq->eoff - block.offset + 1;
+ 
+-	      p7_pli_NewSeq(pli, dbsq);
+-	      p7_bg_SetLength(bg, dbsq->n);
+-	      p7_oprofile_ReconfigLength(om, dbsq->n);
+-      
+-	      p7_Pipeline(pli, om, bg, dbsq, NULL, th);
++	      pipeline_sequence(pli, om, bg, dbsq, th);
+ 
+ 	      esl_sq_Reuse(dbsq);
+ 	      p7_pipeline_Reuse(pli);
+@@ -1285,6 +1300,28 @@
+ }
+ #endif /*HMMER_MPI*/
+ 
++/* Run one target through the ordinary protein pipeline. The wrapper keeps
++ * reconfiguration and whole-pipeline timing outside p7_Pipeline(), whose
++ * early filter returns would otherwise require invasive control-flow edits.
++ */
++static void
++pipeline_sequence(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, ESL_SQ *sq, P7_TOPHITS *th)
++{
++  uint64_t stage_started_ns;
++
++  p7_pli_NewSeq(pli, sq);
++
++  stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
++  p7_bg_SetLength(bg, sq->n);
++  p7_oprofile_ReconfigLength(om, sq->n);
++  p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_RECONFIG, stage_started_ns);
++
++  stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
++  p7_Pipeline(pli, om, bg, sq, NULL, th);
++  p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_PIPELINE, stage_started_ns);
++}
++
++
+ static int
+ serial_loop(WORKER_INFO *info, ESL_SQFILE *dbfp, int n_targetseqs)
+ {
+@@ -1297,11 +1334,7 @@
+   /* Main loop: */
+   while ( (n_targetseqs==-1 || seq_cnt<n_targetseqs) &&  (sstatus = esl_sqio_Read(dbfp, dbsq)) == eslOK)
+   {
+-      p7_pli_NewSeq(info->pli, dbsq);
+-      p7_bg_SetLength(info->bg, dbsq->n);
+-      p7_oprofile_ReconfigLength(info->om, dbsq->n);
+-      
+-      p7_Pipeline(info->pli, info->om, info->bg, dbsq, NULL, info->th);
++      pipeline_sequence(info->pli, info->om, info->bg, dbsq, info->th);
+ 
+       seq_cnt++;
+       esl_sq_Reuse(dbsq);
+@@ -1403,11 +1436,7 @@
+ 	{
+ 	  ESL_SQ *dbsq = block->list + i;
+ 
+-	  p7_pli_NewSeq(info->pli, dbsq);
+-	  p7_bg_SetLength(info->bg, dbsq->n);
+-	  p7_oprofile_ReconfigLength(info->om, dbsq->n);
+-	  
+-	  p7_Pipeline(info->pli, info->om, info->bg, dbsq, NULL, info->th);
++	  pipeline_sequence(info->pli, info->om, info->bg, dbsq, info->th);
+ 	  
+ 	  esl_sq_Reuse(dbsq);
+ 	  p7_pipeline_Reuse(info->pli);
+@@ -1427,5 +1456,3 @@
+ }
+ #endif   /* HMMER_THREADS */
+  
+-
+-
+--- a/src/p7_pipeline.c
++++ b/src/p7_pipeline.c
+@@ -19,6 +19,7 @@
+ #include "esl_vectorops.h"
+ 
+ #include "hmmer.h"
++#include "p7_stage_timing.h"
+ 
+ #include "esl_sqio.h" //!!!!DEBUG
+ 
+@@ -249,6 +250,7 @@
+   pli->show_alignments = (go && esl_opt_GetBoolean(go, "--noali") ? FALSE : TRUE);
+   pli->hfp             = NULL;
+   pli->errbuf[0]       = '\0';
++  memset(&pli->stage_timing, 0, sizeof(pli->stage_timing));
+ 
+   return pli;
+ 
+@@ -280,6 +282,21 @@
+ }
+ 
+ 
++/* Enable cumulative stage timing for this pipeline. Timing is opt-in so the
++ * ordinary HMMER path does not call the clock. The MSV observer lives on the
++ * pipeline's private one-row matrix, which also keeps threaded workers
++ * independent.
++ */
++int
++p7_pipeline_EnableStageTiming(P7_PIPELINE *pli)
++{
++  memset(&pli->stage_timing, 0, sizeof(pli->stage_timing));
++  pli->stage_timing.enabled = TRUE;
++  pli->oxf->stage_timing    = &pli->stage_timing;
++  return eslOK;
++}
++
++
+ 
+ /* Function:  p7_pipeline_Destroy()
+  * Synopsis:  Free a <P7_PIPELINE> object.
+@@ -617,6 +634,8 @@
+ int
+ p7_pipeline_Merge(P7_PIPELINE *p1, P7_PIPELINE *p2)
+ {
++  int s;
++
+   /* if we are searching a sequence database, we need to keep track of the
+    * number of sequences and residues processed.
+    */
+@@ -643,6 +662,24 @@
+   p1->pos_past_fwd  += p2->pos_past_fwd;
+   p1->pos_output    += p2->pos_output;
+ 
++  if (p2->stage_timing.enabled)
++    {
++      if (! p1->stage_timing.enabled) p7_pipeline_EnableStageTiming(p1);
++      for (s = 0; s < p7STAGE_N; s++)
++        {
++          p1->stage_timing.stage[s].calls      += p2->stage_timing.stage[s].calls;
++          p1->stage_timing.stage[s].elapsed_ns += p2->stage_timing.stage[s].elapsed_ns;
++        }
++      p1->stage_timing.clock_errors           += p2->stage_timing.clock_errors;
++      p1->stage_timing.ssv_status_ok          += p2->stage_timing.ssv_status_ok;
++      p1->stage_timing.ssv_status_erange      += p2->stage_timing.ssv_status_erange;
++      p1->stage_timing.ssv_status_noresult    += p2->stage_timing.ssv_status_noresult;
++      p1->stage_timing.ssv_status_other       += p2->stage_timing.ssv_status_other;
++      p1->stage_timing.fallback_status_ok      += p2->stage_timing.fallback_status_ok;
++      p1->stage_timing.fallback_status_erange  += p2->stage_timing.fallback_status_erange;
++      p1->stage_timing.fallback_status_other   += p2->stage_timing.fallback_status_other;
++    }
++
+   if (p1->Z_setby == p7_ZSETBY_NTARGETS)
+     {
+       p1->Z += (p1->mode == p7_SCAN_MODELS) ? p2->nmodels : p2->nseqs;
+@@ -709,6 +746,7 @@
+   int              Ld;               /* # of residues in envelopes */
+   int              d;
+   int              status;
++  uint64_t         stage_started_ns;
+   
+   if (sq->n == 0) return eslOK;    /* silently skip length 0 seqs; they'd cause us all sorts of weird problems */
+   if (sq->n > 100000) ESL_EXCEPTION(eslETYPE, "Target sequence length > 100K, over comparison pipeline limit.\n(Did you mean to use nhmmer/nhmmscan?)");
+@@ -716,10 +754,14 @@
+   p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);    /* expand the one-row omx if needed */
+ 
+   /* Base null model score (we could calculate this in NewSeq(), for a scan pipeline) */
++  stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
+   p7_bg_NullOne  (bg, sq->dsq, sq->n, &nullsc);
++  p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_NULL1, stage_started_ns);
+ 
+   /* First level filter: the MSV filter, multihit with <om> */
++  stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
+   p7_MSVFilter(sq->dsq, sq->n, om, pli->oxf, &usc);
++  p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_MSV_PUBLIC, stage_started_ns);
+   seq_score = (usc - nullsc) / eslCONST_LOG2;
+   P = esl_gumbel_surv(seq_score,  om->evparam[p7_MMU],  om->evparam[p7_MLAMBDA]);
+   if (P > pli->F1) return eslOK;
+@@ -728,7 +770,9 @@
+   /* biased composition HMM filtering */
+   if (pli->do_biasfilter)
+     {
++      stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
+       p7_bg_FilterScore(bg, sq->dsq, sq->n, &filtersc);
++      p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_BIAS, stage_started_ns);
+       seq_score = (usc - filtersc) / eslCONST_LOG2;
+       P = esl_gumbel_surv(seq_score,  om->evparam[p7_MMU],  om->evparam[p7_MLAMBDA]);
+       if (P > pli->F1) return eslOK;
+@@ -747,7 +791,9 @@
+   /* Second level filter: ViterbiFilter(), multihit with <om> */
+   if (P > pli->F2)
+     {
++      stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
+       p7_ViterbiFilter(sq->dsq, sq->n, om, pli->oxf, &vfsc);  
++      p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_VITERBI, stage_started_ns);
+       seq_score = (vfsc-filtersc) / eslCONST_LOG2;
+       P  = esl_gumbel_surv(seq_score,  om->evparam[p7_VMU],  om->evparam[p7_VLAMBDA]);
+       if (P > pli->F2) return eslOK;
+@@ -756,7 +802,9 @@
+ 
+ 
+   /* Parse it with Forward and obtain its real Forward score. */
++  stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
+   p7_ForwardParser(sq->dsq, sq->n, om, pli->oxf, &fwdsc);
++  p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_FORWARD_PARSER, stage_started_ns);
+   seq_score = (fwdsc-filtersc) / eslCONST_LOG2;
+   P = esl_exp_surv(seq_score,  om->evparam[p7_FTAU],  om->evparam[p7_FLAMBDA]);
+   if (P > pli->F3) return eslOK;
+@@ -764,9 +812,13 @@
+ 
+   /* ok, it's for real. Now a Backwards parser pass, and hand it to domain definition workflow */
+   p7_omx_GrowTo(pli->oxb, om->M, 0, sq->n);
++  stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
+   p7_BackwardParser(sq->dsq, sq->n, om, pli->oxf, pli->oxb, NULL);
++  p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_BACKWARD_PARSER, stage_started_ns);
+ 
++  stage_started_ns = p7_stage_timing_Start(&pli->stage_timing);
+   status = p7_domaindef_ByPosteriorHeuristics(sq, ntsq, om, pli->oxf, pli->oxb, pli->fwd, pli->bck, pli->ddef, bg, FALSE, NULL, NULL, NULL);
++  p7_stage_timing_Stop(&pli->stage_timing, p7STAGE_DOMAIN, stage_started_ns);
+   if (status != eslOK) ESL_FAIL(status, pli->errbuf, "domain definition workflow failure"); /* eslERANGE can happen  */
+   if (pli->ddef->nregions   == 0) return eslOK; /* score passed threshold but there's no discrete domains here       */
+   if (pli->ddef->nenvelopes == 0) return eslOK; /* rarer: region was found, stochastic clustered, no envelopes found */
+@@ -1798,6 +1850,68 @@
+ 
+   return eslOK;
+ }
++
++
++/* Machine-readable, long-form timing output. Status, survival, and input
++ * rows are count-only and therefore have elapsed_ns=0.
++ */
++int
++p7_pli_StageTimingHeader(FILE *ofp)
++{
++  if (fprintf(ofp, "schema_version\tclock\tquery_index\tquery\tmetric\tcount\telapsed_ns\n") < 0)
++    ESL_EXCEPTION_SYS(eslEWRITE, "stage timing header write failed");
++  return eslOK;
++}
++
++int
++p7_pli_StageTiming(FILE *ofp, const P7_PIPELINE *pli, uint64_t query_index, const char *query_name)
++{
++  static const char *stage_name[p7STAGE_N] = {
++    "target_reconfig",
++    "pipeline_total",
++    "null1",
++    "msv_public",
++    "msv_ssv_attempt",
++    "msv_classic_fallback",
++    "bias_filter",
++    "viterbi_filter",
++    "forward_parser",
++    "backward_parser",
++    "domain_workflow"
++  };
++  const char *clock_name = p7_stage_timing_ClockName();
++  int s;
++
++#define P7_TIMING_ROW(metric, count, elapsed) do {                                                \
++    if (fprintf(ofp, "1\t%s\t%" PRIu64 "\t%s\t%s\t%" PRIu64 "\t%" PRIu64 "\n",            \
++                clock_name, query_index, query_name, (metric),                                  \
++                (uint64_t) (count), (uint64_t) (elapsed)) < 0)                                  \
++      ESL_EXCEPTION_SYS(eslEWRITE, "stage timing data write failed");                            \
++  } while (0)
++
++  for (s = 0; s < p7STAGE_N; s++)
++    P7_TIMING_ROW(stage_name[s], pli->stage_timing.stage[s].calls, pli->stage_timing.stage[s].elapsed_ns);
++
++  P7_TIMING_ROW("clock_errors",                  pli->stage_timing.clock_errors,           0);
++  P7_TIMING_ROW("msv_ssv_status_ok",             pli->stage_timing.ssv_status_ok,          0);
++  P7_TIMING_ROW("msv_ssv_status_erange",         pli->stage_timing.ssv_status_erange,      0);
++  P7_TIMING_ROW("msv_ssv_status_noresult",       pli->stage_timing.ssv_status_noresult,    0);
++  P7_TIMING_ROW("msv_ssv_status_other",          pli->stage_timing.ssv_status_other,       0);
++  P7_TIMING_ROW("msv_fallback_status_ok",        pli->stage_timing.fallback_status_ok,      0);
++  P7_TIMING_ROW("msv_fallback_status_erange",    pli->stage_timing.fallback_status_erange,  0);
++  P7_TIMING_ROW("msv_fallback_status_other",     pli->stage_timing.fallback_status_other,   0);
++  P7_TIMING_ROW("target_sequences",              pli->nseqs,                                0);
++  P7_TIMING_ROW("target_residues",               pli->nres,                                 0);
++  P7_TIMING_ROW("passed_msv",                    pli->n_past_msv,                           0);
++  P7_TIMING_ROW("passed_bias",                   pli->n_past_bias,                          0);
++  P7_TIMING_ROW("passed_viterbi",                pli->n_past_vit,                           0);
++  P7_TIMING_ROW("passed_forward",                pli->n_past_fwd,                           0);
++
++#undef P7_TIMING_ROW
++
++  if (fflush(ofp) != 0) ESL_EXCEPTION_SYS(eslEWRITE, "stage timing flush failed");
++  return eslOK;
++}
+ /*------------------- end, pipeline API -------------------------*/
+ 
+ 
+@@ -2075,5 +2189,3 @@
+ }
+ #endif /*p7PIPELINE_EXAMPLE2*/
+ /*--------------- end, scan mode (HMM db) example ---------------*/
+-
+-
+--- a/src/impl_sse/Makefile.in
++++ b/src/impl_sse/Makefile.in
+@@ -46,7 +46,7 @@
+ 	p7_oprofile.o\
+ 	mpi.o
+ 
+-HDRS =  impl_sse.h
++HDRS =  impl_sse.h ../p7_stage_timing.h
+ 
+ UTESTS = @MPI_UTESTS@\
+ 	decoding_utest\
+@@ -174,4 +174,3 @@
+ 
+ 
+ 
+-
+--- a/src/impl_sse/impl_sse.h
++++ b/src/impl_sse/impl_sse.h
+@@ -208,6 +208,8 @@
+    */
+   int     debugging;    /* TRUE if we're in debugging mode                             */
+   FILE   *dfp;      /* output stream for diagnostics                               */
++
++  P7_STAGE_TIMING *stage_timing; /* optional observer owned by a P7_PIPELINE */
+ } P7_OMX;
+ 
+ /* ?MXo(q) access macros work for either uchar or float, so long as you
+--- a/src/impl_sse/msvfilter.c
++++ b/src/impl_sse/msvfilter.c
+@@ -29,6 +29,7 @@
+ 
+ #include "hmmer.h"
+ #include "impl_sse.h"
++#include "p7_stage_timing.h"
+ 
+ /*****************************************************************
+  * 1. The p7_MSVFilter() DP implementation.
+@@ -94,15 +95,22 @@
+ 
+   int cmp;
+   int status = eslOK;
++  P7_STAGE_TIMING *timing = ox->stage_timing;
++  uint64_t stage_started_ns;
+ 
+   /* Check that the DP matrix is ok for us. */
+   if (Q > ox->allocQ16)  ESL_EXCEPTION(eslEINVAL, "DP matrix allocated too small");
+   ox->M   = om->M;
+ 
+   /* Try highly optimized ssv filter first */
++  stage_started_ns = p7_stage_timing_Start(timing);
+   status = p7_SSVFilter(dsq, L, om, ret_sc);
++  p7_stage_timing_Stop(timing, p7STAGE_MSV_SSV, stage_started_ns);
++  p7_stage_timing_CountSSVStatus(timing, status);
+   if (status != eslENORESULT) return status;
+ 
++  stage_started_ns = p7_stage_timing_Start(timing);
++
+   /* Initialization. In offset unsigned arithmetic, -infinity is 0, and 0 is om->base.
+    */
+   biasv = _mm_set1_epi8((int8_t) om->bias_b); /* yes, you can set1() an unsigned char vector this way */
+@@ -176,6 +184,8 @@
+       if (cmp != 0x0000)
+       {
+         *ret_sc = eslINFINITY;
++        p7_stage_timing_Stop(timing, p7STAGE_MSV_FALLBACK, stage_started_ns);
++        p7_stage_timing_CountFallbackStatus(timing, eslERANGE);
+         return eslERANGE;
+       }
+ 
+@@ -204,6 +214,8 @@
+   *ret_sc /= om->scale_b;
+   *ret_sc -= 3.0; /* that's ~ L \log \frac{L}{L+3}, for our NN,CC,JJ */
+ 
++  p7_stage_timing_Stop(timing, p7STAGE_MSV_FALLBACK, stage_started_ns);
++  p7_stage_timing_CountFallbackStatus(timing, eslOK);
+   return eslOK;
+ }
+ /*------------------ end, p7_MSVFilter() ------------------------*/
+@@ -874,4 +886,3 @@
+ 
+ 
+ 
+-
+--- a/src/impl_sse/p7_omx.c
++++ b/src/impl_sse/p7_omx.c
+@@ -104,6 +104,7 @@
+   ox->L              = 0;
+   ox->totscale       = 0.0;
+   ox->has_own_scales = TRUE;	/* most matrices are Forward, control their own scale factors */
++  ox->stage_timing   = NULL;
+ #if eslDEBUGLEVEL > 0
+   ox->debugging = FALSE;
+   ox->dfp       = NULL;
+@@ -618,4 +619,3 @@
+ }
+ /*------------- end, debugging dumps of P7_OMX ------------------*/
+ 
+-
+--- a/src/impl_neon/Makefile.in
++++ b/src/impl_neon/Makefile.in
+@@ -46,7 +46,7 @@
+ 	p7_oprofile.o\
+ 	mpi.o
+ 
+-HDRS =  impl_neon.h
++HDRS =  impl_neon.h ../p7_stage_timing.h
+ 
+ UTESTS = @MPI_UTESTS@\
+ 	decoding_utest\
+--- a/src/impl_neon/impl_neon.h
++++ b/src/impl_neon/impl_neon.h
+@@ -205,6 +205,8 @@
+    */
+   int     debugging;       /* TRUE if we're in debugging mode                             */
+   FILE   *dfp;             /* output stream for diagnostics                               */
++
++  P7_STAGE_TIMING *stage_timing; /* optional observer owned by a P7_PIPELINE */
+ } P7_OMX;
+ 
+ /* ?MXo(q) access macros work for either uchar or float, so long as you
+--- a/src/impl_neon/msvfilter.c
++++ b/src/impl_neon/msvfilter.c
+@@ -28,6 +28,7 @@
+ 
+ #include "hmmer.h"
+ #include "impl_neon.h"
++#include "p7_stage_timing.h"
+ 
+ /*****************************************************************
+  * 1. The p7_MSVFilter() DP implementation.
+@@ -94,6 +95,8 @@
+ 
+   int cmp;
+   int status = eslOK;
++  P7_STAGE_TIMING *timing = ox->stage_timing;
++  uint64_t stage_started_ns;
+ 
+   /* Keep a null vector in a register to emulate _mm_slli_si128 efficiently */
+   zerov = vmovq_n_u8(0);
+@@ -103,9 +106,14 @@
+   ox->M   = om->M;
+ 
+   /* Try highly optimized ssv filter first */
+-   status = p7_SSVFilter(dsq, L, om, ret_sc);
++  stage_started_ns = p7_stage_timing_Start(timing);
++  status = p7_SSVFilter(dsq, L, om, ret_sc);
++  p7_stage_timing_Stop(timing, p7STAGE_MSV_SSV, stage_started_ns);
++  p7_stage_timing_CountSSVStatus(timing, status);
+   if (status != eslENORESULT) return status;
+ 
++  stage_started_ns = p7_stage_timing_Start(timing);
++
+   /* Initialization. In offset unsigned arithmetic, -infinity is 0, and 0 is om->base.
+    */
+   biasv = vmovq_n_u8(om->bias_b); /* yes, you can set1() an unsigned char vector this way */
+@@ -171,6 +179,8 @@
+       if (cmp != 0)
+       {
+         *ret_sc = eslINFINITY;
++        p7_stage_timing_Stop(timing, p7STAGE_MSV_FALLBACK, stage_started_ns);
++        p7_stage_timing_CountFallbackStatus(timing, eslERANGE);
+         return eslERANGE;
+       }
+ 
+@@ -199,6 +209,8 @@
+   *ret_sc /= om->scale_b;
+   *ret_sc -= 3.0; /* that's ~ L \log \frac{L}{L+3}, for our NN,CC,JJ */
+ 
++  p7_stage_timing_Stop(timing, p7STAGE_MSV_FALLBACK, stage_started_ns);
++  p7_stage_timing_CountFallbackStatus(timing, eslOK);
+   return eslOK;
+ }
+ /*------------------ end, p7_MSVFilter() ------------------------*/
+--- a/src/impl_neon/p7_omx.c
++++ b/src/impl_neon/p7_omx.c
+@@ -100,6 +100,7 @@
+   ox->L              = 0;
+   ox->totscale       = 0.0;
+   ox->has_own_scales = TRUE;    /* most matrices are Forward, control their own scale factors */
++  ox->stage_timing   = NULL;
+ #if eslDEBUGLEVEL > 0
+   ox->debugging = FALSE;
+   ox->dfp       = NULL;
+@@ -614,4 +615,3 @@
+ }
+ /*------------- end, debugging dumps of P7_OMX ------------------*/
+ 
+-
+--- a/src/impl_vmx/Makefile.in
++++ b/src/impl_vmx/Makefile.in
+@@ -44,7 +44,7 @@
+ 	p7_oprofile.o\
+ 	mpi.o
+ 
+-HDRS =  impl_vmx.h
++HDRS =  impl_vmx.h ../p7_stage_timing.h
+ 
+ UTESTS = @MPI_UTESTS@\
+ 	decoding_utest\
+@@ -168,4 +168,3 @@
+ 
+ distclean: clean
+ 	-rm -f Makefile 
+-
+--- a/src/impl_vmx/impl_vmx.h
++++ b/src/impl_vmx/impl_vmx.h
+@@ -202,6 +202,8 @@
+    */
+   int     debugging;		/* TRUE if we're in debugging mode                             */
+   FILE   *dfp;			/* output stream for diagnostics                               */
++
++  P7_STAGE_TIMING *stage_timing; /* optional observer owned by a P7_PIPELINE */
+ } P7_OMX;
+ 
+ /* ?MXo(q) access macros work for either uchar or float, so long as you
+--- a/src/impl_vmx/msvfilter.c
++++ b/src/impl_vmx/msvfilter.c
+@@ -30,6 +30,7 @@
+ 
+ #include "hmmer.h"
+ #include "impl_vmx.h"
++#include "p7_stage_timing.h"
+ 
+ /*****************************************************************
+  * 1. The p7_MSVFilter() DP implementation.
+@@ -92,10 +93,13 @@
+   vector unsigned char basev;      /* offset for scores                                         */
+   vector unsigned char ceilingv;   /* saturateed simd value used to test for overflow           */
+   vector unsigned char tempv;
++  P7_STAGE_TIMING *timing = ox->stage_timing;
++  uint64_t stage_started_ns;
+ 
+   /* Check that the DP matrix is ok for us. */
+   if (Q > ox->allocQ16)  ESL_EXCEPTION(eslEINVAL, "DP matrix allocated too small");
+   ox->M   = om->M;
++  stage_started_ns = p7_stage_timing_Start(timing);
+ 
+   /* Initialization. In offset unsigned arithmetic, -infinity is 0, and 0 is om->base.
+    */
+@@ -170,6 +174,8 @@
+       if (vec_any_gt(xEv, ceilingv))
+       {
+         *ret_sc = eslINFINITY;
++        p7_stage_timing_Stop(timing, p7STAGE_MSV_FALLBACK, stage_started_ns);
++        p7_stage_timing_CountFallbackStatus(timing, eslERANGE);
+         return eslERANGE;
+       }
+ 
+@@ -197,6 +203,8 @@
+   *ret_sc /= om->scale_b;
+   *ret_sc -= 3.0; /* that's ~ L \log \frac{L}{L+3}, for our NN,CC,JJ */
+ 
++  p7_stage_timing_Stop(timing, p7STAGE_MSV_FALLBACK, stage_started_ns);
++  p7_stage_timing_CountFallbackStatus(timing, eslOK);
+   return eslOK;
+ }
+ /*------------------ end, p7_MSVFilter() ------------------------*/
+@@ -856,4 +864,3 @@
+ }
+ #endif /*p7MSVFILTER_EXAMPLE*/
+ /*---------------------- end, example ---------------------------*/
+-
+--- a/src/impl_vmx/p7_omx.c
++++ b/src/impl_vmx/p7_omx.c
+@@ -107,6 +107,7 @@
+   ox->L              = 0;
+   ox->totscale       = 0.0;
+   ox->has_own_scales = TRUE;	/* most matrices are Forward, control their own scale factors */
++  ox->stage_timing   = NULL;
+ #if eslDEBUGLEVEL > 0
+   ox->debugging = FALSE;
+   ox->dfp       = NULL;
+@@ -638,4 +639,3 @@
+ }
+ /*------------- end, debugging dumps of P7_OMX ------------------*/
+ 
+-
+--- /dev/null
++++ b/src/p7_stage_timing.h
+@@ -0,0 +1,88 @@
++/* Internal helpers for opt-in pipeline stage timing. */
++#ifndef P7_STAGE_TIMING_INCLUDED
++#define P7_STAGE_TIMING_INCLUDED
++
++#include <stdint.h>
++#include <time.h>
++
++#include "hmmer.h"
++
++static inline const char *
++p7_stage_timing_ClockName(void)
++{
++#if defined(CLOCK_MONOTONIC_RAW)
++  return "CLOCK_MONOTONIC_RAW";
++#elif defined(CLOCK_MONOTONIC)
++  return "CLOCK_MONOTONIC";
++#else
++  return "unavailable";
++#endif
++}
++
++static inline uint64_t
++p7_stage_timing_Now(P7_STAGE_TIMING *timing)
++{
++  struct timespec ts;
++  uint64_t        now_ns;
++#if defined(CLOCK_MONOTONIC_RAW)
++  const clockid_t clock_id = CLOCK_MONOTONIC_RAW;
++#elif defined(CLOCK_MONOTONIC)
++  const clockid_t clock_id = CLOCK_MONOTONIC;
++#else
++  timing->clock_errors++;
++  return 0;
++#endif
++
++  if (clock_gettime(clock_id, &ts) != 0)
++    {
++      timing->clock_errors++;
++      return 0;
++    }
++  now_ns = (uint64_t) ts.tv_sec * UINT64_C(1000000000) + (uint64_t) ts.tv_nsec;
++  if (now_ns == 0) timing->clock_errors++;
++  return now_ns;
++}
++
++static inline uint64_t
++p7_stage_timing_Start(P7_STAGE_TIMING *timing)
++{
++  return (timing != NULL && timing->enabled) ? p7_stage_timing_Now(timing) : 0;
++}
++
++static inline void
++p7_stage_timing_Stop(P7_STAGE_TIMING *timing, enum p7_stage_e stage, uint64_t started_ns)
++{
++  uint64_t stopped_ns;
++
++  if (timing == NULL || ! timing->enabled) return;
++  timing->stage[stage].calls++;
++  stopped_ns = p7_stage_timing_Now(timing);
++  if (started_ns == 0 || stopped_ns == 0) return; /* failing read already counted at its source */
++  if (stopped_ns < started_ns)
++    {
++      timing->clock_errors++;
++      return;
++    }
++  timing->stage[stage].elapsed_ns += stopped_ns - started_ns;
++}
++
++static inline void
++p7_stage_timing_CountSSVStatus(P7_STAGE_TIMING *timing, int status)
++{
++  if (timing == NULL || ! timing->enabled) return;
++  if      (status == eslOK)       timing->ssv_status_ok++;
++  else if (status == eslERANGE)   timing->ssv_status_erange++;
++  else if (status == eslENORESULT) timing->ssv_status_noresult++;
++  else                             timing->ssv_status_other++;
++}
++
++static inline void
++p7_stage_timing_CountFallbackStatus(P7_STAGE_TIMING *timing, int status)
++{
++  if (timing == NULL || ! timing->enabled) return;
++  if      (status == eslOK)     timing->fallback_status_ok++;
++  else if (status == eslERANGE) timing->fallback_status_erange++;
++  else                          timing->fallback_status_other++;
++}
++
++#endif /*P7_STAGE_TIMING_INCLUDED*/

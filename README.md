@@ -1,29 +1,27 @@
 # plan7-gpu
 
-`plan7-gpu` is an experimental hybrid GPU/CPU accelerator for the
-HMMER 3.4 protein `hmmsearch` pipeline.
+`plan7-gpu` is an experimental hybrid GPU/CPU accelerator for Astra's
+HMMER 3.4 protein-search pipeline.
 
 The first implementation target is deliberately narrow:
 
-1. digitize a real protein sequence corpus once;
+1. reuse the HMMs and digital sequences already loaded by Astra;
 2. evaluate HMMER-equivalent SSV/MSV stage-1 scores on a GPU;
 3. conservatively select candidate model/sequence pairs;
-4. run the unmodified CPU HMMER pipeline on candidates; and
-5. require exact agreement with reference HMMER output.
+4. run Astra's existing CPU HMMER pipeline on candidates; and
+5. require exact agreement with ordinary Astra output.
 
-GPU Forward/Backward and Astra integration are out of scope until a
-scientifically exact MSV accelerator demonstrates useful end-to-end speedup.
+The native backend must plug into Astra without replacing its input handling,
+threshold logic, downstream HMMER pipeline, or result formatting.
 
 ## Status
 
-Reference-oracle and stage-timing phase. The oracle's route-specific reference
-agrees bit-for-bit with pristine HMMER on the initial 11,145 real and upstream
-tutorial comparisons, covering all four SSV/fallback outcomes. Direct SSV may
-conservatively overestimate literal full MSV, so the GPU target must preserve
-the public SSV-first behavior rather than assume the two scores are identical.
-This is an initial result, not a completed correctness gate. No CUDA code or
-GPU performance claim exists yet. See [`handoff.md`](handoff.md) for the
-project brief and gates.
+The correctness oracle agrees with pristine HMMER on the initial 11,145
+comparisons and covers all four SSV/fallback outcomes. Direct measurements in
+Astra show that stage one is about 45% of wall time for the PFAM pilot but only
+26% for HydDB, so GPU use must be workload-selective. The GPU target is the
+public SSV-first behavior, not generic full MSV. No GPU performance claim
+exists yet.
 
 ## Layout
 
