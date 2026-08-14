@@ -25,6 +25,8 @@ PYHMMER_INCLUDE ?= $(PYHMMER_LIB_DIR)/include
 PYHMMER_EASEL_INCLUDE ?= $(PYHMMER_LIB_DIR)/include/libeasel
 PYHMMER_EASEL_LIB ?= $(PYHMMER_LIB_DIR)/liblibeasel.so
 PYHMMER_HMMER_LIB ?= $(PYHMMER_LIB_DIR)/liblibhmmer.so
+PYHMMER_ABI_SHA256 := $(shell $(PYTHON) python/plan7_gpu/_abi.py)
+PYHMMER_ABI_STAMP := $(BUILD_DIR)/pipeline/.pyhmmer-abi-$(PYHMMER_ABI_SHA256)
 CYTHON_CPP := $(BUILD_DIR)/cuda/_native.cpp
 CYTHON_OBJ := $(BUILD_DIR)/cuda/_native.o
 CUDA_OBJ := $(BUILD_DIR)/cuda/ssv_cuda.o
@@ -88,7 +90,12 @@ $(CUDA_MODULE): $(CYTHON_OBJ) $(CUDA_OBJ) $(PYHMMER_EASEL_LIB)
 		-L$(PYHMMER_LIB_DIR) -llibeasel \
 		-Xlinker -rpath -Xlinker $(PYHMMER_LIB_DIR)
 
-$(PIPELINE_C): python/plan7_gpu/_pipeline.pyx \
+$(PYHMMER_ABI_STAMP):
+	mkdir -p $(@D)
+	touch $@
+
+$(PIPELINE_C): python/plan7_gpu/_pipeline.pyx python/plan7_gpu/_abi.py \
+		$(PYHMMER_ABI_STAMP) \
 		$(PYHMMER_PACKAGE_DIR)/plan7.pxd \
 		$(PYHMMER_PACKAGE_DIR)/easel.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libeasel/sq.pxd \
@@ -99,9 +106,12 @@ $(PIPELINE_C): python/plan7_gpu/_pipeline.pyx \
 	mkdir -p $(@D)
 	test "$$($(PYTHON) -c 'import pyhmmer; print(pyhmmer.__version__)')" = "$(PYHMMER_ABI_VERSION)" || \
 		{ echo "plan7_gpu._pipeline requires PyHMMER $(PYHMMER_ABI_VERSION)" >&2; exit 1; }
+	test -n "$(PYHMMER_ABI_SHA256)" || \
+		{ echo "failed to fingerprint the PyHMMER private ABI" >&2; exit 1; }
 	$(PYTHON) -m cython -3 -I$(PYHMMER_CYTHON_INCLUDE) \
 		-E HMMER_IMPL=$(PYHMMER_HMMER_IMPL) \
-		-E TARGET_SYSTEM=$(PYHMMER_TARGET_SYSTEM) -o $@ $<
+		-E TARGET_SYSTEM=$(PYHMMER_TARGET_SYSTEM) \
+		-E PYHMMER_ABI_SHA256=$(PYHMMER_ABI_SHA256) -o $@ $<
 
 $(PIPELINE_OBJ): $(PIPELINE_C)
 	$(CC) -O3 -g -std=c11 -fPIC $(PYHMMER_SIMD_CFLAGS) \

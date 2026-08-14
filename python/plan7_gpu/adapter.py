@@ -2,11 +2,271 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Iterable
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
+import io
+from itertools import zip_longest
 import math
+import operator
+from pathlib import Path
+import stat
+import struct
 from threading import Lock
 from typing import Any, NamedTuple, cast
+from weakref import WeakKeyDictionary
+
+import pyhmmer
 
 from . import _native  # type: ignore[attr-defined]
+
+
+_PRESSED_SUFFIXES = ("h3m", "h3i", "h3f", "h3p")
+_MISSING = object()
+_PIPELINE_LEASES_LOCK = Lock()
+
+
+class _PipelineLease:
+    __slots__ = ("pipeline", "lock", "refcount")
+
+    def __init__(self, pipeline: Any) -> None:
+        self.pipeline = pipeline
+        self.lock = Lock()
+        self.refcount = 0
+
+
+_PIPELINE_LEASES: dict[int, _PipelineLease] = {}
+
+
+@contextmanager
+def _lease_pipeline(pipeline: Any):
+    identity = id(pipeline)
+    with _PIPELINE_LEASES_LOCK:
+        lease = _PIPELINE_LEASES.get(identity)
+        if lease is None:
+            lease = _PipelineLease(pipeline)
+            _PIPELINE_LEASES[identity] = lease
+        elif lease.pipeline is not pipeline:
+            raise RuntimeError("pipeline identity collision")
+        lease.refcount += 1
+
+    try:
+        with lease.lock:
+            yield
+    finally:
+        with _PIPELINE_LEASES_LOCK:
+            lease.refcount -= 1
+            if lease.refcount == 0:
+                if _PIPELINE_LEASES.get(identity) is not lease:
+                    raise RuntimeError("pipeline lease registry corruption")
+                del _PIPELINE_LEASES[identity]
+
+
+class _FileStat(NamedTuple):
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+class _PressedStatToken(NamedTuple):
+    h3m: _FileStat
+    h3i: _FileStat
+    h3f: _FileStat
+    h3p: _FileStat
+
+
+class _CutoffSnapshot(NamedTuple):
+    gathering: tuple[float, float] | None
+    noise: tuple[float, float] | None
+    trusted: tuple[float, float] | None
+
+
+class _PairState:
+    __slots__ = ("hmm", "optimized_profile", "background_fingerprint", "lock")
+
+    def __init__(
+        self,
+        hmm: Any,
+        optimized_profile: Any,
+        background_fingerprint: bytes,
+    ) -> None:
+        self.hmm = hmm
+        self.optimized_profile = optimized_profile
+        self.background_fingerprint = background_fingerprint
+        self.lock = Lock()
+
+
+def _pressed_stat_token(base: Path) -> _PressedStatToken:
+    token = []
+    for suffix in _PRESSED_SUFFIXES:
+        path = Path(f"{base}.{suffix}")
+        file_stat = path.stat()
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"pressed database member is not a regular file: {path}")
+        token.append(
+            _FileStat(
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            )
+        )
+    return _PressedStatToken(*token)
+
+
+def _background_fingerprint(background: Any) -> bytes:
+    frequencies = memoryview(background.residue_frequencies)
+    if frequencies.format != "f" or frequencies.ndim != 1:
+        raise TypeError("background residue frequencies are not binary32")
+    return frequencies.cast("B").tobytes() + struct.pack("=f", background.omega)
+
+
+def _optimized_profile_bytes(profile: Any) -> tuple[bytes, bytes]:
+    filter_output = io.BytesIO()
+    profile_output = io.BytesIO()
+    profile.write(filter_output, profile_output)
+    return filter_output.getvalue(), profile_output.getvalue()
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+    weakref_slot=True,
+    init=False,
+    eq=False,
+    repr=False,
+)
+class PressedProfilePair:
+    """One immutable HMM/optimized-profile pair read in pressed-file lockstep."""
+
+    canonical_base: Path
+    ordinal: int
+    stat_token: _PressedStatToken
+    cutoffs: _CutoffSnapshot
+
+    def __init__(self) -> None:
+        raise TypeError("PressedProfilePair objects come from load_pressed_profiles")
+
+    @property
+    def hmm(self) -> Any:
+        return _pair_state(self).hmm.copy()
+
+    def __repr__(self) -> str:
+        return (
+            f"PressedProfilePair(canonical_base={self.canonical_base!r}, "
+            f"ordinal={self.ordinal})"
+        )
+
+
+_PAIR_STATES: WeakKeyDictionary[PressedProfilePair, _PairState] = WeakKeyDictionary()
+
+
+def _pair_state(pair: PressedProfilePair) -> _PairState:
+    try:
+        return _PAIR_STATES[pair]
+    except KeyError as error:
+        raise TypeError(
+            "candidate batches require pairs from load_pressed_profiles"
+        ) from error
+
+
+def _new_pressed_profile_pair(
+    hmm: Any,
+    optimized_profile: Any,
+    canonical_base: Path,
+    ordinal: int,
+    stat_token: _PressedStatToken,
+    cutoffs: _CutoffSnapshot,
+    background_fingerprint: bytes,
+) -> PressedProfilePair:
+    pair = object.__new__(PressedProfilePair)
+    object.__setattr__(pair, "canonical_base", canonical_base)
+    object.__setattr__(pair, "ordinal", ordinal)
+    object.__setattr__(pair, "stat_token", stat_token)
+    object.__setattr__(pair, "cutoffs", cutoffs)
+    _PAIR_STATES[pair] = _PairState(hmm, optimized_profile, background_fingerprint)
+    return pair
+
+
+def load_pressed_profiles(path: str | Path) -> tuple[PressedProfilePair, ...]:
+    """Load a pressed HMM database as provenance-bound lockstep pairs."""
+    from . import _pipeline  # type: ignore[attr-defined]
+
+    base = Path(path).resolve(strict=False)
+    amino_alphabet = pyhmmer.easel.Alphabet.amino()
+    before = _pressed_stat_token(base)
+    pairs = []
+    with (
+        pyhmmer.plan7.HMMFile(base) as hmm_file,
+        pyhmmer.plan7.HMMPressedFile(base) as optimized_file,
+    ):
+        for ordinal, (hmm, optimized_profile) in enumerate(
+            zip_longest(hmm_file, optimized_file, fillvalue=_MISSING)
+        ):
+            if hmm is _MISSING:
+                raise ValueError(
+                    "pressed optimized-profile stream has more models than HMM stream"
+                )
+            if optimized_profile is _MISSING:
+                raise ValueError(
+                    "pressed HMM stream has more models than optimized-profile stream"
+                )
+            hmm = cast(pyhmmer.plan7.HMM, hmm)
+            optimized_profile = cast(pyhmmer.plan7.OptimizedProfile, optimized_profile)
+            if hmm.alphabet != amino_alphabet:
+                raise ValueError(
+                    "bound candidate search only supports amino-acid profiles"
+                )
+            if (
+                hmm.alphabet != optimized_profile.alphabet
+                or hmm.M != optimized_profile.M
+                or hmm.name != optimized_profile.name
+                or hmm.accession != optimized_profile.accession
+                or hmm.consensus != optimized_profile.consensus
+            ):
+                raise ValueError(
+                    f"pressed HMM/profile identity mismatch at ordinal {ordinal}"
+                )
+            canonical_background = pyhmmer.plan7.Background(hmm.alphabet)
+            reference_profile = hmm.to_profile(
+                canonical_background, L=optimized_profile.L
+            ).to_optimized()
+            for offset_name in ("model", "filter", "profile"):
+                setattr(
+                    reference_profile.offsets,
+                    offset_name,
+                    getattr(optimized_profile.offsets, offset_name),
+                )
+            if not _pipeline._oprofiles_equal_hmmer(
+                reference_profile, optimized_profile
+            ) or _optimized_profile_bytes(
+                reference_profile
+            ) != _optimized_profile_bytes(optimized_profile):
+                raise ValueError(
+                    f"pressed HMM/profile score mismatch at ordinal {ordinal}"
+                )
+            pairs.append(
+                _new_pressed_profile_pair(
+                    hmm,
+                    optimized_profile,
+                    base,
+                    ordinal,
+                    before,
+                    _CutoffSnapshot(
+                        hmm.cutoffs.gathering,
+                        hmm.cutoffs.noise,
+                        hmm.cutoffs.trusted,
+                    ),
+                    _background_fingerprint(canonical_background),
+                )
+            )
+
+    after = _pressed_stat_token(base)
+    if after != before:
+        raise RuntimeError("pressed database changed while it was being loaded")
+    return tuple(pairs)
 
 
 class _PackedProfiles(NamedTuple):
@@ -112,8 +372,193 @@ def _format_results(raw_results: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
     ]
 
 
+class _CandidateState:
+    __slots__ = (
+        "pairs",
+        "targets",
+        "indices",
+        "offsets",
+        "all_rows",
+        "all_targets",
+        "f1",
+    )
+
+    def __init__(
+        self,
+        pairs: tuple[PressedProfilePair, ...],
+        targets: Any,
+        indices: bytes,
+        offsets: bytes,
+        all_rows: bytes,
+        all_targets: bytes,
+        f1: float,
+    ) -> None:
+        self.pairs = pairs
+        self.targets = targets
+        self.indices = indices
+        self.offsets = offsets
+        self.all_rows = all_rows
+        self.all_targets = all_targets
+        self.f1 = f1
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+    weakref_slot=True,
+    init=False,
+    eq=False,
+    repr=False,
+)
+class CandidateBatch:
+    """Opaque candidate rows bound to their queries, profiles, and targets."""
+
+    def __init__(self) -> None:
+        raise TypeError(
+            "CandidateBatch objects come from SequenceBatch.candidate_batch"
+        )
+
+    def __len__(self) -> int:
+        return len(_candidate_state(self).pairs)
+
+    @property
+    def F1(self) -> float:
+        return _candidate_state(self).f1
+
+    def __repr__(self) -> str:
+        return f"CandidateBatch(rows={len(self)}, F1={self.F1!r})"
+
+    def _row_index(self, row: int) -> int:
+        if isinstance(row, bool):
+            raise TypeError("candidate row must be an integer, not bool")
+        try:
+            row_index = operator.index(row)
+        except TypeError as error:
+            raise TypeError("candidate row must be an integer") from error
+        if not 0 <= row_index < len(self):
+            raise IndexError("candidate row out of range")
+        return row_index
+
+    def candidate_count(self, row: int) -> int:
+        """Return the number of targets retained in one bound row."""
+        row_index = self._row_index(row)
+        state = _candidate_state(self)
+        if state.all_rows[row_index]:
+            return len(state.all_targets) // 4
+        offsets = memoryview(state.offsets).cast("Q")
+        return offsets[row_index + 1] - offsets[row_index]
+
+    def search(self, row: int, pipeline: Any) -> Any:
+        """Search one bound row using an exclusively owned matching pipeline.
+
+        The caller must not inspect, mutate, clear, or use ``pipeline`` from
+        another thread until this call returns.
+        """
+        row_index = self._row_index(row)
+        if type(pipeline) is not pyhmmer.plan7.Pipeline:
+            raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+        candidate_state = _candidate_state(self)
+        pair = candidate_state.pairs[row_index]
+        if candidate_state.all_rows[row_index]:
+            candidate_row = memoryview(candidate_state.all_targets).cast("I")
+        else:
+            offsets = memoryview(candidate_state.offsets).cast("Q")
+            start = offsets[row_index]
+            stop = offsets[row_index + 1]
+            candidate_row = memoryview(candidate_state.indices).cast("I")[start:stop]
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        state = _pair_state(pair)
+
+        with _lease_pipeline(pipeline):
+            if float(pipeline.F1) != candidate_state.f1:
+                raise ValueError(
+                    f"pipeline F1 {pipeline.F1!r} does not match "
+                    f"candidate F1 {candidate_state.f1!r}"
+                )
+            if (
+                _background_fingerprint(pipeline.background)
+                != state.background_fingerprint
+            ):
+                raise ValueError(
+                    "pipeline background does not match the canonical "
+                    "hmmpress background"
+                )
+            with state.lock:
+                return _pipeline._search_hmm_candidates(
+                    pipeline,
+                    state.hmm.copy(),
+                    state.optimized_profile,
+                    candidate_state.targets,
+                    candidate_row,
+                )
+
+
+_CANDIDATE_STATES: WeakKeyDictionary[CandidateBatch, _CandidateState] = (
+    WeakKeyDictionary()
+)
+
+
+def _candidate_state(candidates: CandidateBatch) -> _CandidateState:
+    try:
+        return _CANDIDATE_STATES[candidates]
+    except KeyError as error:
+        raise TypeError(
+            "CandidateBatch objects come from SequenceBatch.candidate_batch"
+        ) from error
+
+
+def _new_candidate_batch(
+    pairs: tuple[PressedProfilePair, ...],
+    targets: Any,
+    indices: array[int],
+    offsets: array[int],
+    all_rows: bytes,
+    all_targets: array[int],
+    f1: float,
+) -> CandidateBatch:
+    candidates = object.__new__(CandidateBatch)
+    _CANDIDATE_STATES[candidates] = _CandidateState(
+        pairs,
+        targets,
+        indices.tobytes(),
+        offsets.tobytes(),
+        all_rows,
+        all_targets.tobytes(),
+        f1,
+    )
+    return candidates
+
+
+class _SequenceState:
+    __slots__ = ("alphabet", "native", "lock", "targets")
+
+    def __init__(self, alphabet: Any, native: Any, targets: Any) -> None:
+        self.alphabet = alphabet
+        self.native = native
+        self.lock = Lock()
+        self.targets = targets
+
+
+_SEQUENCE_STATES: WeakKeyDictionary[Any, _SequenceState] = WeakKeyDictionary()
+
+
+def _sequence_state(batch: Any) -> _SequenceState:
+    try:
+        return _SEQUENCE_STATES[batch]
+    except KeyError as error:
+        raise TypeError("invalid SequenceBatch object") from error
+
+
+def _sequence_native(batch: Any) -> Any:
+    """Return the concealed native batch for package diagnostics only."""
+    return _sequence_state(batch).native
+
+
 class SequenceBatch:
     """A packed target batch kept resident on one CUDA device."""
+
+    __slots__ = ("__weakref__",)
 
     def __init__(self, sequences: Iterable[Any], *, alphabet: Any | None = None):
         inherited_alphabet = getattr(sequences, "alphabet", None)
@@ -125,9 +570,10 @@ class SequenceBatch:
         if alphabet is None:
             raise ValueError("an alphabet is required for an empty sequence batch")
 
+        target_sequences = [sequence.copy() for sequence in sequence_list]
         residues = bytearray()
         offsets = array("Q", [0])
-        for sequence in sequence_list:
+        for sequence in target_sequences:
             if sequence.alphabet != alphabet:
                 raise ValueError("sequence alphabets differ")
             encoded = memoryview(sequence.sequence).cast("B")
@@ -135,22 +581,28 @@ class SequenceBatch:
                 raise ValueError("sequence length exceeds HMMER's protein limit")
             residues.extend(encoded)
             offsets.append(len(residues))
+        targets = pyhmmer.easel.DigitalSequenceBlock(alphabet, target_sequences)
 
-        self.alphabet = alphabet
-        self._native = _native.SequenceBatch(residues, offsets, alphabet.Kp)
-        self._lock = Lock()
+        native = _native.SequenceBatch(residues, offsets, alphabet.Kp)
+        _SEQUENCE_STATES[self] = _SequenceState(alphabet, native, targets)
+
+    @property
+    def alphabet(self) -> Any:
+        return _sequence_state(self).alphabet
 
     def __len__(self) -> int:
-        return len(self._native)
+        return len(_sequence_state(self).native)
 
     @property
     def closed(self) -> bool:
-        with self._lock:
-            return bool(self._native.closed)
+        state = _sequence_state(self)
+        with state.lock:
+            return bool(state.native.closed)
 
     def close(self) -> None:
-        with self._lock:
-            self._native.close()
+        state = _sequence_state(self)
+        with state.lock:
+            state.native.close()
 
     def __enter__(self) -> SequenceBatch:
         if self.closed:
@@ -161,13 +613,14 @@ class SequenceBatch:
         self.close()
 
     def _filter_raw(self, optimized_profile: Any) -> list[tuple[Any, ...]]:
-        with self._lock:
-            if optimized_profile.alphabet != self.alphabet:
+        state = _sequence_state(self)
+        with state.lock:
+            if optimized_profile.alphabet != state.alphabet:
                 raise ValueError("profile and sequence alphabets differ")
             scores = memoryview(optimized_profile.sbv).cast("B")
             return cast(
                 list[tuple[Any, ...]],
-                self._native.filter_raw(
+                state.native.filter_raw(
                     scores,
                     optimized_profile.sbv.shape[1],
                     optimized_profile.M,
@@ -190,10 +643,11 @@ class SequenceBatch:
         ``F1`` are omitted. Every fallback, overflow, empty, or invalid case
         is retained conservatively.
         """
-        with self._lock:
-            if optimized_profile.alphabet != self.alphabet:
+        state = _sequence_state(self)
+        with state.lock:
+            if optimized_profile.alphabet != state.alphabet:
                 raise ValueError("profile and sequence alphabets differ")
-            if self._native.closed:
+            if state.native.closed:
                 raise RuntimeError("sequence batch is closed")
 
             try:
@@ -211,7 +665,7 @@ class SequenceBatch:
             scores = memoryview(optimized_profile.sbv).cast("B")
             return cast(
                 list[int],
-                self._native.cpu_candidates_raw(
+                state.native.cpu_candidates_raw(
                     scores,
                     optimized_profile.sbv.shape[1],
                     optimized_profile.M,
@@ -231,16 +685,17 @@ class SequenceBatch:
         self, optimized_profiles: Iterable[Any]
     ) -> list[list[dict[str, Any]]]:
         profiles = list(optimized_profiles)
-        with self._lock:
-            if self._native.closed:
+        state = _sequence_state(self)
+        with state.lock:
+            if state.native.closed:
                 raise RuntimeError("sequence batch is closed")
             for profile in profiles:
-                if profile.alphabet != self.alphabet:
+                if profile.alphabet != state.alphabet:
                     raise ValueError("profile and sequence alphabets differ")
             packed = _pack_profiles(profiles)
             raw = cast(
                 list[list[tuple[Any, ...]]],
-                self._native.filter_many_raw(*packed),
+                state.native.filter_many_raw(*packed),
             )
         return [_format_results(profile_results) for profile_results in raw]
 
@@ -248,11 +703,12 @@ class SequenceBatch:
         self, optimized_profiles: Iterable[Any], F1: float = 0.02
     ) -> list[list[int]]:
         profiles = list(optimized_profiles)
-        with self._lock:
-            if self._native.closed:
+        state = _sequence_state(self)
+        with state.lock:
+            if state.native.closed:
                 raise RuntimeError("sequence batch is closed")
             for profile in profiles:
-                if profile.alphabet != self.alphabet:
+                if profile.alphabet != state.alphabet:
                     raise ValueError("profile and sequence alphabets differ")
             try:
                 threshold = float(F1)
@@ -281,7 +737,7 @@ class SequenceBatch:
                 packed = _pack_profiles(valid_profiles)
                 candidates = cast(
                     list[list[int]],
-                    self._native.cpu_candidates_many_raw(
+                    state.native.cpu_candidates_many_raw(
                         *packed, m_mu, m_lambda, threshold
                     ),
                 )
@@ -291,6 +747,128 @@ class SequenceBatch:
                     output[index] = profile_candidates
 
             return cast(list[list[int]], output)
+
+    def _candidate_csr_locked(
+        self, profiles: list[Any], threshold: float
+    ) -> tuple[array[int], array[int], bytes, array[int]]:
+        """Build complete CSR rows, promoting invalid profiles fail-closed."""
+        state = _sequence_state(self)
+        if not profiles:
+            return array("I"), array("Q", [0]), b"", array("I")
+        if threshold == 1.0:
+            return (
+                array("I"),
+                array("Q", [0]) * (len(profiles) + 1),
+                bytes([1]) * len(profiles),
+                array("I", range(len(state.native))),
+            )
+
+        parameters = [_f1_parameters(profile) for profile in profiles]
+        valid_profiles = [
+            profile
+            for profile, profile_parameters in zip(profiles, parameters, strict=True)
+            if profile_parameters is not None
+        ]
+        valid_indices = array("I")
+        valid_offsets = array("Q", [0])
+        if valid_profiles:
+            m_mu = array(
+                "f",
+                [
+                    cast(tuple[float, float, float], profile_parameters)[0]
+                    for profile_parameters in parameters
+                    if profile_parameters is not None
+                ],
+            )
+            m_lambda = array(
+                "f",
+                [
+                    cast(tuple[float, float, float], profile_parameters)[1]
+                    for profile_parameters in parameters
+                    if profile_parameters is not None
+                ],
+            )
+            packed = _pack_profiles(valid_profiles)
+            valid_indices, valid_offsets = cast(
+                tuple[array[int], array[int]],
+                state.native.cpu_candidates_many_csr_raw(
+                    *packed, m_mu, m_lambda, threshold
+                ),
+            )
+
+        if len(valid_profiles) == len(profiles):
+            return (
+                valid_indices,
+                valid_offsets,
+                bytes(len(profiles)),
+                array("I"),
+            )
+
+        all_targets = array("I", range(len(state.native)))
+        indices = array("I")
+        offsets = array("Q", [0])
+        all_rows = bytearray()
+        valid_row = 0
+        for profile_parameters in parameters:
+            if profile_parameters is None:
+                all_rows.append(1)
+            else:
+                start = valid_offsets[valid_row]
+                stop = valid_offsets[valid_row + 1]
+                indices.frombytes(memoryview(valid_indices)[start:stop].cast("B"))
+                valid_row += 1
+                all_rows.append(0)
+            offsets.append(len(indices))
+        return indices, offsets, bytes(all_rows), all_targets
+
+    def candidate_batch(
+        self,
+        profile_pairs: Iterable[PressedProfilePair],
+        F1: float = 0.02,
+    ) -> CandidateBatch:
+        """Bind exact CUDA candidates to immutable pressed-profile pairs."""
+        sequence_state = _sequence_state(self)
+        pairs = tuple(profile_pairs)
+        try:
+            threshold = float(F1)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("F1 must be a finite number in [0, 1]") from error
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("F1 must be a finite number in [0, 1]")
+
+        profiles = []
+        states = []
+        for pair in pairs:
+            if type(pair) is not PressedProfilePair:
+                raise TypeError(
+                    "candidate batches require pairs from load_pressed_profiles"
+                )
+            state = _pair_state(pair)
+            if state.hmm.alphabet != sequence_state.alphabet:
+                raise ValueError("profile and sequence alphabets differ")
+            profiles.append(state.optimized_profile)
+            states.append(state)
+
+        unique_locks = {id(state.lock): state.lock for state in states}
+        with ExitStack() as locks:
+            for lock_id in sorted(unique_locks):
+                locks.enter_context(unique_locks[lock_id])
+            with sequence_state.lock:
+                if sequence_state.native.closed:
+                    raise RuntimeError("sequence batch is closed")
+                indices, offsets, all_rows, all_targets = self._candidate_csr_locked(
+                    profiles, threshold
+                )
+
+        return _new_candidate_batch(
+            pairs,
+            sequence_state.targets,
+            indices,
+            offsets,
+            all_rows,
+            all_targets,
+            threshold,
+        )
 
 
 def filter_ssv(

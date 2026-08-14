@@ -11,10 +11,11 @@ loading it against an unsupported private ABI.
 from libc.stddef cimport size_t
 from libc.stdint cimport uint32_t
 
-from libeasel cimport eslEINVAL, eslERANGE, eslOK
+from libeasel cimport eslERRBUFSIZE, eslEINVAL, eslERANGE, eslOK
 from libeasel.sq cimport ESL_SQ
 from libhmmer.impl.p7_oprofile cimport (
     P7_OPROFILE,
+    p7_oprofile_Compare,
     p7_oprofile_ReconfigLength,
 )
 from libhmmer.p7_bg cimport P7_BG, p7_bg_SetLength
@@ -33,17 +34,50 @@ from pyhmmer.plan7 cimport HMM, OptimizedProfile, Pipeline, TopHits
 
 import pyhmmer as _pyhmmer
 from pyhmmer.errors import AlphabetMismatch, UnexpectedError
+import importlib.util as _importlib_util
+from pathlib import Path as _Path
+
+
+_abi_spec = _importlib_util.spec_from_file_location(
+    "_plan7_gpu_pyhmmer_abi", _Path(__file__).resolve().with_name("_abi.py")
+)
+if _abi_spec is None or _abi_spec.loader is None:
+    raise ImportError("cannot load the plan7_gpu PyHMMER ABI verifier")
+_abi_module = _importlib_util.module_from_spec(_abi_spec)
+_abi_spec.loader.exec_module(_abi_module)
 
 
 PYHMMER_PRIVATE_ABI = "0.12.0"
+PYHMMER_PRIVATE_ABI_SHA256 = PYHMMER_ABI_SHA256
 if _pyhmmer.__version__ != PYHMMER_PRIVATE_ABI:
     raise ImportError(
         f"plan7_gpu._pipeline requires PyHMMER {PYHMMER_PRIVATE_ABI}, "
         f"found {_pyhmmer.__version__}"
     )
+_abi_module.validate_private_abi_platform()
+_runtime_abi_sha256 = _abi_module.pyhmmer_abi_fingerprint()
+if _runtime_abi_sha256 != PYHMMER_PRIVATE_ABI_SHA256:
+    raise ImportError(
+        "plan7_gpu._pipeline was built against a different PyHMMER private ABI "
+        f"({PYHMMER_PRIVATE_ABI_SHA256} != {_runtime_abi_sha256})"
+    )
 
 
 cdef size_t HMMER_TARGET_LIMIT = 100000
+
+
+def _oprofiles_equal_hmmer(
+    OptimizedProfile expected,
+    OptimizedProfile observed,
+):
+    """Run HMMER's own optimized-profile comparator at zero tolerance."""
+    cdef char error[eslERRBUFSIZE]
+    cdef int status
+
+    error[0] = 0
+    with nogil:
+        status = p7_oprofile_Compare(expected._om, observed._om, 0.0, error)
+    return status == eslOK
 
 
 cdef int _search_loop_candidates(

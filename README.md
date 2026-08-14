@@ -5,7 +5,7 @@ HMMER 3.4 protein-search pipeline.
 
 The first implementation target is deliberately narrow:
 
-1. reuse the HMMs and digital sequences already loaded by Astra;
+1. consume Astra's pressed HMM database and digital protein sequences;
 2. evaluate HMMER-equivalent SSV/MSV stage-1 scores on a GPU;
 3. conservatively select candidate model/sequence pairs;
 4. run Astra's existing CPU HMMER pipeline on candidates; and
@@ -24,10 +24,11 @@ target upload can now be reused across profiles, and the native adapter returns
 only pairs that direct SSV cannot safely reject at HMMER's exact F1 decision.
 Profiles can now be evaluated in batches rather than one kernel launch apiece.
 Length terms and exact binary32 F1 cutoffs are cached for the host gate.
-An ABI-pinned private pipeline loop can skip definite rejects while preserving
-HMMER's accounting and exact `TopHits`; it remains private until candidate
-rows are bound to their exact targets, profile, and F1. End-to-end Astra
-integration remains open, and there is no performance claim yet.
+Candidate rows are now immutably bound to verified pressed profiles, copied
+targets, and F1. The ABI-pinned CPU handoff skips definite rejects while
+preserving HMMER accounting and exact `TopHits`; all 21,000 real pilot pairs
+match ordinary PyHMMER end to end. End-to-end Astra integration remains open,
+and there is no performance claim yet.
 
 ## Layout
 

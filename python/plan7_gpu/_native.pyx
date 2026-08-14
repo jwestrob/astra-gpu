@@ -3,7 +3,15 @@
 from libc.stddef cimport size_t
 from libc.stdint cimport int16_t, int32_t, uint8_t, uint32_t, uint64_t
 from libc.math cimport isfinite
+from libc.string cimport memcpy
+from cpython.array cimport array as carray, clone
 from libcpp.vector cimport vector
+
+import array as _array
+
+
+cdef carray _UINT32_ARRAY_TEMPLATE = _array.array("I")
+cdef carray _UINT64_ARRAY_TEMPLATE = _array.array("Q")
 
 
 cdef extern from "ssv_cuda.h" nogil:
@@ -593,7 +601,7 @@ cdef class SequenceBatch:
         )
         return _format_many_results(self._many_results, scales, self._sequence_count)
 
-    def cpu_candidates_many_raw(
+    cdef size_t _run_candidates_many(
         self,
         const uint8_t[::1] packed_scores,
         const uint64_t[::1] score_offsets,
@@ -605,16 +613,13 @@ cdef class SequenceBatch:
         const float[::1] m_mu,
         const float[::1] m_lambda,
         double f1,
-    ):
+    ) except? 0:
         cdef size_t profile_count
         cdef size_t profile_index
-        cdef size_t sequence_index
         cdef size_t result_count
         cdef size_t candidate_count = 0
         cdef int status
         cdef char error[512]
-        cdef list candidates
-        cdef list output = []
 
         profile_count = <size_t> score_offsets.shape[0]
         if (
@@ -681,6 +686,39 @@ cdef class SequenceBatch:
                 )
             if status != 0:
                 raise RuntimeError(error.decode("utf-8", "replace"))
+        return profile_count
+
+    def cpu_candidates_many_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+    ):
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t sequence_index
+        cdef list candidates
+        cdef list output = []
+
+        profile_count = self._run_candidates_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+            m_mu,
+            m_lambda,
+            f1,
+        )
         for profile_index in range(profile_count):
             candidates = []
             for sequence_index in range(self._candidate_counts[profile_index]):
@@ -691,6 +729,59 @@ cdef class SequenceBatch:
                 )
             output.append(candidates)
         return output
+
+    def cpu_candidates_many_csr_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+    ):
+        """Return compact candidate rows as native uint32 data and uint64 offsets."""
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t candidate_count
+        cdef carray indices
+        cdef carray offsets
+
+        if _UINT32_ARRAY_TEMPLATE.itemsize != sizeof(uint32_t):
+            raise RuntimeError("array('I') is not native uint32")
+        if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
+            raise RuntimeError("array('Q') is not native uint64")
+
+        profile_count = self._run_candidates_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+            m_mu,
+            m_lambda,
+            f1,
+        )
+        candidate_count = self._candidate_indices.size()
+        indices = clone(_UINT32_ARRAY_TEMPLATE, candidate_count, False)
+        offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
+        if candidate_count:
+            memcpy(
+                indices.data.as_uints,
+                self._candidate_indices.data(),
+                candidate_count * sizeof(uint32_t),
+            )
+        for profile_index in range(profile_count):
+            offsets.data.as_ulonglongs[profile_index] = <uint64_t> (
+                self._candidate_offsets[profile_index]
+            )
+        offsets.data.as_ulonglongs[profile_count] = <uint64_t> candidate_count
+        return indices, offsets
 
 
 def filter_raw(

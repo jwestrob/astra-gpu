@@ -1,6 +1,10 @@
+import io
 import math
+import shutil
 import struct
 import sys
+import tempfile
+import threading
 import unittest
 from array import array
 from pathlib import Path
@@ -10,18 +14,45 @@ import pyhmmer
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 try:
-    from plan7_gpu import SequenceBatch, _native, cpu_candidates, filter_ssv
+    from plan7_gpu import (
+        CandidateBatch,
+        PressedProfilePair,
+        SequenceBatch,
+        _native,
+        _pipeline,
+        cpu_candidates,
+        filter_ssv,
+        load_pressed_profiles,
+    )
     from plan7_gpu.adapter import _pack_profiles
+    from plan7_gpu.adapter import (
+        _PIPELINE_LEASES,
+        _candidate_state,
+        _pair_state,
+        _sequence_native,
+    )
+    from plan7_gpu._abi import pyhmmer_abi_fingerprint
 except ImportError:
     SequenceBatch = None
     _native = None
+    _pipeline = None
     cpu_candidates = None
     filter_ssv = None
     _pack_profiles = None
+    CandidateBatch = None
+    PressedProfilePair = None
+    load_pressed_profiles = None
+    _PIPELINE_LEASES = None
+    _candidate_state = None
+    _pair_state = None
+    _sequence_native = None
+    pyhmmer_abi_fingerprint = None
 
 HMM_20AA = ROOT / "refs" / "src" / "hmmer-3.4" / "testsuite" / "20aa.hmm"
 HMM_M1 = ROOT / "refs" / "src" / "hmmer-3.4" / "testsuite" / "M1.hmm"
 HMM_STRIPE_BOUNDARIES = ROOT / "results" / "datasets" / "pfam-stripe-boundaries.hmm"
+HMM_GLOBINS = ROOT / "refs" / "src" / "hmmer-3.4" / "tutorial" / "globins4.hmm"
+FASTA_GLOBINS = ROOT / "refs" / "src" / "hmmer-3.4" / "tutorial" / "globins45.fa"
 
 
 def float32_bits(value):
@@ -476,6 +507,55 @@ class CudaSsvTests(unittest.TestCase):
             )
         self.assertEqual([profile.L for profile in profiles], original_lengths)
 
+    def test_compact_candidate_csr_matches_diagnostic_lists(self):
+        profiles = [
+            self.optimized(HMM_20AA),
+            self.optimized(HMM_M1),
+            self.optimized(HMM_20AA),
+        ]
+        sequences = self.sequences(
+            profiles[0], ["", "G", "ACDEX", "ACDEFGHIKLMNPQRSTVWY"]
+        )
+        packed = _pack_profiles(profiles)
+        m_mu = array(
+            "f", [profile.evalue_parameters.as_vector()[0] for profile in profiles]
+        )
+        m_lambda = array(
+            "f", [profile.evalue_parameters.as_vector()[1] for profile in profiles]
+        )
+
+        with SequenceBatch(sequences) as batch:
+            native = _sequence_native(batch)
+            empty_indices, empty_offsets = native.cpu_candidates_many_csr_raw(
+                *_pack_profiles([]), array("f"), array("f"), 0.02
+            )
+            self.assertEqual(empty_indices.tolist(), [])
+            self.assertEqual(empty_offsets.tolist(), [0])
+
+            expected = batch.cpu_candidates_many(profiles)
+            indices, offsets = native.cpu_candidates_many_csr_raw(
+                *packed, m_mu, m_lambda, 0.02
+            )
+            observed = [
+                list(indices[offsets[row] : offsets[row + 1]])
+                for row in range(len(profiles))
+            ]
+            self.assertEqual(observed, expected)
+            self.assertEqual(indices.typecode, "I")
+            self.assertEqual(indices.itemsize, 4)
+            self.assertEqual(offsets.typecode, "Q")
+            self.assertEqual(offsets.tolist()[0], 0)
+            self.assertEqual(offsets.tolist()[-1], len(indices))
+
+            m_mu[1] = math.nan
+            invalid_indices, invalid_offsets = native.cpu_candidates_many_csr_raw(
+                *packed, m_mu, m_lambda, 0.02
+            )
+            self.assertEqual(
+                list(invalid_indices[invalid_offsets[1] : invalid_offsets[2]]),
+                list(range(len(sequences))),
+            )
+
     def test_compact_many_matches_striped_at_model_boundaries(self):
         with pyhmmer.plan7.HMMFile(HMM_STRIPE_BOUNDARIES) as hmm_file:
             hmms = list(hmm_file)
@@ -534,12 +614,13 @@ class CudaSsvTests(unittest.TestCase):
 
         sequences = self.sequences(profiles[0], ["G", "ACDEX"])
         with SequenceBatch(sequences) as batch:
+            native = _sequence_native(batch)
             bad_offsets = array("Q", packed.score_offsets)
             bad_offsets[0] = 1
             with self.assertRaisesRegex(
                 RuntimeError, "invalid compact profile score range"
             ):
-                batch._native.filter_many_raw(
+                native.filter_many_raw(
                     packed.scores,
                     bad_offsets,
                     packed.score_counts,
@@ -554,7 +635,7 @@ class CudaSsvTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 RuntimeError, "invalid compact profile score range"
             ):
-                batch._native.filter_many_raw(
+                native.filter_many_raw(
                     packed.scores,
                     packed.score_offsets,
                     packed.score_counts,
@@ -565,7 +646,7 @@ class CudaSsvTests(unittest.TestCase):
                 )
 
             with self.assertRaisesRegex(RuntimeError, "trailing bytes"):
-                batch._native.filter_many_raw(
+                native.filter_many_raw(
                     packed.scores + b"\0",
                     packed.score_offsets,
                     packed.score_counts,
@@ -612,7 +693,7 @@ class CudaSsvTests(unittest.TestCase):
         batch = SequenceBatch(sequences)
 
         def observed_tjb(scale):
-            raw = batch._native.filter_raw(
+            raw = _sequence_native(batch).filter_raw(
                 scores,
                 profile.sbv.shape[1],
                 profile.M,
@@ -689,6 +770,338 @@ class CudaSsvTests(unittest.TestCase):
                 _native.tjb_for_lengths(scale, array("Q", [1]))
         with self.assertRaises(ValueError):
             _native.tjb_for_lengths(3.0, array("Q", [100_001]))
+
+
+@unittest.skipUnless(cuda_available(), "CUDA backend or device unavailable")
+class CudaCandidateBatchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._temporary = tempfile.TemporaryDirectory(
+            prefix="plan7-candidate-batch-test-"
+        )
+        cls.pressed_base = Path(cls._temporary.name) / "globins"
+        hmms = []
+        for path in (HMM_GLOBINS, HMM_M1):
+            with pyhmmer.plan7.HMMFile(path) as hmm_file:
+                hmms.extend(hmm_file)
+        pyhmmer.hmmer.hmmpress(hmms, cls.pressed_base)
+        cls.pairs = load_pressed_profiles(cls.pressed_base)
+        cls.alphabet = cls.pairs[0].hmm.alphabet
+        with pyhmmer.easel.SequenceFile(
+            FASTA_GLOBINS, digital=True, alphabet=cls.alphabet
+        ) as sequence_file:
+            cls.targets = sequence_file.read_block()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._temporary.cleanup()
+
+    @classmethod
+    def pipeline(cls, **options):
+        defaults = {"E": 10.0, "domE": 10.0, "incE": 10.0, "incdomE": 10.0}
+        defaults.update(options)
+        return pyhmmer.plan7.Pipeline(cls.alphabet, **defaults)
+
+    @staticmethod
+    def table_bytes(hits, format):
+        output = io.BytesIO()
+        hits.write(output, format=format, header=True)
+        return output.getvalue()
+
+    @staticmethod
+    def hmm_bytes(hmm):
+        output = io.BytesIO()
+        hmm.write(output, binary=True)
+        return output.getvalue()
+
+    def assert_exact_hits(self, expected, actual):
+        fields = (
+            "Z",
+            "domZ",
+            "searched_models",
+            "searched_nodes",
+            "searched_residues",
+            "searched_sequences",
+        )
+        self.assertEqual(
+            tuple(getattr(actual, field) for field in fields),
+            tuple(getattr(expected, field) for field in fields),
+        )
+        self.assertEqual(
+            self.table_bytes(actual, "targets"),
+            self.table_bytes(expected, "targets"),
+        )
+        self.assertEqual(
+            self.table_bytes(actual, "domains"),
+            self.table_bytes(expected, "domains"),
+        )
+
+    def test_default_f1_end_to_end_query_copy_and_reuse(self):
+        pair = self.pairs[0]
+        owner = pair.hmm
+        expected_pipeline = self.pipeline()
+        actual_pipeline = self.pipeline()
+        with SequenceBatch(self.targets) as sequences:
+            candidates = sequences.candidate_batch([pair])
+            self.assertFalse(hasattr(sequences, "_sequences"))
+        self.assertIsInstance(candidates, CandidateBatch)
+        self.assertEqual(candidates.F1, actual_pipeline.F1)
+        self.assertLessEqual(candidates.candidate_count(0), len(self.targets))
+        self.assertFalse(hasattr(candidates, "_targets"))
+        self.assertFalse(hasattr(candidates, "_pairs"))
+        self.assertIsInstance(_candidate_state(candidates).indices, bytes)
+        self.assertIsInstance(_candidate_state(candidates).offsets, bytes)
+
+        expected_first = expected_pipeline.search_hmm(owner, self.targets)
+        actual_first = candidates.search(0, actual_pipeline)
+        self.assertIsNot(actual_first.query, owner)
+        self.assertEqual(self.hmm_bytes(actual_first.query), self.hmm_bytes(owner))
+        self.assert_exact_hits(expected_first, actual_first)
+
+        expected_second = expected_pipeline.search_hmm(pair.hmm, self.targets)
+        actual_second = candidates.search(0, actual_pipeline)
+        self.assert_exact_hits(expected_second, actual_second)
+
+    def test_f1_and_row_mismatches_fail_before_pipeline_mutation(self):
+        pair = self.pairs[0]
+        with SequenceBatch(self.targets) as sequences:
+            candidates = sequences.candidate_batch([pair])
+        long_targets = pyhmmer.plan7.LongTargetsPipeline(pyhmmer.easel.Alphabet.dna())
+        with self.assertRaisesRegex(TypeError, "exactly pyhmmer.plan7.Pipeline"):
+            candidates.search(0, long_targets)
+        self.assertEqual(_PIPELINE_LEASES, {})
+
+        pipeline = self.pipeline(F1=0.03)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            candidates.search(0, pipeline)
+        with self.assertRaises(IndexError):
+            candidates.search(1, pipeline)
+        with self.assertRaises(TypeError):
+            candidates.candidate_count(True)
+
+        pipeline.F1 = candidates.F1
+        actual = candidates.search(0, pipeline)
+        expected = self.pipeline().search_hmm(pair.hmm, self.targets)
+        self.assert_exact_hits(expected, actual)
+
+    def test_custom_background_is_rejected_before_pipeline_mutation(self):
+        pair = self.pairs[0]
+        with SequenceBatch(self.targets) as sequences:
+            candidates = sequences.candidate_batch([pair])
+
+        uniform = self.pipeline(
+            background=pyhmmer.plan7.Background(self.alphabet, uniform=True)
+        )
+        with self.assertRaisesRegex(ValueError, "canonical hmmpress background"):
+            candidates.search(0, uniform)
+
+        pipeline = self.pipeline()
+        frequencies = pipeline.background.residue_frequencies
+        original = (frequencies[0], frequencies[1])
+        frequencies[0] = original[0] + 0.001
+        frequencies[1] = original[1] - 0.001
+        with self.assertRaisesRegex(ValueError, "canonical hmmpress background"):
+            candidates.search(0, pipeline)
+        frequencies[0], frequencies[1] = original
+
+        actual = candidates.search(0, pipeline)
+        expected = self.pipeline().search_hmm(pair.hmm, self.targets)
+        self.assert_exact_hits(expected, actual)
+
+    def test_same_pipeline_calls_are_process_wide_serialized(self):
+        with SequenceBatch(self.targets) as first_sequences:
+            first = first_sequences.candidate_batch([self.pairs[0]])
+        with SequenceBatch(self.targets) as second_sequences:
+            second = second_sequences.candidate_batch([self.pairs[1]])
+
+        pipeline = self.pipeline()
+        first_entered = threading.Event()
+        second_started = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        state_lock = threading.Lock()
+        outcomes = {}
+        call_count = 0
+        original_search = _pipeline._search_hmm_candidates
+
+        def fake_search(pipeline, query, optimized, targets, row):
+            nonlocal call_count
+            with state_lock:
+                call_count += 1
+                call_number = call_count
+            if call_number == 1:
+                first_entered.set()
+                release_first.wait(2.0)
+            else:
+                second_entered.set()
+            return query
+
+        def invoke(name, candidates, started=None):
+            if started is not None:
+                started.set()
+            try:
+                outcomes[name] = candidates.search(0, pipeline)
+            except BaseException as error:
+                outcomes[name] = error
+
+        first_thread = threading.Thread(target=invoke, args=("first", first))
+        second_thread = threading.Thread(
+            target=invoke, args=("second", second, second_started)
+        )
+        _pipeline._search_hmm_candidates = fake_search
+        try:
+            first_thread.start()
+            self.assertTrue(first_entered.wait(2.0))
+            second_thread.start()
+            self.assertTrue(second_started.wait(2.0))
+            self.assertFalse(second_entered.wait(0.1))
+            pipeline.F1 = 0.03
+            release_first.set()
+            first_thread.join(2.0)
+            second_thread.join(2.0)
+        finally:
+            release_first.set()
+            if first_thread.ident is not None:
+                first_thread.join(2.0)
+            if second_thread.ident is not None:
+                second_thread.join(2.0)
+            _pipeline._search_hmm_candidates = original_search
+            pipeline.F1 = 0.02
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertNotIsInstance(outcomes["first"], BaseException)
+        self.assertIsInstance(outcomes["second"], ValueError)
+        self.assertFalse(second_entered.is_set())
+        self.assertEqual(_PIPELINE_LEASES, {})
+
+    def test_external_block_membership_and_order_are_isolated(self):
+        source = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [sequence.copy() for sequence in self.targets]
+        )
+        snapshot = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [sequence.copy() for sequence in source]
+        )
+        with SequenceBatch(source) as sequences:
+            self.assertFalse(hasattr(sequences, "_native"))
+            self.assertFalse(hasattr(sequences, "_lock"))
+            self.assertEqual(sequences.alphabet, self.alphabet)
+            for attribute, replacement in (
+                ("_native", object()),
+                ("_lock", threading.Lock()),
+                ("alphabet", pyhmmer.easel.Alphabet.dna()),
+            ):
+                with self.subTest(attribute=attribute):
+                    with self.assertRaises(AttributeError):
+                        setattr(sequences, attribute, replacement)
+            candidates = sequences.candidate_batch(self.pairs[:1])
+        source[0].sequence[0] = (source[0].sequence[0] + 1) % self.alphabet.K
+        source[0].name = b"mutated-after-upload"
+        last = source.pop()
+        source.insert(0, last)
+        source.pop()
+        source.append(last)
+
+        actual = candidates.search(0, self.pipeline())
+        expected = self.pipeline().search_hmm(self.pairs[0].hmm, snapshot)
+        self.assert_exact_hits(expected, actual)
+
+    def test_f1_one_uses_one_immutable_shared_all_target_row(self):
+        pair = self.pairs[0]
+        with SequenceBatch(self.targets) as sequences:
+            all_candidates = sequences.candidate_batch([pair, pair, pair], F1=1.0)
+        state = _candidate_state(all_candidates)
+        self.assertEqual(all_candidates.F1, 1.0)
+        self.assertEqual(state.all_rows, b"\x01\x01\x01")
+        self.assertEqual(len(state.indices), 0)
+        self.assertIsInstance(state.all_targets, bytes)
+        self.assertEqual(len(state.all_targets), 4 * len(self.targets))
+        self.assertEqual(all_candidates.candidate_count(2), len(self.targets))
+        self.assert_exact_hits(
+            self.pipeline(F1=1.0).search_hmm(pair.hmm, self.targets),
+            all_candidates.search(2, self.pipeline(F1=1.0)),
+        )
+
+    def test_invalid_profile_uses_shared_fail_closed_row(self):
+        pair = self.pairs[0]
+        profile_state = _pair_state(pair)
+        parameters = profile_state.optimized_profile.evalue_parameters.as_vector()
+        original_mu = parameters[0]
+        try:
+            parameters[0] = math.nan
+            with SequenceBatch(self.targets) as sequences:
+                candidates = sequences.candidate_batch([self.pairs[1], pair])
+        finally:
+            parameters[0] = original_mu
+
+        candidate_state = _candidate_state(candidates)
+        self.assertEqual(candidate_state.all_rows, b"\x00\x01")
+        self.assertEqual(candidates.candidate_count(1), len(self.targets))
+        self.assert_exact_hits(
+            self.pipeline().search_hmm(pair.hmm, self.targets),
+            candidates.search(1, self.pipeline()),
+        )
+
+    def test_only_lockstep_pressed_pairs_are_accepted(self):
+        pair = self.pairs[0]
+        self.assertFalse(hasattr(pair, "optimized_profile"))
+        self.assertFalse(hasattr(pair, "_optimized_profile"))
+        exposed = pair.hmm
+        original_name = pair.hmm.name
+        exposed.name = f"{original_name}-mutated-copy"
+        self.assertEqual(pair.hmm.name, original_name)
+        raw_optimized = pair.hmm.to_profile(
+            pyhmmer.plan7.Background(self.alphabet), L=400
+        ).to_optimized()
+        with SequenceBatch(self.targets) as sequences:
+            with self.assertRaisesRegex(TypeError, "load_pressed_profiles"):
+                sequences.candidate_batch([(pair.hmm, raw_optimized)])
+
+    def test_private_abi_fingerprint_matches_runtime(self):
+        self.assertEqual(
+            _pipeline.PYHMMER_PRIVATE_ABI_SHA256,
+            pyhmmer_abi_fingerprint(),
+        )
+
+    def test_mixed_pressed_profile_bytes_are_rejected(self):
+        original = self.pairs[0].hmm
+        perturbed = original.copy()
+        row = perturbed.match_emissions[1]
+        ranked = sorted(range(len(row)), key=row.__getitem__)
+        source, destination = ranked[:2]
+        epsilon = min(float(row[source]) / 2.0, 1e-4)
+        row[source] -= epsilon
+        row[destination] += epsilon
+        perturbed.renormalize()
+        self.assertEqual(perturbed.consensus, original.consensus)
+
+        directory = Path(self._temporary.name)
+        original_base = directory / "original-single"
+        perturbed_base = directory / "perturbed-single"
+        mixed_base = directory / "mixed-single"
+        pyhmmer.hmmer.hmmpress([original], original_base)
+        pyhmmer.hmmer.hmmpress([perturbed], perturbed_base)
+        for suffix in ("h3m", "h3i"):
+            shutil.copyfile(f"{original_base}.{suffix}", f"{mixed_base}.{suffix}")
+        for suffix in ("h3f", "h3p"):
+            shutil.copyfile(f"{perturbed_base}.{suffix}", f"{mixed_base}.{suffix}")
+
+        with self.assertRaisesRegex(ValueError, "score mismatch at ordinal 0"):
+            load_pressed_profiles(mixed_base)
+
+    def test_non_amino_pressed_profiles_are_rejected(self):
+        alphabet = pyhmmer.easel.Alphabet.dna()
+        sequence = pyhmmer.easel.TextSequence(
+            name=b"dna-model", sequence="ACGTACGTACGT"
+        ).digitize(alphabet)
+        hmm, _, _ = pyhmmer.plan7.Builder(alphabet).build(
+            sequence, pyhmmer.plan7.Background(alphabet)
+        )
+        base = Path(self._temporary.name) / "dna-model"
+        pyhmmer.hmmer.hmmpress([hmm], base)
+
+        with self.assertRaisesRegex(ValueError, "only supports amino-acid"):
+            load_pressed_profiles(base)
 
 
 if __name__ == "__main__":

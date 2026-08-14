@@ -16,19 +16,30 @@
       },
       {
         "path": "python/plan7_gpu/_native.pyx",
-        "sha256": "69e94087575b715f22421e14d7393a8ac217533227a798395571f99425e51860"
+        "sha256": "a5fd5d0765e40b7aadd418e49d5a78541967f3388214f0d63e7fbe6fe958c4fa"
       },
       {
         "path": "python/plan7_gpu/adapter.py",
-        "sha256": "f815e564d957de6454520b7e95fc1bd62da0f345d22b88dcceb076e5908a2a14"
+        "sha256": "b9a5e43b850affd93bd94285783865c1f3e4390e620f8ac602c79cec69d543c6"
+      },
+      {
+        "path": "python/plan7_gpu/_pipeline.pyx",
+        "sha256": "5f13379568c4bcd34497e6455d05fb45c6c81146e77f604e4f40148f1b81145d"
+      },
+      {
+        "path": "python/plan7_gpu/_abi.py",
+        "sha256": "164d6054b5304f0189de58a373704e50624a494c078410dae25ba62cb96cb2e1"
       },
       {
         "path": "Makefile",
-        "sha256": "7145cd106011ec72af148861c441c15cd843c2e241e2a7c5c0cf0ded32b1964a"
+        "sha256": "0c62966cac07643bee231d2cf7403a80f7e671e75aa220ae14033640e55de0c1"
       }
     ],
     "runtime": {
       "pyhmmer_version": "0.12.0",
+      "private_abi_sha256": "169ae774dc6336f4941af349065e6138f4eb2922485606a59ca2dc3ab94d30ff",
+      "hmmer_library": "/home/jwestrob/.pyenv/versions/3.12.0/lib/python3.12/site-packages/pyhmmer.libs/liblibhmmer.so",
+      "hmmer_sha256": "bee1384be9b38c4dbca28801d6a7985bceb4304df51364600a6d9c1670bd69c1",
       "easel_library": "/home/jwestrob/.pyenv/versions/3.12.0/lib/python3.12/site-packages/pyhmmer.libs/liblibeasel.so",
       "easel_sha256": "597c456d3789cbac044928467e1fa7a62eb1ffba29d7e00fe56f7a174dc93c6e"
     }
@@ -69,6 +80,15 @@
       "pairs": 21000,
       "raw_mismatches_vs_repeated_single_profile": 0,
       "score_layout": "model_major_residue_compact"
+    },
+    "bound_candidate_pipeline": {
+      "profiles": 21,
+      "pairs": 21000,
+      "candidates": 721,
+      "candidate_row_mismatches": 0,
+      "target_table_mismatches": 0,
+      "domain_table_mismatches": 0,
+      "accounting_mismatches": 0
     }
   },
   "f1_gate": {
@@ -87,7 +107,8 @@
     }
   },
   "additional_checks": {
-    "focused_tests": 21,
+    "focused_cuda_tests": 33,
+    "full_tests": 99,
     "compact_layout_boundaries": [15, 16, 17, 31, 32, 33],
     "digital_residue_codes_checked": 29,
     "all_lengths_tjb_checked": [0, 100000],

@@ -1,3 +1,17 @@
-from .adapter import SequenceBatch, cpu_candidates, filter_ssv
+from .adapter import (
+    CandidateBatch,
+    PressedProfilePair,
+    SequenceBatch,
+    cpu_candidates,
+    filter_ssv,
+    load_pressed_profiles,
+)
 
-__all__ = ["SequenceBatch", "cpu_candidates", "filter_ssv"]
+__all__ = [
+    "CandidateBatch",
+    "PressedProfilePair",
+    "SequenceBatch",
+    "cpu_candidates",
+    "filter_ssv",
+    "load_pressed_profiles",
+]

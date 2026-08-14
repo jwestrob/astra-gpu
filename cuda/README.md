@@ -14,3 +14,9 @@ evaluate a profile batch in one two-dimensional CUDA launch. The single-profile
 path keeps HMMER's striped layout. The batched host gate caches length-only terms
 and uses an exact per-profile binary32 cutoff, falling back to the scalar Easel
 calculation whenever a cutoff cannot be proven safe.
+
+`load_pressed_profiles` verifies that each protein HMM and pressed optimized
+profile agree before either can enter a provenance-bound `CandidateBatch`.
+Candidate rows own immutable target and CSR state. Searches require a standard
+canonical-background PyHMMER `Pipeline` with matching F1, exclusively owned by
+the calling worker until the search returns.
