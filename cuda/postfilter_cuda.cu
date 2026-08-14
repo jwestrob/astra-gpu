@@ -11,13 +11,17 @@ extern "C" {
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <new>
 #include <thread>
+#include <utility>
 #include <vector>
 
 static_assert(sizeof(plan7_postfilter_result) == PLAN7_POSTFILTER_RECORD_SIZE,
@@ -68,11 +72,13 @@ struct VitProfile {
   uint8_t msv_base;
   uint8_t msv_bias;
   float msv_scale;
-  uintptr_t alphabet_pointer;
+  uint64_t reserved;
 };
 
 static_assert(sizeof(VitProfile) == 96,
               "Viterbi descriptor footprint changed");
+static_assert(sizeof(uintptr_t) >= sizeof(uint64_t),
+              "profile identity tokens require 64-bit uintptr_t");
 static_assert(p7O_NTRANS == 8,
               "Viterbi transition-row footprint changed");
 static_assert((29 + p7O_NTRANS) * kWarpSize * sizeof(int16_t) == 2368,
@@ -574,15 +580,437 @@ __global__ void merge_results_kernel(
 
 }  // namespace
 
+namespace {
+
+class PackWorkerPool {
+ public:
+  using Task = void (*)(void *, size_t) noexcept;
+
+  explicit PackWorkerPool(size_t worker_count) {
+    try {
+      workers_.reserve(worker_count);
+      for (size_t i = 0; i < worker_count; ++i)
+        workers_.emplace_back([this]() { worker_loop(); });
+    } catch (...) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+      }
+      ready_.notify_all();
+      for (auto &worker : workers_)
+        if (worker.joinable()) worker.join();
+      throw;
+    }
+  }
+
+  PackWorkerPool(const PackWorkerPool &) = delete;
+  PackWorkerPool &operator=(const PackWorkerPool &) = delete;
+
+  ~PackWorkerPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    ready_.notify_all();
+    for (auto &worker : workers_)
+      if (worker.joinable()) worker.join();
+  }
+
+  void parallel_for(size_t task_count, void *context, Task task) {
+    if (task_count == 0) return;
+    if (workers_.empty()) {
+      for (size_t task_index = 0; task_index < task_count; ++task_index)
+        task(context, task_index);
+      parallel_run_count_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    completed_.wait(lock, [this]() { return !active_; });
+    task_count_ = task_count;
+    task_context_ = context;
+    task_ = task;
+    next_task_.store(0, std::memory_order_relaxed);
+    finished_workers_ = 0;
+    active_ = true;
+    ++generation_;
+    parallel_run_count_.fetch_add(1, std::memory_order_relaxed);
+    ready_.notify_all();
+    completed_.wait(lock, [this]() { return !active_; });
+  }
+
+  size_t worker_count() const noexcept { return workers_.size(); }
+
+  uint64_t parallel_run_count() const noexcept {
+    return parallel_run_count_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  void worker_loop() noexcept {
+    uint64_t observed_generation = 0;
+    for (;;) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      ready_.wait(lock, [this, observed_generation]() {
+        return stopping_ || generation_ != observed_generation;
+      });
+      if (stopping_) return;
+      observed_generation = generation_;
+      const size_t task_count = task_count_;
+      void *context = task_context_;
+      Task task = task_;
+      lock.unlock();
+      for (;;) {
+        const size_t task_index =
+            next_task_.fetch_add(1, std::memory_order_relaxed);
+        if (task_index >= task_count) break;
+        task(context, task_index);
+      }
+      lock.lock();
+      ++finished_workers_;
+      if (finished_workers_ == workers_.size()) {
+        active_ = false;
+        completed_.notify_all();
+      }
+    }
+  }
+
+  std::vector<std::thread> workers_;
+  mutable std::mutex mutex_;
+  std::condition_variable ready_;
+  std::condition_variable completed_;
+  std::atomic<size_t> next_task_{0};
+  std::atomic<uint64_t> parallel_run_count_{0};
+  size_t task_count_ = 0;
+  void *task_context_ = nullptr;
+  Task task_ = nullptr;
+  size_t finished_workers_ = 0;
+  uint64_t generation_ = 0;
+  bool active_ = false;
+  bool stopping_ = false;
+};
+
+struct HostProfilePack {
+  int alphabet_size = 29;
+  std::vector<VitProfile> vit_profiles;
+  std::vector<uint8_t> ssv_scores;
+  std::vector<uint8_t> exact_rbv;
+  std::vector<int16_t> emissions;
+  std::vector<int16_t> transitions;
+  std::vector<plan7_ssv_profile> ssv_profiles;
+  std::vector<float> m_mu;
+  std::vector<float> m_lambda;
+  std::vector<plan7_bias_profile> bias_templates;
+  std::vector<uintptr_t> identity_tokens;
+};
+
+uint64_t host_pack_bytes(const HostProfilePack &pack) {
+  const uint64_t counts[] = {
+      static_cast<uint64_t>(pack.vit_profiles.size()) * sizeof(VitProfile),
+      static_cast<uint64_t>(pack.ssv_scores.size()),
+      static_cast<uint64_t>(pack.exact_rbv.size()),
+      static_cast<uint64_t>(pack.emissions.size()) * sizeof(int16_t),
+      static_cast<uint64_t>(pack.transitions.size()) * sizeof(int16_t),
+      static_cast<uint64_t>(pack.ssv_profiles.size()) *
+          sizeof(plan7_ssv_profile),
+      static_cast<uint64_t>(pack.m_mu.size()) * sizeof(float),
+      static_cast<uint64_t>(pack.m_lambda.size()) * sizeof(float),
+      static_cast<uint64_t>(pack.bias_templates.size()) *
+          sizeof(plan7_bias_profile),
+      static_cast<uint64_t>(pack.identity_tokens.size()) * sizeof(uintptr_t)};
+  uint64_t total = 0;
+  for (const uint64_t count : counts) {
+    if (count > UINT64_MAX - total) return UINT64_MAX;
+    total += count;
+  }
+  return total;
+}
+
+struct SnapshotTask {
+  const uintptr_t *profile_pointers;
+  HostProfilePack *pack;
+};
+
+void snapshot_profile_task(void *opaque, size_t profile_index) noexcept {
+  auto *task = static_cast<SnapshotTask *>(opaque);
+  const auto *source = reinterpret_cast<const P7_OPROFILE *>(
+      task->profile_pointers[profile_index]);
+  HostProfilePack &pack = *task->pack;
+  const VitProfile descriptor = pack.vit_profiles[profile_index];
+  const int source_q = p7O_NQW(source->M);
+  const int source_qb = std::max(2, (source->M + 15) / 16);
+  const int q_count = static_cast<int>(descriptor.q);
+  for (int q = 0; q < q_count; ++q) {
+    for (int lane = 0; lane < kWarpSize; ++lane) {
+      const int model_position = q + q_count * lane + 1;
+      if (model_position > source->M) continue;
+      const int source_stripe = (model_position - 1) % source_q;
+      const int source_lane = (model_position - 1) / source_q;
+      for (int residue = 0; residue < source->abc->Kp; ++residue) {
+        const auto *source_bytes = reinterpret_cast<const uint8_t *>(
+            source->sbv[residue] + (model_position - 1) % source_qb);
+        pack.ssv_scores[
+            descriptor.ssv_offset +
+            static_cast<uint64_t>(model_position - 1) *
+                source->abc->Kp + residue] =
+            source_bytes[(model_position - 1) / source_qb];
+        if (descriptor.rbv_offset != UINT64_MAX) {
+          const auto *source_rbv = reinterpret_cast<const uint8_t *>(
+              source->rbv[residue] + (model_position - 1) % source_qb);
+          pack.exact_rbv[
+              descriptor.rbv_offset +
+              static_cast<uint64_t>(model_position - 1) *
+                  source->abc->Kp + residue] =
+              source_rbv[(model_position - 1) / source_qb];
+        }
+        const uint64_t destination = descriptor.emission_offset +
+            (static_cast<uint64_t>(residue) * q_count + q) *
+                kWarpSize + lane;
+        const auto *source_words = reinterpret_cast<const int16_t *>(
+            source->rwv[residue] + source_stripe);
+        pack.emissions[destination] = source_words[source_lane];
+      }
+      for (int transition = p7O_BM; transition <= p7O_II; ++transition) {
+        const uint64_t destination = descriptor.transition_offset +
+            (static_cast<uint64_t>(q) * p7O_NTRANS + transition) *
+                kWarpSize + lane;
+        const auto *source_words = reinterpret_cast<const int16_t *>(
+            source->twv + source_stripe * 7 + transition);
+        pack.transitions[destination] = source_words[source_lane];
+      }
+      const uint64_t dd_destination = descriptor.transition_offset +
+          (static_cast<uint64_t>(q) * p7O_NTRANS + p7O_DD) *
+              kWarpSize + lane;
+      const auto *dd_words = reinterpret_cast<const int16_t *>(
+          source->twv + 7 * source_q + source_stripe);
+      pack.transitions[dd_destination] = dd_words[source_lane];
+    }
+  }
+}
+
+int snapshot_profiles(const uintptr_t *profile_pointers, size_t profile_count,
+                      const float *background, PackWorkerPool *workers,
+                      HostProfilePack *output, char *error,
+                      size_t error_size) {
+  if (output == nullptr || workers == nullptr ||
+      (profile_count != 0 && profile_pointers == nullptr)) {
+    set_error(error, error_size, "invalid host profile snapshot arguments");
+    return -1;
+  }
+  HostProfilePack pack;
+  uint64_t emission_total = 0;
+  uint64_t transition_total = 0;
+  uint64_t ssv_total = 0;
+  uint64_t exact_rbv_total = 0;
+  try {
+    pack.vit_profiles.resize(profile_count);
+    pack.ssv_profiles.resize(profile_count);
+    pack.m_mu.resize(profile_count);
+    pack.m_lambda.resize(profile_count);
+    if (background != nullptr) pack.bias_templates.resize(profile_count);
+  } catch (...) {
+    set_error(error, error_size, "host profile descriptor allocation failed");
+    return -1;
+  }
+
+  for (size_t p = 0; p < profile_count; ++p) {
+    const auto *source = reinterpret_cast<const P7_OPROFILE *>(
+        profile_pointers[p]);
+    if (!valid_profile_storage(source) || !valid_viterbi_specials(source) ||
+        source->abc == nullptr || source->abc->Kp != 29 ||
+        !isfinite(source->scale_b) || source->scale_b <= 0.0f ||
+        !isfinite(source->scale_w) || source->scale_w <= 0.0f ||
+        (source->mode != p7_LOCAL && source->mode != p7_UNILOCAL)) {
+      set_error(error, error_size, "invalid optimized Viterbi profile");
+      return -1;
+    }
+    const int q = (source->M + kWarpSize - 1) / kWarpSize;
+    const uint64_t emission_count =
+        static_cast<uint64_t>(source->abc->Kp) * q * kWarpSize;
+    const uint64_t ssv_count =
+        static_cast<uint64_t>(source->abc->Kp) * source->M;
+    const uint64_t transition_count =
+        static_cast<uint64_t>(q) * p7O_NTRANS * kWarpSize;
+    bool needs_exact_rbv = false;
+    const int source_qb = std::max(2, (source->M + 15) / 16);
+    for (int model_position = 0;
+         model_position < source->M && !needs_exact_rbv;
+         ++model_position) {
+      const int source_stripe = model_position % source_qb;
+      const int source_lane = model_position / source_qb;
+      for (int residue = 0; residue < source->abc->Kp; ++residue) {
+        const auto *sbv = reinterpret_cast<const uint8_t *>(
+            source->sbv[residue] + source_stripe);
+        const auto *rbv = reinterpret_cast<const uint8_t *>(
+            source->rbv[residue] + source_stripe);
+        const unsigned raw = sbv[source_lane];
+        const int signed_score = raw < 128 ? static_cast<int>(raw)
+                                           : static_cast<int>(raw) - 256;
+        const int decoded_value =
+            signed_score + static_cast<int>(source->bias_b);
+        const unsigned decoded = residue == 20 || residue == 27 ||
+                                 residue == 28
+            ? UINT8_MAX
+            : static_cast<unsigned>(decoded_value < 0 ? 0 :
+                                    (decoded_value > 255 ? 255 :
+                                     decoded_value));
+        if (decoded != rbv[source_lane]) {
+          needs_exact_rbv = true;
+          break;
+        }
+      }
+    }
+    const uint64_t exact_rbv_count = needs_exact_rbv ? ssv_count : 0;
+    if (!checked_add(ssv_total, ssv_count, &ssv_total) ||
+        !checked_add(exact_rbv_total, exact_rbv_count, &exact_rbv_total) ||
+        !checked_add(emission_total, emission_count, &emission_total) ||
+        !checked_add(transition_total, transition_count, &transition_total) ||
+        ssv_total > SIZE_MAX || exact_rbv_total > SIZE_MAX ||
+        emission_total > SIZE_MAX || transition_total > SIZE_MAX) {
+      set_error(error, error_size, "Viterbi packed profile size overflow");
+      return -1;
+    }
+    VitProfile descriptor{};
+    descriptor.ssv_offset = ssv_total - ssv_count;
+    descriptor.rbv_offset = needs_exact_rbv
+        ? exact_rbv_total - exact_rbv_count
+        : UINT64_MAX;
+    descriptor.emission_offset = emission_total - emission_count;
+    descriptor.transition_offset = transition_total - transition_count;
+    descriptor.q = static_cast<uint32_t>(q);
+    descriptor.model_length = static_cast<uint32_t>(source->M);
+    descriptor.mode = source->mode;
+    descriptor.base = source->base_w;
+    descriptor.ddbound = source->ddbound_w;
+    descriptor.e_move = source->xw[p7O_E][p7O_MOVE];
+    descriptor.e_loop = source->xw[p7O_E][p7O_LOOP];
+    descriptor.n_loop = source->xw[p7O_N][p7O_LOOP];
+    descriptor.j_loop = source->xw[p7O_J][p7O_LOOP];
+    descriptor.c_loop = source->xw[p7O_C][p7O_LOOP];
+    descriptor.scale = source->scale_w;
+    descriptor.nj = source->nj;
+    descriptor.msv_tbm = source->tbm_b;
+    descriptor.msv_tec = source->tec_b;
+    descriptor.msv_base = source->base_b;
+    descriptor.msv_bias = source->bias_b;
+    descriptor.msv_scale = source->scale_b;
+    pack.vit_profiles[p] = descriptor;
+    pack.ssv_profiles[p] = {
+        descriptor.ssv_offset, ssv_count, 29, source->M,
+        source->tbm_b, source->tec_b, source->base_b, source->bias_b,
+        source->scale_b};
+    pack.m_mu[p] = source->evparam[p7_MMU];
+    pack.m_lambda[p] = source->evparam[p7_MLAMBDA];
+    if (background != nullptr &&
+        plan7_bias_pack_amino_profile(
+            background, source->compo, source->M, source->scale_b,
+            PLAN7_BIAS_CUTOFF_INVALID, NAN, &pack.bias_templates[p],
+            error, error_size) != 0)
+      return -1;
+  }
+
+  try {
+    pack.ssv_scores.resize(static_cast<size_t>(ssv_total));
+    pack.exact_rbv.resize(static_cast<size_t>(exact_rbv_total));
+    pack.emissions.assign(static_cast<size_t>(emission_total),
+                          static_cast<int16_t>(kNegInf));
+    pack.transitions.assign(static_cast<size_t>(transition_total),
+                            static_cast<int16_t>(kNegInf));
+  } catch (...) {
+    set_error(error, error_size, "Viterbi packed data allocation failed");
+    return -1;
+  }
+  SnapshotTask task{profile_pointers, &pack};
+  workers->parallel_for(profile_count, &task, snapshot_profile_task);
+  *output = std::move(pack);
+  return 0;
+}
+
+struct SelectionCopyTask {
+  const HostProfilePack *source;
+  HostProfilePack *destination;
+  const size_t *indices;
+};
+
+void copy_selection_profile(void *opaque, size_t output_index) noexcept {
+  auto *task = static_cast<SelectionCopyTask *>(opaque);
+  const HostProfilePack &source = *task->source;
+  HostProfilePack &destination = *task->destination;
+  const size_t source_index = task->indices[output_index];
+  const VitProfile &from = source.vit_profiles[source_index];
+  const VitProfile &to = destination.vit_profiles[output_index];
+  const size_t ssv_count =
+      static_cast<size_t>(to.model_length) * destination.alphabet_size;
+  const size_t emission_count = static_cast<size_t>(to.q) * kWarpSize *
+                                destination.alphabet_size;
+  const size_t transition_count =
+      static_cast<size_t>(to.q) * kWarpSize * p7O_NTRANS;
+  std::memcpy(destination.ssv_scores.data() + to.ssv_offset,
+              source.ssv_scores.data() + from.ssv_offset, ssv_count);
+  if (to.rbv_offset != UINT64_MAX)
+    std::memcpy(destination.exact_rbv.data() + to.rbv_offset,
+                source.exact_rbv.data() + from.rbv_offset, ssv_count);
+  std::memcpy(destination.emissions.data() + to.emission_offset,
+              source.emissions.data() + from.emission_offset,
+              emission_count * sizeof(int16_t));
+  std::memcpy(destination.transitions.data() + to.transition_offset,
+              source.transitions.data() + from.transition_offset,
+              transition_count * sizeof(int16_t));
+}
+
+std::atomic<uint64_t> next_profile_session_id{1};
+std::atomic<uint64_t> next_profile_identity_token{1};
+
+bool claim_profile_session_id(uint64_t *session_id) {
+  uint64_t current = next_profile_session_id.load(std::memory_order_relaxed);
+  while (current != 0) {
+    const uint64_t next = current == UINT64_MAX ? 0 : current + 1;
+    if (next_profile_session_id.compare_exchange_weak(
+          current, next, std::memory_order_relaxed,
+          std::memory_order_relaxed)) {
+      *session_id = current;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool claim_profile_identity_tokens(size_t token_count,
+                                   uint64_t *first_token) {
+  if (token_count == 0) {
+    *first_token = 0;
+    return true;
+  }
+  const uint64_t count = static_cast<uint64_t>(token_count);
+  if (static_cast<size_t>(count) != token_count) return false;
+  uint64_t current = next_profile_identity_token.load(
+      std::memory_order_relaxed);
+  while (current != 0) {
+    if (count - 1 > UINT64_MAX - current) return false;
+    const uint64_t last = current + count - 1;
+    const uint64_t next = last == UINT64_MAX ? 0 : last + 1;
+    if (next_profile_identity_token.compare_exchange_weak(
+          current, next, std::memory_order_relaxed,
+          std::memory_order_relaxed)) {
+      *first_token = current;
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 struct plan7_viterbi_database {
   int device_ordinal;
   int alphabet_size;
+  bool sealed_source;
   std::vector<VitProfile> host_profiles;
   std::vector<uintptr_t> source_profile_pointers;
+  std::vector<uintptr_t> source_alphabet_pointers;
   std::vector<uint8_t> host_ssv_scores;
   std::vector<uint8_t> host_exact_rbv;
   std::vector<int16_t> host_emissions;
   std::vector<int16_t> host_transitions;
+  std::shared_ptr<const HostProfilePack> sealed_pack;
   VitProfile *device_profiles;
   int16_t *device_emissions;
   int16_t *device_transitions;
@@ -590,6 +1018,20 @@ struct plan7_viterbi_database {
   size_t emission_count;
   size_t transition_count;
   size_t exact_rbv_count;
+};
+
+struct plan7_profile_session {
+  uint64_t session_id;
+  uint64_t selection_count;
+  std::shared_ptr<const HostProfilePack> pack;
+  std::unique_ptr<PackWorkerPool> workers;
+  std::mutex operation_mutex;
+};
+
+struct plan7_profile_selection {
+  uint64_t session_id;
+  uint64_t selection_id;
+  std::shared_ptr<const HostProfilePack> pack;
 };
 
 struct plan7_postfilter_workspace {
@@ -622,6 +1064,41 @@ struct plan7_postfilter_workspace {
 };
 
 namespace {
+
+const std::vector<VitProfile> &database_host_profiles(
+    const plan7_viterbi_database *database) {
+  return database->sealed_pack != nullptr
+      ? database->sealed_pack->vit_profiles
+      : database->host_profiles;
+}
+
+const std::vector<uint8_t> &database_host_ssv_scores(
+    const plan7_viterbi_database *database) {
+  return database->sealed_pack != nullptr
+      ? database->sealed_pack->ssv_scores
+      : database->host_ssv_scores;
+}
+
+const std::vector<uint8_t> &database_host_exact_rbv(
+    const plan7_viterbi_database *database) {
+  return database->sealed_pack != nullptr
+      ? database->sealed_pack->exact_rbv
+      : database->host_exact_rbv;
+}
+
+const std::vector<int16_t> &database_host_emissions(
+    const plan7_viterbi_database *database) {
+  return database->sealed_pack != nullptr
+      ? database->sealed_pack->emissions
+      : database->host_emissions;
+}
+
+const std::vector<int16_t> &database_host_transitions(
+    const plan7_viterbi_database *database) {
+  return database->sealed_pack != nullptr
+      ? database->sealed_pack->transitions
+      : database->host_transitions;
+}
 
 template <typename T>
 int grow_workspace_buffer(T **buffer, size_t *capacity, size_t required_bytes,
@@ -722,13 +1199,18 @@ int destroy_postfilter_workspace_device(plan7_postfilter_workspace *workspace,
 
 bool live_profile_matches_snapshot(const plan7_viterbi_database *database,
                                    size_t profile_index) {
+  if (database->sealed_source) return true;
   const auto *source = reinterpret_cast<const P7_OPROFILE *>(
       database->source_profile_pointers[profile_index]);
-  const VitProfile &descriptor = database->host_profiles[profile_index];
+  const VitProfile &descriptor = database_host_profiles(database)[profile_index];
+  const auto &host_scores = database_host_ssv_scores(database);
+  const auto &host_exact_rbv = database_host_exact_rbv(database);
+  const auto &host_emissions = database_host_emissions(database);
+  const auto &host_transitions = database_host_transitions(database);
   if (!valid_profile_storage(source) || !valid_viterbi_specials(source) ||
       source->abc->Kp != database->alphabet_size ||
       reinterpret_cast<uintptr_t>(source->abc) !=
-          descriptor.alphabet_pointer ||
+          database->source_alphabet_pointers[profile_index] ||
       source->M != static_cast<int>(descriptor.model_length) ||
       source->mode != descriptor.mode ||
       source->tbm_b != descriptor.msv_tbm ||
@@ -770,14 +1252,14 @@ bool live_profile_matches_snapshot(const plan7_viterbi_database *database,
         const auto *source_rbv = reinterpret_cast<const uint8_t *>(
             source->rbv[residue] + source_byte_stripe);
         if (source_sbv[source_byte_lane] !=
-            database->host_ssv_scores[ssv_index])
+            host_scores[ssv_index])
           return false;
         if (descriptor.rbv_offset != UINT64_MAX) {
           const uint64_t rbv_index = descriptor.rbv_offset +
               static_cast<uint64_t>(model_position - 1) *
                   source->abc->Kp + residue;
           if (source_rbv[source_byte_lane] !=
-              database->host_exact_rbv[rbv_index])
+              host_exact_rbv[rbv_index])
             return false;
         } else {
           const unsigned raw = source_sbv[source_byte_lane];
@@ -799,7 +1281,7 @@ bool live_profile_matches_snapshot(const plan7_viterbi_database *database,
         const auto *source_words = reinterpret_cast<const int16_t *>(
             source->rwv[residue] + source_word_stripe);
         if (source_words[source_word_lane] !=
-            database->host_emissions[emission_index])
+            host_emissions[emission_index])
           return false;
       }
       for (int transition = p7O_BM; transition <= p7O_II;
@@ -810,7 +1292,7 @@ bool live_profile_matches_snapshot(const plan7_viterbi_database *database,
         const auto *source_words = reinterpret_cast<const int16_t *>(
             source->twv + source_word_stripe * 7 + transition);
         if (source_words[source_word_lane] !=
-            database->host_transitions[transition_index])
+            host_transitions[transition_index])
           return false;
       }
       const uint64_t dd_index = descriptor.transition_offset +
@@ -819,12 +1301,94 @@ bool live_profile_matches_snapshot(const plan7_viterbi_database *database,
       const auto *dd_words = reinterpret_cast<const int16_t *>(
           source->twv + 7 * source_qw + source_word_stripe);
       if (dd_words[source_word_lane] !=
-          database->host_transitions[dd_index])
+          host_transitions[dd_index])
         return false;
     }
   }
   return true;
 }
+
+namespace {
+
+void initialize_viterbi_database(plan7_viterbi_database *database) {
+  database->device_ordinal = -1;
+  database->alphabet_size = 29;
+  database->sealed_source = false;
+  database->device_profiles = nullptr;
+  database->device_emissions = nullptr;
+  database->device_transitions = nullptr;
+  database->device_exact_rbv = nullptr;
+  database->emission_count = 0;
+  database->transition_count = 0;
+  database->exact_rbv_count = 0;
+}
+
+void release_partial_viterbi_upload(plan7_viterbi_database *database) {
+  cudaFree(database->device_exact_rbv);
+  cudaFree(database->device_transitions);
+  cudaFree(database->device_emissions);
+  cudaFree(database->device_profiles);
+  database->device_exact_rbv = nullptr;
+  database->device_transitions = nullptr;
+  database->device_emissions = nullptr;
+  database->device_profiles = nullptr;
+}
+
+int upload_viterbi_database(plan7_viterbi_database *database, char *error,
+                            size_t error_size) {
+  int current_device = -1;
+  cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  database->device_ordinal = current_device;
+  const auto &profiles = database_host_profiles(database);
+  const auto &emissions = database_host_emissions(database);
+  const auto &transitions = database_host_transitions(database);
+  const auto &exact_rbv = database_host_exact_rbv(database);
+  database->emission_count = emissions.size();
+  database->transition_count = transitions.size();
+  database->exact_rbv_count = exact_rbv.size();
+  if (profiles.empty()) return 0;
+
+  size_t profile_bytes;
+  size_t emission_bytes;
+  size_t transition_bytes;
+  if (!checked_bytes(profiles.size(), sizeof(VitProfile), &profile_bytes) ||
+      !checked_bytes(emissions.size(), sizeof(int16_t), &emission_bytes) ||
+      !checked_bytes(transitions.size(), sizeof(int16_t), &transition_bytes)) {
+    set_error(error, error_size, "Viterbi device allocation size overflow");
+    return -1;
+  }
+#define CUDA_UPLOAD(call)                                                     \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, #call, status);                       \
+      release_partial_viterbi_upload(database);                               \
+      return -1;                                                              \
+    }                                                                         \
+  } while (0)
+  CUDA_UPLOAD(cudaMalloc(&database->device_profiles, profile_bytes));
+  CUDA_UPLOAD(cudaMalloc(&database->device_emissions, emission_bytes));
+  CUDA_UPLOAD(cudaMalloc(&database->device_transitions, transition_bytes));
+  if (!exact_rbv.empty())
+    CUDA_UPLOAD(cudaMalloc(&database->device_exact_rbv, exact_rbv.size()));
+  CUDA_UPLOAD(cudaMemcpy(database->device_profiles, profiles.data(),
+                         profile_bytes, cudaMemcpyHostToDevice));
+  CUDA_UPLOAD(cudaMemcpy(database->device_emissions, emissions.data(),
+                         emission_bytes, cudaMemcpyHostToDevice));
+  CUDA_UPLOAD(cudaMemcpy(database->device_transitions, transitions.data(),
+                         transition_bytes, cudaMemcpyHostToDevice));
+  if (!exact_rbv.empty())
+    CUDA_UPLOAD(cudaMemcpy(database->device_exact_rbv, exact_rbv.data(),
+                           exact_rbv.size(), cudaMemcpyHostToDevice));
+#undef CUDA_UPLOAD
+  return 0;
+}
+
+}  // namespace
 
 extern "C" int plan7_viterbi_database_create(
     const uintptr_t *profile_pointers, size_t profile_count,
@@ -834,313 +1398,51 @@ extern "C" int plan7_viterbi_database_create(
     set_error(error, error_size, "invalid Viterbi database arguments");
     return -1;
   }
-  int current_device = -1;
-  cudaError_t status = cudaGetDevice(&current_device);
-  if (status != cudaSuccess) {
-    set_cuda_error(error, error_size, "cudaGetDevice", status);
+  std::unique_ptr<PackWorkerPool> workers;
+  try {
+    workers = std::make_unique<PackWorkerPool>(
+        std::min<size_t>(16, profile_count));
+  } catch (...) {
+    set_error(error, error_size, "Viterbi profile worker launch failed");
     return -1;
   }
+  HostProfilePack pack;
+  if (snapshot_profiles(profile_pointers, profile_count, nullptr,
+                        workers.get(), &pack, error, error_size) != 0)
+    return -1;
   auto *created = new (std::nothrow) plan7_viterbi_database{};
   if (created == nullptr) {
     set_error(error, error_size, "Viterbi database allocation failed");
     return -1;
   }
-  created->device_ordinal = current_device;
-  created->alphabet_size = -1;
-  created->device_profiles = nullptr;
-  created->device_emissions = nullptr;
-  created->device_transitions = nullptr;
-  created->device_exact_rbv = nullptr;
-  created->emission_count = 0;
-  created->transition_count = 0;
-  created->exact_rbv_count = 0;
+  initialize_viterbi_database(created);
   try {
-    created->host_profiles.resize(profile_count);
-    if (profile_count != 0)
+    created->host_profiles = std::move(pack.vit_profiles);
+    created->host_ssv_scores = std::move(pack.ssv_scores);
+    created->host_exact_rbv = std::move(pack.exact_rbv);
+    created->host_emissions = std::move(pack.emissions);
+    created->host_transitions = std::move(pack.transitions);
+    if (profile_count != 0) {
       created->source_profile_pointers.assign(
           profile_pointers, profile_pointers + profile_count);
+      created->source_alphabet_pointers.resize(profile_count);
+      for (size_t profile_index = 0; profile_index < profile_count;
+           ++profile_index) {
+        const auto *source = reinterpret_cast<const P7_OPROFILE *>(
+            profile_pointers[profile_index]);
+        created->source_alphabet_pointers[profile_index] =
+            reinterpret_cast<uintptr_t>(source->abc);
+      }
+    }
   } catch (...) {
     delete created;
     set_error(error, error_size, "Viterbi descriptor allocation failed");
     return -1;
   }
-
-  uint64_t emission_total = 0;
-  uint64_t transition_total = 0;
-  uint64_t ssv_total = 0;
-  uint64_t exact_rbv_total = 0;
-  for (size_t p = 0; p < profile_count; ++p) {
-    const auto *source = reinterpret_cast<const P7_OPROFILE *>(
-        profile_pointers[p]);
-    if (!valid_profile_storage(source) || !valid_viterbi_specials(source) ||
-        source->abc == nullptr || source->abc->Kp != 29 ||
-        !isfinite(source->scale_b) || source->scale_b <= 0.0f ||
-        !isfinite(source->scale_w) || source->scale_w <= 0.0f ||
-        (source->mode != p7_LOCAL && source->mode != p7_UNILOCAL)) {
-      delete created;
-      set_error(error, error_size, "invalid optimized Viterbi profile");
-      return -1;
-    }
-    for (int residue = 0; residue < source->abc->Kp; ++residue) {
-      if (source->sbv[residue] == nullptr ||
-          source->rbv[residue] == nullptr ||
-          source->rwv[residue] == nullptr) {
-        delete created;
-        set_error(error, error_size,
-                  "optimized Viterbi profile has null score rows");
-        return -1;
-      }
-    }
-    if (created->alphabet_size < 0)
-      created->alphabet_size = source->abc->Kp;
-    else if (created->alphabet_size != source->abc->Kp) {
-      delete created;
-      set_error(error, error_size, "Viterbi profile alphabets differ");
-      return -1;
-    }
-    const int q = (source->M + kWarpSize - 1) / kWarpSize;
-    const uint64_t emission_count =
-        static_cast<uint64_t>(source->abc->Kp) * q * kWarpSize;
-    const uint64_t ssv_count =
-        static_cast<uint64_t>(source->abc->Kp) * source->M;
-    const uint64_t transition_count =
-        static_cast<uint64_t>(q) * p7O_NTRANS * kWarpSize;
-    bool needs_exact_rbv = false;
-    const int source_qb = std::max(2, (source->M + 15) / 16);
-    for (int model_position = 0;
-         model_position < source->M && !needs_exact_rbv;
-         ++model_position) {
-      const int source_stripe = model_position % source_qb;
-      const int source_lane = model_position / source_qb;
-      for (int residue = 0; residue < source->abc->Kp; ++residue) {
-        const auto *sbv = reinterpret_cast<const uint8_t *>(
-            source->sbv[residue] + source_stripe);
-        const auto *rbv = reinterpret_cast<const uint8_t *>(
-            source->rbv[residue] + source_stripe);
-        const unsigned raw = sbv[source_lane];
-        const int signed_score = raw < 128 ? static_cast<int>(raw)
-                                           : static_cast<int>(raw) - 256;
-        const int decoded_value =
-            signed_score + static_cast<int>(source->bias_b);
-        const unsigned decoded = residue == 20 || residue == 27 ||
-                                 residue == 28
-            ? UINT8_MAX
-            : static_cast<unsigned>(decoded_value < 0 ? 0 :
-                                    (decoded_value > 255 ? 255 :
-                                     decoded_value));
-        if (decoded != rbv[source_lane]) {
-          needs_exact_rbv = true;
-          break;
-        }
-      }
-    }
-    const uint64_t exact_rbv_count = needs_exact_rbv ? ssv_count : 0;
-    if (!checked_add(ssv_total, ssv_count, &ssv_total) ||
-        !checked_add(exact_rbv_total, exact_rbv_count, &exact_rbv_total) ||
-        !checked_add(emission_total, emission_count, &emission_total) ||
-        !checked_add(transition_total, transition_count, &transition_total) ||
-        ssv_total > SIZE_MAX || exact_rbv_total > SIZE_MAX ||
-        emission_total > SIZE_MAX ||
-        transition_total > SIZE_MAX) {
-      delete created;
-      set_error(error, error_size, "Viterbi packed profile size overflow");
-      return -1;
-    }
-    VitProfile descriptor{};
-    descriptor.ssv_offset = ssv_total - ssv_count;
-    descriptor.rbv_offset = needs_exact_rbv
-        ? exact_rbv_total - exact_rbv_count
-        : UINT64_MAX;
-    descriptor.emission_offset = emission_total - emission_count;
-    descriptor.transition_offset = transition_total - transition_count;
-    descriptor.q = static_cast<uint32_t>(q);
-    descriptor.model_length = static_cast<uint32_t>(source->M);
-    descriptor.mode = source->mode;
-    descriptor.base = source->base_w;
-    descriptor.ddbound = source->ddbound_w;
-    descriptor.e_move = source->xw[p7O_E][p7O_MOVE];
-    descriptor.e_loop = source->xw[p7O_E][p7O_LOOP];
-    descriptor.n_loop = source->xw[p7O_N][p7O_LOOP];
-    descriptor.j_loop = source->xw[p7O_J][p7O_LOOP];
-    descriptor.c_loop = source->xw[p7O_C][p7O_LOOP];
-    descriptor.scale = source->scale_w;
-    descriptor.nj = source->nj;
-    descriptor.msv_tbm = source->tbm_b;
-    descriptor.msv_tec = source->tec_b;
-    descriptor.msv_base = source->base_b;
-    descriptor.msv_bias = source->bias_b;
-    descriptor.msv_scale = source->scale_b;
-    descriptor.alphabet_pointer = reinterpret_cast<uintptr_t>(source->abc);
-    created->host_profiles[p] = descriptor;
-  }
-  created->emission_count = static_cast<size_t>(emission_total);
-  created->transition_count = static_cast<size_t>(transition_total);
-  created->exact_rbv_count = static_cast<size_t>(exact_rbv_total);
-  try {
-    created->host_ssv_scores.resize(static_cast<size_t>(ssv_total));
-    created->host_exact_rbv.resize(created->exact_rbv_count);
-    created->host_emissions.assign(
-        created->emission_count, static_cast<int16_t>(kNegInf));
-    created->host_transitions.assign(
-        created->transition_count, static_cast<int16_t>(kNegInf));
-  } catch (...) {
+  if (upload_viterbi_database(created, error, error_size) != 0) {
     delete created;
-    set_error(error, error_size, "Viterbi packed data allocation failed");
     return -1;
   }
-
-  std::atomic<size_t> next_profile{0};
-  std::atomic<unsigned> completed_workers{0};
-  const unsigned thread_count = static_cast<unsigned>(std::min<size_t>(
-      16, std::max<size_t>(1, profile_count)));
-  auto worker = [&]() {
-    while (true) {
-      const size_t p = next_profile.fetch_add(1, std::memory_order_relaxed);
-      if (p >= profile_count) break;
-      const auto *source = reinterpret_cast<const P7_OPROFILE *>(
-          profile_pointers[p]);
-      const int source_q = p7O_NQW(source->M);
-      const int source_qb = std::max(2, (source->M + 15) / 16);
-      const VitProfile descriptor = created->host_profiles[p];
-      const int q_count = static_cast<int>(descriptor.q);
-      for (int q = 0; q < q_count; ++q) {
-        for (int lane = 0; lane < kWarpSize; ++lane) {
-          const int model_position = q + q_count * lane + 1;
-          if (model_position > source->M) continue;
-          const int source_stripe = (model_position - 1) % source_q;
-          const int source_lane = (model_position - 1) / source_q;
-          for (int residue = 0; residue < source->abc->Kp; ++residue) {
-            const auto *source_bytes = reinterpret_cast<const uint8_t *>(
-                source->sbv[residue] +
-                (model_position - 1) % source_qb);
-            created->host_ssv_scores[
-                descriptor.ssv_offset +
-                static_cast<uint64_t>(model_position - 1) *
-                    source->abc->Kp + residue] =
-                source_bytes[(model_position - 1) / source_qb];
-            if (descriptor.rbv_offset != UINT64_MAX) {
-              const auto *source_rbv = reinterpret_cast<const uint8_t *>(
-                  source->rbv[residue] +
-                  (model_position - 1) % source_qb);
-              created->host_exact_rbv[
-                  descriptor.rbv_offset +
-                  static_cast<uint64_t>(model_position - 1) *
-                      source->abc->Kp + residue] =
-                  source_rbv[(model_position - 1) / source_qb];
-            }
-            const uint64_t destination = descriptor.emission_offset +
-                (static_cast<uint64_t>(residue) * q_count + q) *
-                    kWarpSize + lane;
-            const auto *source_words = reinterpret_cast<const int16_t *>(
-                source->rwv[residue] + source_stripe);
-            created->host_emissions[destination] = source_words[source_lane];
-          }
-          for (int transition = p7O_BM; transition <= p7O_II;
-               ++transition) {
-            const uint64_t destination = descriptor.transition_offset +
-                (static_cast<uint64_t>(q) * p7O_NTRANS + transition) *
-                    kWarpSize + lane;
-            const auto *source_words = reinterpret_cast<const int16_t *>(
-                source->twv + source_stripe * 7 + transition);
-            created->host_transitions[destination] = source_words[source_lane];
-          }
-          const uint64_t dd_destination = descriptor.transition_offset +
-              (static_cast<uint64_t>(q) * p7O_NTRANS + p7O_DD) *
-                  kWarpSize + lane;
-          const auto *dd_words = reinterpret_cast<const int16_t *>(
-              source->twv + 7 * source_q + source_stripe);
-          created->host_transitions[dd_destination] = dd_words[source_lane];
-        }
-      }
-    }
-    completed_workers.fetch_add(1, std::memory_order_release);
-  };
-  std::vector<std::thread> workers;
-  bool worker_failure = false;
-  try {
-    workers.reserve(thread_count);
-    for (unsigned thread = 0; thread < thread_count; ++thread)
-      workers.emplace_back(worker);
-  } catch (...) {
-    worker_failure = true;
-  }
-  for (auto &thread : workers) {
-    try {
-      thread.join();
-    } catch (...) {
-      worker_failure = true;
-      if (thread.joinable()) {
-        try {
-          thread.detach();
-        } catch (...) {
-          worker_failure = true;
-        }
-      }
-    }
-  }
-  while (completed_workers.load(std::memory_order_acquire) < workers.size())
-    std::this_thread::yield();
-  if (worker_failure || workers.size() != thread_count) {
-    delete created;
-    set_error(error, error_size, "Viterbi profile worker launch failed");
-    return -1;
-  }
-
-#define CUDA_CREATE(call)                                                     \
-  do {                                                                        \
-    status = (call);                                                          \
-    if (status != cudaSuccess) {                                              \
-      set_cuda_error(error, error_size, #call, status);                       \
-      cudaFree(created->device_transitions);                                  \
-      cudaFree(created->device_exact_rbv);                                    \
-      cudaFree(created->device_emissions);                                    \
-      cudaFree(created->device_profiles);                                     \
-      delete created;                                                         \
-      return -1;                                                              \
-    }                                                                         \
-  } while (0)
-
-  if (profile_count != 0) {
-    size_t profile_bytes;
-    size_t emission_bytes;
-    size_t transition_bytes;
-    if (!checked_bytes(profile_count, sizeof(VitProfile), &profile_bytes) ||
-        !checked_bytes(created->emission_count, sizeof(int16_t),
-                       &emission_bytes) ||
-        !checked_bytes(created->transition_count, sizeof(int16_t),
-                       &transition_bytes)) {
-      delete created;
-      set_error(error, error_size, "Viterbi device allocation size overflow");
-      return -1;
-    }
-    CUDA_CREATE(cudaMalloc(&created->device_profiles,
-                           profile_bytes));
-    CUDA_CREATE(cudaMalloc(&created->device_emissions,
-                           emission_bytes));
-    CUDA_CREATE(cudaMalloc(&created->device_transitions,
-                           transition_bytes));
-    if (created->exact_rbv_count != 0)
-      CUDA_CREATE(cudaMalloc(&created->device_exact_rbv,
-                             created->exact_rbv_count));
-    CUDA_CREATE(cudaMemcpy(created->device_profiles,
-                           created->host_profiles.data(),
-                           profile_bytes,
-                           cudaMemcpyHostToDevice));
-    CUDA_CREATE(cudaMemcpy(created->device_emissions,
-                           created->host_emissions.data(),
-                           emission_bytes,
-                           cudaMemcpyHostToDevice));
-    CUDA_CREATE(cudaMemcpy(created->device_transitions,
-                           created->host_transitions.data(),
-                           transition_bytes,
-                           cudaMemcpyHostToDevice));
-    if (created->exact_rbv_count != 0)
-      CUDA_CREATE(cudaMemcpy(created->device_exact_rbv,
-                             created->host_exact_rbv.data(),
-                             created->exact_rbv_count,
-                             cudaMemcpyHostToDevice));
-  }
-#undef CUDA_CREATE
   *database = created;
   return 0;
 }
@@ -1203,7 +1505,313 @@ extern "C" int plan7_viterbi_database_destroy(
 
 extern "C" size_t plan7_viterbi_database_profile_count(
     const plan7_viterbi_database *database) {
-  return database == nullptr ? 0 : database->host_profiles.size();
+  return database == nullptr ? 0 : database_host_profiles(database).size();
+}
+
+extern "C" int plan7_profile_session_create(
+    const uintptr_t *profile_pointers, size_t profile_count,
+    const float *background, size_t background_count,
+    plan7_profile_session **session, char *error, size_t error_size) {
+  if (session == nullptr || *session != nullptr || background == nullptr ||
+      background_count != 20 ||
+      (profile_count != 0 && profile_pointers == nullptr)) {
+    set_error(error, error_size, "invalid profile session arguments");
+    return -1;
+  }
+  if (plan7_bias_host_environment_attested() != 1) {
+    set_error(error, error_size,
+              "profile session requires the attested host environment");
+    return -1;
+  }
+  for (size_t residue = 0; residue < background_count; ++residue) {
+    if (!isfinite(background[residue]) || background[residue] <= 0.0f) {
+      set_error(error, error_size, "invalid profile session background");
+      return -1;
+    }
+  }
+
+  std::unique_ptr<PackWorkerPool> workers;
+  try {
+    workers = std::make_unique<PackWorkerPool>(
+        std::min<size_t>(16, profile_count));
+  } catch (...) {
+    set_error(error, error_size, "profile session worker launch failed");
+    return -1;
+  }
+  HostProfilePack pack;
+  if (snapshot_profiles(profile_pointers, profile_count, background,
+                        workers.get(), &pack, error, error_size) != 0)
+    return -1;
+
+  uint64_t session_id;
+  if (!claim_profile_session_id(&session_id)) {
+    set_error(error, error_size, "profile session identity exhausted");
+    return -1;
+  }
+  uint64_t first_identity_token;
+  if (!claim_profile_identity_tokens(profile_count, &first_identity_token)) {
+    set_error(error, error_size, "profile identity token space exhausted");
+    return -1;
+  }
+  try {
+    pack.identity_tokens.resize(profile_count);
+    for (size_t profile_index = 0; profile_index < profile_count;
+         ++profile_index)
+      pack.identity_tokens[profile_index] =
+          static_cast<uintptr_t>(first_identity_token + profile_index);
+  } catch (...) {
+    set_error(error, error_size, "profile session identity allocation failed");
+    return -1;
+  }
+
+  auto *created = new (std::nothrow) plan7_profile_session{};
+  if (created == nullptr) {
+    set_error(error, error_size, "profile session allocation failed");
+    return -1;
+  }
+  try {
+    created->session_id = session_id;
+    created->selection_count = 0;
+    created->pack = std::make_shared<const HostProfilePack>(std::move(pack));
+    created->workers = std::move(workers);
+  } catch (...) {
+    delete created;
+    set_error(error, error_size, "profile session allocation failed");
+    return -1;
+  }
+  *session = created;
+  return 0;
+}
+
+extern "C" int plan7_profile_session_destroy(
+    plan7_profile_session **session, char *error, size_t error_size) {
+  if (session == nullptr) {
+    set_error(error, error_size, "profile session handle is null");
+    return -1;
+  }
+  plan7_profile_session *value = *session;
+  *session = nullptr;
+  delete value;
+  return 0;
+}
+
+extern "C" int plan7_profile_session_get_statistics(
+    const plan7_profile_session *session,
+    plan7_profile_session_statistics *statistics,
+    char *error, size_t error_size) {
+  if (session == nullptr || statistics == nullptr || session->pack == nullptr ||
+      session->workers == nullptr) {
+    set_error(error, error_size, "invalid profile session statistics");
+    return -1;
+  }
+  const HostProfilePack &pack = *session->pack;
+  *statistics = {};
+  statistics->session_id = session->session_id;
+  statistics->profile_count = pack.vit_profiles.size();
+  statistics->worker_count = session->workers->worker_count();
+  statistics->selection_count = session->selection_count;
+  statistics->parallel_run_count = session->workers->parallel_run_count();
+  statistics->host_bytes = host_pack_bytes(pack);
+  statistics->ssv_score_bytes = pack.ssv_scores.size();
+  statistics->bias_profile_bytes =
+      static_cast<uint64_t>(pack.bias_templates.size()) *
+      sizeof(plan7_bias_profile);
+  statistics->viterbi_descriptor_bytes =
+      static_cast<uint64_t>(pack.vit_profiles.size()) * sizeof(VitProfile);
+  statistics->viterbi_emission_bytes =
+      static_cast<uint64_t>(pack.emissions.size()) * sizeof(int16_t);
+  statistics->viterbi_transition_bytes =
+      static_cast<uint64_t>(pack.transitions.size()) * sizeof(int16_t);
+  statistics->viterbi_exact_rbv_bytes = pack.exact_rbv.size();
+  return 0;
+}
+
+extern "C" int plan7_profile_session_select(
+    plan7_profile_session *session, const size_t *profile_indices,
+    size_t profile_count, plan7_profile_selection **selection,
+    char *error, size_t error_size) {
+  if (session == nullptr || session->pack == nullptr ||
+      session->workers == nullptr || selection == nullptr ||
+      *selection != nullptr ||
+      (profile_count != 0 && profile_indices == nullptr)) {
+    set_error(error, error_size, "invalid profile selection arguments");
+    return -1;
+  }
+  std::lock_guard<std::mutex> operation(session->operation_mutex);
+  const HostProfilePack &source = *session->pack;
+  HostProfilePack selected;
+  selected.alphabet_size = source.alphabet_size;
+  std::vector<uint8_t> seen;
+  uint64_t ssv_total = 0;
+  uint64_t rbv_total = 0;
+  uint64_t emission_total = 0;
+  uint64_t transition_total = 0;
+  try {
+    seen.assign(source.vit_profiles.size(), 0);
+    selected.vit_profiles.resize(profile_count);
+    selected.ssv_profiles.resize(profile_count);
+    selected.m_mu.resize(profile_count);
+    selected.m_lambda.resize(profile_count);
+    selected.bias_templates.resize(profile_count);
+    selected.identity_tokens.resize(profile_count);
+  } catch (...) {
+    set_error(error, error_size, "profile selection allocation failed");
+    return -1;
+  }
+
+  for (size_t output_index = 0; output_index < profile_count;
+       ++output_index) {
+    const size_t source_index = profile_indices[output_index];
+    if (source_index >= source.vit_profiles.size()) {
+      set_error(error, error_size, "profile selection index is out of range");
+      return -1;
+    }
+    if (seen[source_index] != 0) {
+      set_error(error, error_size, "profile selection indexes must be unique");
+      return -1;
+    }
+    seen[source_index] = 1;
+    const VitProfile &from = source.vit_profiles[source_index];
+    const uint64_t ssv_count =
+        static_cast<uint64_t>(from.model_length) * source.alphabet_size;
+    const uint64_t rbv_count =
+        from.rbv_offset == UINT64_MAX ? 0 : ssv_count;
+    const uint64_t emission_count =
+        static_cast<uint64_t>(from.q) * kWarpSize * source.alphabet_size;
+    const uint64_t transition_count =
+        static_cast<uint64_t>(from.q) * kWarpSize * p7O_NTRANS;
+    VitProfile to = from;
+    to.ssv_offset = ssv_total;
+    to.rbv_offset = rbv_count == 0 ? UINT64_MAX : rbv_total;
+    to.emission_offset = emission_total;
+    to.transition_offset = transition_total;
+    if (!checked_add(ssv_total, ssv_count, &ssv_total) ||
+        !checked_add(rbv_total, rbv_count, &rbv_total) ||
+        !checked_add(emission_total, emission_count, &emission_total) ||
+        !checked_add(transition_total, transition_count, &transition_total) ||
+        ssv_total > SIZE_MAX || rbv_total > SIZE_MAX ||
+        emission_total > SIZE_MAX || transition_total > SIZE_MAX) {
+      set_error(error, error_size, "profile selection size overflow");
+      return -1;
+    }
+    selected.vit_profiles[output_index] = to;
+    selected.ssv_profiles[output_index] = source.ssv_profiles[source_index];
+    selected.ssv_profiles[output_index].score_offset = to.ssv_offset;
+    selected.m_mu[output_index] = source.m_mu[source_index];
+    selected.m_lambda[output_index] = source.m_lambda[source_index];
+    selected.bias_templates[output_index] =
+        source.bias_templates[source_index];
+    selected.identity_tokens[output_index] =
+        source.identity_tokens[source_index];
+  }
+  try {
+    selected.ssv_scores.resize(static_cast<size_t>(ssv_total));
+    selected.exact_rbv.resize(static_cast<size_t>(rbv_total));
+    selected.emissions.resize(static_cast<size_t>(emission_total));
+    selected.transitions.resize(static_cast<size_t>(transition_total));
+  } catch (...) {
+    set_error(error, error_size, "profile selection data allocation failed");
+    return -1;
+  }
+  SelectionCopyTask task{&source, &selected, profile_indices};
+  session->workers->parallel_for(
+      profile_count, &task, copy_selection_profile);
+
+  if (session->selection_count == UINT64_MAX) {
+    set_error(error, error_size, "profile selection identity exhausted");
+    return -1;
+  }
+  auto *created = new (std::nothrow) plan7_profile_selection{};
+  if (created == nullptr) {
+    set_error(error, error_size, "profile selection allocation failed");
+    return -1;
+  }
+  try {
+    created->session_id = session->session_id;
+    created->selection_id = session->selection_count + 1;
+    created->pack =
+        std::make_shared<const HostProfilePack>(std::move(selected));
+  } catch (...) {
+    delete created;
+    set_error(error, error_size, "profile selection allocation failed");
+    return -1;
+  }
+  ++session->selection_count;
+  *selection = created;
+  return 0;
+}
+
+extern "C" int plan7_profile_selection_destroy(
+    plan7_profile_selection **selection, char *error, size_t error_size) {
+  if (selection == nullptr) {
+    set_error(error, error_size, "profile selection handle is null");
+    return -1;
+  }
+  plan7_profile_selection *value = *selection;
+  *selection = nullptr;
+  delete value;
+  return 0;
+}
+
+extern "C" int plan7_profile_selection_get_view(
+    const plan7_profile_selection *selection,
+    plan7_profile_selection_view *view,
+    char *error, size_t error_size) {
+  if (selection == nullptr || selection->pack == nullptr || view == nullptr) {
+    set_error(error, error_size, "invalid profile selection view");
+    return -1;
+  }
+  const HostProfilePack &pack = *selection->pack;
+  *view = {};
+  view->session_id = selection->session_id;
+  view->selection_id = selection->selection_id;
+  view->profile_count = pack.ssv_profiles.size();
+  view->packed_scores = pack.ssv_scores.empty()
+      ? nullptr : pack.ssv_scores.data();
+  view->packed_score_count = pack.ssv_scores.size();
+  view->profiles = pack.ssv_profiles.empty()
+      ? nullptr : pack.ssv_profiles.data();
+  view->m_mu = pack.m_mu.empty() ? nullptr : pack.m_mu.data();
+  view->m_lambda = pack.m_lambda.empty() ? nullptr : pack.m_lambda.data();
+  view->bias_templates = pack.bias_templates.empty()
+      ? nullptr : pack.bias_templates.data();
+  view->identity_tokens = pack.identity_tokens.empty()
+      ? nullptr : pack.identity_tokens.data();
+  view->host_bytes = host_pack_bytes(pack);
+  return 0;
+}
+
+extern "C" int plan7_profile_selection_stage_viterbi(
+    const plan7_profile_selection *selection,
+    plan7_viterbi_database **database,
+    char *error, size_t error_size) {
+  if (selection == nullptr || selection->pack == nullptr ||
+      database == nullptr || *database != nullptr) {
+    set_error(error, error_size, "invalid staged Viterbi arguments");
+    return -1;
+  }
+  auto *created = new (std::nothrow) plan7_viterbi_database{};
+  if (created == nullptr) {
+    set_error(error, error_size, "staged Viterbi allocation failed");
+    return -1;
+  }
+  initialize_viterbi_database(created);
+  created->sealed_source = true;
+  created->sealed_pack = selection->pack;
+  created->alphabet_size = selection->pack->alphabet_size;
+  try {
+    created->source_profile_pointers = selection->pack->identity_tokens;
+  } catch (...) {
+    delete created;
+    set_error(error, error_size, "staged Viterbi identity allocation failed");
+    return -1;
+  }
+  if (upload_viterbi_database(created, error, error_size) != 0) {
+    delete created;
+    return -1;
+  }
+  *database = created;
+  return 0;
 }
 
 extern "C" int plan7_postfilter_workspace_create(
@@ -1282,18 +1890,21 @@ extern "C" int plan7_viterbi_database_matches_ssv(
       (profile_count != 0 &&
        (profiles == nullptr || packed_scores == nullptr ||
         source_profile_pointers == nullptr)) ||
-      database->host_profiles.size() != profile_count) {
+      database_host_profiles(database).size() != profile_count) {
     set_error(error, error_size, "Viterbi and SSV profile counts differ");
     return -1;
   }
+  const auto &host_profiles = database_host_profiles(database);
+  const auto &host_scores = database_host_ssv_scores(database);
   for (size_t p = 0; p < profile_count; ++p) {
-    const VitProfile &vit = database->host_profiles[p];
+    const VitProfile &vit = host_profiles[p];
     const plan7_ssv_profile &msv = profiles[p].profile;
     const uint64_t expected_count =
         static_cast<uint64_t>(vit.model_length) * database->alphabet_size;
     if (source_profile_pointers[p] !=
           database->source_profile_pointers[p] ||
-        !live_profile_matches_snapshot(database, p) ||
+        (!database->sealed_source &&
+         !live_profile_matches_snapshot(database, p)) ||
         vit.model_length != static_cast<uint32_t>(msv.model_length) ||
         msv.score_offset != vit.ssv_offset ||
         msv.score_count != expected_count ||
@@ -1303,7 +1914,7 @@ extern "C" int plan7_viterbi_database_matches_ssv(
         vit.msv_tbm != msv.tbm || vit.msv_tec != msv.tec ||
         vit.msv_base != msv.base || vit.msv_bias != msv.bias ||
         vit.msv_scale != msv.scale ||
-        std::memcmp(database->host_ssv_scores.data() + vit.ssv_offset,
+        std::memcmp(host_scores.data() + vit.ssv_offset,
                     packed_scores + msv.score_offset,
                     static_cast<size_t>(expected_count)) != 0) {
       set_error(error, error_size,
@@ -1311,7 +1922,7 @@ extern "C" int plan7_viterbi_database_matches_ssv(
       return -1;
     }
   }
-  if (packed_score_count != database->host_ssv_scores.size()) {
+  if (packed_score_count != host_scores.size()) {
     set_error(error, error_size,
               "SSV profile scores have trailing bytes");
     return -1;
@@ -1385,14 +1996,14 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
     vit_tiles.push_back(0);
     for (size_t c = 0; c < candidate_count; ++c) {
       const plan7_bias_candidate mapping = host_candidates[c];
-      if (mapping.profile_index >= database->host_profiles.size() ||
+      const auto &profiles = database_host_profiles(database);
+      if (mapping.profile_index >= profiles.size() ||
           mapping.sequence_index >= sequence_count ||
           host_sequence_lengths[mapping.sequence_index] > 100000) {
         set_error(error, error_size, "invalid post-filter candidate mapping");
         return -1;
       }
-      const VitProfile &profile =
-          database->host_profiles[mapping.profile_index];
+      const VitProfile &profile = profiles[mapping.profile_index];
       const int length = static_cast<int>(
           host_sequence_lengths[mapping.sequence_index]);
       host_moves[c] = length_transitions_for(profile, length);

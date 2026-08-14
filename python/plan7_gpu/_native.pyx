@@ -424,6 +424,39 @@ cdef extern from "postfilter_cuda.h" nogil:
     ctypedef struct plan7_viterbi_database:
         pass
 
+    ctypedef struct plan7_profile_session:
+        pass
+
+    ctypedef struct plan7_profile_selection:
+        pass
+
+    ctypedef struct plan7_profile_selection_view:
+        uint64_t session_id
+        uint64_t selection_id
+        size_t profile_count
+        const uint8_t *packed_scores
+        size_t packed_score_count
+        const plan7_ssv_profile *profiles
+        const float *m_mu
+        const float *m_lambda
+        const plan7_bias_profile *bias_templates
+        const uintptr_t *identity_tokens
+        uint64_t host_bytes
+
+    ctypedef struct plan7_profile_session_statistics:
+        uint64_t session_id
+        uint64_t profile_count
+        uint64_t worker_count
+        uint64_t selection_count
+        uint64_t parallel_run_count
+        uint64_t host_bytes
+        uint64_t ssv_score_bytes
+        uint64_t bias_profile_bytes
+        uint64_t viterbi_descriptor_bytes
+        uint64_t viterbi_emission_bytes
+        uint64_t viterbi_transition_bytes
+        uint64_t viterbi_exact_rbv_bytes
+
     int plan7_viterbi_database_create(
         const uintptr_t *profile_pointers,
         size_t profile_count,
@@ -440,6 +473,58 @@ cdef extern from "postfilter_cuda.h" nogil:
 
     size_t plan7_viterbi_database_profile_count(
         const plan7_viterbi_database *database,
+    )
+
+    int plan7_profile_session_create(
+        const uintptr_t *profile_pointers,
+        size_t profile_count,
+        const float *background,
+        size_t background_count,
+        plan7_profile_session **session,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_profile_session_destroy(
+        plan7_profile_session **session,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_profile_session_get_statistics(
+        const plan7_profile_session *session,
+        plan7_profile_session_statistics *statistics,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_profile_session_select(
+        plan7_profile_session *session,
+        const size_t *profile_indices,
+        size_t profile_count,
+        plan7_profile_selection **selection,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_profile_selection_destroy(
+        plan7_profile_selection **selection,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_profile_selection_get_view(
+        const plan7_profile_selection *selection,
+        plan7_profile_selection_view *view,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_profile_selection_stage_viterbi(
+        const plan7_profile_selection *selection,
+        plan7_viterbi_database **database,
+        char *error,
+        size_t error_size,
     )
 
     int plan7_ssv_sequence_batch_postfilter_candidates_many(
@@ -1032,6 +1117,209 @@ def pack_striped_scores(
                     ]
         output_offset += model_length * <size_t> alphabet_size
     return packed_scores
+
+
+cdef class ProfileSelection:
+    """Immutable pointer-free host pack for an ordered profile slice.
+
+    Operations and ``close`` must be serialized by the public adapter.
+    """
+
+    cdef plan7_profile_selection *_selection
+    cdef object _owner
+
+    def __cinit__(self):
+        self._selection = NULL
+        self._owner = None
+
+    def __dealloc__(self):
+        if self._selection != NULL:
+            plan7_profile_selection_destroy(&self._selection, NULL, 0)
+
+    cdef plan7_profile_selection_view _view(self) except *:
+        cdef plan7_profile_selection_view view
+        cdef char error[512]
+        cdef int status
+        if self._selection == NULL:
+            raise RuntimeError("profile selection is closed")
+        error[0] = 0
+        status = plan7_profile_selection_get_view(
+            self._selection, &view, error, sizeof(error)
+        )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        return view
+
+    def __len__(self):
+        cdef plan7_profile_selection_view view = self._view()
+        return view.profile_count
+
+    @property
+    def closed(self):
+        return self._selection == NULL
+
+    @property
+    def identity(self):
+        cdef plan7_profile_selection_view view = self._view()
+        return view.session_id, view.selection_id
+
+    @property
+    def host_bytes(self):
+        cdef plan7_profile_selection_view view = self._view()
+        return view.host_bytes
+
+    def close(self):
+        cdef plan7_profile_selection *selection = NULL
+        cdef char error[512]
+        cdef int status = 0
+        if self._selection != NULL:
+            selection = self._selection
+            self._selection = NULL
+            self._owner = None
+            error[0] = 0
+            with nogil:
+                status = plan7_profile_selection_destroy(
+                    &selection, error, sizeof(error)
+                )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+
+
+cdef class ProfileSession:
+    """Host-owned immutable SSV, bias, and Viterbi profile snapshots.
+
+    Session operations and ``close`` must be serialized by the public adapter.
+    Construction does not create a CUDA context or allocate device memory.
+    """
+
+    cdef plan7_profile_session *_session
+
+    def __cinit__(self):
+        self._session = NULL
+
+    def __init__(self, profiles, const float[::1] background):
+        cdef tuple owners = tuple(profiles)
+        cdef vector[uintptr_t] pointers
+        cdef OptimizedProfile profile
+        cdef object value
+        cdef char error[512]
+        cdef int status
+
+        if self._session != NULL:
+            raise RuntimeError("profile session is already initialized")
+        if background.shape[0] != 20:
+            raise ValueError("profile session background must have 20 residues")
+        pointers.reserve(len(owners))
+        for value in owners:
+            if not isinstance(value, OptimizedProfile):
+                raise TypeError("profile sessions require OptimizedProfile objects")
+            profile = value
+            pointers.push_back(<uintptr_t> profile._om)
+        error[0] = 0
+        with nogil:
+            status = plan7_profile_session_create(
+                pointers.data() if pointers.size() else NULL,
+                pointers.size(),
+                &background[0],
+                <size_t> background.shape[0],
+                &self._session,
+                error,
+                sizeof(error),
+            )
+        if status != 0:
+            raise ValueError(error.decode("utf-8", "replace"))
+
+    def __dealloc__(self):
+        if self._session != NULL:
+            plan7_profile_session_destroy(&self._session, NULL, 0)
+
+    def __len__(self):
+        return self.statistics["profile_count"]
+
+    @property
+    def closed(self):
+        return self._session == NULL
+
+    @property
+    def statistics(self):
+        cdef plan7_profile_session_statistics statistics
+        cdef char error[512]
+        cdef int status
+        if self._session == NULL:
+            raise RuntimeError("profile session is closed")
+        error[0] = 0
+        status = plan7_profile_session_get_statistics(
+            self._session, &statistics, error, sizeof(error)
+        )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        return {
+            "session_id": statistics.session_id,
+            "profile_count": statistics.profile_count,
+            "worker_count": statistics.worker_count,
+            "selection_count": statistics.selection_count,
+            "parallel_run_count": statistics.parallel_run_count,
+            "host_bytes": statistics.host_bytes,
+            "ssv_score_bytes": statistics.ssv_score_bytes,
+            "bias_profile_bytes": statistics.bias_profile_bytes,
+            "viterbi_descriptor_bytes": statistics.viterbi_descriptor_bytes,
+            "viterbi_emission_bytes": statistics.viterbi_emission_bytes,
+            "viterbi_transition_bytes": statistics.viterbi_transition_bytes,
+            "viterbi_exact_rbv_bytes": statistics.viterbi_exact_rbv_bytes,
+        }
+
+    def select(self, values):
+        cdef tuple requested = tuple(values)
+        cdef vector[size_t] indices
+        cdef object value
+        cdef object indexed
+        cdef ProfileSelection selection
+        cdef char error[512]
+        cdef int status
+
+        if self._session == NULL:
+            raise RuntimeError("profile session is closed")
+        indices.reserve(len(requested))
+        for value in requested:
+            if isinstance(value, bool):
+                raise TypeError("profile selection index must not be bool")
+            try:
+                indexed = value.__index__()
+            except (AttributeError, TypeError) as exc:
+                raise TypeError("profile selection index must be an integer") from exc
+            if indexed < 0:
+                raise IndexError("profile selection index is out of range")
+            indices.push_back(<size_t> indexed)
+        selection = ProfileSelection.__new__(ProfileSelection)
+        error[0] = 0
+        with nogil:
+            status = plan7_profile_session_select(
+                self._session,
+                indices.data() if indices.size() else NULL,
+                indices.size(),
+                &selection._selection,
+                error,
+                sizeof(error),
+            )
+        if status != 0:
+            raise ValueError(error.decode("utf-8", "replace"))
+        selection._owner = self
+        return selection
+
+    def close(self):
+        cdef plan7_profile_session *session = NULL
+        cdef char error[512]
+        cdef int status = 0
+        if self._session != NULL:
+            session = self._session
+            self._session = NULL
+            error[0] = 0
+            with nogil:
+                status = plan7_profile_session_destroy(
+                    &session, error, sizeof(error)
+                )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
 
 
 cdef class ViterbiProfiles:
@@ -2158,6 +2446,201 @@ cdef class SequenceBatch:
         finally:
             if output != NULL:
                 plan7_forward_output_destroy(&output, NULL, 0)
+
+    cdef size_t _run_profile_selection_candidates(
+        self,
+        const plan7_profile_selection_view *view,
+        double f1,
+    ) except? 0:
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t words_per_profile
+        cdef size_t candidate_word_count
+        cdef size_t word_index
+        cdef size_t sequence_index
+        cdef size_t candidate_count = 0
+        cdef size_t output_index
+        cdef uint32_t word
+        cdef unsigned bit
+        cdef int status
+        cdef char error[512]
+
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        profile_count = view.profile_count
+        if profile_count and (
+            view.packed_scores == NULL
+            or view.profiles == NULL
+            or view.m_mu == NULL
+            or view.m_lambda == NULL
+            or view.bias_templates == NULL
+            or view.identity_tokens == NULL
+        ):
+            raise RuntimeError("profile selection storage is incomplete")
+        if self._sequence_count > (<size_t> -1) - 31:
+            raise OverflowError("candidate mask size overflows size_t")
+        words_per_profile = (self._sequence_count + 31) // 32
+        if words_per_profile and profile_count > (<size_t> -1) // words_per_profile:
+            raise OverflowError("candidate mask size overflows size_t")
+        candidate_word_count = profile_count * words_per_profile
+        self._candidate_words.resize(candidate_word_count)
+        self._candidate_counts.resize(profile_count)
+        error[0] = 0
+        with nogil:
+            status = plan7_ssv_sequence_batch_f1_mask_many(
+                self._batch,
+                view.packed_scores,
+                view.packed_score_count,
+                view.profiles,
+                profile_count,
+                view.m_mu,
+                view.m_lambda,
+                f1,
+                self._candidate_words.data() if candidate_word_count else NULL,
+                candidate_word_count,
+                error,
+                sizeof(error),
+            )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+
+        self._candidate_offsets.resize(profile_count)
+        for profile_index in range(profile_count):
+            self._candidate_counts[profile_index] = 0
+            for word_index in range(words_per_profile):
+                self._candidate_counts[profile_index] += plan7_popcount_u32(
+                    self._candidate_words[
+                        profile_index * words_per_profile + word_index
+                    ]
+                )
+            self._candidate_offsets[profile_index] = candidate_count
+            if self._candidate_counts[profile_index] > (
+                (<size_t> -1) - candidate_count
+            ):
+                raise OverflowError("candidate count overflows size_t")
+            candidate_count += self._candidate_counts[profile_index]
+
+        self._candidate_indices.resize(candidate_count)
+        for profile_index in range(profile_count):
+            output_index = self._candidate_offsets[profile_index]
+            for word_index in range(words_per_profile):
+                word = self._candidate_words[
+                    profile_index * words_per_profile + word_index
+                ]
+                while word:
+                    bit = plan7_ctz_u32(word)
+                    sequence_index = word_index * 32 + bit
+                    if sequence_index >= self._sequence_count:
+                        raise RuntimeError("candidate mask has trailing bits set")
+                    self._candidate_indices[output_index] = <uint32_t> sequence_index
+                    output_index += 1
+                    word &= word - 1
+            if output_index != (
+                self._candidate_offsets[profile_index]
+                + self._candidate_counts[profile_index]
+            ):
+                raise RuntimeError("candidate mask count changed")
+        return profile_count
+
+    def postfilter_profile_selection_csr_raw(
+        self,
+        ProfileSelection selection,
+        double f1,
+    ):
+        """Run a sealed selection without reading any live optimized profile."""
+        cdef plan7_profile_selection_view view = selection._view()
+        cdef plan7_viterbi_database *database = NULL
+        cdef char error[512]
+        cdef char destroy_error[512]
+        cdef int status = 0
+        cdef int destroy_status = 0
+        cdef int cutoff_mode
+        cdef float cutoff
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t candidate_count
+        cdef size_t result_bytes
+        cdef bytearray records
+        cdef uint8_t[::1] record_view
+        cdef carray offsets
+
+        if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
+            raise RuntimeError("array('Q') is not native uint64")
+        if sizeof(plan7_postfilter_result) != PLAN7_POSTFILTER_RECORD_SIZE:
+            raise RuntimeError("post-filter result ABI size mismatch")
+        profile_count = self._run_profile_selection_candidates(&view, f1)
+        self._bias_profiles.resize(profile_count)
+        self._bias_candidate_offsets.resize(profile_count + 1)
+        if profile_count:
+            memcpy(
+                self._bias_profiles.data(),
+                view.bias_templates,
+                profile_count * sizeof(plan7_bias_profile),
+            )
+        for profile_index in range(profile_count):
+            cutoff_mode = plan7_ssv_f1_cutoff(
+                view.m_mu[profile_index],
+                view.m_lambda[profile_index],
+                f1,
+                &cutoff,
+            )
+            self._bias_profiles[profile_index].cutoff_mode = cutoff_mode
+            if cutoff_mode == PLAN7_F1_CUTOFF_SCORE:
+                self._bias_profiles[profile_index].cutoff_bit_score = cutoff
+            self._bias_candidate_offsets[profile_index] = (
+                self._candidate_offsets[profile_index]
+            )
+        candidate_count = self._candidate_indices.size()
+        self._bias_candidate_offsets[profile_count] = candidate_count
+        self._postfilter_results.resize(candidate_count)
+
+        if candidate_count:
+            error[0] = 0
+            with nogil:
+                status = plan7_profile_selection_stage_viterbi(
+                    selection._selection, &database, error, sizeof(error)
+                )
+            if status == 0:
+                with nogil:
+                    status = plan7_ssv_sequence_batch_postfilter_candidates_many(
+                        self._batch,
+                        self._bias_profiles.data(),
+                        profile_count,
+                        self._bias_candidate_offsets.data(),
+                        self._candidate_indices.data(),
+                        candidate_count,
+                        view.identity_tokens,
+                        database,
+                        self._postfilter_results.data(),
+                        candidate_count,
+                        error,
+                        sizeof(error),
+                    )
+                destroy_error[0] = 0
+                with nogil:
+                    destroy_status = plan7_viterbi_database_destroy(
+                        &database, destroy_error, sizeof(destroy_error)
+                    )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
+            if destroy_status != 0:
+                raise RuntimeError(destroy_error.decode("utf-8", "replace"))
+
+        if candidate_count > (<size_t> -1) // sizeof(plan7_postfilter_result):
+            raise OverflowError("post-filter result size overflows size_t")
+        result_bytes = candidate_count * sizeof(plan7_postfilter_result)
+        records = bytearray(result_bytes)
+        if result_bytes:
+            record_view = records
+            memcpy(
+                &record_view[0], self._postfilter_results.data(), result_bytes
+            )
+        offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
+        for profile_index in range(profile_count + 1):
+            offsets.data.as_ulonglongs[profile_index] = <uint64_t> (
+                self._bias_candidate_offsets[profile_index]
+            )
+        return records, offsets
 
     cdef size_t _run_postfilter_candidates_many(
         self,

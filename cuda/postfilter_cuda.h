@@ -39,6 +39,41 @@ typedef struct plan7_postfilter_result {
 
 typedef struct plan7_viterbi_database plan7_viterbi_database;
 typedef struct plan7_postfilter_workspace plan7_postfilter_workspace;
+typedef struct plan7_profile_session plan7_profile_session;
+typedef struct plan7_profile_selection plan7_profile_selection;
+
+/* Immutable, pointer-free host data for one ordered profile selection.  Every
+ * pointer remains valid until the selection is destroyed.  The identity
+ * tokens are opaque values: they are compared but never dereferenced. */
+typedef struct plan7_profile_selection_view {
+  uint64_t session_id;
+  uint64_t selection_id;
+  size_t profile_count;
+  const uint8_t *packed_scores;
+  size_t packed_score_count;
+  const plan7_ssv_profile *profiles;
+  const float *m_mu;
+  const float *m_lambda;
+  const plan7_bias_profile *bias_templates;
+  const uintptr_t *identity_tokens;
+  uint64_t host_bytes;
+} plan7_profile_selection_view;
+
+typedef struct plan7_profile_session_statistics {
+  uint64_t session_id;
+  uint64_t profile_count;
+  uint64_t worker_count;
+  uint64_t selection_count;
+  uint64_t parallel_run_count;
+  /* Immutable payload bytes, excluding allocator slack and worker stacks. */
+  uint64_t host_bytes;
+  uint64_t ssv_score_bytes;
+  uint64_t bias_profile_bytes;
+  uint64_t viterbi_descriptor_bytes;
+  uint64_t viterbi_emission_bytes;
+  uint64_t viterbi_transition_bytes;
+  uint64_t viterbi_exact_rbv_bytes;
+} plan7_profile_session_statistics;
 
 enum plan7_postfilter_workspace_capacity {
   PLAN7_POSTFILTER_CAPACITY_STATES = 0,
@@ -75,7 +110,58 @@ int plan7_viterbi_database_destroy(plan7_viterbi_database **database,
 size_t plan7_viterbi_database_profile_count(
   const plan7_viterbi_database *database);
 
-/* Check exact source identity, live snapshot, and packed SSV row affinity. */
+/* Snapshot private optimized-profile arrays into immutable host storage.
+ * The caller must prevent every source profile from being mutated until this
+ * function returns.  No CUDA context or device allocation is used here. */
+int plan7_profile_session_create(const uintptr_t *profile_pointers,
+                                 size_t profile_count,
+                                 const float *background,
+                                 size_t background_count,
+                                 plan7_profile_session **session,
+                                 char *error,
+                                 size_t error_size);
+
+int plan7_profile_session_destroy(plan7_profile_session **session,
+                                  char *error,
+                                  size_t error_size);
+
+int plan7_profile_session_get_statistics(
+  const plan7_profile_session *session,
+  plan7_profile_session_statistics *statistics,
+  char *error,
+  size_t error_size);
+
+/* Selection order is semantically significant.  Indexes must be unique and
+ * in range.  Calls on a session, including destroy, must be serialized. */
+int plan7_profile_session_select(plan7_profile_session *session,
+                                 const size_t *profile_indices,
+                                 size_t profile_count,
+                                 plan7_profile_selection **selection,
+                                 char *error,
+                                 size_t error_size);
+
+int plan7_profile_selection_destroy(plan7_profile_selection **selection,
+                                    char *error,
+                                    size_t error_size);
+
+/* Destroy must be serialized against view and staging calls on the same
+ * selection.  A selection remains valid after its source session closes. */
+int plan7_profile_selection_get_view(
+  const plan7_profile_selection *selection,
+  plan7_profile_selection_view *view,
+  char *error,
+  size_t error_size);
+
+/* Upload only this selection to the current device.  The resulting database
+ * contains sealed host provenance and never reads a live P7_OPROFILE. */
+int plan7_profile_selection_stage_viterbi(
+  const plan7_profile_selection *selection,
+  plan7_viterbi_database **database,
+  char *error,
+  size_t error_size);
+
+/* Check exact source identity, packed SSV row affinity, and (for legacy
+ * databases) the live optimized-profile snapshot. */
 int plan7_viterbi_database_matches_ssv(
   const plan7_viterbi_database *database,
   const uint8_t *packed_scores,

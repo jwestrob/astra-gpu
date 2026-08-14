@@ -1936,12 +1936,15 @@ plan7_ssv_sequence_batch_f1_mask_many(
   memcpy(batch->host_f1_scores, packed_scores, packed_score_count);
   batch->host_f1_score_count = packed_score_count;
 
+  const bool float_environment_valid =
+    batch->host_float_environment_valid &&
+    plan7_bias_host_environment_attested() == 1;
   for (size_t profile = 0; profile < profile_count; ++profile) {
     plan7_ssv_f1_profile *f1_profile = &batch->host_f1_profiles[profile];
     float cutoff = NAN;
     size_t tjb_offset = SIZE_MAX;
     f1_profile->profile = profiles[profile];
-    f1_profile->cutoff_mode = batch->host_float_environment_valid
+    f1_profile->cutoff_mode = float_environment_valid
       ? derive_f1_cutoff(m_mu[profile], m_lambda[profile], f1, &cutoff)
       : PLAN7_F1_CUTOFF_INVALID;
     f1_profile->cutoff_bit_score = cutoff;

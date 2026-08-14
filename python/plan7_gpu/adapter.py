@@ -191,6 +191,239 @@ def _new_pressed_profile_pair(
     return pair
 
 
+class _ProfileSessionState:
+    __slots__ = ("pairs", "alphabet", "native", "lock")
+
+    def __init__(
+        self,
+        pairs: tuple[PressedProfilePair, ...],
+        alphabet: Any,
+        native: Any,
+    ) -> None:
+        self.pairs = pairs
+        self.alphabet = alphabet
+        self.native = native
+        self.lock = Lock()
+
+
+class _ProfileSelectionState:
+    __slots__ = ("owner", "pairs", "indices", "alphabet", "native", "lock")
+
+    def __init__(
+        self,
+        owner: ProfileSession,
+        pairs: tuple[PressedProfilePair, ...],
+        indices: tuple[int, ...],
+        alphabet: Any,
+        native: Any,
+    ) -> None:
+        self.owner = owner
+        self.pairs = pairs
+        self.indices = indices
+        self.alphabet = alphabet
+        self.native = native
+        self.lock = Lock()
+
+
+_PROFILE_SESSION_STATES: WeakKeyDictionary[Any, _ProfileSessionState] = (
+    WeakKeyDictionary()
+)
+_PROFILE_SELECTION_STATES: WeakKeyDictionary[Any, _ProfileSelectionState] = (
+    WeakKeyDictionary()
+)
+
+
+def _profile_session_state(session: Any) -> _ProfileSessionState:
+    try:
+        return _PROFILE_SESSION_STATES[session]
+    except KeyError as error:
+        raise TypeError("invalid ProfileSession object") from error
+
+
+def _profile_selection_state(selection: Any) -> _ProfileSelectionState:
+    try:
+        return _PROFILE_SELECTION_STATES[selection]
+    except KeyError as error:
+        raise TypeError("invalid ProfileSelection object") from error
+
+
+class ProfileSession:
+    """An immutable host snapshot of one pressed profile database."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, profile_pairs: Iterable[PressedProfilePair]):
+        pairs = tuple(profile_pairs)
+        if not pairs:
+            raise ValueError("a profile session requires at least one profile")
+        if not _native.bias_host_environment_attested():
+            raise RuntimeError(
+                "profile sessions require the attested host floating-point environment"
+            )
+        if type(pairs[0]) is not PressedProfilePair:
+            raise TypeError(
+                "profile sessions require pairs from load_pressed_profiles"
+            )
+
+        states = []
+        seen: set[int] = set()
+        canonical_base = pairs[0].canonical_base
+        stat_token = pairs[0].stat_token
+        for pair in pairs:
+            if type(pair) is not PressedProfilePair:
+                raise TypeError(
+                    "profile sessions require pairs from load_pressed_profiles"
+                )
+            if pair.ordinal in seen:
+                raise ValueError("profile session pairs must be unique")
+            seen.add(pair.ordinal)
+            if pair.canonical_base != canonical_base or pair.stat_token != stat_token:
+                raise ValueError("profile session pairs come from different databases")
+            states.append(_pair_state(pair))
+
+        unique_locks = {id(state.lock): state.lock for state in states}
+        with ExitStack() as locks:
+            for lock_id in sorted(unique_locks):
+                locks.enter_context(unique_locks[lock_id])
+            alphabet = states[0].hmm.alphabet
+            background_fingerprint = states[0].background_fingerprint
+            for state in states:
+                if state.hmm.alphabet != alphabet:
+                    raise ValueError("profile session alphabets differ")
+                if state.background_fingerprint != background_fingerprint:
+                    raise ValueError("profile session backgrounds differ")
+            background = pyhmmer.plan7.Background(alphabet)
+            if _background_fingerprint(background) != background_fingerprint:
+                raise ValueError(
+                    "profile session background is not the canonical hmmpress background"
+                )
+            profiles = [state.optimized_profile for state in states]
+            native = _native.ProfileSession(
+                profiles,
+                memoryview(background.residue_frequencies),
+            )
+        _PROFILE_SESSION_STATES[self] = _ProfileSessionState(
+            pairs, alphabet, native
+        )
+
+    def __len__(self) -> int:
+        return len(_profile_session_state(self).pairs)
+
+    @property
+    def closed(self) -> bool:
+        state = _profile_session_state(self)
+        with state.lock:
+            return bool(state.native.closed)
+
+    @property
+    def statistics(self) -> dict[str, int]:
+        state = _profile_session_state(self)
+        with state.lock:
+            return cast(dict[str, int], state.native.statistics)
+
+    def select(self, indices: Iterable[int]) -> ProfileSelection:
+        state = _profile_session_state(self)
+        requested = tuple(indices)
+        normalized = []
+        seen: set[int] = set()
+        for value in requested:
+            if isinstance(value, bool):
+                raise TypeError("profile selection index must not be bool")
+            try:
+                index = operator.index(value)
+            except TypeError as error:
+                raise TypeError(
+                    "profile selection index must be an integer"
+                ) from error
+            if not 0 <= index < len(state.pairs):
+                raise IndexError("profile selection index is out of range")
+            if index in seen:
+                raise ValueError("profile selection indexes must be unique")
+            seen.add(index)
+            normalized.append(index)
+        normalized_indices = tuple(normalized)
+        with state.lock:
+            if state.native.closed:
+                raise RuntimeError("profile session is closed")
+            native = state.native.select(normalized_indices)
+        selection = object.__new__(ProfileSelection)
+        selected_pairs = tuple(state.pairs[index] for index in normalized_indices)
+        _PROFILE_SELECTION_STATES[selection] = _ProfileSelectionState(
+            self,
+            selected_pairs,
+            normalized_indices,
+            state.alphabet,
+            native,
+        )
+        return selection
+
+    def close(self) -> None:
+        state = _profile_session_state(self)
+        with state.lock:
+            state.native.close()
+
+    def __enter__(self) -> ProfileSession:
+        if self.closed:
+            raise RuntimeError("profile session is closed")
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+    weakref_slot=True,
+    init=False,
+    eq=False,
+    repr=False,
+)
+class ProfileSelection:
+    """One immutable ordered selection from a profile session."""
+
+    def __init__(self) -> None:
+        raise TypeError("ProfileSelection objects come from ProfileSession.select")
+
+    def __len__(self) -> int:
+        return len(_profile_selection_state(self).pairs)
+
+    @property
+    def indices(self) -> tuple[int, ...]:
+        return _profile_selection_state(self).indices
+
+    @property
+    def closed(self) -> bool:
+        state = _profile_selection_state(self)
+        with state.lock:
+            return bool(state.native.closed)
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        state = _profile_selection_state(self)
+        with state.lock:
+            return cast(tuple[int, int], state.native.identity)
+
+    @property
+    def host_bytes(self) -> int:
+        state = _profile_selection_state(self)
+        with state.lock:
+            return int(state.native.host_bytes)
+
+    def close(self) -> None:
+        state = _profile_selection_state(self)
+        with state.lock:
+            state.native.close()
+
+    def __enter__(self) -> ProfileSelection:
+        if self.closed:
+            raise RuntimeError("profile selection is closed")
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+
 def load_pressed_profiles(
     path: str | Path,
     *,
@@ -1087,6 +1320,73 @@ class SequenceBatch:
     ) -> CandidateBatch:
         """Bind exact CUDA MSV, bias, and Viterbi records to pressed pairs."""
         return self._postfilter_batch(profile_pairs, F1, None)
+
+    def postfilter_selection(
+        self,
+        selection: ProfileSelection,
+        F1: float = 0.02,
+    ) -> CandidateBatch:
+        """Generate exact records from an immutable host profile selection."""
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        if not _pipeline._filter_scores_seam_available():
+            raise RuntimeError(
+                "post-filter batches require the project-private "
+                "p7_PipelineFromFilterScores HMMER seam"
+            )
+        if type(selection) is not ProfileSelection:
+            raise TypeError(
+                "postfilter_selection requires ProfileSession.select output"
+            )
+        try:
+            threshold = float(F1)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("F1 must be a finite number in [0, 1]") from error
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("F1 must be a finite number in [0, 1]")
+
+        sequence_state = _sequence_state(self)
+        selection_state = _profile_selection_state(selection)
+        if selection_state.alphabet != sequence_state.alphabet:
+            raise ValueError("profile and sequence alphabets differ")
+        with selection_state.lock:
+            if selection_state.native.closed:
+                raise RuntimeError("profile selection is closed")
+            with sequence_state.lock:
+                if sequence_state.native.closed:
+                    raise RuntimeError("sequence batch is closed")
+                if threshold == 1.0:
+                    records = None
+                    offsets = array("Q", [0]) * (len(selection_state.pairs) + 1)
+                    all_rows = bytes([1]) * len(selection_state.pairs)
+                    all_targets = (
+                        array("I", range(len(sequence_state.native)))
+                        if selection_state.pairs
+                        else array("I")
+                    )
+                else:
+                    raw_records, offsets = cast(
+                        tuple[bytearray, array[int]],
+                        sequence_state.native.postfilter_profile_selection_csr_raw(
+                            selection_state.native,
+                            threshold,
+                        ),
+                    )
+                    records = bytes(raw_records)
+                    all_rows = bytes(len(selection_state.pairs))
+                    all_targets = array("I")
+
+        return _new_candidate_batch(
+            selection_state.pairs,
+            sequence_state.targets,
+            sequence_state.residue_offsets,
+            array("I"),
+            offsets,
+            all_rows,
+            all_targets,
+            threshold,
+            postfilter_records=records,
+        )
 
     def _postfilter_forward_batch(
         self,

@@ -1,6 +1,8 @@
 from .adapter import (
     CandidateBatch,
     PressedProfilePair,
+    ProfileSelection,
+    ProfileSession,
     SequenceBatch,
     cpu_candidates,
     filter_ssv,
@@ -10,6 +12,8 @@ from .adapter import (
 __all__ = [
     "CandidateBatch",
     "PressedProfilePair",
+    "ProfileSelection",
+    "ProfileSession",
     "SequenceBatch",
     "cpu_candidates",
     "filter_ssv",
