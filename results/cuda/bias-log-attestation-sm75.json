@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-14T07:34:51-07:00",
+  "source": {
+    "path": "oracle/bias_log_attestation.cu",
+    "sha256": "62cc60ae697e8add1ea3ce45e0be009b0375ff869a22c0e454900efff68ef111"
+  },
+  "production_source": {
+    "path": "cuda/bias_cuda.cu",
+    "sha256": "54f2b726928037cc371911391af2780dffdfa994e9c88147d80b3f792aac16a4"
+  },
+  "integration_source": {
+    "path": "cuda/ssv_cuda.cu",
+    "sha256": "58f3d903c085d7478b6af86009d5c5a1a3af2cf55aafd78b709e382a39ebbcca"
+  },
+  "command": "make bias-attestation",
+  "comparison": "host (float)log((double)x) versus CUDA device (float)log((double)x)",
+  "input_bits": {
+    "first": "0x00000001",
+    "last": "0x7f7fffff",
+    "class": "all positive finite binary32 values",
+    "count": 2139095039
+  },
+  "result": {
+    "mismatches": 0,
+    "maximum_ulp": 0,
+    "seconds": 14.433222,
+    "host_threads": 64
+  },
+  "host": {
+    "architecture": "x86_64",
+    "cpu": "Intel(R) Xeon(R) Platinum 8176M CPU @ 2.10GHz",
+    "cpu_family": 6,
+    "cpu_model": 85,
+    "cpu_stepping": 4,
+    "glibc": "Ubuntu GLIBC 2.35-0ubuntu3.14",
+    "libm_path": "/lib/x86_64-linux-gnu/libm.so.6",
+    "libm_elf_build_id": "e6f050696120aeb5134a14e38bc54e8ce1bdc0b5",
+    "libm_sha256": "df621c68dbfed7e843434ef2faedb9f4d4b0543ad161e9a55eaf4d4ce2443176",
+    "gcc": "Ubuntu 11.4.0-1ubuntu1~22.04.3"
+  },
+  "cuda": {
+    "nvcc": "12.5.82",
+    "cudart_version": 12050,
+    "driver": "555.42.06",
+    "gpu": "NVIDIA GeForce RTX 2080 Ti",
+    "gpu_uuid": "GPU-942c2749-c9d1-fb00-a711-c3e4aa8dcc3c",
+    "compute_capability": "7.5"
+  },
+  "production_gate": "Exact bias CUDA is enabled only with FE_TONEAREST and MXCSR round-to-nearest with FTZ/DAZ disabled, on the attested CPU family/model/stepping and feature set, loaded libm ELF build-id, glibc 2.35, nvcc 12.5.82, and RTX 2080 Ti sm75 target; all other environments retain candidates for CPU scoring."
+}

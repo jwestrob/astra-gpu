@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bias_cuda.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -139,6 +141,18 @@ int plan7_ssv_sequence_batch_f1_mask_many(
   double f1,
   uint32_t *profile_major_candidate_words,
   size_t candidate_word_count,
+  char *error,
+  size_t error_size);
+
+int plan7_ssv_sequence_batch_bias_candidates_many(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  plan7_bias_result *results,
+  size_t result_count,
   char *error,
   size_t error_size);
 

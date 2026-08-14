@@ -13,6 +13,7 @@ LDLIBS   += -L$(HMMER_ROOT)/src -lhmmer \
 
 ORACLE_BIN := $(BUILD_DIR)/oracle/msv-oracle
 ORACLE_OBJ := $(BUILD_DIR)/oracle/msv_oracle.o
+BIAS_ATTEST_BIN := $(BUILD_DIR)/oracle/bias-log-attestation
 PYTHON_EXT_SUFFIX := $(shell $(PYTHON)-config --extension-suffix)
 PYHMMER_LIB_DIR ?= $(shell $(PYTHON) -c 'from pathlib import Path; import pyhmmer; print((Path(pyhmmer.__file__).resolve().parent.parent / "pyhmmer.libs").resolve())')
 PYHMMER_PACKAGE_DIR ?= $(shell $(PYTHON) -c 'from pathlib import Path; import pyhmmer; print(Path(pyhmmer.__file__).resolve().parent)')
@@ -30,6 +31,7 @@ PYHMMER_ABI_STAMP := $(BUILD_DIR)/pipeline/.pyhmmer-abi-$(PYHMMER_ABI_SHA256)
 CYTHON_CPP := $(BUILD_DIR)/cuda/_native.cpp
 CYTHON_OBJ := $(BUILD_DIR)/cuda/_native.o
 CUDA_OBJ := $(BUILD_DIR)/cuda/ssv_cuda.o
+BIAS_CUDA_OBJ := $(BUILD_DIR)/cuda/bias_cuda.o
 CUDA_MODULE := python/plan7_gpu/_native$(PYTHON_EXT_SUFFIX)
 PIPELINE_C := $(BUILD_DIR)/pipeline/_pipeline.c
 PIPELINE_OBJ := $(BUILD_DIR)/pipeline/_pipeline.o
@@ -45,11 +47,14 @@ HMMER_HEADERS := $(HMMER_ROOT)/src/hmmer.h \
 	$(HMMER_ROOT)/src/p7_config.h \
 	$(HMMER_ROOT)/src/impl_sse/impl_sse.h
 
-.PHONY: all oracle cuda cuda-test pipeline pipeline-test test clean
+.PHONY: all oracle bias-attestation cuda cuda-test pipeline pipeline-test test clean
 
 all: oracle
 
 oracle: $(ORACLE_BIN)
+
+bias-attestation: $(BIAS_ATTEST_BIN)
+	$(BIAS_ATTEST_BIN) 0x1000000 64
 
 cuda: $(CUDA_MODULE) $(PIPELINE_MODULE)
 
@@ -61,7 +66,7 @@ pipeline-test: pipeline
 
 cuda-test: cuda
 	PYTHONPATH=python $(PYTHON) -c 'import sys; from plan7_gpu import _native; sys.exit("no CUDA device") if _native.device_count() <= 0 else None'
-	PYTHONPATH=python $(PYTHON) -m unittest discover -s tests -p 'test_cuda_ssv.py' -v
+	PYTHONPATH=python $(PYTHON) -m unittest discover -s tests -p 'test_cuda_*.py' -v
 
 $(ORACLE_BIN): $(ORACLE_OBJ) $(HMMER_LIBS)
 	$(CC) $(LDFLAGS) -o $@ $(ORACLE_OBJ) $(LDLIBS)
@@ -70,24 +75,35 @@ $(ORACLE_OBJ): oracle/msv_oracle.c $(HMMER_HEADERS)
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
-$(CYTHON_CPP): python/plan7_gpu/_native.pyx cuda/ssv_cuda.h
+$(BIAS_ATTEST_BIN): oracle/bias_log_attestation.cu
+	mkdir -p $(@D)
+	$(NVCC) -O3 -std=c++17 -arch=sm_75 -Xcompiler=-fopenmp \
+		-o $@ $< -lgomp
+
+$(CYTHON_CPP): python/plan7_gpu/_native.pyx cuda/ssv_cuda.h cuda/bias_cuda.h
 	mkdir -p $(@D)
 	$(PYTHON) -m cython --cplus -3 -o $@ $<
 
-$(CYTHON_OBJ): $(CYTHON_CPP) cuda/ssv_cuda.h
+$(CYTHON_OBJ): $(CYTHON_CPP) cuda/ssv_cuda.h cuda/bias_cuda.h
 	$(CXX) -O3 -g -std=c++17 -fPIC -Wall -Wextra -Icuda \
 		$$($(PYTHON)-config --includes) -c -o $@ $<
 
 $(CUDA_OBJ): cuda/ssv_cuda.cu cuda/ssv_cuda.h \
+	cuda/bias_cuda.h \
 	$(PYHMMER_EASEL_INCLUDE)/easel.h \
 	$(PYHMMER_EASEL_INCLUDE)/esl_gumbel.h
 	mkdir -p $(@D)
 	$(NVCC) -O3 -g -std=c++17 -Xcompiler=-fPIC $(CUDA_ARCH_FLAGS) \
 		-Icuda -I$(PYHMMER_EASEL_INCLUDE) -c -o $@ $<
 
-$(CUDA_MODULE): $(CYTHON_OBJ) $(CUDA_OBJ) $(PYHMMER_EASEL_LIB)
-	$(NVCC) -shared $(CUDA_ARCH_FLAGS) -o $@ $(CYTHON_OBJ) $(CUDA_OBJ) \
-		-L$(PYHMMER_LIB_DIR) -llibeasel \
+$(BIAS_CUDA_OBJ): cuda/bias_cuda.cu cuda/bias_cuda.h
+	mkdir -p $(@D)
+	$(NVCC) -O3 -g -std=c++17 -Xcompiler=-fPIC $(CUDA_ARCH_FLAGS) \
+		-Icuda -c -o $@ $<
+
+$(CUDA_MODULE): $(CYTHON_OBJ) $(CUDA_OBJ) $(BIAS_CUDA_OBJ) $(PYHMMER_EASEL_LIB)
+	$(NVCC) -shared $(CUDA_ARCH_FLAGS) -o $@ $(CYTHON_OBJ) $(CUDA_OBJ) $(BIAS_CUDA_OBJ) \
+		-L$(PYHMMER_LIB_DIR) -llibeasel -ldl \
 		-Xlinker -rpath -Xlinker $(PYHMMER_LIB_DIR)
 
 $(PYHMMER_ABI_STAMP):

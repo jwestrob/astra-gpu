@@ -27,6 +27,71 @@ cdef extern from * nogil:
     unsigned plan7_ctz_u32(uint32_t value)
 
 
+cdef extern from "bias_cuda.h" nogil:
+    cdef enum plan7_bias_action:
+        PLAN7_BIAS_CPU_REQUIRED
+        PLAN7_BIAS_DEFINITE_REJECT
+        PLAN7_BIAS_DEFINITE_PASS
+
+    cdef enum plan7_bias_cutoff_mode:
+        PLAN7_BIAS_CUTOFF_INVALID
+        PLAN7_BIAS_CUTOFF_SCORE
+        PLAN7_BIAS_CUTOFF_ALWAYS_REJECT
+        PLAN7_BIAS_CUTOFF_ALWAYS_PASS
+
+    ctypedef struct plan7_bias_profile:
+        float t10
+        float t11
+        float scale
+        float cutoff_bit_score
+        int32_t cutoff_mode
+        uint32_t reserved
+        float pi0
+        float pi1
+        float t02
+        float t12
+        float eo[29][2]
+
+    ctypedef struct plan7_bias_result:
+        uint32_t sequence_index
+        float filtersc
+        int16_t ssv_numerator
+        uint8_t ssv_status
+        uint8_t action
+
+    int plan7_bias_pack_amino_profile(
+        const float *background,
+        const float *composition,
+        int model_length,
+        float scale,
+        int cutoff_mode,
+        float cutoff_bit_score,
+        plan7_bias_profile *profile,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_bias_filter_score_host(
+        const plan7_bias_profile *profile,
+        const uint8_t *residues,
+        uint64_t length,
+        float *filtersc,
+    )
+
+    int plan7_bias_rebias_decision(
+        uint8_t ssv_status,
+        int16_t ssv_numerator,
+        float scale,
+        float filtersc,
+        int cutoff_mode,
+        float cutoff_bit_score,
+        float *bit_score,
+    )
+
+    int plan7_bias_host_environment_attested()
+    int plan7_bias_environment_attested(char *reason, size_t reason_size)
+
+
 cdef extern from "ssv_cuda.h" nogil:
     cdef enum plan7_ssv_status:
         PLAN7_SSV_OK
@@ -173,6 +238,19 @@ cdef extern from "ssv_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_ssv_sequence_batch_bias_candidates_many(
+        plan7_ssv_sequence_batch *batch,
+        const plan7_bias_profile *bias_profiles,
+        size_t profile_count,
+        const size_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        size_t candidate_count,
+        plan7_bias_result *results,
+        size_t result_count,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_ssv_filter_cuda(
         const uint8_t *striped_scores,
         size_t striped_score_count,
@@ -199,6 +277,114 @@ cdef extern from "ssv_cuda.h" nogil:
 cdef union float_bits:
     float value
     uint32_t bits
+
+
+def bias_environment_attested():
+    cdef char reason[512]
+    cdef int attested
+    reason[0] = 0
+    with nogil:
+        attested = plan7_bias_environment_attested(reason, sizeof(reason))
+    return bool(attested), reason.decode("utf-8", "replace")
+
+
+def bias_host_environment_attested():
+    cdef int attested
+    with nogil:
+        attested = plan7_bias_host_environment_attested()
+    return bool(attested)
+
+
+def pack_bias_profile_raw(
+    const float[::1] background,
+    const float[::1] composition,
+    int model_length,
+    float scale,
+    int cutoff_mode,
+    float cutoff_bit_score,
+):
+    cdef char error[512]
+    cdef int status
+    cdef plan7_bias_profile profile
+    cdef bytearray output
+    cdef uint8_t[::1] output_view
+    if background.shape[0] != 20 or composition.shape[0] != 20:
+        raise ValueError("bias background and composition must contain 20 values")
+    error[0] = 0
+    with nogil:
+        status = plan7_bias_pack_amino_profile(
+            &background[0],
+            &composition[0],
+            model_length,
+            scale,
+            cutoff_mode,
+            cutoff_bit_score,
+            &profile,
+            error,
+            sizeof(error),
+        )
+    if status != 0:
+        raise ValueError(error.decode("utf-8", "replace"))
+    output = bytearray(sizeof(plan7_bias_profile))
+    output_view = output
+    memcpy(&output_view[0], &profile, sizeof(plan7_bias_profile))
+    return bytes(output)
+
+
+def bias_filter_score_host_raw(
+    const uint8_t[::1] packed_profile,
+    const uint8_t[::1] residues,
+):
+    cdef plan7_bias_profile profile
+    cdef float score
+    cdef float_bits score_bits
+    cdef int status
+    if packed_profile.shape[0] != sizeof(plan7_bias_profile):
+        raise ValueError("packed bias profile has the wrong size")
+    if residues.shape[0] == 0:
+        raise ValueError("bias filter does not score empty targets")
+    memcpy(&profile, &packed_profile[0], sizeof(plan7_bias_profile))
+    with nogil:
+        status = plan7_bias_filter_score_host(
+            &profile,
+            &residues[0],
+            <uint64_t> residues.shape[0],
+            &score,
+        )
+    if status != 0:
+        raise ValueError("invalid bias profile or target")
+    score_bits.value = score
+    return score_bits.bits
+
+
+def bias_rebias_decision_raw(
+    int ssv_status,
+    int ssv_numerator,
+    float scale,
+    float filtersc,
+    int cutoff_mode,
+    float cutoff_bit_score,
+):
+    cdef float bit_score
+    cdef float_bits encoded
+    cdef int action
+    if not 0 <= ssv_status <= 255:
+        raise ValueError("SSV status must fit in uint8")
+    if not -32768 <= ssv_numerator <= 32767:
+        raise ValueError("SSV numerator must fit in int16")
+    action = plan7_bias_rebias_decision(
+        <uint8_t> ssv_status,
+        <int16_t> ssv_numerator,
+        scale,
+        filtersc,
+        cutoff_mode,
+        cutoff_bit_score,
+        &bit_score,
+    )
+    if isfinite(bit_score):
+        encoded.value = bit_score
+        return action, encoded.bits
+    return action, None
 
 
 cdef list _format_results(vector[plan7_ssv_result]& results, float scale):
@@ -362,6 +548,9 @@ cdef class SequenceBatch:
     cdef vector[uint32_t] _candidate_indices
     cdef vector[size_t] _candidate_offsets
     cdef vector[size_t] _candidate_counts
+    cdef vector[size_t] _bias_candidate_offsets
+    cdef vector[plan7_bias_profile] _bias_profiles
+    cdef vector[plan7_bias_result] _bias_results
     cdef vector[uint64_t] _lengths
     cdef size_t _sequence_count
     cdef int _alphabet_size
@@ -413,6 +602,14 @@ cdef class SequenceBatch:
     @property
     def closed(self):
         return self._batch == NULL
+
+    def __enter__(self):
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
     def close(self):
         cdef char error[512]
@@ -849,6 +1046,201 @@ cdef class SequenceBatch:
         offsets.data.as_ulonglongs[profile_count] = <uint64_t> candidate_count
         return indices, offsets
 
+    cdef size_t _run_bias_candidates_many(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+        const uint8_t[::1] packed_bias_profiles,
+    ) except? 0:
+        cdef char error[512]
+        cdef size_t profile_count
+        cdef size_t candidate_count
+        cdef size_t profile_index
+        cdef size_t expected_bias_bytes
+        cdef int status
+
+        profile_count = self._run_candidates_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+            m_mu,
+            m_lambda,
+            f1,
+        )
+        if profile_count == 0:
+            if packed_bias_profiles.shape[0] != 0:
+                raise ValueError("packed bias profiles have trailing bytes")
+            self._bias_profiles.clear()
+            self._bias_results.clear()
+            self._bias_candidate_offsets.resize(1)
+            self._bias_candidate_offsets[0] = 0
+            return 0
+        if profile_count > (<size_t> -1) // sizeof(plan7_bias_profile):
+            raise OverflowError("packed bias profile size overflows size_t")
+        expected_bias_bytes = profile_count * sizeof(plan7_bias_profile)
+        if <size_t> packed_bias_profiles.shape[0] != expected_bias_bytes:
+            raise ValueError("packed bias profile buffer has the wrong size")
+
+        self._bias_profiles.resize(profile_count)
+        memcpy(
+            self._bias_profiles.data(),
+            &packed_bias_profiles[0],
+            expected_bias_bytes,
+        )
+        candidate_count = self._candidate_indices.size()
+        self._bias_results.resize(candidate_count)
+        self._bias_candidate_offsets.resize(profile_count + 1)
+        for profile_index in range(profile_count):
+            self._bias_candidate_offsets[profile_index] = (
+                self._candidate_offsets[profile_index]
+            )
+        self._bias_candidate_offsets[profile_count] = candidate_count
+
+        if candidate_count == 0:
+            return profile_count
+
+        error[0] = 0
+        with nogil:
+            status = plan7_ssv_sequence_batch_bias_candidates_many(
+                self._batch,
+                self._bias_profiles.data(),
+                profile_count,
+                self._bias_candidate_offsets.data(),
+                self._candidate_indices.data() if candidate_count else NULL,
+                candidate_count,
+                self._bias_results.data() if candidate_count else NULL,
+                candidate_count,
+                error,
+                sizeof(error),
+            )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        return profile_count
+
+    def bias_candidates_many_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+        const uint8_t[::1] packed_bias_profiles,
+    ):
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t candidate_index
+        cdef plan7_bias_result result
+        cdef float_bits score
+        cdef object score_bits
+        cdef list row
+        cdef list output = []
+
+        profile_count = self._run_bias_candidates_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+            m_mu,
+            m_lambda,
+            f1,
+            packed_bias_profiles,
+        )
+        for profile_index in range(profile_count):
+            row = []
+            for candidate_index in range(
+                self._bias_candidate_offsets[profile_index],
+                self._bias_candidate_offsets[profile_index + 1],
+            ):
+                result = self._bias_results[candidate_index]
+                if isfinite(result.filtersc):
+                    score.value = result.filtersc
+                    score_bits = score.bits
+                else:
+                    score_bits = None
+                row.append(
+                    (
+                        result.sequence_index,
+                        result.action,
+                        result.ssv_status,
+                        result.ssv_numerator,
+                        score_bits,
+                    )
+                )
+            output.append(row)
+        return output
+
+    def bias_candidates_many_csr_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+        const uint8_t[::1] packed_bias_profiles,
+    ):
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t candidate_count
+        cdef size_t result_bytes
+        cdef bytearray records
+        cdef uint8_t[::1] record_view
+        cdef carray offsets
+
+        if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
+            raise RuntimeError("array('Q') is not native uint64")
+        profile_count = self._run_bias_candidates_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+            m_mu,
+            m_lambda,
+            f1,
+            packed_bias_profiles,
+        )
+        candidate_count = self._bias_results.size()
+        if candidate_count > (<size_t> -1) // sizeof(plan7_bias_result):
+            raise OverflowError("bias result size overflows size_t")
+        result_bytes = candidate_count * sizeof(plan7_bias_result)
+        records = bytearray(result_bytes)
+        if result_bytes:
+            record_view = records
+            memcpy(&record_view[0], self._bias_results.data(), result_bytes)
+        offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
+        for profile_index in range(profile_count + 1):
+            offsets.data.as_ulonglongs[profile_index] = <uint64_t> (
+                self._bias_candidate_offsets[profile_index]
+            )
+        return records, offsets
+
 
 def filter_raw(
     const uint8_t[::1] striped_scores,
@@ -946,3 +1338,12 @@ F1_CUTOFF_INVALID = PLAN7_F1_CUTOFF_INVALID
 F1_CUTOFF_SCORE = PLAN7_F1_CUTOFF_SCORE
 F1_CUTOFF_ALWAYS_REJECT = PLAN7_F1_CUTOFF_ALWAYS_REJECT
 F1_CUTOFF_ALWAYS_CPU = PLAN7_F1_CUTOFF_ALWAYS_CPU
+BIAS_CPU_REQUIRED = PLAN7_BIAS_CPU_REQUIRED
+BIAS_DEFINITE_REJECT = PLAN7_BIAS_DEFINITE_REJECT
+BIAS_DEFINITE_PASS = PLAN7_BIAS_DEFINITE_PASS
+BIAS_CUTOFF_INVALID = PLAN7_BIAS_CUTOFF_INVALID
+BIAS_CUTOFF_SCORE = PLAN7_BIAS_CUTOFF_SCORE
+BIAS_CUTOFF_ALWAYS_REJECT = PLAN7_BIAS_CUTOFF_ALWAYS_REJECT
+BIAS_CUTOFF_ALWAYS_PASS = PLAN7_BIAS_CUTOFF_ALWAYS_PASS
+BIAS_PROFILE_SIZE = sizeof(plan7_bias_profile)
+BIAS_RESULT_SIZE = sizeof(plan7_bias_result)

@@ -19,7 +19,12 @@ from libhmmer.impl.p7_oprofile cimport (
     p7_oprofile_Compare,
     p7_oprofile_ReconfigLength,
 )
-from libhmmer.p7_bg cimport P7_BG, p7_bg_SetLength
+from libhmmer.p7_bg cimport (
+    P7_BG,
+    p7_bg_FilterScore,
+    p7_bg_SetFilter,
+    p7_bg_SetLength,
+)
 from libhmmer.p7_pipeline cimport (
     P7_PIPELINE,
     p7_SEARCH_SEQS,
@@ -30,7 +35,7 @@ from libhmmer.p7_pipeline cimport (
 )
 from libhmmer.p7_tophits cimport P7_TOPHITS
 
-from pyhmmer.easel cimport DigitalSequenceBlock
+from pyhmmer.easel cimport DigitalSequence, DigitalSequenceBlock
 from pyhmmer.plan7 cimport HMM, OptimizedProfile, Pipeline, TopHits
 
 import pyhmmer as _pyhmmer
@@ -65,6 +70,47 @@ if _runtime_abi_sha256 != PYHMMER_PRIVATE_ABI_SHA256:
 
 
 cdef size_t HMMER_TARGET_LIMIT = 100000
+
+
+cdef union _float_bits:
+    float value
+    uint32_t bits
+
+
+def _bias_filter_score_bits(
+    Pipeline pipeline,
+    OptimizedProfile optimized_profile,
+    DigitalSequence sequence,
+):
+    """Return HMMER 3.4 ``p7_bg_FilterScore`` as raw binary32 bits."""
+    cdef float filtersc
+    cdef _float_bits encoded
+    cdef int status
+    if not pipeline.alphabet._eq(optimized_profile.alphabet):
+        raise AlphabetMismatch(pipeline.alphabet, optimized_profile.alphabet)
+    if not pipeline.alphabet._eq(sequence.alphabet):
+        raise AlphabetMismatch(pipeline.alphabet, sequence.alphabet)
+    if sequence._sq.n == 0 or sequence._sq.n > HMMER_TARGET_LIMIT:
+        raise ValueError("bias oracle target length must be in [1, 100000]")
+    with nogil:
+        status = p7_bg_SetFilter(
+            pipeline.background._bg,
+            optimized_profile._om.M,
+            optimized_profile._om.compo,
+        )
+        if status == eslOK:
+            status = p7_bg_SetLength(pipeline.background._bg, sequence._sq.n)
+        if status == eslOK:
+            status = p7_bg_FilterScore(
+                pipeline.background._bg,
+                sequence._sq.dsq,
+                sequence._sq.n,
+                &filtersc,
+            )
+    if status != eslOK:
+        raise UnexpectedError(status, "p7_bg_FilterScore")
+    encoded.value = filtersc
+    return encoded.bits
 
 
 def _oprofiles_equal_hmmer(
