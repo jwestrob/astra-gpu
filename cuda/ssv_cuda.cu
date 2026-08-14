@@ -71,6 +71,7 @@ static_assert(offsetof(plan7_ssv_profile, score_offset) == 0 &&
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kSequencesPerBlock = 4;
 constexpr int kExtraScoreVectors = 17;
 constexpr uint64_t kMaximumTargetLength = 100000;
 constexpr float kEvparamUnset = -99999.0f;
@@ -139,12 +140,21 @@ ssv_filter_block(const uint8_t *scores,
     }
   }
 
-  maxima[threadIdx.x] = local_maximum;
+  for (int width = 16; width > 0; width >>= 1)
+    local_maximum = max(
+      local_maximum,
+      __shfl_down_sync(UINT32_MAX, local_maximum, width));
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  if (lane == 0) maxima[warp] = local_maximum;
   __syncthreads();
-  for (int width = blockDim.x / 2; width > 0; width >>= 1) {
-    if (threadIdx.x < width)
-      maxima[threadIdx.x] = max(maxima[threadIdx.x], maxima[threadIdx.x + width]);
-    __syncthreads();
+  if (warp == 0) {
+    local_maximum = lane < blockDim.x / 32 ? maxima[lane] : 128;
+    for (int width = 16; width > 0; width >>= 1)
+      local_maximum = max(
+        local_maximum,
+        __shfl_down_sync(UINT32_MAX, local_maximum, width));
+    if (lane == 0) maxima[0] = local_maximum;
   }
 
   if (threadIdx.x == 0) {
@@ -276,40 +286,47 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
 {
   __shared__ unsigned maxima[kThreads];
   __shared__ plan7_ssv_f1_profile profile_descriptor;
-  const size_t sequence = static_cast<size_t>(blockIdx.x);
   const size_t profile = static_cast<size_t>(blockIdx.y);
 
   if (threadIdx.x == 0) profile_descriptor = profiles[profile];
   __syncthreads();
 
-  if (profile_descriptor.cutoff_mode == PLAN7_F1_CUTOFF_INVALID ||
-      profile_descriptor.cutoff_mode == PLAN7_F1_CUTOFF_ALWAYS_CPU) {
-    if (threadIdx.x == 0) {
+  const size_t first_sequence =
+    static_cast<size_t>(blockIdx.x) * kSequencesPerBlock;
+  for (int iteration = 0; iteration < kSequencesPerBlock; ++iteration) {
+    const size_t sequence = first_sequence + static_cast<size_t>(iteration);
+    if (sequence >= sequence_count) break;
+
+    if (profile_descriptor.cutoff_mode == PLAN7_F1_CUTOFF_INVALID ||
+        profile_descriptor.cutoff_mode == PLAN7_F1_CUTOFF_ALWAYS_CPU) {
+      if (threadIdx.x == 0) {
+        const size_t word = profile * words_per_profile + sequence / 32;
+        atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+      }
+      continue;
+    }
+
+    plan7_ssv_result result;
+    ssv_filter_block<true>(
+      packed_scores + profile_descriptor.profile.score_offset,
+      profile_descriptor.profile.score_stride,
+      profile_descriptor.profile.model_length,
+      residues,
+      offsets,
+      sequence,
+      tjb[profile_descriptor.tjb_offset + sequence],
+      profile_descriptor.profile.tbm,
+      profile_descriptor.profile.tec,
+      profile_descriptor.profile.base,
+      profile_descriptor.profile.bias,
+      &result,
+      maxima);
+    if (threadIdx.x == 0 &&
+        f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
       const size_t word = profile * words_per_profile + sequence / 32;
       atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
     }
-    return;
-  }
-
-  plan7_ssv_result result;
-  ssv_filter_block<true>(
-    packed_scores + profile_descriptor.profile.score_offset,
-    profile_descriptor.profile.score_stride,
-    profile_descriptor.profile.model_length,
-    residues,
-    offsets,
-    sequence,
-    tjb[profile_descriptor.tjb_offset + sequence],
-    profile_descriptor.profile.tbm,
-    profile_descriptor.profile.tec,
-    profile_descriptor.profile.base,
-    profile_descriptor.profile.bias,
-    &result,
-    maxima);
-  if (threadIdx.x == 0 &&
-      f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
-    const size_t word = profile * words_per_profile + sequence / 32;
-    atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+    __syncthreads();
   }
 }
 
@@ -1441,7 +1458,9 @@ plan7_ssv_sequence_batch_f1_mask_many(
                             0,
                             candidate_word_bytes));
 
-  const dim3 grid(static_cast<unsigned>(batch->sequence_count),
+  const dim3 grid(static_cast<unsigned>(
+                    (batch->sequence_count + kSequencesPerBlock - 1) /
+                    kSequencesPerBlock),
                   static_cast<unsigned>(profile_count));
   ssv_f1_mask_many_kernel<<<grid, kThreads>>>(
     batch->device_scores,
