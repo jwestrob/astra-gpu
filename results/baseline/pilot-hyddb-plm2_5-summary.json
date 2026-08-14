@@ -1,0 +1,122 @@
+{
+  "aggregate_stage_promotions": {
+    "bias": {
+      "comparisons": 900558,
+      "fraction": 0.026093821830465113,
+      "passed": 23499
+    },
+    "forward": {
+      "comparisons": 900558,
+      "fraction": 0.0011748271627146725,
+      "passed": 1058
+    },
+    "msv": {
+      "comparisons": 900558,
+      "fraction": 0.029445077385354415,
+      "passed": 26517
+    },
+    "viterbi": {
+      "comparisons": 900558,
+      "fraction": 0.003850945746970212,
+      "passed": 3468
+    }
+  },
+  "dataset_id": "hyddb-plm2_5",
+  "hosts": [
+    "node-128-512g-8gpu-1"
+  ],
+  "run_status": [
+    "pilot"
+  ],
+  "scaling": {
+    "0": {
+      "cpu_seconds_median": 8.066243,
+      "cpu_utilization_median": 0.9986313977011128,
+      "max_rss_kib_median": 25548,
+      "replicates": 3,
+      "speedup_vs_cpu0": 1.0,
+      "wall_seconds": {
+        "max": 8.088832245,
+        "mean": 8.082428305666667,
+        "median": 8.084958269,
+        "min": 8.073494403,
+        "stdev": 0.007975768624731722
+      }
+    },
+    "1": {
+      "cpu_seconds_median": 9.183942,
+      "cpu_utilization_median": 1.2169432699391367,
+      "max_rss_kib_median": 29620,
+      "replicates": 3,
+      "speedup_vs_cpu0": 1.0705256491839312,
+      "wall_seconds": {
+        "max": 7.632147643,
+        "mean": 7.577067670999999,
+        "median": 7.552325603,
+        "min": 7.546729767,
+        "stdev": 0.04778264153199659
+      }
+    },
+    "16": {
+      "cpu_seconds_median": 12.073627,
+      "cpu_utilization_median": 6.486143462277802,
+      "max_rss_kib_median": 267820,
+      "replicates": 3,
+      "speedup_vs_cpu0": 4.5539324952834646,
+      "wall_seconds": {
+        "max": 1.861449268,
+        "mean": 1.7394430969999999,
+        "median": 1.775379472,
+        "min": 1.581500551,
+        "stdev": 0.14339242770659827
+      }
+    },
+    "32": {
+      "cpu_seconds_median": 14.851096,
+      "cpu_utilization_median": 9.784592414548296,
+      "max_rss_kib_median": 488624,
+      "replicates": 3,
+      "speedup_vs_cpu0": 4.877056374232055,
+      "wall_seconds": {
+        "max": 1.768412025,
+        "mean": 1.6247588106666668,
+        "median": 1.657753704,
+        "min": 1.448110703,
+        "stdev": 0.16267984342965003
+      }
+    },
+    "4": {
+      "cpu_seconds_median": 10.841998,
+      "cpu_utilization_median": 3.9014326332435605,
+      "max_rss_kib_median": 81596,
+      "replicates": 3,
+      "speedup_vs_cpu0": 2.909327231852373,
+      "wall_seconds": {
+        "max": 2.889078343,
+        "mean": 2.8118933003333333,
+        "median": 2.778978652,
+        "min": 2.767622906,
+        "stdev": 0.0670849189490118
+      }
+    },
+    "8": {
+      "cpu_seconds_median": 10.255462,
+      "cpu_utilization_median": 5.058713115614648,
+      "max_rss_kib_median": 144696,
+      "replicates": 3,
+      "speedup_vs_cpu0": 4.081966158635528,
+      "wall_seconds": {
+        "max": 2.0301463,
+        "mean": 1.989514099,
+        "median": 1.980652939,
+        "min": 1.957743058,
+        "stdev": 0.03700604653886781
+      }
+    }
+  },
+  "schema_version": 1,
+  "scientific_summary_equivalent": true,
+  "scientific_summary_mismatches": [],
+  "source_dir": "results/baseline/pilot-hyddb-plm2_5",
+  "warning": "Pilot timings from a shared allocation are not reportable performance results."
+}
