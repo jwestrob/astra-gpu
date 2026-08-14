@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -241,14 +242,16 @@ class AstraSearchTests(unittest.TestCase):
                 )
 
     def test_threaded_order_and_worker_local_pipeline_reuse(self):
-        pairs = self.pairs
+        # Forty rows select the maximum eight-row task size and leave one task
+        # beyond the strict four-task reorder window for two workers.
+        pairs = self.pairs * 5
         candidates = self.synthetic_batch.candidate_batch(pairs, F1=1.0)
         expected = self.reference(pairs, self.synthetic_targets, cpus=2, F1=1.0)
 
         original_search = CandidateBatch.search
-        row_two_started = threading.Event()
-        row_three_finished = threading.Event()
-        row_four_started = threading.Event()
+        row_eight_started = threading.Event()
+        row_thirty_one_finished = threading.Event()
+        row_thirty_two_started = threading.Event()
         release_row_zero = threading.Event()
         row_zero_released = threading.Event()
         lock = threading.Lock()
@@ -259,6 +262,24 @@ class AstraSearchTests(unittest.TestCase):
         threads_by_pipeline = defaultdict(set)
         pipeline_calls = Counter()
         completion_order = []
+        submitted_ranges = []
+        shutdown_calls = []
+
+        class ObservedExecutor:
+            def __init__(self, *args, **kwargs):
+                self._executor = RealThreadPoolExecutor(*args, **kwargs)
+
+            def submit(self, function, *args, **kwargs):
+                with lock:
+                    submitted_ranges.append(args)
+                return self._executor.submit(function, *args, **kwargs)
+
+            def shutdown(self, *, wait=True, cancel_futures=False):
+                shutdown_calls.append((wait, cancel_futures))
+                return self._executor.shutdown(
+                    wait=wait,
+                    cancel_futures=cancel_futures,
+                )
 
         def observed_search(candidate_batch, row, pipeline):
             thread_id = threading.get_ident()
@@ -275,23 +296,24 @@ class AstraSearchTests(unittest.TestCase):
                 threads_by_pipeline[pipeline_id].add(thread_id)
                 pipeline_calls[pipeline_id] += 1
             try:
-                # Keep row 0 blocked while the other worker drains the rest of
-                # the four-row reorder window. Row 4 must remain unsubmitted.
+                # Keep the first eight-row task blocked while the other worker
+                # drains the other three tasks in the reorder window. Row 32
+                # must remain unsubmitted.
                 if row == 0:
                     if not release_row_zero.wait(10):
                         raise RuntimeError("test did not release row 0")
                     row_zero_released.set()
-                elif row == 2:
-                    row_two_started.set()
-                elif row == 4:
-                    row_four_started.set()
+                elif row == 8:
+                    row_eight_started.set()
+                elif row == 32:
+                    row_thirty_two_started.set()
                 return original_search(candidate_batch, row, pipeline)
             finally:
                 with lock:
                     completion_order.append(row)
                     active_pipelines.remove(pipeline_id)
-                if row == 3:
-                    row_three_finished.set()
+                if row == 31:
+                    row_thirty_one_finished.set()
 
         actual = []
         consumer_errors = []
@@ -302,28 +324,46 @@ class AstraSearchTests(unittest.TestCase):
             except BaseException as error:
                 consumer_errors.append(error)
 
-        with mock.patch.object(CandidateBatch, "search", new=observed_search):
+        with (
+            mock.patch(
+                "plan7_gpu.astra_search.ThreadPoolExecutor",
+                new=ObservedExecutor,
+            ),
+            mock.patch.object(CandidateBatch, "search", new=observed_search),
+        ):
             consumer = threading.Thread(target=consume, name="astra-test-consumer")
             consumer.start()
             try:
-                self.assertTrue(row_two_started.wait(10))
-                self.assertTrue(row_three_finished.wait(10))
+                self.assertTrue(row_eight_started.wait(10))
+                self.assertTrue(row_thirty_one_finished.wait(10))
                 self.assertFalse(
-                    row_four_started.wait(0.5),
+                    row_thirty_two_started.wait(0.5),
                     "row beyond the reorder window started while row 0 was held",
                 )
                 with lock:
-                    self.assertEqual(rows_started_while_zero_blocked, {0, 1, 2, 3})
+                    self.assertEqual(
+                        rows_started_while_zero_blocked,
+                        {0, *range(8, 32)},
+                    )
+                    self.assertEqual(
+                        submitted_ranges,
+                        [(0, 8), (8, 16), (16, 24), (24, 32)],
+                    )
             finally:
                 release_row_zero.set()
                 consumer.join(10)
 
-        self.assertTrue(row_two_started.is_set())
+        self.assertTrue(row_eight_started.is_set())
         self.assertTrue(row_zero_released.is_set())
-        self.assertTrue(row_four_started.is_set())
+        self.assertTrue(row_thirty_two_started.is_set())
         self.assertFalse(consumer.is_alive())
         self.assertFalse(consumer_errors)
-        self.assertEqual(completion_order[0], 1)
+        self.assertEqual(completion_order[0], 8)
+        self.assertEqual(
+            submitted_ranges,
+            [(0, 8), (8, 16), (16, 24), (24, 32), (32, 40)],
+        )
+        self.assertEqual(shutdown_calls, [(True, True)])
         self.assertEqual(
             [hits.query.name for hits in actual],
             [pair.hmm.name for pair in pairs],
@@ -338,7 +378,10 @@ class AstraSearchTests(unittest.TestCase):
             self.assert_exact_hits(expected_hits, actual_hits)
 
     def test_threaded_yields_prior_row_then_propagates_pipeline_error(self):
-        pairs = (self.pairs[2], self.pairs[0])
+        # Ten rows produce three-row tasks for two workers. The missing-cutoff
+        # failure is inside the first task, so row 0 must still be yielded and
+        # row 2 in that task must never run.
+        pairs = (self.pairs[2], self.pairs[0]) + (self.pairs[2],) * 8
         candidates = self.synthetic_batch.candidate_batch(pairs, F1=1.0)
         iterator = hmmsearch(
             pairs,
@@ -346,6 +389,12 @@ class AstraSearchTests(unittest.TestCase):
             cpus=2,
             bit_cutoffs="gathering",
         )
+        searched_rows = []
+        original_search = CandidateBatch.search
+
+        def observed_search(candidate_batch, row, pipeline):
+            searched_rows.append(row)
+            return original_search(candidate_batch, row, pipeline)
 
         expected_first = self.reference(
             pairs[:1],
@@ -354,9 +403,12 @@ class AstraSearchTests(unittest.TestCase):
             F1=1.0,
             bit_cutoffs="gathering",
         )[0]
-        self.assert_exact_hits(expected_first, next(iterator))
-        with self.assertRaises(MissingCutoffs) as actual_error:
-            next(iterator)
+        with mock.patch.object(CandidateBatch, "search", new=observed_search):
+            self.assert_exact_hits(expected_first, next(iterator))
+            with self.assertRaises(MissingCutoffs) as actual_error:
+                next(iterator)
+
+        self.assertNotIn(2, searched_rows)
 
         with self.assertRaises(MissingCutoffs) as reference_error:
             pyhmmer.plan7.Pipeline(
@@ -366,6 +418,56 @@ class AstraSearchTests(unittest.TestCase):
         self.assertEqual(
             actual_error.exception.model_name,
             reference_error.exception.model_name,
+        )
+        self.assertFalse(
+            any(
+                thread.name.startswith("plan7-gpu-astra")
+                for thread in threading.enumerate()
+            )
+        )
+
+    def test_threaded_close_cancels_queued_chunks_and_joins_workers(self):
+        pairs = self.pairs * 5
+        candidates = self.synthetic_batch.candidate_batch(pairs, F1=1.0)
+        original_search = CandidateBatch.search
+        blocked_rows_started = {8: threading.Event(), 16: threading.Event()}
+        release_workers = threading.Event()
+        searched_rows = []
+        lock = threading.Lock()
+
+        def observed_search(candidate_batch, row, pipeline):
+            with lock:
+                searched_rows.append(row)
+            if row in blocked_rows_started:
+                blocked_rows_started[row].set()
+                if not release_workers.wait(10):
+                    raise RuntimeError("test did not release worker")
+            return original_search(candidate_batch, row, pipeline)
+
+        with mock.patch.object(CandidateBatch, "search", new=observed_search):
+            iterator = hmmsearch(pairs, candidates, cpus=2)
+            first = next(iterator)
+            self.assertEqual(first.query.name, pairs[0].hmm.name)
+            for event in blocked_rows_started.values():
+                self.assertTrue(event.wait(10))
+
+            closer = threading.Thread(target=iterator.close, name="astra-test-close")
+            closer.start()
+            try:
+                closer.join(0.2)
+                self.assertTrue(closer.is_alive(), "close did not wait for workers")
+            finally:
+                release_workers.set()
+                closer.join(10)
+
+        self.assertFalse(closer.is_alive())
+        with lock:
+            self.assertFalse(any(row >= 24 for row in searched_rows))
+        self.assertFalse(
+            any(
+                thread.name.startswith("plan7-gpu-astra")
+                for thread in threading.enumerate()
+            )
         )
 
     def test_empty_inputs_and_bridge_contract_validation(self):

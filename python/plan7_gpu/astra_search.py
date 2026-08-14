@@ -10,10 +10,11 @@ A :class:`~plan7_gpu.adapter.SequenceBatch` is convenient when the caller
 wants this function to build the candidate rows.  Passing a precomputed
 :class:`~plan7_gpu.adapter.CandidateBatch` avoids filtering twice; its bound
 profile identities and F1 threshold are checked before any CPU search starts.
-Parallel searches use a two-rows-per-worker reorder window and one exclusively
-owned, exact-base PyHMMER ``Pipeline`` per worker thread.  The window keeps
-workers busy across query skew without retaining an unbounded number of
-completed ``TopHits`` objects behind one slow query.
+Parallel searches use small contiguous row chunks, a two-chunks-per-worker
+reorder window, and one exclusively owned, exact-base PyHMMER ``Pipeline`` per
+worker thread.  The window keeps workers busy across query skew without
+retaining an unbounded number of completed ``TopHits`` objects behind one slow
+query.
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ from .adapter import (
     SequenceBatch,
     _candidate_state,
 )
+
+
+_MAX_ROWS_PER_TASK = 8
+_TASKS_PER_WORKER_WINDOW = 2
 
 
 def _positive_cpus(value: Any) -> int:
@@ -146,21 +151,45 @@ def _threaded_hmmsearch(
     worker_count = min(cpus, len(candidates))
     worker_state = local()
 
-    def search(row: int) -> Any:
+    # Eight rows is enough to amortize Future creation for the many cheap
+    # reject-only rows common after GPU filtering, while keeping retained
+    # TopHits and query-skew latency small.  Shrink chunks for short searches
+    # so there are up to two initial tasks per worker instead of idling most
+    # workers behind one oversized chunk.
+    chunk_size = min(
+        _MAX_ROWS_PER_TASK,
+        max(
+            1,
+            (len(candidates) + _TASKS_PER_WORKER_WINDOW * worker_count - 1)
+            // (_TASKS_PER_WORKER_WINDOW * worker_count),
+        ),
+    )
+
+    def search_chunk(start: int, stop: int) -> tuple[list[Any], BaseException | None]:
         pipeline = getattr(worker_state, "pipeline", None)
         if pipeline is None:
             pipeline = pyhmmer.plan7.Pipeline(**pipeline_options)
             worker_state.pipeline = pipeline
-        return _search_row(candidates, row, pipeline)
+
+        hits = []
+        for row in range(start, stop):
+            try:
+                hits.append(_search_row(candidates, row, pipeline))
+            except BaseException as error:
+                # A task must preserve row-wise failure order: successful rows
+                # before the failing row are yielded before this exact error.
+                return hits, error
+        return hits, None
 
     executor = ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="plan7-gpu-astra",
     )
 
-    def submit(row: int) -> Future[Any]:
+    def submit(start: int) -> Future[Any]:
+        stop = min(start + chunk_size, len(candidates))
         try:
-            return executor.submit(search, row)
+            return executor.submit(search_chunk, start, stop)
         except BaseException as error:
             failed: Future[Any] = Future()
             failed.set_exception(error)
@@ -168,21 +197,28 @@ def _threaded_hmmsearch(
 
     pending: deque[Future[Any]] = deque()
     next_row = 0
-    window_size = min(len(candidates), 2 * worker_count)
+    window_size = min(
+        len(candidates),
+        chunk_size * _TASKS_PER_WORKER_WINDOW * worker_count,
+    )
     try:
         while next_row < window_size:
             pending.append(submit(next_row))
-            next_row += 1
+            next_row += chunk_size
 
         while pending:
             future = pending.popleft()
-            hits = future.result()
-            # Refill the strict reorder window before handing this result to
-            # Astra, so CPU workers keep running while Astra writes the hits.
-            if next_row < len(candidates):
+            chunk_hits, error = future.result()
+            # Refill the strict chunk window before handing successful results
+            # to Astra, so workers keep running while Astra writes the hits.
+            # Do not schedule more work after a known row failure.
+            if error is None and next_row < len(candidates):
                 pending.append(submit(next_row))
-                next_row += 1
-            yield hits
+                next_row += chunk_size
+            for hits in chunk_hits:
+                yield hits
+            if error is not None:
+                raise error
     finally:
         for future in pending:
             future.cancel()
@@ -208,10 +244,10 @@ def hmmsearch(
     must be a positive integer, with ``1`` executing lazily in the consuming
     thread.  Values of ``0`` are rejected instead of consulting host topology,
     so Astra's explicit ``--threads`` allocation cannot be exceeded silently.
-    Threaded iteration keeps at most twice the effective worker count submitted
-    but not yet yielded, bounding both the reorder buffer and queued work.
-    The returned iterator owns all pipelines and worker threads until it is
-    exhausted or closed.
+    Threaded iteration keeps at most twice the effective worker count in-flight
+    chunks of at most eight rows each, bounding both the reorder buffer and
+    queued work.  The returned iterator owns all pipelines and worker threads
+    until it is exhausted or closed.
     """
     worker_count = _positive_cpus(cpus)
     pairs = _pressed_pairs(profile_pairs)
