@@ -247,8 +247,32 @@ def _profile_selection_state(selection: Any) -> _ProfileSelectionState:
         raise TypeError("invalid ProfileSelection object") from error
 
 
+def _profile_worker_budget(
+    value: Any,
+    default: int,
+    profile_count: int,
+    name: str,
+) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a nonnegative integer")
+    try:
+        requested = operator.index(value)
+    except TypeError as error:
+        raise TypeError(f"{name} must be a nonnegative integer") from error
+    if requested < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return min(requested, profile_count)
+
+
 class ProfileSession:
-    """An immutable host snapshot of one pressed profile database."""
+    """An immutable host snapshot of one pressed profile database.
+
+    ``pack_workers`` remains the shared default for construction and selection.
+    Either phase may be overridden independently; construction workers are
+    retired before this constructor returns.
+    """
 
     __slots__ = ("__weakref__",)
 
@@ -257,24 +281,25 @@ class ProfileSession:
         profile_pairs: Iterable[PressedProfilePair],
         *,
         pack_workers: int | None = None,
+        build_workers: int | None = None,
+        selection_workers: int | None = None,
     ):
         pairs = tuple(profile_pairs)
         if not pairs:
             raise ValueError("a profile session requires at least one profile")
-        if pack_workers is None:
-            worker_count = min(16, len(pairs))
-        else:
-            if isinstance(pack_workers, bool):
-                raise TypeError("pack_workers must be a nonnegative integer")
-            try:
-                requested_workers = operator.index(pack_workers)
-            except TypeError as error:
-                raise TypeError(
-                    "pack_workers must be a nonnegative integer"
-                ) from error
-            if requested_workers < 0:
-                raise ValueError("pack_workers must be nonnegative")
-            worker_count = min(requested_workers, len(pairs))
+        default_workers = min(16, len(pairs))
+        shared_workers = _profile_worker_budget(
+            pack_workers, default_workers, len(pairs), "pack_workers"
+        )
+        build_worker_count = _profile_worker_budget(
+            build_workers, shared_workers, len(pairs), "build_workers"
+        )
+        selection_worker_count = _profile_worker_budget(
+            selection_workers,
+            shared_workers,
+            len(pairs),
+            "selection_workers",
+        )
         if not _native.bias_host_environment_attested():
             raise RuntimeError(
                 "profile sessions require the attested host floating-point environment"
@@ -320,7 +345,8 @@ class ProfileSession:
             native = _native.ProfileSession(
                 profiles,
                 memoryview(background.residue_frequencies),
-                worker_count,
+                build_worker_count,
+                selection_worker_count,
             )
         _PROFILE_SESSION_STATES[self] = _ProfileSessionState(
             pairs, alphabet, native

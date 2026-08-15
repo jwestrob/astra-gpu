@@ -1200,9 +1200,11 @@ struct plan7_viterbi_database {
 
 struct plan7_profile_session {
   uint64_t session_id;
+  uint64_t build_worker_count;
+  uint64_t build_parallel_run_count;
   uint64_t selection_count;
   std::shared_ptr<const HostProfilePack> pack;
-  std::unique_ptr<PackWorkerPool> workers;
+  std::unique_ptr<PackWorkerPool> selection_workers;
   std::mutex operation_mutex;
 };
 
@@ -1689,11 +1691,12 @@ extern "C" size_t plan7_viterbi_database_profile_count(
 extern "C" int plan7_profile_session_create(
     const uintptr_t *profile_pointers, size_t profile_count,
     const float *background, size_t background_count,
-    size_t worker_count,
+    size_t build_worker_count, size_t selection_worker_count,
     plan7_profile_session **session, char *error, size_t error_size) {
   if (session == nullptr || *session != nullptr || background == nullptr ||
       background_count != 20 ||
-      worker_count > profile_count ||
+      build_worker_count > profile_count ||
+      selection_worker_count > profile_count ||
       (profile_count != 0 && profile_pointers == nullptr)) {
     set_error(error, error_size, "invalid profile session arguments");
     return -1;
@@ -1710,17 +1713,20 @@ extern "C" int plan7_profile_session_create(
     }
   }
 
-  std::unique_ptr<PackWorkerPool> workers;
+  std::unique_ptr<PackWorkerPool> build_workers;
   try {
-    workers = std::make_unique<PackWorkerPool>(worker_count);
+    build_workers = std::make_unique<PackWorkerPool>(build_worker_count);
   } catch (...) {
-    set_error(error, error_size, "profile session worker launch failed");
+    set_error(error, error_size, "profile session build worker launch failed");
     return -1;
   }
   HostProfilePack pack;
   if (snapshot_profiles(profile_pointers, profile_count, background,
-                        workers.get(), &pack, error, error_size) != 0)
+                        build_workers.get(), &pack, error, error_size) != 0)
     return -1;
+  const uint64_t build_parallel_run_count =
+      build_workers->parallel_run_count();
+  build_workers.reset();
 
   uint64_t session_id;
   if (!claim_profile_session_id(&session_id)) {
@@ -1743,6 +1749,16 @@ extern "C" int plan7_profile_session_create(
     return -1;
   }
 
+  std::unique_ptr<PackWorkerPool> selection_workers;
+  try {
+    selection_workers =
+        std::make_unique<PackWorkerPool>(selection_worker_count);
+  } catch (...) {
+    set_error(error, error_size,
+              "profile session selection worker launch failed");
+    return -1;
+  }
+
   auto *created = new (std::nothrow) plan7_profile_session{};
   if (created == nullptr) {
     set_error(error, error_size, "profile session allocation failed");
@@ -1750,9 +1766,11 @@ extern "C" int plan7_profile_session_create(
   }
   try {
     created->session_id = session_id;
+    created->build_worker_count = build_worker_count;
+    created->build_parallel_run_count = build_parallel_run_count;
     created->selection_count = 0;
     created->pack = std::make_shared<const HostProfilePack>(std::move(pack));
-    created->workers = std::move(workers);
+    created->selection_workers = std::move(selection_workers);
   } catch (...) {
     delete created;
     set_error(error, error_size, "profile session allocation failed");
@@ -1779,7 +1797,7 @@ extern "C" int plan7_profile_session_get_statistics(
     plan7_profile_session_statistics *statistics,
     char *error, size_t error_size) {
   if (session == nullptr || statistics == nullptr || session->pack == nullptr ||
-      session->workers == nullptr) {
+      session->selection_workers == nullptr) {
     set_error(error, error_size, "invalid profile session statistics");
     return -1;
   }
@@ -1787,9 +1805,21 @@ extern "C" int plan7_profile_session_get_statistics(
   *statistics = {};
   statistics->session_id = session->session_id;
   statistics->profile_count = pack.vit_profiles.size();
-  statistics->worker_count = session->workers->worker_count();
+  statistics->worker_count = session->selection_workers->worker_count();
+  statistics->build_worker_count = session->build_worker_count;
+  statistics->selection_worker_count =
+      session->selection_workers->worker_count();
   statistics->selection_count = session->selection_count;
-  statistics->parallel_run_count = session->workers->parallel_run_count();
+  statistics->build_parallel_run_count =
+      session->build_parallel_run_count;
+  statistics->selection_parallel_run_count =
+      session->selection_workers->parallel_run_count();
+  statistics->parallel_run_count =
+      statistics->selection_parallel_run_count >
+              UINT64_MAX - statistics->build_parallel_run_count
+          ? UINT64_MAX
+          : statistics->build_parallel_run_count +
+                statistics->selection_parallel_run_count;
   statistics->host_bytes = host_pack_bytes(pack);
   statistics->ssv_score_bytes = pack.ssv_scores.size();
   statistics->bias_profile_bytes =
@@ -1817,7 +1847,7 @@ extern "C" int plan7_profile_session_select(
     size_t profile_count, plan7_profile_selection **selection,
     char *error, size_t error_size) {
   if (session == nullptr || session->pack == nullptr ||
-      session->workers == nullptr || selection == nullptr ||
+      session->selection_workers == nullptr || selection == nullptr ||
       *selection != nullptr ||
       (profile_count != 0 && profile_indices == nullptr)) {
     set_error(error, error_size, "invalid profile selection arguments");
@@ -1929,7 +1959,7 @@ extern "C" int plan7_profile_session_select(
     return -1;
   }
   SelectionCopyTask task{&source, &selected, profile_indices};
-  session->workers->parallel_for(
+  session->selection_workers->parallel_for(
       profile_count, &task, copy_selection_profile);
 
   if (session->selection_count == UINT64_MAX) {

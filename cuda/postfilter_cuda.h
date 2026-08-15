@@ -64,9 +64,14 @@ typedef struct plan7_profile_selection_view {
 typedef struct plan7_profile_session_statistics {
   uint64_t session_id;
   uint64_t profile_count;
+  /* Legacy alias for selection_worker_count. */
   uint64_t worker_count;
+  uint64_t build_worker_count;
+  uint64_t selection_worker_count;
   uint64_t selection_count;
   uint64_t parallel_run_count;
+  uint64_t build_parallel_run_count;
+  uint64_t selection_parallel_run_count;
   /* Immutable payload bytes, excluding allocator slack and worker stacks. */
   uint64_t host_bytes;
   uint64_t ssv_score_bytes;
@@ -122,7 +127,8 @@ int plan7_profile_session_create(const uintptr_t *profile_pointers,
                                  size_t profile_count,
                                  const float *background,
                                  size_t background_count,
-                                 size_t worker_count,
+                                 size_t build_worker_count,
+                                 size_t selection_worker_count,
                                  plan7_profile_session **session,
                                  char *error,
                                  size_t error_size);

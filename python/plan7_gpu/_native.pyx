@@ -457,8 +457,12 @@ cdef extern from "postfilter_cuda.h" nogil:
         uint64_t session_id
         uint64_t profile_count
         uint64_t worker_count
+        uint64_t build_worker_count
+        uint64_t selection_worker_count
         uint64_t selection_count
         uint64_t parallel_run_count
+        uint64_t build_parallel_run_count
+        uint64_t selection_parallel_run_count
         uint64_t host_bytes
         uint64_t ssv_score_bytes
         uint64_t bias_profile_bytes
@@ -493,7 +497,8 @@ cdef extern from "postfilter_cuda.h" nogil:
         size_t profile_count,
         const float *background,
         size_t background_count,
-        size_t worker_count,
+        size_t build_worker_count,
+        size_t selection_worker_count,
         plan7_profile_session **session,
         char *error,
         size_t error_size,
@@ -1220,7 +1225,13 @@ cdef class ProfileSession:
     def __cinit__(self):
         self._session = NULL
 
-    def __init__(self, profiles, const float[::1] background, size_t worker_count):
+    def __init__(
+        self,
+        profiles,
+        const float[::1] background,
+        size_t build_worker_count,
+        size_t selection_worker_count,
+    ):
         cdef tuple owners = tuple(profiles)
         cdef vector[uintptr_t] pointers
         cdef OptimizedProfile profile
@@ -1232,7 +1243,10 @@ cdef class ProfileSession:
             raise RuntimeError("profile session is already initialized")
         if background.shape[0] != 20:
             raise ValueError("profile session background must have 20 residues")
-        if worker_count > <size_t> len(owners):
+        if (
+            build_worker_count > <size_t> len(owners)
+            or selection_worker_count > <size_t> len(owners)
+        ):
             raise ValueError("profile session worker count exceeds profile count")
         pointers.reserve(len(owners))
         for value in owners:
@@ -1247,7 +1261,8 @@ cdef class ProfileSession:
                 pointers.size(),
                 &background[0],
                 <size_t> background.shape[0],
-                worker_count,
+                build_worker_count,
+                selection_worker_count,
                 &self._session,
                 error,
                 sizeof(error),
@@ -1283,8 +1298,16 @@ cdef class ProfileSession:
             "session_id": statistics.session_id,
             "profile_count": statistics.profile_count,
             "worker_count": statistics.worker_count,
+            "build_worker_count": statistics.build_worker_count,
+            "selection_worker_count": statistics.selection_worker_count,
             "selection_count": statistics.selection_count,
             "parallel_run_count": statistics.parallel_run_count,
+            "build_parallel_run_count": (
+                statistics.build_parallel_run_count
+            ),
+            "selection_parallel_run_count": (
+                statistics.selection_parallel_run_count
+            ),
             "host_bytes": statistics.host_bytes,
             "ssv_score_bytes": statistics.ssv_score_bytes,
             "bias_profile_bytes": statistics.bias_profile_bytes,

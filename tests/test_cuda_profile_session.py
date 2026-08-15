@@ -138,7 +138,11 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
             forward_q_counts = [(length + 3) // 4 for length in lengths]
             self.assertEqual(statistics["profile_count"], 3)
             self.assertEqual(statistics["worker_count"], 3)
+            self.assertEqual(statistics["build_worker_count"], 3)
+            self.assertEqual(statistics["selection_worker_count"], 3)
             self.assertEqual(statistics["parallel_run_count"], 1)
+            self.assertEqual(statistics["build_parallel_run_count"], 1)
+            self.assertEqual(statistics["selection_parallel_run_count"], 0)
             self.assertEqual(statistics["ssv_score_bytes"], sum(lengths) * 29)
             self.assertEqual(statistics["bias_profile_bytes"], 3 * 272)
             self.assertEqual(statistics["viterbi_descriptor_bytes"], 3 * 96)
@@ -172,6 +176,8 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                 updated = session.statistics
                 self.assertEqual(updated["selection_count"], 2)
                 self.assertEqual(updated["parallel_run_count"], 2)
+                self.assertEqual(updated["build_parallel_run_count"], 1)
+                self.assertEqual(updated["selection_parallel_run_count"], 1)
             finally:
                 empty.close()
                 first.close()
@@ -193,6 +199,12 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                     self.assertEqual(
                         session.statistics["worker_count"], expected
                     )
+                    self.assertEqual(
+                        session.statistics["build_worker_count"], expected
+                    )
+                    self.assertEqual(
+                        session.statistics["selection_worker_count"], expected
+                    )
                     with session.select([2, 0]):
                         self.assertEqual(
                             session.statistics["parallel_run_count"], 2
@@ -203,6 +215,103 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                     ProfileSession(self.pairs, pack_workers=value)
         with self.assertRaisesRegex(ValueError, "nonnegative"):
             ProfileSession(self.pairs, pack_workers=-1)
+
+    def test_build_and_selection_worker_budgets_are_independent(self):
+        with ProfileSession(
+            self.pairs,
+            build_workers=2,
+            selection_workers=0,
+        ) as session:
+            statistics = session.statistics
+            self.assertEqual(statistics["worker_count"], 0)
+            self.assertEqual(statistics["build_worker_count"], 2)
+            self.assertEqual(statistics["selection_worker_count"], 0)
+            self.assertEqual(statistics["build_parallel_run_count"], 1)
+            self.assertEqual(statistics["selection_parallel_run_count"], 0)
+            with session.select([2, 0]):
+                statistics = session.statistics
+                self.assertEqual(statistics["parallel_run_count"], 2)
+                self.assertEqual(
+                    statistics["selection_parallel_run_count"], 1
+                )
+
+        with ProfileSession(
+            self.pairs,
+            pack_workers=0,
+            build_workers=2,
+        ) as session:
+            self.assertEqual(session.statistics["build_worker_count"], 2)
+            self.assertEqual(session.statistics["selection_worker_count"], 0)
+
+        with ProfileSession(
+            self.pairs,
+            pack_workers=1,
+            build_workers=99,
+            selection_workers=2,
+        ) as session:
+            self.assertEqual(session.statistics["build_worker_count"], 3)
+            self.assertEqual(session.statistics["selection_worker_count"], 2)
+
+        for name in ("build_workers", "selection_workers"):
+            for value in (True, 1.5, "1"):
+                with self.subTest(name=name, invalid=value):
+                    with self.assertRaisesRegex(TypeError, name):
+                        ProfileSession(self.pairs, **{name: value})
+            with self.subTest(name=name, invalid=-1):
+                with self.assertRaisesRegex(ValueError, name):
+                    ProfileSession(self.pairs, **{name: -1})
+
+    @unittest.skipUnless(
+        platform.system() == "Linux" and Path("/proc/self/task").is_dir(),
+        "worker thread lifecycle probe requires Linux procfs",
+    )
+    def test_build_workers_retire_and_selection_workers_persist(self):
+        tasks = Path("/proc/self/task")
+        baseline = {entry.name for entry in tasks.iterdir()}
+        with ProfileSession(
+            self.pairs,
+            build_workers=2,
+            selection_workers=0,
+        ):
+            self.assertEqual(
+                {entry.name for entry in tasks.iterdir()}, baseline
+            )
+
+        session = ProfileSession(
+            self.pairs,
+            build_workers=0,
+            selection_workers=2,
+        )
+        persistent = {entry.name for entry in tasks.iterdir()} - baseline
+        try:
+            self.assertEqual(len(persistent), 2)
+        finally:
+            session.close()
+        self.assertTrue(
+            persistent.isdisjoint(entry.name for entry in tasks.iterdir())
+        )
+
+    @unittest.skipUnless(
+        platform.system() == "Linux" and Path("/proc/self/task").is_dir(),
+        "worker thread lifecycle probe requires Linux procfs",
+    )
+    def test_build_workers_retire_after_snapshot_failure(self):
+        tasks = Path("/proc/self/task")
+        baseline = {entry.name for entry in tasks.iterdir()}
+        invalid = pyhmmer.plan7.OptimizedProfile.__new__(
+            pyhmmer.plan7.OptimizedProfile
+        )
+        background = pyhmmer.plan7.Background(self.alphabet)
+        with self.assertRaisesRegex(
+            ValueError, "invalid optimized Viterbi profile"
+        ):
+            _native.ProfileSession(
+                [invalid],
+                memoryview(background.residue_frequencies),
+                1,
+                0,
+            )
+        self.assertEqual({entry.name for entry in tasks.iterdir()}, baseline)
 
     def test_selection_validation_and_lifecycle(self):
         with self.assertRaisesRegex(ValueError, "at least one"):
