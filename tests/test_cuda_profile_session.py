@@ -35,6 +35,11 @@ except ImportError:
     _candidate_state = None
     _pair_state = None
 
+try:
+    from plan7_gpu import _pipeline
+except ImportError:
+    _pipeline = None
+
 
 DATA = Path(pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
 
@@ -46,6 +51,10 @@ def cuda_available():
         return _native.device_count() > 0
     except RuntimeError:
         return False
+
+
+def postfilter_seam_available():
+    return _pipeline is not None and _pipeline._filter_scores_seam_available()
 
 
 class ProfileSessionFixture:
@@ -301,6 +310,29 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
 
 
 @unittest.skipUnless(cuda_available(), "CUDA backend or device unavailable")
+@unittest.skipUnless(_pipeline is not None, "pipeline extension unavailable")
+@unittest.skipIf(
+    postfilter_seam_available(), "private filter-score seam is available"
+)
+class StockCudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
+    def test_postfilter_apis_require_private_continuation_seam(self):
+        with ProfileSession(self.pairs) as session:
+            with session.select([2]) as selection:
+                with SequenceBatch(self.targets) as batch:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "p7_PipelineFromFilterScores"
+                    ):
+                        batch.postfilter_batch([self.pairs[2]])
+                    with self.assertRaisesRegex(
+                        RuntimeError, "p7_PipelineFromFilterScores"
+                    ):
+                        batch.postfilter_selection(selection)
+
+
+@unittest.skipUnless(cuda_available(), "CUDA backend or device unavailable")
+@unittest.skipUnless(
+    postfilter_seam_available(), "private filter-score seam is unavailable"
+)
 class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
     def test_noncontiguous_selection_matches_live_path_exactly(self):
         with ProfileSession(self.pairs) as session:
