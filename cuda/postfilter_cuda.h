@@ -54,6 +54,8 @@ typedef struct plan7_profile_selection_view {
   const plan7_ssv_profile *profiles;
   const float *m_mu;
   const float *m_lambda;
+  const float *v_mu;
+  const float *v_lambda;
   const plan7_bias_profile *bias_templates;
   const uintptr_t *identity_tokens;
   uint64_t host_bytes;
@@ -73,6 +75,9 @@ typedef struct plan7_profile_session_statistics {
   uint64_t viterbi_emission_bytes;
   uint64_t viterbi_transition_bytes;
   uint64_t viterbi_exact_rbv_bytes;
+  uint64_t forward_descriptor_bytes;
+  uint64_t forward_emission_bytes;
+  uint64_t forward_transition_bytes;
 } plan7_profile_session_statistics;
 
 enum plan7_postfilter_workspace_capacity {
@@ -117,6 +122,7 @@ int plan7_profile_session_create(const uintptr_t *profile_pointers,
                                  size_t profile_count,
                                  const float *background,
                                  size_t background_count,
+                                 size_t worker_count,
                                  plan7_profile_session **session,
                                  char *error,
                                  size_t error_size);
@@ -157,6 +163,16 @@ int plan7_profile_selection_get_view(
 int plan7_profile_selection_stage_viterbi(
   const plan7_profile_selection *selection,
   plan7_viterbi_database **database,
+  char *error,
+  size_t error_size);
+
+struct plan7_forward_database;
+
+/* Upload the immutable Forward pack for this selection to the current
+ * device. The returned database owns everything needed after this call. */
+int plan7_profile_selection_stage_forward(
+  const plan7_profile_selection *selection,
+  struct plan7_forward_database **database,
   char *error,
   size_t error_size);
 

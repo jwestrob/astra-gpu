@@ -25,7 +25,12 @@ try:
         load_pressed_profiles,
     )
     from plan7_gpu import _native
-    from plan7_gpu.adapter import _candidate_state, _pair_state
+    from plan7_gpu.adapter import (
+        _candidate_state,
+        _pair_state,
+        _profile_selection_state,
+        _sequence_state,
+    )
 except ImportError:
     ProfileSelection = None
     ProfileSession = None
@@ -34,6 +39,8 @@ except ImportError:
     _native = None
     _candidate_state = None
     _pair_state = None
+    _profile_selection_state = None
+    _sequence_state = None
 
 try:
     from plan7_gpu import _pipeline
@@ -55,6 +62,13 @@ def cuda_available():
 
 def postfilter_seam_available():
     return _pipeline is not None and _pipeline._filter_scores_seam_available()
+
+
+def forward_seam_available():
+    return (
+        _pipeline is not None
+        and _pipeline._filter_and_forward_scores_seam_available()
+    )
 
 
 class ProfileSessionFixture:
@@ -92,14 +106,18 @@ class ProfileSessionFixture:
         cls.temporary.cleanup()
 
     @classmethod
-    def pipeline(cls, f1=0.02):
+    def pipeline(cls, f1=0.02, **options):
+        arguments = {
+            "F1": f1,
+            "E": 10.0,
+            "domE": 10.0,
+            "incE": 10.0,
+            "incdomE": 10.0,
+        }
+        arguments.update(options)
         return pyhmmer.plan7.Pipeline(
             cls.alphabet,
-            F1=f1,
-            E=10.0,
-            domE=10.0,
-            incE=10.0,
-            incdomE=10.0,
+            **arguments,
         )
 
     @staticmethod
@@ -117,6 +135,7 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
             statistics = session.statistics
             lengths = [pair.hmm.M for pair in self.pairs]
             q_counts = [(length + 31) // 32 for length in lengths]
+            forward_q_counts = [(length + 3) // 4 for length in lengths]
             self.assertEqual(statistics["profile_count"], 3)
             self.assertEqual(statistics["worker_count"], 3)
             self.assertEqual(statistics["parallel_run_count"], 1)
@@ -130,6 +149,15 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
             self.assertEqual(
                 statistics["viterbi_transition_bytes"],
                 sum(q_counts) * 8 * 32 * 2,
+            )
+            self.assertEqual(statistics["forward_descriptor_bytes"], 3 * 48)
+            self.assertEqual(
+                statistics["forward_emission_bytes"],
+                sum(forward_q_counts) * 29 * 4 * 4,
+            )
+            self.assertEqual(
+                statistics["forward_transition_bytes"],
+                sum(forward_q_counts) * 8 * 4 * 4,
             )
 
             first = session.select([2, 0])
@@ -149,6 +177,32 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                 first.close()
         finally:
             session.close()
+
+    def test_pack_worker_budget_is_explicit_and_bounded(self):
+        for requested, expected in (
+            (None, 3),
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (99, 3),
+        ):
+            with self.subTest(requested=requested):
+                options = {} if requested is None else {"pack_workers": requested}
+                with ProfileSession(self.pairs, **options) as session:
+                    self.assertEqual(
+                        session.statistics["worker_count"], expected
+                    )
+                    with session.select([2, 0]):
+                        self.assertEqual(
+                            session.statistics["parallel_run_count"], 2
+                        )
+        for value in (True, 1.5, "1"):
+            with self.subTest(invalid=value):
+                with self.assertRaisesRegex(TypeError, "pack_workers"):
+                    ProfileSession(self.pairs, pack_workers=value)
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            ProfileSession(self.pairs, pack_workers=-1)
 
     def test_selection_validation_and_lifecycle(self):
         with self.assertRaisesRegex(ValueError, "at least one"):
@@ -327,6 +381,12 @@ class StockCudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                         RuntimeError, "p7_PipelineFromFilterScores"
                     ):
                         batch.postfilter_selection(selection)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "p7_PipelineFromFilterScores"
+                    ):
+                        batch._postfilter_forward_selection(
+                            selection, 0.02, 1.0, 1.0, True
+                        )
 
 
 @unittest.skipUnless(cuda_available(), "CUDA backend or device unavailable")
@@ -354,6 +414,278 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
             [actual.candidate_count(row) for row in range(2)],
             [expected.candidate_count(row) for row in range(2)],
         )
+        self.assertIsNotNone(actual_state.sealed_postfilter)
+
+    @unittest.skipUnless(
+        forward_seam_available(), "private Forward-score seam is unavailable"
+    )
+    def test_noncontiguous_forward_selection_matches_live_path_exactly(self):
+        options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        with ProfileSession(self.pairs, pack_workers=1) as session:
+            with session.select([2, 0]) as selection:
+                with SequenceBatch(self.targets) as batch:
+                    expected = batch._postfilter_forward_batch(
+                        [self.pairs[2], self.pairs[0]],
+                        options["F1"],
+                        options["F2"],
+                        options["F3"],
+                        True,
+                    )
+                    actual = batch._postfilter_forward_selection(
+                        selection,
+                        options["F1"],
+                        options["F2"],
+                        options["F3"],
+                        True,
+                    )
+                    actual_state = _candidate_state(actual)
+                    live_rows, live_indices, _live_filters = (
+                        _pipeline._select_forward_inputs_bound(
+                            [
+                                _pair_state(pair).optimized_profile
+                                for pair in (self.pairs[2], self.pairs[0])
+                            ],
+                            memoryview(actual_state.postfilter_records),
+                            memoryview(actual_state.offsets).cast("Q"),
+                            memoryview(
+                                _sequence_state(batch).residue_offsets
+                            ).cast("Q"),
+                            options["F2"],
+                        )
+                    )
+                    (
+                        _,
+                        snapshot_rows,
+                        snapshot_indices,
+                        _,
+                        _,
+                        _,
+                    ) = _sequence_state(
+                        batch
+                    ).native.forward_profile_selection_raw(
+                        _profile_selection_state(selection).native,
+                        memoryview(actual_state.postfilter_records),
+                        memoryview(actual_state.offsets).cast("Q"),
+                        memoryview(
+                            _sequence_state(batch).residue_offsets
+                        ).cast("Q"),
+                        options["F2"],
+                        options["F3"],
+                    )
+                    self.assertEqual(list(snapshot_rows), list(live_rows))
+                    self.assertEqual(
+                        list(snapshot_indices), list(live_indices)
+                    )
+                    self.assertGreaterEqual(
+                        _sequence_state(batch).native.workspace_statistics[
+                            "forward_run_count"
+                        ],
+                        2,
+                    )
+        expected_state = _candidate_state(expected)
+        actual_state = _candidate_state(actual)
+        self.assertEqual(actual_state.pairs, (self.pairs[2], self.pairs[0]))
+        self.assertEqual(actual_state.offsets, expected_state.offsets)
+        self.assertEqual(
+            actual_state.postfilter_records,
+            expected_state.postfilter_records,
+        )
+        self.assertIsNotNone(actual_state.sealed_postfilter)
+        self.assertIsNone(actual_state.forward)
+        for row in range(2):
+            with self.subTest(row=row):
+                expected_hits = expected.search(row, self.pipeline(**options))
+                actual_hits = actual.search(row, self.pipeline(**options))
+                self.assertEqual(
+                    self.hits_bytes(actual_hits), self.hits_bytes(expected_hits)
+                )
+
+    @unittest.skipUnless(
+        forward_seam_available(), "private Forward-score seam is unavailable"
+    )
+    def test_forward_batch_outlives_inputs_and_searches_concurrently(self):
+        options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        session = ProfileSession(self.pairs, pack_workers=0)
+        selection = session.select([2, 0])
+        session.close()
+        batch = SequenceBatch(self.targets)
+        candidates = batch._postfilter_forward_selection(
+            selection,
+            options["F1"],
+            options["F2"],
+            options["F3"],
+            True,
+        )
+        batch.close()
+        selection.close()
+
+        expected = [
+            self.hits_bytes(
+                self.pipeline(**options).search_hmm(pair.hmm, self.targets)
+            )
+            for pair in (self.pairs[2], self.pairs[0])
+        ]
+        barrier = threading.Barrier(8)
+        failures = []
+
+        def search(worker_index):
+            try:
+                barrier.wait()
+                row = worker_index % 2
+                hits = candidates.search(row, self.pipeline(**options))
+                self.assertEqual(self.hits_bytes(hits), expected[row])
+            except BaseException as error:
+                failures.append(error)
+
+        workers = [
+            threading.Thread(target=search, args=(index,)) for index in range(8)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(20)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        if failures:
+            raise failures[0]
+
+    @unittest.skipUnless(
+        forward_seam_available(), "private Forward-score seam is unavailable"
+    )
+    def test_forward_provenance_mismatch_falls_back_exactly(self):
+        generation = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        with ProfileSession(self.pairs) as session:
+            with session.select([2]) as selection:
+                with SequenceBatch(self.targets) as batch:
+                    candidates = batch._postfilter_forward_selection(
+                        selection,
+                        generation["F1"],
+                        generation["F2"],
+                        generation["F3"],
+                        True,
+                    )
+        mismatches = (
+            {"F2": math.nextafter(1.0, 0.0), "F3": 1.0},
+            {"F2": 1.0, "F3": math.nextafter(1.0, 0.0)},
+            {"F2": 1.0, "F3": 1.0, "bias_filter": False},
+        )
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                options = dict(generation)
+                options.update(mismatch)
+                actual = candidates.search(0, self.pipeline(**options))
+                expected = self.pipeline(**options).search_hmm(
+                    self.pairs[2].hmm, self.targets
+                )
+                self.assertEqual(
+                    self.hits_bytes(actual), self.hits_bytes(expected)
+                )
+
+    @unittest.skipUnless(
+        forward_seam_available(), "private Forward-score seam is unavailable"
+    )
+    def test_forward_generation_uses_snapshot_after_live_arrays_change(self):
+        options = {"F1": 0.99, "F2": 0.99, "F3": 0.99}
+        session = ProfileSession(self.pairs)
+        selection = session.select([2])
+        profile = _pair_state(self.pairs[2]).optimized_profile
+        emissions = memoryview(profile.rfv).cast("B")
+        transitions = memoryview(profile.tfv).cast("B")
+        parameters = profile.evalue_parameters.as_vector()
+        original_emissions = emissions.tobytes()
+        original_transitions = transitions.tobytes()
+        original_parameters = tuple(parameters)
+        try:
+            with SequenceBatch(self.targets) as batch:
+                baseline = batch._postfilter_forward_selection(
+                    selection,
+                    options["F1"],
+                    options["F2"],
+                    options["F3"],
+                    True,
+                )
+                emissions[:] = bytes(len(emissions))
+                transitions[:] = bytes(len(transitions))
+                for index in range(2, 6):
+                    parameters[index] = 1000.0
+                changed = batch._postfilter_forward_selection(
+                    selection,
+                    options["F1"],
+                    options["F2"],
+                    options["F3"],
+                    True,
+                )
+        finally:
+            emissions[:] = original_emissions
+            transitions[:] = original_transitions
+            for index, value in enumerate(original_parameters):
+                parameters[index] = value
+            selection.close()
+            session.close()
+
+        baseline_hits = baseline.search(0, self.pipeline(**options))
+        changed_hits = changed.search(0, self.pipeline(**options))
+        expected_hits = self.pipeline(**options).search_hmm(
+            self.pairs[2].hmm, self.targets
+        )
+        self.assertEqual(
+            self.hits_bytes(changed_hits), self.hits_bytes(baseline_hits)
+        )
+        self.assertEqual(
+            self.hits_bytes(changed_hits), self.hits_bytes(expected_hits)
+        )
+
+    @unittest.skipUnless(
+        forward_seam_available(), "private Forward-score seam is unavailable"
+    )
+    def test_forward_native_stage_and_run_release_gil(self):
+        targets = []
+        for index in range(1024):
+            target = self.targets[2].copy()
+            target.name = f"target-{index}".encode()
+            targets.append(target)
+        target_block = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, targets
+        )
+        with ProfileSession(self.pairs, pack_workers=1) as session:
+            with session.select([2]) as selection:
+                with SequenceBatch(target_block) as batch:
+                    candidates = batch.postfilter_selection(
+                        selection, F1=0.99
+                    )
+                    state = _candidate_state(candidates)
+                    self.assertEqual(candidates.candidate_count(0), len(targets))
+                    ready = threading.Event()
+                    stop = threading.Event()
+                    counter = [0]
+
+                    def spin():
+                        ready.set()
+                        while not stop.is_set():
+                            counter[0] += 1
+
+                    worker = threading.Thread(target=spin)
+                    worker.start()
+                    self.assertTrue(ready.wait(2))
+                    before = counter[0]
+                    try:
+                        _sequence_state(
+                            batch
+                        ).native.forward_profile_selection_raw(
+                            _profile_selection_state(selection).native,
+                            memoryview(state.postfilter_records),
+                            memoryview(state.offsets).cast("Q"),
+                            memoryview(
+                                _sequence_state(batch).residue_offsets
+                            ).cast("Q"),
+                            1.0,
+                            1.0,
+                        )
+                        after = counter[0]
+                    finally:
+                        stop.set()
+                        worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    self.assertGreater(after, before)
 
     def test_exact_rbv_snapshot_matches_live_path(self):
         profile = _pair_state(self.pairs[2]).optimized_profile
@@ -469,7 +801,12 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
         original = libc.fegetround()
         try:
             self.assertEqual(libc.fesetround(0x400), 0)
-            candidates = batch.postfilter_selection(selection)
+            if forward_seam_available():
+                candidates = batch._postfilter_forward_selection(
+                    selection, 0.02, 1.0, 1.0, True
+                )
+            else:
+                candidates = batch.postfilter_selection(selection)
         finally:
             self.assertEqual(libc.fesetround(original), 0)
             batch.close()

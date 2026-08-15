@@ -118,7 +118,7 @@ $(BIAS_CUDA_OBJ): cuda/bias_cuda.cu cuda/bias_cuda.h
 		-Icuda -c -o $@ $<
 
 $(POSTFILTER_CUDA_OBJ): cuda/postfilter_cuda.cu cuda/postfilter_cuda.h \
-		cuda/ssv_cuda.h cuda/bias_cuda.h \
+		cuda/ssv_cuda.h cuda/bias_cuda.h cuda/forward_cuda.h \
 		$(PYHMMER_INCLUDE)/libhmmer/hmmer.h \
 		$(PYHMMER_INCLUDE)/libhmmer/impl_sse/impl_sse.h
 	mkdir -p $(@D)

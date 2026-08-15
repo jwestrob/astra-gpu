@@ -8,6 +8,7 @@ from cpython.array cimport array as carray, clone
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
 from cpython.pyport cimport PY_SSIZE_T_MAX
 from libcpp.vector cimport vector
+from libeasel cimport eslCONST_LOG2
 from pyhmmer.plan7 cimport OptimizedProfile
 
 import array as _array
@@ -77,6 +78,9 @@ _DEVICE_CAPACITY_NAMES = (
 
 cdef extern from * nogil:
     """
+    extern "C" {
+    #include <esl_gumbel.h>
+    }
     static inline unsigned plan7_popcount_u32(uint32_t value) {
       return (unsigned) __builtin_popcount(value);
     }
@@ -86,6 +90,7 @@ cdef extern from * nogil:
     """
     unsigned plan7_popcount_u32(uint32_t value)
     unsigned plan7_ctz_u32(uint32_t value)
+    double esl_gumbel_surv(double, double, double)
 
 
 cdef extern from "bias_cuda.h" nogil:
@@ -430,6 +435,9 @@ cdef extern from "postfilter_cuda.h" nogil:
     ctypedef struct plan7_profile_selection:
         pass
 
+    ctypedef struct plan7_forward_database:
+        pass
+
     ctypedef struct plan7_profile_selection_view:
         uint64_t session_id
         uint64_t selection_id
@@ -439,6 +447,8 @@ cdef extern from "postfilter_cuda.h" nogil:
         const plan7_ssv_profile *profiles
         const float *m_mu
         const float *m_lambda
+        const float *v_mu
+        const float *v_lambda
         const plan7_bias_profile *bias_templates
         const uintptr_t *identity_tokens
         uint64_t host_bytes
@@ -456,6 +466,9 @@ cdef extern from "postfilter_cuda.h" nogil:
         uint64_t viterbi_emission_bytes
         uint64_t viterbi_transition_bytes
         uint64_t viterbi_exact_rbv_bytes
+        uint64_t forward_descriptor_bytes
+        uint64_t forward_emission_bytes
+        uint64_t forward_transition_bytes
 
     int plan7_viterbi_database_create(
         const uintptr_t *profile_pointers,
@@ -480,6 +493,7 @@ cdef extern from "postfilter_cuda.h" nogil:
         size_t profile_count,
         const float *background,
         size_t background_count,
+        size_t worker_count,
         plan7_profile_session **session,
         char *error,
         size_t error_size,
@@ -523,6 +537,13 @@ cdef extern from "postfilter_cuda.h" nogil:
     int plan7_profile_selection_stage_viterbi(
         const plan7_profile_selection *selection,
         plan7_viterbi_database **database,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_profile_selection_stage_forward(
+        const plan7_profile_selection *selection,
+        plan7_forward_database **database,
         char *error,
         size_t error_size,
     )
@@ -605,9 +626,6 @@ cdef extern from "forward_cuda.h" nogil:
         float gather_milliseconds
         float download_milliseconds
         float total_milliseconds
-
-    ctypedef struct plan7_forward_database:
-        pass
 
     ctypedef struct plan7_forward_output:
         pass
@@ -708,6 +726,11 @@ cdef extern from "forward_cuda.h" nogil:
 cdef union float_bits:
     float value
     uint32_t bits
+
+
+cdef union double_bits:
+    double value
+    uint64_t bits
 
 
 def bias_environment_attested():
@@ -1186,7 +1209,7 @@ cdef class ProfileSelection:
 
 
 cdef class ProfileSession:
-    """Host-owned immutable SSV, bias, and Viterbi profile snapshots.
+    """Host-owned immutable SSV, bias, Viterbi, and Forward snapshots.
 
     Session operations and ``close`` must be serialized by the public adapter.
     Construction does not create a CUDA context or allocate device memory.
@@ -1197,7 +1220,7 @@ cdef class ProfileSession:
     def __cinit__(self):
         self._session = NULL
 
-    def __init__(self, profiles, const float[::1] background):
+    def __init__(self, profiles, const float[::1] background, size_t worker_count):
         cdef tuple owners = tuple(profiles)
         cdef vector[uintptr_t] pointers
         cdef OptimizedProfile profile
@@ -1209,6 +1232,8 @@ cdef class ProfileSession:
             raise RuntimeError("profile session is already initialized")
         if background.shape[0] != 20:
             raise ValueError("profile session background must have 20 residues")
+        if worker_count > <size_t> len(owners):
+            raise ValueError("profile session worker count exceeds profile count")
         pointers.reserve(len(owners))
         for value in owners:
             if not isinstance(value, OptimizedProfile):
@@ -1222,6 +1247,7 @@ cdef class ProfileSession:
                 pointers.size(),
                 &background[0],
                 <size_t> background.shape[0],
+                worker_count,
                 &self._session,
                 error,
                 sizeof(error),
@@ -1266,6 +1292,9 @@ cdef class ProfileSession:
             "viterbi_emission_bytes": statistics.viterbi_emission_bytes,
             "viterbi_transition_bytes": statistics.viterbi_transition_bytes,
             "viterbi_exact_rbv_bytes": statistics.viterbi_exact_rbv_bytes,
+            "forward_descriptor_bytes": statistics.forward_descriptor_bytes,
+            "forward_emission_bytes": statistics.forward_emission_bytes,
+            "forward_transition_bytes": statistics.forward_transition_bytes,
         }
 
     def select(self, values):
@@ -2447,6 +2476,331 @@ cdef class SequenceBatch:
             if output != NULL:
                 plan7_forward_output_destroy(&output, NULL, 0)
 
+    def forward_profile_selection_raw(
+        self,
+        ProfileSelection selection,
+        const uint8_t[::1] postfilter_records,
+        const uint64_t[::1] postfilter_offsets,
+        const uint64_t[::1] residue_offsets,
+        double f2,
+        double f3,
+        uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
+    ):
+        """Run selection-aware F2/F3 without reading a live optimized profile."""
+        cdef plan7_profile_selection_view view = selection._view()
+        cdef vector[uint64_t] candidate_offsets
+        cdef vector[uint32_t] candidate_indices
+        cdef vector[float] filter_scores
+        cdef plan7_postfilter_result record
+        cdef float_bits vfsc_bits
+        cdef double_bits generation_f3
+        cdef float usc
+        cdef float bit_score
+        cdef double probability
+        cdef uint32_t previous
+        cdef bint have_previous
+        cdef bint host_attested
+        cdef size_t profile_count = view.profile_count
+        cdef size_t profile_index
+        cdef size_t cursor
+        cdef size_t start
+        cdef size_t stop
+        cdef size_t record_count
+        cdef size_t candidate_count
+        cdef uint64_t sequence_length
+        cdef plan7_forward_database *database = NULL
+        cdef plan7_forward_output *output = NULL
+        cdef const plan7_forward_result *native_results
+        cdef const uint64_t *native_offsets
+        cdef const float *native_specials
+        cdef const plan7_forward_statistics *native_statistics
+        cdef char error[512]
+        cdef char destroy_error[512]
+        cdef int status = 0
+        cdef int destroy_status = 0
+        cdef size_t result_count
+        cdef size_t result_bytes
+        cdef size_t offset_bytes
+        cdef size_t special_count
+        cdef size_t special_bytes
+        cdef bytes records
+        cdef bytes offset_storage
+        cdef bytes special_storage
+        cdef object special_offsets
+        cdef object specials
+        cdef carray row_offsets
+        cdef carray expected_indices
+        cdef dict statistics
+
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        if sizeof(plan7_postfilter_result) != PLAN7_POSTFILTER_RECORD_SIZE:
+            raise RuntimeError("post-filter result ABI size mismatch")
+        if sizeof(plan7_forward_result) != PLAN7_FORWARD_RECORD_SIZE:
+            raise RuntimeError("Forward result ABI size mismatch")
+        if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
+            raise RuntimeError("array('Q') is not native uint64")
+        if _UINT32_ARRAY_TEMPLATE.itemsize != sizeof(uint32_t):
+            raise RuntimeError("array('I') is not native uint32")
+        if postfilter_offsets.shape[0] != profile_count + 1:
+            raise ValueError("post-filter row-offset count differs from selection")
+        if postfilter_offsets[0] != 0:
+            raise ValueError("post-filter row offsets must start at zero")
+        if <size_t> postfilter_records.shape[0] % sizeof(plan7_postfilter_result):
+            raise ValueError("post-filter result storage has trailing bytes")
+        record_count = (
+            <size_t> postfilter_records.shape[0]
+            // sizeof(plan7_postfilter_result)
+        )
+        if postfilter_offsets[profile_count] != record_count:
+            raise ValueError("post-filter row offsets do not span result storage")
+        if residue_offsets.shape[0] != self._sequence_count + 1:
+            raise ValueError("target residue-prefix length differs from targets")
+        if residue_offsets[0] != 0:
+            raise ValueError("target residue prefix must start at zero")
+        if profile_count and (
+            view.profiles == NULL
+            or view.m_mu == NULL
+            or view.m_lambda == NULL
+            or view.v_mu == NULL
+            or view.v_lambda == NULL
+            or view.identity_tokens == NULL
+        ):
+            raise RuntimeError("profile selection storage is incomplete")
+
+        host_attested = plan7_bias_host_environment_attested() == 1
+        candidate_offsets.reserve(profile_count + 1)
+        candidate_offsets.push_back(0)
+        for profile_index in range(profile_count):
+            start = <size_t> postfilter_offsets[profile_index]
+            stop = <size_t> postfilter_offsets[profile_index + 1]
+            if start > stop or stop > record_count:
+                raise ValueError("post-filter row offsets are not monotone")
+            previous = 0
+            have_previous = False
+            for cursor in range(start, stop):
+                memcpy(
+                    &record,
+                    &postfilter_records[cursor * sizeof(plan7_postfilter_result)],
+                    sizeof(plan7_postfilter_result),
+                )
+                if record.sequence_index >= self._sequence_count:
+                    raise IndexError("post-filter result sequence index out of range")
+                if have_previous and record.sequence_index <= previous:
+                    raise ValueError(
+                        "post-filter result sequence indexes are not increasing"
+                    )
+                previous = record.sequence_index
+                have_previous = True
+                if not host_attested or record.action != PLAN7_BIAS_DEFINITE_PASS:
+                    continue
+                vfsc_bits.value = record.vfsc
+                if (
+                    record.msv_status != PLAN7_SSV_OK
+                    or not isfinite(record.filtersc)
+                    or (
+                        not isfinite(record.vfsc)
+                        and vfsc_bits.bits != 0x7f800000
+                    )
+                    or not isfinite(view.profiles[profile_index].scale)
+                    or view.profiles[profile_index].scale <= 0.0
+                ):
+                    continue
+                usc = <float> record.msv_numerator
+                usc = usc / view.profiles[profile_index].scale
+                usc = usc - <float> 3.0
+                bit_score = <float> ((usc - record.filtersc) / eslCONST_LOG2)
+                probability = esl_gumbel_surv(
+                    bit_score,
+                    view.m_mu[profile_index],
+                    view.m_lambda[profile_index],
+                )
+                if probability > f2:
+                    bit_score = <float> (
+                        (record.vfsc - record.filtersc) / eslCONST_LOG2
+                    )
+                    probability = esl_gumbel_surv(
+                        bit_score,
+                        view.v_mu[profile_index],
+                        view.v_lambda[profile_index],
+                    )
+                    if probability > f2:
+                        continue
+                if residue_offsets[record.sequence_index + 1] < (
+                    residue_offsets[record.sequence_index]
+                ):
+                    raise ValueError("target residue prefix is not monotone")
+                sequence_length = (
+                    residue_offsets[record.sequence_index + 1]
+                    - residue_offsets[record.sequence_index]
+                )
+                if sequence_length > 100000:
+                    raise ValueError("Forward target exceeds HMMER's protein limit")
+                candidate_indices.push_back(record.sequence_index)
+                filter_scores.push_back(record.filtersc)
+            candidate_offsets.push_back(candidate_indices.size())
+
+        candidate_count = candidate_indices.size()
+        row_offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
+        for profile_index in range(profile_count + 1):
+            row_offsets.data.as_ulonglongs[profile_index] = (
+                candidate_offsets[profile_index]
+            )
+        expected_indices = clone(_UINT32_ARRAY_TEMPLATE, candidate_count, False)
+        for cursor in range(candidate_count):
+            expected_indices.data.as_uints[cursor] = candidate_indices[cursor]
+        if candidate_count == 0:
+            generation_f3.value = f3
+            offset_storage = bytes(sizeof(uint64_t))
+            special_offsets = memoryview(offset_storage).cast("Q")
+            special_storage = b""
+            specials = memoryview(special_storage).cast("f")
+            statistics = {
+                "generation_f3_bits": generation_f3.bits,
+                "candidate_count": 0,
+                "survivor_count": 0,
+                "work_cells": 0,
+                "dp_workspace_bytes": 0,
+                "xmx_workspace_bytes": 0,
+                "gather_workspace_bytes": 0,
+                "gathered_xmx_bytes": 0,
+                "output_byte_limit": (
+                    min(gathered_byte_budget, PLAN7_FORWARD_MAX_GATHERED_BYTES)
+                    & ~<uint64_t> 3
+                ),
+                "output_cap_fallback_count": 0,
+                "kernel_ms": 0.0,
+                "classification_ms": 0.0,
+                "gather_ms": 0.0,
+                "download_ms": 0.0,
+                "total_ms": 0.0,
+            }
+            return (
+                b"",
+                row_offsets,
+                expected_indices,
+                special_offsets,
+                specials,
+                statistics,
+            )
+
+        error[0] = 0
+        with nogil:
+            status = plan7_profile_selection_stage_forward(
+                selection._selection, &database, error, sizeof(error)
+            )
+        if status == 0:
+            with nogil:
+                status = plan7_forward_run_batch_workspace(
+                    database,
+                    self._batch,
+                    view.identity_tokens,
+                    profile_count,
+                    candidate_offsets.data(),
+                    candidate_indices.data(),
+                    filter_scores.data(),
+                    candidate_count,
+                    f3,
+                    gathered_byte_budget,
+                    &output,
+                    error,
+                    sizeof(error),
+                )
+        destroy_error[0] = 0
+        if database != NULL:
+            with nogil:
+                destroy_status = plan7_forward_database_destroy(
+                    &database, destroy_error, sizeof(destroy_error)
+                )
+        if status != 0:
+            if output != NULL:
+                plan7_forward_output_destroy(&output, NULL, 0)
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        if destroy_status != 0:
+            if output != NULL:
+                plan7_forward_output_destroy(&output, NULL, 0)
+            raise RuntimeError(destroy_error.decode("utf-8", "replace"))
+
+        try:
+            result_count = plan7_forward_output_result_count(output)
+            if result_count != candidate_count:
+                raise RuntimeError("Forward result count changed")
+            if result_count > (<size_t> -1) // sizeof(plan7_forward_result):
+                raise OverflowError("Forward result size overflows size_t")
+            result_bytes = result_count * sizeof(plan7_forward_result)
+            if result_bytes > <size_t> PY_SSIZE_T_MAX:
+                raise OverflowError("Forward result size exceeds Python limits")
+            records = PyBytes_FromStringAndSize(NULL, result_bytes)
+            native_results = plan7_forward_output_results(output)
+            if result_bytes:
+                if native_results == NULL:
+                    raise RuntimeError("Forward result storage is null")
+                memcpy(PyBytes_AS_STRING(records), native_results, result_bytes)
+
+            native_offsets = plan7_forward_output_special_offsets(output)
+            if native_offsets == NULL:
+                raise RuntimeError("Forward special offsets are null")
+            if result_count > (
+                <size_t> PY_SSIZE_T_MAX // sizeof(uint64_t)
+            ) - 1:
+                raise OverflowError("Forward special offsets exceed Python limits")
+            offset_bytes = (result_count + 1) * sizeof(uint64_t)
+            offset_storage = PyBytes_FromStringAndSize(NULL, offset_bytes)
+            memcpy(PyBytes_AS_STRING(offset_storage), native_offsets, offset_bytes)
+            special_offsets = memoryview(offset_storage).cast("Q")
+
+            special_count = plan7_forward_output_special_count(output)
+            if special_count > (<size_t> -1) // sizeof(float):
+                raise OverflowError("Forward special matrix size overflows size_t")
+            special_bytes = special_count * sizeof(float)
+            if special_bytes > <size_t> PY_SSIZE_T_MAX:
+                raise OverflowError("Forward special matrix exceeds Python limits")
+            special_storage = PyBytes_FromStringAndSize(NULL, special_bytes)
+            native_specials = plan7_forward_output_specials(output)
+            if special_bytes:
+                if native_specials == NULL:
+                    raise RuntimeError("Forward special matrix is null")
+                memcpy(
+                    PyBytes_AS_STRING(special_storage),
+                    native_specials,
+                    special_bytes,
+                )
+            specials = memoryview(special_storage).cast("f")
+
+            native_statistics = plan7_forward_output_statistics(output)
+            if native_statistics == NULL:
+                raise RuntimeError("Forward statistics are null")
+            statistics = {
+                "generation_f3_bits": native_statistics.generation_f3_bits,
+                "candidate_count": native_statistics.candidate_count,
+                "survivor_count": native_statistics.survivor_count,
+                "work_cells": native_statistics.work_cells,
+                "dp_workspace_bytes": native_statistics.dp_workspace_bytes,
+                "xmx_workspace_bytes": native_statistics.xmx_workspace_bytes,
+                "gather_workspace_bytes": native_statistics.gather_workspace_bytes,
+                "gathered_xmx_bytes": native_statistics.gathered_xmx_bytes,
+                "output_byte_limit": native_statistics.output_byte_limit,
+                "output_cap_fallback_count": (
+                    native_statistics.output_cap_fallback_count
+                ),
+                "kernel_ms": native_statistics.kernel_milliseconds,
+                "classification_ms": native_statistics.classification_milliseconds,
+                "gather_ms": native_statistics.gather_milliseconds,
+                "download_ms": native_statistics.download_milliseconds,
+                "total_ms": native_statistics.total_milliseconds,
+            }
+            return (
+                records,
+                row_offsets,
+                expected_indices,
+                special_offsets,
+                specials,
+                statistics,
+            )
+        finally:
+            if output != NULL:
+                plan7_forward_output_destroy(&output, NULL, 0)
+
     cdef size_t _run_profile_selection_candidates(
         self,
         const plan7_profile_selection_view *view,
@@ -2473,6 +2827,8 @@ cdef class SequenceBatch:
             or view.profiles == NULL
             or view.m_mu == NULL
             or view.m_lambda == NULL
+            or view.v_mu == NULL
+            or view.v_lambda == NULL
             or view.bias_templates == NULL
             or view.identity_tokens == NULL
         ):

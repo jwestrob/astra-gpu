@@ -60,6 +60,20 @@ typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 typedef struct plan7_forward_output plan7_forward_output;
 typedef struct plan7_forward_workspace plan7_forward_workspace;
 
+/* Pointer-free immutable host representation used by ProfileSelection. */
+typedef struct plan7_forward_snapshot_profile {
+  uint64_t emission_offset;
+  uint64_t transition_offset;
+  uint32_t q;
+  uint32_t model_length;
+  float e_move;
+  float e_loop;
+  float f_tau;
+  float f_lambda;
+  float nj;
+  int32_t mode;
+} plan7_forward_snapshot_profile;
+
 enum plan7_forward_workspace_capacity {
   PLAN7_FORWARD_CAPACITY_CANDIDATE_PROFILES = 0,
   PLAN7_FORWARD_CAPACITY_CANDIDATE_SEQUENCES = 1,
@@ -92,6 +106,22 @@ int plan7_forward_database_create(const uintptr_t *profile_pointers,
                                   plan7_forward_database **database,
                                   char *error,
                                   size_t error_size);
+
+/* Stage one trusted immutable ProfileSelection snapshot on the current
+ * device. All host arrays are consumed synchronously and need not outlive the
+ * call. identity_tokens are opaque values and are never dereferenced. */
+int plan7_forward_database_create_snapshot(
+  int alphabet_size,
+  const plan7_forward_snapshot_profile *profiles,
+  size_t profile_count,
+  const float *emissions,
+  size_t emission_count,
+  const float *transitions,
+  size_t transition_count,
+  const uintptr_t *identity_tokens,
+  plan7_forward_database **database,
+  char *error,
+  size_t error_size);
 
 int plan7_forward_database_destroy(plan7_forward_database **database,
                                    char *error,

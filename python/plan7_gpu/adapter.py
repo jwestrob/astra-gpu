@@ -252,10 +252,29 @@ class ProfileSession:
 
     __slots__ = ("__weakref__",)
 
-    def __init__(self, profile_pairs: Iterable[PressedProfilePair]):
+    def __init__(
+        self,
+        profile_pairs: Iterable[PressedProfilePair],
+        *,
+        pack_workers: int | None = None,
+    ):
         pairs = tuple(profile_pairs)
         if not pairs:
             raise ValueError("a profile session requires at least one profile")
+        if pack_workers is None:
+            worker_count = min(16, len(pairs))
+        else:
+            if isinstance(pack_workers, bool):
+                raise TypeError("pack_workers must be a nonnegative integer")
+            try:
+                requested_workers = operator.index(pack_workers)
+            except TypeError as error:
+                raise TypeError(
+                    "pack_workers must be a nonnegative integer"
+                ) from error
+            if requested_workers < 0:
+                raise ValueError("pack_workers must be nonnegative")
+            worker_count = min(requested_workers, len(pairs))
         if not _native.bias_host_environment_attested():
             raise RuntimeError(
                 "profile sessions require the attested host floating-point environment"
@@ -301,6 +320,7 @@ class ProfileSession:
             native = _native.ProfileSession(
                 profiles,
                 memoryview(background.residue_frequencies),
+                worker_count,
             )
         _PROFILE_SESSION_STATES[self] = _ProfileSessionState(
             pairs, alphabet, native
@@ -1327,6 +1347,34 @@ class SequenceBatch:
         F1: float = 0.02,
     ) -> CandidateBatch:
         """Generate exact records from an immutable host profile selection."""
+        return self._postfilter_selection(selection, F1, None)
+
+    def _postfilter_forward_selection(
+        self,
+        selection: ProfileSelection,
+        F1: float,
+        F2: float,
+        F3: float,
+        bias_filter: bool,
+    ) -> CandidateBatch:
+        """Build a sealed selection batch with bounded Forward results."""
+        try:
+            f2 = float(F2)
+            f3 = float(F3)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("Forward thresholds must be real numbers") from error
+        if type(bias_filter) is not bool:
+            raise TypeError("bias_filter must be bool")
+        return self._postfilter_selection(
+            selection, F1, (f2, f3, bias_filter)
+        )
+
+    def _postfilter_selection(
+        self,
+        selection: ProfileSelection,
+        F1: float,
+        forward_options: tuple[float, float, bool] | None,
+    ) -> CandidateBatch:
         from . import _pipeline  # type: ignore[attr-defined]
 
         if not _pipeline._filter_scores_seam_available():
@@ -1349,6 +1397,10 @@ class SequenceBatch:
         selection_state = _profile_selection_state(selection)
         if selection_state.alphabet != sequence_state.alphabet:
             raise ValueError("profile and sequence alphabets differ")
+        forward: _ForwardAugmentation | None = None
+        expected_forward_indices: Any = array("I")
+        sealed_postfilter: Any | None = None
+        seal_factory = getattr(_pipeline, "_seal_postfilter_batch_bound", None)
         with selection_state.lock:
             if selection_state.native.closed:
                 raise RuntimeError("profile selection is closed")
@@ -1376,6 +1428,99 @@ class SequenceBatch:
                     all_rows = bytes(len(selection_state.pairs))
                     all_targets = array("I")
 
+                    if (
+                        forward_options is not None
+                        and forward_options[2]
+                        and math.isfinite(forward_options[1])
+                        and forward_options[1] >= 0.0
+                        and _pipeline._filter_and_forward_scores_seam_available()
+                        and hasattr(
+                            type(sequence_state.native),
+                            "forward_profile_selection_raw",
+                        )
+                    ):
+                        f2, f3, bias_filter = forward_options
+                        (
+                            forward_records,
+                            forward_row_offsets,
+                            expected_forward_indices,
+                            special_offsets,
+                            specials,
+                            statistics,
+                        ) = sequence_state.native.forward_profile_selection_raw(
+                            selection_state.native,
+                            memoryview(records),
+                            memoryview(offsets),
+                            memoryview(sequence_state.residue_offsets).cast("Q"),
+                            f2,
+                            f3,
+                            gathered_byte_budget=(_FORWARD_SPECIAL_BYTE_BUDGET),
+                        )
+                        f2_bits = struct.unpack("=Q", struct.pack("=d", f2))[0]
+                        f3_bits = struct.unpack("=Q", struct.pack("=d", f3))[0]
+                        if statistics["generation_f3_bits"] != f3_bits:
+                            raise RuntimeError(
+                                "Forward generation F3 provenance changed"
+                            )
+                        if statistics["candidate_count"] != len(
+                            expected_forward_indices
+                        ):
+                            raise RuntimeError(
+                                "Forward result count differs from input"
+                            )
+                        if statistics["candidate_count"]:
+                            forward = _ForwardAugmentation(
+                                bytes(forward_records),
+                                forward_row_offsets,
+                                special_offsets,
+                                specials,
+                                f2_bits,
+                                f3_bits,
+                                bias_filter,
+                            )
+
+        if records is not None and seal_factory is not None:
+            states = [_pair_state(pair) for pair in selection_state.pairs]
+            unique_locks = {id(state.lock): state.lock for state in states}
+            with ExitStack() as locks:
+                for lock_id in sorted(unique_locks):
+                    locks.enter_context(unique_locks[lock_id])
+                background = pyhmmer.plan7.Background(sequence_state.alphabet)
+                canonical_background = _background_fingerprint(background)
+                if any(
+                    state.background_fingerprint != canonical_background
+                    for state in states
+                ):
+                    raise ValueError(
+                        "pressed profiles do not share the canonical "
+                        "hmmpress background"
+                    )
+                seal_options: dict[str, Any] = {}
+                if forward is not None:
+                    seal_options = {
+                        "forward_records": memoryview(forward.records),
+                        "forward_offsets": forward.row_offsets,
+                        "special_offsets": forward.special_offsets,
+                        "specials": forward.specials,
+                        "expected_forward_indices": memoryview(
+                            expected_forward_indices
+                        ),
+                        "generation_f2_bits": forward.f2_bits,
+                        "generation_f3_bits": forward.f3_bits,
+                        "generation_bias_filter": forward.bias_filter,
+                    }
+                sealed_postfilter = seal_factory(
+                    tuple(state.hmm for state in states),
+                    tuple(state.optimized_profile for state in states),
+                    sequence_state.targets,
+                    memoryview(records),
+                    memoryview(offsets),
+                    memoryview(sequence_state.residue_offsets).cast("Q"),
+                    threshold,
+                    memoryview(canonical_background),
+                    **seal_options,
+                )
+
         return _new_candidate_batch(
             selection_state.pairs,
             sequence_state.targets,
@@ -1386,6 +1531,8 @@ class SequenceBatch:
             all_targets,
             threshold,
             postfilter_records=records,
+            forward=forward if sealed_postfilter is None else None,
+            sealed_postfilter=sealed_postfilter,
         )
 
     def _postfilter_forward_batch(

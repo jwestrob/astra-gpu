@@ -1,4 +1,5 @@
 #include "postfilter_cuda.h"
+#include "forward_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -33,10 +34,13 @@ static_assert(offsetof(plan7_postfilter_result, sequence_index) == 0 &&
               offsetof(plan7_postfilter_result, action) == 11 &&
               offsetof(plan7_postfilter_result, vfsc) == 12,
               "post-filter record ABI layout changed");
+static_assert(sizeof(plan7_forward_snapshot_profile) == 48,
+              "Forward snapshot descriptor footprint changed");
 
 namespace {
 
 constexpr int kWarpSize = 32;
+constexpr int kForwardSubwarp = 4;
 constexpr int kWarpsPerBlock = 8;
 constexpr int kThreads = kWarpSize * kWarpsPerBlock;
 constexpr int kNegInf = -32768;
@@ -119,6 +123,12 @@ bool checked_add(uint64_t left, uint64_t right, uint64_t *sum) {
   return true;
 }
 
+bool checked_multiply(uint64_t left, uint64_t right, uint64_t *product) {
+  if (left != 0 && right > UINT64_MAX / left) return false;
+  *product = left * right;
+  return true;
+}
+
 bool checked_bytes(size_t count, size_t size, size_t *bytes) {
   if (size != 0 && count > SIZE_MAX / size) return false;
   *bytes = count * size;
@@ -192,6 +202,60 @@ bool valid_viterbi_specials(const P7_OPROFILE *profile) {
          profile->xw[p7O_E][p7O_MOVE] > kNegInf &&
          profile->xw[p7O_E][p7O_LOOP] ==
              profile->xw[p7O_E][p7O_MOVE];
+}
+
+bool valid_forward_storage(const P7_OPROFILE *profile) {
+  if (profile == nullptr || profile->abc == nullptr ||
+      profile->abc->type != eslAMINO || profile->abc->K != 20 ||
+      profile->abc->Kp != 29 || profile->M < 1 || profile->M > 100000 ||
+      profile->allocM < profile->M || profile->allocM > 100000 ||
+      profile->allocQ4 != p7O_NQF(profile->allocM) ||
+      profile->allocQ4 < p7O_NQF(profile->M) ||
+      profile->rfv == nullptr || profile->tfv == nullptr ||
+      profile->rfv_mem == nullptr || profile->tfv_mem == nullptr)
+    return false;
+
+  uintptr_t rfv_base;
+  uintptr_t tfv_base;
+  if (!aligned_vector_address(profile->rfv_mem, &rfv_base) ||
+      !aligned_vector_address(profile->tfv_mem, &tfv_base) ||
+      reinterpret_cast<uintptr_t>(profile->tfv) != tfv_base)
+    return false;
+  const size_t row_stride = static_cast<size_t>(profile->allocQ4);
+  for (int residue = 0; residue < profile->abc->Kp; ++residue) {
+    const uintptr_t expected = rfv_base +
+        static_cast<size_t>(residue) * row_stride * sizeof(__m128);
+    if (profile->rfv[residue] == nullptr ||
+        reinterpret_cast<uintptr_t>(profile->rfv[residue]) != expected)
+      return false;
+  }
+  return true;
+}
+
+bool valid_forward_specials(const P7_OPROFILE *profile) {
+  if ((profile->mode != p7_LOCAL && profile->mode != p7_UNILOCAL) ||
+      (profile->nj != 0.0f && profile->nj != 1.0f))
+    return false;
+  if (profile->nj == 0.0f)
+    return profile->xf[p7O_E][p7O_MOVE] == 1.0f &&
+           profile->xf[p7O_E][p7O_LOOP] == 0.0f;
+  return profile->xf[p7O_E][p7O_MOVE] == 0.5f &&
+         profile->xf[p7O_E][p7O_LOOP] == 0.5f;
+}
+
+bool valid_forward_probability_rows(const P7_OPROFILE *profile) {
+  const int q_count = p7O_NQF(profile->M);
+  for (int residue = 0; residue < profile->abc->Kp; ++residue) {
+    const auto *values = reinterpret_cast<const float *>(profile->rfv[residue]);
+    for (int cell = 0; cell < q_count * kForwardSubwarp; ++cell)
+      if (!std::isfinite(values[cell]) || values[cell] < 0.0f) return false;
+  }
+  const auto *transitions = reinterpret_cast<const float *>(profile->tfv);
+  for (int cell = 0;
+       cell < q_count * p7O_NTRANS * kForwardSubwarp; ++cell)
+    if (!std::isfinite(transitions[cell]) || transitions[cell] < 0.0f)
+      return false;
+  return true;
 }
 
 VitLengthTransitions length_transitions_for(const VitProfile &profile,
@@ -698,7 +762,12 @@ struct HostProfilePack {
   std::vector<plan7_ssv_profile> ssv_profiles;
   std::vector<float> m_mu;
   std::vector<float> m_lambda;
+  std::vector<float> v_mu;
+  std::vector<float> v_lambda;
   std::vector<plan7_bias_profile> bias_templates;
+  std::vector<plan7_forward_snapshot_profile> forward_profiles;
+  std::vector<float> forward_emissions;
+  std::vector<float> forward_transitions;
   std::vector<uintptr_t> identity_tokens;
 };
 
@@ -713,8 +782,14 @@ uint64_t host_pack_bytes(const HostProfilePack &pack) {
           sizeof(plan7_ssv_profile),
       static_cast<uint64_t>(pack.m_mu.size()) * sizeof(float),
       static_cast<uint64_t>(pack.m_lambda.size()) * sizeof(float),
+      static_cast<uint64_t>(pack.v_mu.size()) * sizeof(float),
+      static_cast<uint64_t>(pack.v_lambda.size()) * sizeof(float),
       static_cast<uint64_t>(pack.bias_templates.size()) *
           sizeof(plan7_bias_profile),
+      static_cast<uint64_t>(pack.forward_profiles.size()) *
+          sizeof(plan7_forward_snapshot_profile),
+      static_cast<uint64_t>(pack.forward_emissions.size()) * sizeof(float),
+      static_cast<uint64_t>(pack.forward_transitions.size()) * sizeof(float),
       static_cast<uint64_t>(pack.identity_tokens.size()) * sizeof(uintptr_t)};
   uint64_t total = 0;
   for (const uint64_t count : counts) {
@@ -784,6 +859,41 @@ void snapshot_profile_task(void *opaque, size_t profile_index) noexcept {
       pack.transitions[dd_destination] = dd_words[source_lane];
     }
   }
+
+  if (pack.forward_profiles.empty()) return;
+  const plan7_forward_snapshot_profile forward =
+      pack.forward_profiles[profile_index];
+  const int forward_q = static_cast<int>(forward.q);
+  for (int residue = 0; residue < source->abc->Kp; ++residue) {
+    const auto *source_values =
+        reinterpret_cast<const float *>(source->rfv[residue]);
+    float *destination = pack.forward_emissions.data() +
+        forward.emission_offset +
+        static_cast<uint64_t>(residue) * forward_q * kForwardSubwarp;
+    std::memcpy(destination, source_values,
+                static_cast<size_t>(forward_q) * kForwardSubwarp *
+                    sizeof(float));
+  }
+  for (int q = 0; q < forward_q; ++q) {
+    for (int transition = p7O_BM; transition <= p7O_II; ++transition) {
+      const auto *source_values = reinterpret_cast<const float *>(
+          source->tfv + q * 7 + transition);
+      float *destination = pack.forward_transitions.data() +
+          forward.transition_offset +
+          (static_cast<uint64_t>(q) * p7O_NTRANS + transition) *
+              kForwardSubwarp;
+      std::memcpy(destination, source_values,
+                  kForwardSubwarp * sizeof(float));
+    }
+    const auto *source_dd = reinterpret_cast<const float *>(
+        source->tfv + 7 * forward_q + q);
+    float *destination_dd = pack.forward_transitions.data() +
+        forward.transition_offset +
+        (static_cast<uint64_t>(q) * p7O_NTRANS + p7O_DD) *
+            kForwardSubwarp;
+    std::memcpy(destination_dd, source_dd,
+                kForwardSubwarp * sizeof(float));
+  }
 }
 
 int snapshot_profiles(const uintptr_t *profile_pointers, size_t profile_count,
@@ -800,12 +910,19 @@ int snapshot_profiles(const uintptr_t *profile_pointers, size_t profile_count,
   uint64_t transition_total = 0;
   uint64_t ssv_total = 0;
   uint64_t exact_rbv_total = 0;
+  uint64_t forward_emission_total = 0;
+  uint64_t forward_transition_total = 0;
   try {
     pack.vit_profiles.resize(profile_count);
     pack.ssv_profiles.resize(profile_count);
     pack.m_mu.resize(profile_count);
     pack.m_lambda.resize(profile_count);
-    if (background != nullptr) pack.bias_templates.resize(profile_count);
+    if (background != nullptr) {
+      pack.v_mu.resize(profile_count);
+      pack.v_lambda.resize(profile_count);
+      pack.bias_templates.resize(profile_count);
+      pack.forward_profiles.resize(profile_count);
+    }
   } catch (...) {
     set_error(error, error_size, "host profile descriptor allocation failed");
     return -1;
@@ -815,6 +932,9 @@ int snapshot_profiles(const uintptr_t *profile_pointers, size_t profile_count,
     const auto *source = reinterpret_cast<const P7_OPROFILE *>(
         profile_pointers[p]);
     if (!valid_profile_storage(source) || !valid_viterbi_specials(source) ||
+        (background != nullptr &&
+         (!valid_forward_storage(source) || !valid_forward_specials(source) ||
+          !valid_forward_probability_rows(source))) ||
         source->abc == nullptr || source->abc->Kp != 29 ||
         !isfinite(source->scale_b) || source->scale_b <= 0.0f ||
         !isfinite(source->scale_w) || source->scale_w <= 0.0f ||
@@ -829,6 +949,20 @@ int snapshot_profiles(const uintptr_t *profile_pointers, size_t profile_count,
         static_cast<uint64_t>(source->abc->Kp) * source->M;
     const uint64_t transition_count =
         static_cast<uint64_t>(q) * p7O_NTRANS * kWarpSize;
+    const uint64_t forward_q = background == nullptr
+        ? 0 : static_cast<uint64_t>(p7O_NQF(source->M));
+    uint64_t forward_emission_count = 0;
+    uint64_t forward_transition_count = 0;
+    if (background != nullptr &&
+        (!checked_multiply(static_cast<uint64_t>(source->abc->Kp),
+                           forward_q * kForwardSubwarp,
+                           &forward_emission_count) ||
+         !checked_multiply(forward_q,
+                           p7O_NTRANS * kForwardSubwarp,
+                           &forward_transition_count))) {
+      set_error(error, error_size, "Forward packed profile size overflow");
+      return -1;
+    }
     bool needs_exact_rbv = false;
     const int source_qb = std::max(2, (source->M + 15) / 16);
     for (int model_position = 0;
@@ -863,8 +997,14 @@ int snapshot_profiles(const uintptr_t *profile_pointers, size_t profile_count,
         !checked_add(exact_rbv_total, exact_rbv_count, &exact_rbv_total) ||
         !checked_add(emission_total, emission_count, &emission_total) ||
         !checked_add(transition_total, transition_count, &transition_total) ||
+        !checked_add(forward_emission_total, forward_emission_count,
+                     &forward_emission_total) ||
+        !checked_add(forward_transition_total, forward_transition_count,
+                     &forward_transition_total) ||
         ssv_total > SIZE_MAX || exact_rbv_total > SIZE_MAX ||
-        emission_total > SIZE_MAX || transition_total > SIZE_MAX) {
+        emission_total > SIZE_MAX || transition_total > SIZE_MAX ||
+        forward_emission_total > SIZE_MAX ||
+        forward_transition_total > SIZE_MAX) {
       set_error(error, error_size, "Viterbi packed profile size overflow");
       return -1;
     }
@@ -899,6 +1039,22 @@ int snapshot_profiles(const uintptr_t *profile_pointers, size_t profile_count,
         source->scale_b};
     pack.m_mu[p] = source->evparam[p7_MMU];
     pack.m_lambda[p] = source->evparam[p7_MLAMBDA];
+    if (background != nullptr) {
+      pack.v_mu[p] = source->evparam[p7_VMU];
+      pack.v_lambda[p] = source->evparam[p7_VLAMBDA];
+      pack.forward_profiles[p] = {
+        forward_emission_total - forward_emission_count,
+        forward_transition_total - forward_transition_count,
+        static_cast<uint32_t>(forward_q),
+        static_cast<uint32_t>(source->M),
+        source->xf[p7O_E][p7O_MOVE],
+        source->xf[p7O_E][p7O_LOOP],
+        source->evparam[p7_FTAU],
+        source->evparam[p7_FLAMBDA],
+        source->nj,
+        source->mode
+      };
+    }
     if (background != nullptr &&
         plan7_bias_pack_amino_profile(
             background, source->compo, source->M, source->scale_b,
@@ -914,6 +1070,10 @@ int snapshot_profiles(const uintptr_t *profile_pointers, size_t profile_count,
                           static_cast<int16_t>(kNegInf));
     pack.transitions.assign(static_cast<size_t>(transition_total),
                             static_cast<int16_t>(kNegInf));
+    pack.forward_emissions.resize(
+        static_cast<size_t>(forward_emission_total));
+    pack.forward_transitions.resize(
+        static_cast<size_t>(forward_transition_total));
   } catch (...) {
     set_error(error, error_size, "Viterbi packed data allocation failed");
     return -1;
@@ -954,6 +1114,24 @@ void copy_selection_profile(void *opaque, size_t output_index) noexcept {
   std::memcpy(destination.transitions.data() + to.transition_offset,
               source.transitions.data() + from.transition_offset,
               transition_count * sizeof(int16_t));
+
+  const plan7_forward_snapshot_profile &forward_from =
+      source.forward_profiles[source_index];
+  const plan7_forward_snapshot_profile &forward_to =
+      destination.forward_profiles[output_index];
+  const size_t forward_emission_count =
+      static_cast<size_t>(forward_to.q) * kForwardSubwarp *
+      destination.alphabet_size;
+  const size_t forward_transition_count =
+      static_cast<size_t>(forward_to.q) * kForwardSubwarp * p7O_NTRANS;
+  std::memcpy(
+      destination.forward_emissions.data() + forward_to.emission_offset,
+      source.forward_emissions.data() + forward_from.emission_offset,
+      forward_emission_count * sizeof(float));
+  std::memcpy(
+      destination.forward_transitions.data() + forward_to.transition_offset,
+      source.forward_transitions.data() + forward_from.transition_offset,
+      forward_transition_count * sizeof(float));
 }
 
 std::atomic<uint64_t> next_profile_session_id{1};
@@ -1511,9 +1689,11 @@ extern "C" size_t plan7_viterbi_database_profile_count(
 extern "C" int plan7_profile_session_create(
     const uintptr_t *profile_pointers, size_t profile_count,
     const float *background, size_t background_count,
+    size_t worker_count,
     plan7_profile_session **session, char *error, size_t error_size) {
   if (session == nullptr || *session != nullptr || background == nullptr ||
       background_count != 20 ||
+      worker_count > profile_count ||
       (profile_count != 0 && profile_pointers == nullptr)) {
     set_error(error, error_size, "invalid profile session arguments");
     return -1;
@@ -1532,8 +1712,7 @@ extern "C" int plan7_profile_session_create(
 
   std::unique_ptr<PackWorkerPool> workers;
   try {
-    workers = std::make_unique<PackWorkerPool>(
-        std::min<size_t>(16, profile_count));
+    workers = std::make_unique<PackWorkerPool>(worker_count);
   } catch (...) {
     set_error(error, error_size, "profile session worker launch failed");
     return -1;
@@ -1623,6 +1802,13 @@ extern "C" int plan7_profile_session_get_statistics(
   statistics->viterbi_transition_bytes =
       static_cast<uint64_t>(pack.transitions.size()) * sizeof(int16_t);
   statistics->viterbi_exact_rbv_bytes = pack.exact_rbv.size();
+  statistics->forward_descriptor_bytes =
+      static_cast<uint64_t>(pack.forward_profiles.size()) *
+      sizeof(plan7_forward_snapshot_profile);
+  statistics->forward_emission_bytes =
+      static_cast<uint64_t>(pack.forward_emissions.size()) * sizeof(float);
+  statistics->forward_transition_bytes =
+      static_cast<uint64_t>(pack.forward_transitions.size()) * sizeof(float);
   return 0;
 }
 
@@ -1646,13 +1832,18 @@ extern "C" int plan7_profile_session_select(
   uint64_t rbv_total = 0;
   uint64_t emission_total = 0;
   uint64_t transition_total = 0;
+  uint64_t forward_emission_total = 0;
+  uint64_t forward_transition_total = 0;
   try {
     seen.assign(source.vit_profiles.size(), 0);
     selected.vit_profiles.resize(profile_count);
     selected.ssv_profiles.resize(profile_count);
     selected.m_mu.resize(profile_count);
     selected.m_lambda.resize(profile_count);
+    selected.v_mu.resize(profile_count);
+    selected.v_lambda.resize(profile_count);
     selected.bias_templates.resize(profile_count);
+    selected.forward_profiles.resize(profile_count);
     selected.identity_tokens.resize(profile_count);
   } catch (...) {
     set_error(error, error_size, "profile selection allocation failed");
@@ -1680,6 +1871,13 @@ extern "C" int plan7_profile_session_select(
         static_cast<uint64_t>(from.q) * kWarpSize * source.alphabet_size;
     const uint64_t transition_count =
         static_cast<uint64_t>(from.q) * kWarpSize * p7O_NTRANS;
+    const plan7_forward_snapshot_profile &forward_from =
+        source.forward_profiles[source_index];
+    const uint64_t forward_emission_count =
+        static_cast<uint64_t>(forward_from.q) * kForwardSubwarp *
+        source.alphabet_size;
+    const uint64_t forward_transition_count =
+        static_cast<uint64_t>(forward_from.q) * kForwardSubwarp * p7O_NTRANS;
     VitProfile to = from;
     to.ssv_offset = ssv_total;
     to.rbv_offset = rbv_count == 0 ? UINT64_MAX : rbv_total;
@@ -1689,8 +1887,14 @@ extern "C" int plan7_profile_session_select(
         !checked_add(rbv_total, rbv_count, &rbv_total) ||
         !checked_add(emission_total, emission_count, &emission_total) ||
         !checked_add(transition_total, transition_count, &transition_total) ||
+        !checked_add(forward_emission_total, forward_emission_count,
+                     &forward_emission_total) ||
+        !checked_add(forward_transition_total, forward_transition_count,
+                     &forward_transition_total) ||
         ssv_total > SIZE_MAX || rbv_total > SIZE_MAX ||
-        emission_total > SIZE_MAX || transition_total > SIZE_MAX) {
+        emission_total > SIZE_MAX || transition_total > SIZE_MAX ||
+        forward_emission_total > SIZE_MAX ||
+        forward_transition_total > SIZE_MAX) {
       set_error(error, error_size, "profile selection size overflow");
       return -1;
     }
@@ -1699,8 +1903,15 @@ extern "C" int plan7_profile_session_select(
     selected.ssv_profiles[output_index].score_offset = to.ssv_offset;
     selected.m_mu[output_index] = source.m_mu[source_index];
     selected.m_lambda[output_index] = source.m_lambda[source_index];
+    selected.v_mu[output_index] = source.v_mu[source_index];
+    selected.v_lambda[output_index] = source.v_lambda[source_index];
     selected.bias_templates[output_index] =
         source.bias_templates[source_index];
+    selected.forward_profiles[output_index] = forward_from;
+    selected.forward_profiles[output_index].emission_offset =
+        forward_emission_total - forward_emission_count;
+    selected.forward_profiles[output_index].transition_offset =
+        forward_transition_total - forward_transition_count;
     selected.identity_tokens[output_index] =
         source.identity_tokens[source_index];
   }
@@ -1709,6 +1920,10 @@ extern "C" int plan7_profile_session_select(
     selected.exact_rbv.resize(static_cast<size_t>(rbv_total));
     selected.emissions.resize(static_cast<size_t>(emission_total));
     selected.transitions.resize(static_cast<size_t>(transition_total));
+    selected.forward_emissions.resize(
+        static_cast<size_t>(forward_emission_total));
+    selected.forward_transitions.resize(
+        static_cast<size_t>(forward_transition_total));
   } catch (...) {
     set_error(error, error_size, "profile selection data allocation failed");
     return -1;
@@ -1773,6 +1988,8 @@ extern "C" int plan7_profile_selection_get_view(
       ? nullptr : pack.ssv_profiles.data();
   view->m_mu = pack.m_mu.empty() ? nullptr : pack.m_mu.data();
   view->m_lambda = pack.m_lambda.empty() ? nullptr : pack.m_lambda.data();
+  view->v_mu = pack.v_mu.empty() ? nullptr : pack.v_mu.data();
+  view->v_lambda = pack.v_lambda.empty() ? nullptr : pack.v_lambda.data();
   view->bias_templates = pack.bias_templates.empty()
       ? nullptr : pack.bias_templates.data();
   view->identity_tokens = pack.identity_tokens.empty()
@@ -1812,6 +2029,28 @@ extern "C" int plan7_profile_selection_stage_viterbi(
   }
   *database = created;
   return 0;
+}
+
+extern "C" int plan7_profile_selection_stage_forward(
+    const plan7_profile_selection *selection,
+    plan7_forward_database **database,
+    char *error, size_t error_size) {
+  if (selection == nullptr || selection->pack == nullptr) {
+    set_error(error, error_size, "invalid staged Forward selection");
+    return -1;
+  }
+  const HostProfilePack &pack = *selection->pack;
+  return plan7_forward_database_create_snapshot(
+      pack.alphabet_size,
+      pack.forward_profiles.empty() ? nullptr : pack.forward_profiles.data(),
+      pack.forward_profiles.size(),
+      pack.forward_emissions.empty() ? nullptr : pack.forward_emissions.data(),
+      pack.forward_emissions.size(),
+      pack.forward_transitions.empty()
+          ? nullptr : pack.forward_transitions.data(),
+      pack.forward_transitions.size(),
+      pack.identity_tokens.empty() ? nullptr : pack.identity_tokens.data(),
+      database, error, error_size);
 }
 
 extern "C" int plan7_postfilter_workspace_create(

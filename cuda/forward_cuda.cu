@@ -35,6 +35,14 @@ static_assert(offsetof(plan7_forward_result, sequence_index) == 0 &&
               offsetof(plan7_forward_result, action) == 9 &&
               offsetof(plan7_forward_result, reserved) == 10,
               "Forward result ABI layout changed");
+static_assert(sizeof(plan7_forward_snapshot_profile) == 48 &&
+              offsetof(plan7_forward_snapshot_profile, emission_offset) == 0 &&
+              offsetof(plan7_forward_snapshot_profile, transition_offset) == 8 &&
+              offsetof(plan7_forward_snapshot_profile, q) == 16 &&
+              offsetof(plan7_forward_snapshot_profile, model_length) == 20 &&
+              offsetof(plan7_forward_snapshot_profile, e_move) == 24 &&
+              offsetof(plan7_forward_snapshot_profile, mode) == 44,
+              "Forward snapshot descriptor ABI changed");
 
 namespace {
 
@@ -467,6 +475,7 @@ struct RunBuffers {
 struct plan7_forward_database {
   int device_ordinal;
   int alphabet_size;
+  bool sealed_source;
   std::vector<ForwardProfile> host_profiles;
   std::vector<ForwardDeviceProfile> host_device_profiles;
   std::vector<uintptr_t> source_profile_pointers;
@@ -722,6 +731,7 @@ extern "C" int plan7_forward_database_create(
   }
   created->device_ordinal = current_device;
   created->alphabet_size = -1;
+  created->sealed_source = false;
   created->device_profiles = nullptr;
   created->device_emissions = nullptr;
   created->device_transitions = nullptr;
@@ -912,6 +922,165 @@ extern "C" int plan7_forward_database_create(
     CUDA_CREATE(cudaDeviceSynchronize());
   }
 #undef CUDA_CREATE
+  created->device_bytes = static_cast<uint64_t>(profile_bytes) +
+                          static_cast<uint64_t>(emission_bytes) +
+                          static_cast<uint64_t>(transition_bytes);
+  created->upload_milliseconds = std::chrono::duration<float, std::milli>(
+      std::chrono::steady_clock::now() - upload_begin).count();
+  *database = created.release();
+  return 0;
+}
+
+extern "C" int plan7_forward_database_create_snapshot(
+    int alphabet_size,
+    const plan7_forward_snapshot_profile *profiles, size_t profile_count,
+    const float *emissions, size_t emission_count,
+    const float *transitions, size_t transition_count,
+    const uintptr_t *identity_tokens,
+    plan7_forward_database **database, char *error, size_t error_size) {
+  if (database == nullptr || *database != nullptr || alphabet_size != 29 ||
+      (profile_count != 0 &&
+       (profiles == nullptr || identity_tokens == nullptr)) ||
+      (emission_count != 0 && emissions == nullptr) ||
+      (transition_count != 0 && transitions == nullptr)) {
+    set_error(error, error_size, "invalid Forward snapshot arguments");
+    return -1;
+  }
+  if (profile_count > UINT32_MAX) {
+    set_error(error, error_size, "Forward profile count exceeds uint32");
+    return -1;
+  }
+  int current_device = -1;
+  cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+
+  std::unique_ptr<plan7_forward_database> created(
+      new (std::nothrow) plan7_forward_database{});
+  if (!created) {
+    set_error(error, error_size, "Forward database allocation failed");
+    return -1;
+  }
+  created->device_ordinal = current_device;
+  created->alphabet_size = alphabet_size;
+  created->sealed_source = true;
+  created->device_profiles = nullptr;
+  created->device_emissions = nullptr;
+  created->device_transitions = nullptr;
+  created->device_bytes = 0;
+  created->pack_milliseconds = 0.0f;
+  created->upload_milliseconds = 0.0f;
+
+  const auto pack_begin = std::chrono::steady_clock::now();
+  try {
+    created->host_profiles.resize(profile_count);
+    created->host_device_profiles.resize(profile_count);
+    if (profile_count != 0)
+      created->source_profile_pointers.assign(
+          identity_tokens, identity_tokens + profile_count);
+  } catch (...) {
+    set_error(error, error_size, "Forward descriptor allocation failed");
+    return -1;
+  }
+
+  uint64_t expected_emissions = 0;
+  uint64_t expected_transitions = 0;
+  for (size_t profile_index = 0; profile_index < profile_count;
+       ++profile_index) {
+    const plan7_forward_snapshot_profile &source = profiles[profile_index];
+    if (source.model_length < 1 || source.model_length > kMaximumModelLength ||
+        source.q != static_cast<uint32_t>(p7O_NQF(source.model_length)) ||
+        source.emission_offset != expected_emissions ||
+        source.transition_offset != expected_transitions ||
+        (source.mode != p7_LOCAL && source.mode != p7_UNILOCAL) ||
+        (source.nj != 0.0f && source.nj != 1.0f) ||
+        (source.nj == 0.0f &&
+         (source.e_move != 1.0f || source.e_loop != 0.0f)) ||
+        (source.nj == 1.0f &&
+         (source.e_move != 0.5f || source.e_loop != 0.5f))) {
+      set_error(error, error_size, "invalid Forward snapshot descriptor");
+      return -1;
+    }
+    uint64_t profile_emissions;
+    uint64_t profile_transitions;
+    if (!checked_multiply(alphabet_size,
+                          static_cast<uint64_t>(source.q) * kSubwarp,
+                          &profile_emissions) ||
+        !checked_multiply(source.q, p7O_NTRANS * kSubwarp,
+                          &profile_transitions) ||
+        !checked_add(expected_emissions, profile_emissions,
+                     &expected_emissions) ||
+        !checked_add(expected_transitions, profile_transitions,
+                     &expected_transitions)) {
+      set_error(error, error_size, "Forward snapshot size overflow");
+      return -1;
+    }
+    created->host_profiles[profile_index] = {
+      source.emission_offset,
+      source.transition_offset,
+      source.q,
+      source.model_length,
+      source.e_move,
+      source.e_loop,
+      source.f_tau,
+      source.f_lambda,
+      source.nj,
+      source.mode,
+      0
+    };
+    created->host_device_profiles[profile_index] = {
+      source.emission_offset,
+      source.transition_offset,
+      source.q,
+      source.model_length,
+      source.e_move,
+      source.e_loop
+    };
+  }
+  if (expected_emissions != emission_count ||
+      expected_transitions != transition_count) {
+    set_error(error, error_size, "Forward snapshot arrays have trailing data");
+    return -1;
+  }
+  created->pack_milliseconds = std::chrono::duration<float, std::milli>(
+      std::chrono::steady_clock::now() - pack_begin).count();
+
+  size_t profile_bytes;
+  size_t emission_bytes;
+  size_t transition_bytes;
+  if (!checked_bytes(profile_count, sizeof(ForwardDeviceProfile),
+                     &profile_bytes) ||
+      !checked_bytes(emission_count, sizeof(float), &emission_bytes) ||
+      !checked_bytes(transition_count, sizeof(float), &transition_bytes)) {
+    set_error(error, error_size, "Forward device allocation size overflow");
+    return -1;
+  }
+  const auto upload_begin = std::chrono::steady_clock::now();
+#define CUDA_STAGE(call)                                                       \
+  do {                                                                         \
+    status = (call);                                                           \
+    if (status != cudaSuccess) {                                               \
+      set_cuda_error(error, error_size, #call, status);                        \
+      free_database_device(created.get());                                     \
+      return -1;                                                               \
+    }                                                                          \
+  } while (0)
+  if (profile_count != 0) {
+    CUDA_STAGE(cudaMalloc(&created->device_profiles, profile_bytes));
+    CUDA_STAGE(cudaMalloc(&created->device_emissions, emission_bytes));
+    CUDA_STAGE(cudaMalloc(&created->device_transitions, transition_bytes));
+    CUDA_STAGE(cudaMemcpy(created->device_profiles,
+                          created->host_device_profiles.data(), profile_bytes,
+                          cudaMemcpyHostToDevice));
+    CUDA_STAGE(cudaMemcpy(created->device_emissions, emissions, emission_bytes,
+                          cudaMemcpyHostToDevice));
+    CUDA_STAGE(cudaMemcpy(created->device_transitions, transitions,
+                          transition_bytes, cudaMemcpyHostToDevice));
+    CUDA_STAGE(cudaDeviceSynchronize());
+  }
+#undef CUDA_STAGE
   created->device_bytes = static_cast<uint64_t>(profile_bytes) +
                           static_cast<uint64_t>(emission_bytes) +
                           static_cast<uint64_t>(transition_bytes);
@@ -1143,7 +1312,8 @@ extern "C" int plan7_forward_run_with_workspace(
     }
     if (source_profile_pointers[profile] !=
             database->source_profile_pointers[profile] ||
-        !live_profile_matches_snapshot(database, profile)) {
+        (!database->sealed_source &&
+         !live_profile_matches_snapshot(database, profile))) {
       set_error(error, error_size,
                 "Forward database does not match the source profile row");
       return -1;
