@@ -75,6 +75,17 @@ the OA score reconstructed from trace posteriors each use a `2e-3` absolute
 tolerance. Accepted input is staged into stock traces, domains, and alignment
 displays, then passed to the unchanged HMMER final tail.
 
+Pressed optimized profiles, the pipeline background, its bias-filter HMM, and
+the digitized target legitimately own separate `ESL_ALPHABET` objects, so
+pointer identity is not a compatibility condition. The seam instead requires
+all four objects to be independently canonical standard-amino alphabets
+(`type=eslAMINO`, `K=20`, `Kp=29`, null complement) and checks the complete
+semantic content: the 30-byte symbol string including its terminator, all 128
+input-map entries, all 29-by-20 degeneracy entries, and all 29 degeneracy
+counts. It also checks pairwise semantic equality, every required table
+pointer/row, and the filter HMM's cached alphabet size. The exported domain
+worker repeats the same validation so it cannot bypass the pipeline boundary.
+
 Guard version 1 also prevents a compact/GPU rounding difference from changing
 any final report or inclusion call. It encloses each accepted external score
 by `0.004` nats plus a `1e-5`-bit arithmetic margin, reconstructs HMMER's exact

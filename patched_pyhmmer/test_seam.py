@@ -193,6 +193,11 @@ def main() -> None:
     assert pyhmmer.__version__ == "0.12.0"
     assert importlib.metadata.version("pyhmmer") == "0.12.0+plan7gpu.0"
 
+    alphabet_cases = seam_probe.compact_alphabet_contract_cases()
+    assert alphabet_cases.pop("distinct_equal") is True
+    assert alphabet_cases
+    assert not any(alphabet_cases.values()), alphabet_cases
+
     hmm, sequences = load("Thioesterase.hmm")
     for label, options in (
         ("default", {}),
@@ -549,7 +554,7 @@ def main() -> None:
     assert status == seam_probe.GPU_VITERBI_OK
     assert changed
 
-    for corruption in (*range(41), *range(42, 47)):
+    for corruption in (*range(41), *range(42, 47), *range(57, 73)):
         optimized = hmm.to_profile(
             plan7.Background(hmm.alphabet),
             L=400,

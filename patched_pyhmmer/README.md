@@ -62,6 +62,13 @@ stock unihit trace. The live profile/background length state, floating-point
 environment, filter gates, and a canonical continuation-option fingerprint
 are rechecked at the boundary.
 
+Alphabet compatibility is semantic, not pointer-based: pressed profiles,
+pipeline backgrounds, bias-filter HMMs, and targets may hold distinct standard
+amino alphabet objects. The seam independently validates their type, sizes,
+complete symbol/input-map/degeneracy tables, counts, and complement semantics,
+then requires their contents to agree. Any null, DNA, noncanonical, or tampered
+alphabet fails before mutation.
+
 The V2 call also receives the authenticated final target count. Before any
 mutation, its final-call guard propagates a conservative score interval through
 the stock full-target, reconstruction, and domain formulas and checks every

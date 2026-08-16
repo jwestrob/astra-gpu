@@ -360,6 +360,17 @@ cdef struct _forward_result:
     uint16_t reserved
 
 
+cdef struct _compact_consumption_statistics:
+    uint64_t attempt_count
+    uint64_t accepted_count
+    uint64_t invalid_retry_count
+    uint64_t threshold_retry_count
+    uint64_t first_row_index
+    uint32_t first_profile_index
+    uint32_t first_sequence_index
+    uint64_t first_domain_count
+
+
 ctypedef int (*_pipeline_from_filter_scores_f)(
     P7_PIPELINE*,
     P7_OPROFILE*,
@@ -1553,6 +1564,7 @@ cdef int _search_loop_postfilter_forward(
     _pipeline_compact_tail_fingerprint_f compact_tail_fingerprint,
     _pipeline_from_filter_forward_compact_domains_f compact_domains_seam,
     uint64_t* compact_rebased_offsets,
+    _compact_consumption_statistics* compact_statistics,
 ) except 1 nogil:
     cdef _postfilter_result postfilter
     cdef _forward_result forward
@@ -1689,6 +1701,21 @@ cdef int _search_loop_postfilter_forward(
                     and compact_generation_matches
                     and compact_rebased_offsets != NULL
                 ):
+                    if compact_statistics != NULL:
+                        if compact_statistics.attempt_count == 0:
+                            compact_statistics.first_row_index = (
+                                journal_row_base + journal_cursor
+                            )
+                            compact_statistics.first_profile_index = (
+                                journal.profile_index
+                            )
+                            compact_statistics.first_sequence_index = (
+                                journal.sequence_index
+                            )
+                            compact_statistics.first_domain_count = (
+                                compact_count
+                            )
+                        compact_statistics.attempt_count += 1
                     compact_trace_base = compact_trace_offsets[compact_start]
                     compact_trace_stop = compact_trace_offsets[compact_stop]
                     for compact_index in range(compact_count + 1):
@@ -1744,12 +1771,16 @@ cdef int _search_loop_postfilter_forward(
                     )
                     used_compact_domains_seam = True
                     if status == eslEINACCURATE:
+                        if compact_statistics != NULL:
+                            compact_statistics.threshold_retry_count += 1
                         # The guard covers uncertainty in both the compact
                         # domains and the upstream Forward score. Recompute
                         # the entire native pipeline so the retry is exact.
                         status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
                         used_compact_domains_seam = False
                     elif status == eslEINVAL:
+                        if compact_statistics != NULL:
+                            compact_statistics.invalid_retry_count += 1
                         xmx_count = (
                             special_offsets[forward_cursor + 1]
                             - special_offsets[forward_cursor]
@@ -1774,6 +1805,8 @@ cdef int _search_loop_postfilter_forward(
                         )
                         used_compact_domains_seam = False
                         used_forward_seam = True
+                    elif status == eslOK and compact_statistics != NULL:
+                        compact_statistics.accepted_count += 1
                 else:
                     status = simple_regions_seam(
                         pli,
@@ -2118,6 +2151,7 @@ cdef TopHits _search_postfilter_forward_validated(
             NULL,
             NULL,
             NULL,
+            NULL,
         )
         hits._sort_by_key()
         hits._threshold(pipeline)
@@ -2156,6 +2190,7 @@ cdef TopHits _search_postfilter_forward_journal_validated(
     _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam,
     _pipeline_compact_tail_fingerprint_f compact_tail_fingerprint,
     _pipeline_from_filter_forward_compact_domains_f compact_domains_seam,
+    _compact_consumption_statistics* compact_statistics,
 ):
     cdef const uint8_t* postfilter_ptr = NULL
     cdef const uint8_t* forward_ptr = NULL
@@ -2246,6 +2281,7 @@ cdef TopHits _search_postfilter_forward_journal_validated(
                 compact_tail_fingerprint,
                 compact_domains_seam,
                 compact_rebased_offsets,
+                compact_statistics,
             )
     finally:
         free(compact_rebased_offsets)
@@ -4425,10 +4461,36 @@ cdef bint _sealed_background_matches(
     ) == 0
 
 
+cdef object _sealed_search_result(
+    TopHits hits,
+    const _compact_consumption_statistics* statistics,
+    bint return_compact_statistics,
+):
+    if not return_compact_statistics:
+        return hits
+    return hits, {
+        "attempt_count": statistics.attempt_count,
+        "accepted_count": statistics.accepted_count,
+        "invalid_retry_count": statistics.invalid_retry_count,
+        "threshold_retry_count": statistics.threshold_retry_count,
+        "first_attempt": (
+            None
+            if statistics.attempt_count == 0
+            else (
+                statistics.first_row_index,
+                statistics.first_profile_index,
+                statistics.first_sequence_index,
+                statistics.first_domain_count,
+            )
+        ),
+    }
+
+
 def _search_hmm_sealed_postfilter_bound(
     sealed_object,
     Py_ssize_t row,
     Pipeline pipeline,
+    bint _return_compact_statistics=False,
 ):
     """Search one row whose complete immutable batch was already validated."""
     cdef _SealedPostfilterBatch sealed
@@ -4445,6 +4507,19 @@ def _search_hmm_sealed_postfilter_bound(
     cdef _double_bits generation_f1
     cdef bint use_forward
     cdef bint use_journal
+    cdef _compact_consumption_statistics statistics
+    cdef _compact_consumption_statistics* compact_statistics = NULL
+
+    if _return_compact_statistics:
+        statistics.attempt_count = 0
+        statistics.accepted_count = 0
+        statistics.invalid_retry_count = 0
+        statistics.threshold_retry_count = 0
+        statistics.first_row_index = 0
+        statistics.first_profile_index = 0
+        statistics.first_sequence_index = 0
+        statistics.first_domain_count = 0
+        compact_statistics = &statistics
 
     if type(sealed_object) is not _SealedPostfilterBatch:
         raise TypeError("sealed batch has the wrong extension type")
@@ -4486,17 +4561,21 @@ def _search_hmm_sealed_postfilter_bound(
         and pipeline._pli.do_biasfilter == sealed._generation_bias_filter
     )
     if not use_forward:
-        return _search_postfilter_validated(
-            pipeline,
-            query,
-            optimized_profile,
-            sealed._sequences,
-            sealed._postfilter_records[
-                postfilter_start * sizeof(_postfilter_result):
-                postfilter_stop * sizeof(_postfilter_result)
-            ],
-            &sealed._residue_offsets[0],
-            sealed._filter_scores_seam,
+        return _sealed_search_result(
+            _search_postfilter_validated(
+                pipeline,
+                query,
+                optimized_profile,
+                sealed._sequences,
+                sealed._postfilter_records[
+                    postfilter_start * sizeof(_postfilter_result):
+                    postfilter_stop * sizeof(_postfilter_result)
+                ],
+                &sealed._residue_offsets[0],
+                sealed._filter_scores_seam,
+            ),
+            &statistics,
+            _return_compact_statistics,
         )
     use_journal = (
         sealed._journal_storage.shape[0] != 0
@@ -4507,7 +4586,54 @@ def _search_hmm_sealed_postfilter_bound(
         journal_start = <size_t> sealed._journal_profile_offsets[row]
         journal_stop = <size_t> sealed._journal_profile_offsets[row + 1]
         generation_f1.value = sealed._f1
-        return _search_postfilter_forward_journal_validated(
+        return _sealed_search_result(
+            _search_postfilter_forward_journal_validated(
+                pipeline,
+                query,
+                optimized_profile,
+                sealed._sequences,
+                sealed._postfilter_records[
+                    postfilter_start * sizeof(_postfilter_result):
+                    postfilter_stop * sizeof(_postfilter_result)
+                ],
+                sealed._forward_records[
+                    forward_start * sizeof(_forward_result):
+                    forward_stop * sizeof(_forward_result)
+                ],
+                sealed._special_offsets[forward_start:forward_stop + 1],
+                sealed._specials,
+                sealed._journal_rows[
+                    journal_start * sizeof(plan7_continuation_journal_row):
+                    journal_stop * sizeof(plan7_continuation_journal_row)
+                ],
+                sealed._journal_region_offsets[journal_start:journal_stop + 1],
+                sealed._journal_regions,
+                sealed._journal_compact_row_offsets[
+                    journal_start:journal_stop + 1
+                ],
+                sealed._journal_compact_results,
+                sealed._journal_compact_trace_offsets,
+                sealed._journal_compact_traces,
+                sealed._journal_compact_null2,
+                journal_start,
+                sealed._generation_tail_fingerprint,
+                &sealed._residue_offsets[0],
+                generation_f1.bits,
+                sealed._generation_f2_bits,
+                sealed._generation_f3_bits,
+                sealed._generation_bias_filter,
+                sealed._filter_scores_seam,
+                sealed._forward_scores_seam,
+                sealed._simple_regions_seam,
+                sealed._compact_tail_fingerprint,
+                sealed._compact_domains_seam,
+                compact_statistics,
+            ),
+            &statistics,
+            _return_compact_statistics,
+        )
+    return _sealed_search_result(
+        _search_postfilter_forward_validated(
             pipeline,
             query,
             optimized_profile,
@@ -4522,50 +4648,12 @@ def _search_hmm_sealed_postfilter_bound(
             ],
             sealed._special_offsets[forward_start:forward_stop + 1],
             sealed._specials,
-            sealed._journal_rows[
-                journal_start * sizeof(plan7_continuation_journal_row):
-                journal_stop * sizeof(plan7_continuation_journal_row)
-            ],
-            sealed._journal_region_offsets[journal_start:journal_stop + 1],
-            sealed._journal_regions,
-            sealed._journal_compact_row_offsets[
-                journal_start:journal_stop + 1
-            ],
-            sealed._journal_compact_results,
-            sealed._journal_compact_trace_offsets,
-            sealed._journal_compact_traces,
-            sealed._journal_compact_null2,
-            journal_start,
-            sealed._generation_tail_fingerprint,
             &sealed._residue_offsets[0],
-            generation_f1.bits,
-            sealed._generation_f2_bits,
-            sealed._generation_f3_bits,
-            sealed._generation_bias_filter,
             sealed._filter_scores_seam,
             sealed._forward_scores_seam,
-            sealed._simple_regions_seam,
-            sealed._compact_tail_fingerprint,
-            sealed._compact_domains_seam,
-        )
-    return _search_postfilter_forward_validated(
-        pipeline,
-        query,
-        optimized_profile,
-        sealed._sequences,
-        sealed._postfilter_records[
-            postfilter_start * sizeof(_postfilter_result):
-            postfilter_stop * sizeof(_postfilter_result)
-        ],
-        sealed._forward_records[
-            forward_start * sizeof(_forward_result):
-            forward_stop * sizeof(_forward_result)
-        ],
-        sealed._special_offsets[forward_start:forward_stop + 1],
-        sealed._specials,
-        &sealed._residue_offsets[0],
-        sealed._filter_scores_seam,
-        sealed._forward_scores_seam,
+        ),
+        &statistics,
+        _return_compact_statistics,
     )
 
 

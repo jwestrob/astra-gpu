@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import io
 import math
 import os
@@ -52,6 +53,18 @@ except ImportError:
 
 DATA = Path(pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
 JOURNAL_CAPSULE_NAME = b"plan7_gpu._native._continuation_journal_v2"
+REAL_PFAM_SOURCE = Path(
+    os.environ.get(
+        "PLAN7_GPU_TEST_PFAM_SOURCE",
+        Path.home() / ".config" / "Astra" / "PFAM" / "Pfam-A.hmm",
+    )
+)
+REAL_PFAM_FIRST1000 = Path(
+    os.environ.get(
+        "PLAN7_GPU_TEST_PFAM_FIRST1000",
+        ROOT / "results" / "datasets" / "PLM2_5.first1000.faa",
+    )
+)
 
 
 class ContinuationJournalPrefix(ctypes.Structure):
@@ -1604,6 +1617,31 @@ class CompactDomainProfileSessionTests(ProfileSessionFixture, unittest.TestCase)
             + statistics["compact_numeric_fallback_count"]
             + statistics["compact_device_result_count"],
         )
+        consumption = {
+            "attempt_count": 0,
+            "accepted_count": 0,
+            "invalid_retry_count": 0,
+            "threshold_retry_count": 0,
+        }
+        diagnostic_pipeline = self.pipeline(**self.options)
+        sealed = _candidate_state(fused).sealed_postfilter
+        for row in range(len(pairs)):
+            _, row_consumption = (
+                _pipeline._search_hmm_sealed_postfilter_bound(
+                    sealed,
+                    row,
+                    diagnostic_pipeline,
+                    True,
+                )
+            )
+            for name in consumption:
+                consumption[name] += row_consumption[name]
+        self.assertGreater(consumption["attempt_count"], 0)
+        self.assertEqual(
+            consumption["accepted_count"], consumption["attempt_count"]
+        )
+        self.assertEqual(consumption["invalid_retry_count"], 0)
+        self.assertEqual(consumption["threshold_retry_count"], 0)
         self.assert_batch_matches_cpu(fused, pairs)
 
         thioesterase_row = self.selection_indices.index(1)
@@ -1620,6 +1658,92 @@ class CompactDomainProfileSessionTests(ProfileSessionFixture, unittest.TestCase)
         self.assertTrue(cache["same_dso"])
         self.assertEqual(cache["resolutions"], 1)
         self.assertEqual(cache["dlopen_calls"], cache["dlclose_calls"])
+
+    @unittest.skipUnless(
+        REAL_PFAM_SOURCE.is_file() and REAL_PFAM_FIRST1000.is_file(),
+        "real PFAM/first1000 regression inputs are unavailable",
+    )
+    def test_real_pfam_first_rejected_row_is_compact_accepted(self):
+        with tempfile.TemporaryDirectory(
+            prefix="plan7-real-pfam-compact-test-"
+        ) as temporary:
+            with REAL_PFAM_FIRST1000.open("rb") as source:
+                self.assertEqual(
+                    hashlib.file_digest(source, "sha256").hexdigest(),
+                    "b835fa20310971a507f5067f7136291cf2a4f5671e7ad64cf503c258cf24db2b",
+                )
+            with pyhmmer.plan7.HMMFile(REAL_PFAM_SOURCE) as source:
+                hmms = [source.read() for _ in range(13)]
+            self.assertTrue(all(hmm is not None for hmm in hmms))
+            self.assertEqual(hmms[12].name, "2-Hacid_dh_C")
+
+            base = Path(temporary) / "first13"
+            pyhmmer.hmmer.hmmpress(hmms, base)
+            pairs = load_pressed_profiles(base)
+            alphabet = hmms[0].alphabet
+            with pyhmmer.easel.SequenceFile(
+                REAL_PFAM_FIRST1000,
+                digital=True,
+                alphabet=alphabet,
+            ) as source:
+                targets = source.read_block()
+            self.assertEqual(len(targets), 1000)
+            self.assertEqual(
+                targets[56].name,
+                "PLM2_5_b1_jun17_scaffold_0_57",
+            )
+
+            options = {
+                "F1": 0.02,
+                "F2": 0.001,
+                "F3": 0.00001,
+                "bit_cutoffs": "gathering",
+            }
+            with ProfileSession(pairs, pack_workers=1) as session:
+                with session.select(range(13)) as selection:
+                    with SequenceBatch(targets) as batch:
+                        candidates = batch._postfilter_forward_selection(
+                            selection,
+                            options["F1"],
+                            options["F2"],
+                            options["F3"],
+                            True,
+                            pipeline=pyhmmer.plan7.Pipeline(
+                                alphabet, **options
+                            ),
+                        )
+                        sealed = _candidate_state(candidates).sealed_postfilter
+                        actual, consumption = (
+                            _pipeline._search_hmm_sealed_postfilter_bound(
+                                sealed,
+                                12,
+                                pyhmmer.plan7.Pipeline(alphabet, **options),
+                                True,
+                            )
+                        )
+
+            self.assertGreater(consumption["attempt_count"], 0)
+            self.assertEqual(
+                consumption["accepted_count"],
+                consumption["attempt_count"],
+            )
+            self.assertEqual(consumption["invalid_retry_count"], 0)
+            self.assertEqual(consumption["threshold_retry_count"], 0)
+            self.assertEqual(consumption["first_attempt"], (0, 12, 56, 1))
+            expected = pyhmmer.plan7.Pipeline(
+                alphabet, **options
+            ).search_hmm(pairs[12].hmm, targets)
+            self.assert_hits_close(actual, expected)
+            self.assertEqual(
+                self.semantic_pipeline_state(actual),
+                self.semantic_pipeline_state(expected),
+            )
+            hit = next(
+                hit
+                for hit in actual
+                if hit.name == "PLM2_5_b1_jun17_scaffold_0_57"
+            )
+            self.assertEqual(len(hit.domains), 1)
 
     def test_threshold_adjacent_device_row_retries_full_pipeline_exactly(self):
         pair = self.pairs[0]

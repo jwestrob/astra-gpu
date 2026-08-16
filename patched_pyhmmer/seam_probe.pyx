@@ -7,6 +7,7 @@ from libc.string cimport memcmp, memcpy, memset
 from libc.math cimport exp, fabsf, log, logf
 
 from libeasel cimport (
+    ESL_DSQ,
     eslCONST_LOG2,
     eslEINACCURATE,
     eslEINVAL,
@@ -16,6 +17,14 @@ from libeasel cimport (
     eslOK,
 )
 from libeasel.sq cimport ESL_SQ
+from libeasel.alphabet cimport (
+    ESL_ALPHABET,
+    eslAMINO,
+    eslDNA,
+    esl_alphabet_Create,
+    esl_alphabet_CreateCustom,
+    esl_alphabet_Destroy,
+)
 from libhmmer cimport p7_FLAMBDA, p7_FTAU
 from libhmmer.impl_sse cimport p7_MSVFilter
 from libhmmer.impl.p7_omx cimport P7_OMX, p7_omx_GrowTo
@@ -71,6 +80,20 @@ from libhmmer.p7_tophits cimport P7_TOPHITS
 
 from pyhmmer.easel cimport DigitalSequenceBlock
 from pyhmmer.plan7 cimport HMM, OptimizedProfile, Pipeline, TopHits
+
+
+cdef extern from "hmmer.h" nogil:
+    int p7_compact_AlphabetIsCanonicalAminoV2(const ESL_ALPHABET *abc)
+    int p7_compact_AlphabetsAreEqualV2(
+        const ESL_ALPHABET *left,
+        const ESL_ALPHABET *right,
+    )
+    int p7_compact_AlphabetSetIsExactV2(
+        const ESL_ALPHABET *profile,
+        const ESL_ALPHABET *background,
+        const ESL_ALPHABET *filter,
+        const ESL_ALPHABET *sequence,
+    )
 
 
 cdef extern from "fenv.h" nogil:
@@ -1274,6 +1297,56 @@ cdef int _invalid_simple_regions(
     return status
 
 
+cdef void _restore_compact_alphabet_corruption(
+    P7_OPROFILE* om,
+    P7_BG* bg,
+    ESL_SQ* sq,
+    int corruption,
+    int saved_int,
+    char saved_char,
+    ESL_DSQ saved_code,
+    char* saved_sym,
+    char** saved_degen,
+    char* saved_degen_row,
+    int* saved_ndegen,
+    ESL_DSQ* saved_complement,
+    const ESL_ALPHABET* saved_filter_alphabet,
+    const ESL_ALPHABET* saved_sequence_alphabet,
+) noexcept nogil:
+    cdef ESL_ALPHABET* alphabet = <ESL_ALPHABET*> om.abc
+
+    if corruption == 57:
+        alphabet.type = saved_int
+    elif corruption == 58:
+        alphabet.K = saved_int
+    elif corruption == 59:
+        alphabet.Kp = saved_int
+    elif corruption == 60:
+        alphabet.sym[0] = saved_char
+    elif corruption == 61:
+        alphabet.inmap[65] = saved_code
+    elif corruption == 62:
+        alphabet.degen[0][0] = saved_char
+    elif corruption == 63:
+        alphabet.ndegen[0] = saved_int
+    elif corruption == 64:
+        alphabet.complement = saved_complement
+    elif corruption == 65:
+        bg.fhmm.K = saved_int
+    elif corruption == 66:
+        alphabet.sym = saved_sym
+    elif corruption == 67:
+        alphabet.degen = saved_degen
+    elif corruption == 68:
+        alphabet.degen[0] = saved_degen_row
+    elif corruption == 69:
+        alphabet.ndegen = saved_ndegen
+    elif corruption == 70:
+        bg.fhmm.abc = saved_filter_alphabet
+    elif corruption == 71 or corruption == 72:
+        sq.abc = <ESL_ALPHABET*> saved_sequence_alphabet
+
+
 cdef int _invalid_compact_domains(
     P7_PIPELINE* pli,
     P7_OPROFILE* om,
@@ -1321,6 +1394,19 @@ cdef int _invalid_compact_domains(
     cdef int original_rounding = -1
     cdef int status
     cdef int z
+    cdef ESL_ALPHABET* alphabet
+    cdef ESL_ALPHABET* replacement_alphabet = NULL
+    cdef ESL_SQ* mutable_sq = <ESL_SQ*> sq
+    cdef int saved_alphabet_int = 0
+    cdef char saved_alphabet_char = 0
+    cdef ESL_DSQ saved_alphabet_code = 0
+    cdef char* saved_alphabet_sym = NULL
+    cdef char** saved_alphabet_degen = NULL
+    cdef char* saved_alphabet_degen_row = NULL
+    cdef int* saved_alphabet_ndegen = NULL
+    cdef ESL_DSQ* saved_alphabet_complement = NULL
+    cdef const ESL_ALPHABET* saved_filter_alphabet = NULL
+    cdef const ESL_ALPHABET* saved_sequence_alphabet = NULL
 
     ret_changed[0] = 1
     if sq.n <= 0:
@@ -1371,6 +1457,7 @@ cdef int _invalid_compact_domains(
         return status
     supplied_trace_count = trace_count
     generation_tail_fingerprint = p7_pipeline_CompactTailFingerprintV2(pli)
+    alphabet = <ESL_ALPHABET*> om.abc
     for z in range(<int> trace_count):
         if traces[z].state == p7T_M:
             first_match = z
@@ -1606,6 +1693,64 @@ cdef int _invalid_compact_domains(
         generation_tail_fingerprint = (
             p7_pipeline_CompactTailFingerprintV2(pli)
         )
+    elif corruption == 57:
+        saved_alphabet_int = alphabet.type
+        alphabet.type = eslDNA
+    elif corruption == 58:
+        saved_alphabet_int = alphabet.K
+        alphabet.K = 19
+    elif corruption == 59:
+        saved_alphabet_int = alphabet.Kp
+        alphabet.Kp = 28
+    elif corruption == 60:
+        saved_alphabet_char = alphabet.sym[0]
+        alphabet.sym[0] = 90
+    elif corruption == 61:
+        saved_alphabet_code = alphabet.inmap[65]
+        alphabet.inmap[65] += 1
+    elif corruption == 62:
+        saved_alphabet_char = alphabet.degen[0][0]
+        alphabet.degen[0][0] = 0
+    elif corruption == 63:
+        saved_alphabet_int = alphabet.ndegen[0]
+        alphabet.ndegen[0] = 2
+    elif corruption == 64:
+        saved_alphabet_complement = alphabet.complement
+        alphabet.complement = <ESL_DSQ*> alphabet.sym
+    elif corruption == 65:
+        saved_alphabet_int = bg.fhmm.K
+        bg.fhmm.K -= 1
+    elif corruption == 66:
+        saved_alphabet_sym = alphabet.sym
+        alphabet.sym = NULL
+    elif corruption == 67:
+        saved_alphabet_degen = alphabet.degen
+        alphabet.degen = NULL
+    elif corruption == 68:
+        saved_alphabet_degen_row = alphabet.degen[0]
+        alphabet.degen[0] = NULL
+    elif corruption == 69:
+        saved_alphabet_ndegen = alphabet.ndegen
+        alphabet.ndegen = NULL
+    elif corruption == 70:
+        saved_filter_alphabet = bg.fhmm.abc
+        bg.fhmm.abc = NULL
+    elif corruption == 71:
+        saved_sequence_alphabet = <const ESL_ALPHABET*> mutable_sq.abc
+        replacement_alphabet = esl_alphabet_Create(eslDNA)
+        if replacement_alphabet == NULL:
+            free(traces)
+            return eslEMEM
+        mutable_sq.abc = replacement_alphabet
+    elif corruption == 72:
+        saved_sequence_alphabet = <const ESL_ALPHABET*> mutable_sq.abc
+        replacement_alphabet = esl_alphabet_CreateCustom(
+            "ACDEFGHIKLMNPQRSTVWY-BJZOUX*~", 20, 29,
+        )
+        if replacement_alphabet == NULL:
+            free(traces)
+            return eslEMEM
+        mutable_sq.abc = replacement_alphabet
     elif corruption != 41:
         free(traces)
         return eslEINVAL
@@ -1620,6 +1765,15 @@ cdef int _invalid_compact_domains(
     )
     snapshot = <unsigned char*> malloc(snapshot_size)
     if snapshot == NULL:
+        _restore_compact_alphabet_corruption(
+            om, bg, mutable_sq, corruption,
+            saved_alphabet_int, saved_alphabet_char, saved_alphabet_code,
+            saved_alphabet_sym, saved_alphabet_degen,
+            saved_alphabet_degen_row, saved_alphabet_ndegen,
+            saved_alphabet_complement, saved_filter_alphabet,
+            saved_sequence_alphabet,
+        )
+        esl_alphabet_Destroy(replacement_alphabet)
         if original_rounding != -1:
             fesetround(original_rounding)
         free(traces)
@@ -1659,6 +1813,15 @@ cdef int _invalid_compact_domains(
         traces, supplied_trace_count,
         null2, supplied_null2_count,
     )
+    _restore_compact_alphabet_corruption(
+        om, bg, mutable_sq, corruption,
+        saved_alphabet_int, saved_alphabet_char, saved_alphabet_code,
+        saved_alphabet_sym, saved_alphabet_degen,
+        saved_alphabet_degen_row, saved_alphabet_ndegen,
+        saved_alphabet_complement, saved_filter_alphabet,
+        saved_sequence_alphabet,
+    )
+    esl_alphabet_Destroy(replacement_alphabet)
     if original_rounding != -1 and fesetround(original_rounding) != 0:
         free(snapshot)
         free(traces)
@@ -1832,6 +1995,163 @@ def search_simple_regions(
     return hits, (
         route_counts[0], route_counts[1], route_counts[2],
     )
+
+
+cdef bint _compact_alphabet_contract_case(int fault) except -1:
+    cdef ESL_ALPHABET* profile = esl_alphabet_Create(eslAMINO)
+    cdef ESL_ALPHABET* background = esl_alphabet_Create(eslAMINO)
+    cdef ESL_ALPHABET* filter_abc = esl_alphabet_Create(eslAMINO)
+    cdef ESL_ALPHABET* sequence = esl_alphabet_Create(eslAMINO)
+    cdef char* saved_degen = NULL
+    cdef char** saved_degen_table = NULL
+    cdef int* saved_ndegen = NULL
+    cdef bint result
+
+    if (
+        profile == NULL
+        or background == NULL
+        or filter_abc == NULL
+        or sequence == NULL
+    ):
+        esl_alphabet_Destroy(profile)
+        esl_alphabet_Destroy(background)
+        esl_alphabet_Destroy(filter_abc)
+        esl_alphabet_Destroy(sequence)
+        raise MemoryError("alphabet contract probe allocation failed")
+    try:
+        if fault == 1:
+            profile.type = eslDNA
+        elif fault == 2:
+            profile.K = 19
+        elif fault == 3:
+            profile.Kp = 28
+        elif fault == 4:
+            profile.sym[0] = 90
+        elif fault == 5:
+            profile.sym[29] = 88
+        elif fault == 6:
+            background.inmap[65] += 1
+        elif fault == 7:
+            filter_abc.degen[0][0] = 0
+        elif fault == 8:
+            sequence.ndegen[0] = 2
+        elif fault == 9:
+            profile.complement = <unsigned char*> profile.sym
+        elif fault == 10:
+            saved_degen = profile.degen[0]
+            profile.degen[0] = NULL
+        elif fault == 11:
+            saved_ndegen = profile.ndegen
+            profile.ndegen = NULL
+        elif fault == 12:
+            esl_alphabet_Destroy(sequence)
+            sequence = esl_alphabet_Create(eslDNA)
+            if sequence == NULL:
+                raise MemoryError("DNA alphabet contract probe allocation failed")
+        elif fault == 13:
+            saved_degen_table = profile.degen
+            profile.degen = NULL
+        elif fault == 14:
+            saved_degen = profile.sym
+            profile.sym = NULL
+        elif fault == 15:
+            esl_alphabet_Destroy(sequence)
+            sequence = esl_alphabet_CreateCustom(
+                "ACDEFGHIKLMNPQRSTVWY-BJZOUX*~", 20, 29,
+            )
+            if sequence == NULL:
+                raise MemoryError(
+                    "custom alphabet contract probe allocation failed"
+                )
+        elif fault != 0:
+            raise ValueError("unknown alphabet contract fault")
+        result = p7_compact_AlphabetSetIsExactV2(
+            profile, background, filter_abc, sequence,
+        )
+        if fault == 0:
+            result = (
+                result
+                and p7_compact_AlphabetIsCanonicalAminoV2(profile)
+                and p7_compact_AlphabetsAreEqualV2(profile, background)
+            )
+        return result
+    finally:
+        if fault == 1:
+            profile.type = eslAMINO
+        elif fault == 2:
+            profile.K = 20
+        elif fault == 3:
+            profile.Kp = 29
+        elif fault == 4:
+            profile.sym[0] = 65
+        elif fault == 5:
+            profile.sym[29] = 0
+        elif fault == 6:
+            background.inmap[65] -= 1
+        elif fault == 7:
+            filter_abc.degen[0][0] = 1
+        elif fault == 8:
+            sequence.ndegen[0] = 1
+        elif fault == 9:
+            profile.complement = NULL
+        elif fault == 10:
+            profile.degen[0] = saved_degen
+        elif fault == 11:
+            profile.ndegen = saved_ndegen
+        elif fault == 13:
+            profile.degen = saved_degen_table
+        elif fault == 14:
+            profile.sym = saved_degen
+        esl_alphabet_Destroy(profile)
+        esl_alphabet_Destroy(background)
+        esl_alphabet_Destroy(filter_abc)
+        esl_alphabet_Destroy(sequence)
+
+
+cdef bint _compact_shared_alphabet_corruption_case() except -1:
+    cdef ESL_ALPHABET* alphabet = esl_alphabet_Create(eslAMINO)
+    cdef bint result
+    if alphabet == NULL:
+        raise MemoryError("shared alphabet contract probe allocation failed")
+    try:
+        alphabet.inmap[65] += 1
+        result = p7_compact_AlphabetSetIsExactV2(
+            alphabet, alphabet, alphabet, alphabet,
+        )
+        return result
+    finally:
+        alphabet.inmap[65] -= 1
+        esl_alphabet_Destroy(alphabet)
+
+
+def compact_alphabet_contract_cases():
+    """Probe distinct-equal acceptance and fieldwise fail-closed behavior."""
+    names = (
+        "distinct_equal",
+        "type",
+        "K",
+        "Kp",
+        "symbols",
+        "symbol_terminator",
+        "input_map",
+        "degeneracy_table",
+        "degeneracy_count",
+        "complement",
+        "null_degeneracy_row",
+        "null_degeneracy_counts",
+        "dna_sequence",
+        "null_degeneracy_table",
+        "null_symbols",
+        "custom_sequence",
+    )
+    result = {
+        name: bool(_compact_alphabet_contract_case(fault))
+        for fault, name in enumerate(names)
+    }
+    result["shared_corruption"] = bool(
+        _compact_shared_alphabet_corruption_case()
+    )
+    return result
 
 
 def search_compact_domains(
