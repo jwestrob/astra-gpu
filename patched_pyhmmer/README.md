@@ -33,6 +33,23 @@ Forward score bit-for-bit, then imports the matrix for the unchanged Backward
 and domain workflow. Invalid payloads and unattested host floating-point modes
 fail before survivor counters or workspaces change.
 
+The additive simple-region seam continues guarded F3 survivors without the
+full-target CPU Backward/parser and domain-decoding passes. It accepts only a
+finite posterior domain expectation and ordered, nonoverlapping simple-region
+intervals (or an explicit no-regions route), rechecks the exact F1/F2/F3 and
+bias-filter generation options, then uses HMMER's existing isolated-envelope
+Forward/Backward, posterior decoding, null2, optimal-accuracy, display, and
+shared hit-scoring path. Uncertain, clustered, nonfinite, or otherwise
+unsupported rows must remain on the existing Forward continuation.
+
+This patch supplies only the pinned HMMER boundary and its direct parity
+probe. Product integration is intentionally still blocked: the final opaque
+adapter must seal the complete external score/status tuple, route payload,
+profile identity, target identity, thresholds, and background fingerprint as
+one immutable generation. The HMMER seam additionally rejects stale live
+profile/background length configuration, but cannot establish that hidden
+cross-object provenance by itself.
+
 ## Build and test
 
 ```bash
@@ -54,7 +71,7 @@ private ABI fingerprint changes and intentionally forces `_pipeline` to be
 rebuilt. Regenerate pressed manifests after switching wheels.
 
 The test compares ordinary stock and patched PyHMMER byte-for-byte, then checks
-all three entry points, stage counters, F1/F2/F3 rejects, Viterbi elision,
+all four entry points, stage counters, F1/F2/F3 rejects, Viterbi elision,
 ERANGE/ENORESULT fallback, `--nobias`, malformed Forward payloads, required
 symbols, a real Forward rescaling case, and that only one HMMER and one Easel
 library are mapped.

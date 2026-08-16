@@ -105,6 +105,32 @@ def compare_forward(
         assert counters(standard) == expected_counters, label
 
 
+def compare_simple_regions(
+    label: str,
+    hmm,
+    sequences,
+    options: dict,
+    expected_routes: tuple[int, int, int],
+) -> None:
+    standard = plan7.Pipeline(hmm.alphabet, **options).search_hmm(
+        hmm,
+        sequences,
+    )
+    optimized = hmm.to_profile(
+        plan7.Background(hmm.alphabet),
+        L=400,
+    ).to_optimized()
+    resumed, routes = seam_probe.search_simple_regions(
+        plan7.Pipeline(hmm.alphabet, **options),
+        hmm,
+        optimized,
+        sequences,
+    )
+    assert routes == expected_routes, label
+    assert tables(standard) == tables(resumed), label
+    assert counters(standard) == counters(resumed), label
+
+
 def check_one_library() -> None:
     mapped = Path("/proc/self/maps").read_text().splitlines()
     for library in ("liblibhmmer.so", "liblibeasel.so"):
@@ -278,8 +304,68 @@ def main() -> None:
         assert status == seam_probe.HMMER_EINVAL, corruption
         assert not changed, corruption
 
+    hmm, all_sequences = load("Thioesterase.hmm")
+    route_sequences = easel.DigitalSequenceBlock(
+        hmm.alphabet,
+        [all_sequences[index] for index in (0, 13, 31, 67)],
+    )
+    all_pass = {"F1": 1.0, "F2": 1.0, "F3": 1.0}
+    compare_simple_regions(
+        "external simple regions",
+        hmm,
+        route_sequences,
+        all_pass,
+        (1, 1, 2),
+    )
+    compare_simple_regions(
+        "external simple regions current options",
+        hmm,
+        route_sequences,
+        {
+            **all_pass,
+            "bias_filter": False,
+            "null2": False,
+            "T": -100.0,
+            "domT": -100.0,
+            "incT": -100.0,
+            "incdomT": -100.0,
+        },
+        (1, 1, 2),
+    )
+    invalid_sequence = easel.DigitalSequenceBlock(
+        hmm.alphabet,
+        [all_sequences[13]],
+    )
+    for corruption in (*range(27), *range(28, 37)):
+        optimized = hmm.to_profile(
+            plan7.Background(hmm.alphabet),
+            L=400,
+        ).to_optimized()
+        status, changed = seam_probe.invalid_simple_regions_status(
+            plan7.Pipeline(hmm.alphabet, **all_pass),
+            hmm,
+            optimized,
+            invalid_sequence,
+            corruption,
+        )
+        assert status == seam_probe.HMMER_EINVAL, corruption
+        assert not changed, corruption
+    optimized = hmm.to_profile(
+        plan7.Background(hmm.alphabet),
+        L=400,
+    ).to_optimized()
+    status, changed = seam_probe.invalid_simple_regions_status(
+        plan7.Pipeline(hmm.alphabet, **all_pass),
+        hmm,
+        optimized,
+        invalid_sequence,
+        27,
+    )
+    assert status == seam_probe.GPU_VITERBI_OK
+    assert changed
+
     check_one_library()
-    print("patched PyHMMER seam parity: 4 full searches + 21 seam cases")
+    print("patched PyHMMER seam parity: 4 full searches + 60 seam cases")
 
 
 if __name__ == "__main__":

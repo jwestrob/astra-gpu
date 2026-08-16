@@ -65,7 +65,8 @@ defined_symbols=$(nm -D --defined-only "$library_dir/liblibhmmer.so")
 for symbol in \
   p7_PipelineFromMSV \
   p7_PipelineFromFilterScores \
-  p7_PipelineFromFilterAndForwardScores; do
+  p7_PipelineFromFilterAndForwardScores \
+  p7_PipelineFromFilterAndForwardSimpleRegions; do
   if ! rg -q "[[:space:]]${symbol}$" <<<"$defined_symbols"; then
     echo "patched HMMER library is missing $symbol" >&2
     exit 1
@@ -75,6 +76,20 @@ done
 $bootstrap_python -m venv "$work/stock"
 stock_python=$work/stock/bin/python
 $stock_python -m pip install --quiet "pip==26.2.1" "pyhmmer===0.12.0"
+
+stock_library=$($stock_python - <<'PY'
+from pathlib import Path
+import pyhmmer
+
+package = Path(pyhmmer.__file__).resolve().parent
+print(package.parent / "pyhmmer.libs" / "liblibhmmer.so")
+PY
+)
+if nm -D --defined-only "$stock_library" | \
+    rg -q '[[:space:]]p7_PipelineFromFilterAndForwardSimpleRegions$'; then
+  echo "stock HMMER unexpectedly exports the private simple-region seam" >&2
+  exit 1
+fi
 
 stock_signature=$($stock_python "$here/ordinary_signature.py")
 patched_signature=$($patched_python "$here/ordinary_signature.py")

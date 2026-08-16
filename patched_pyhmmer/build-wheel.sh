@@ -33,6 +33,7 @@ fi
 tar -xzf "$sdist" -C "$work"
 source_root=$work/pyhmmer-$version
 patch --batch --forward -d "$source_root" -p1 < "$here/pyhmmer-0.12.0-plan7gpu.patch"
+patch --batch --forward -d "$source_root" -p1 < "$here/pyhmmer-0.12.0-simple-regions.patch"
 
 $bootstrap_python -m venv "$work/build-venv"
 build_python=$work/build-venv/bin/python
@@ -66,3 +67,4 @@ wheel=$output_dir/${wheel##*/}
 printf 'wheel=%s\n' "$wheel"
 printf 'wheel_sha256=%s\n' "$(sha256sum "$wheel" | cut -d' ' -f1)"
 printf 'patch_sha256=%s\n' "$(sha256sum "$here/pyhmmer-0.12.0-plan7gpu.patch" | cut -d' ' -f1)"
+printf 'simple_regions_patch_sha256=%s\n' "$(sha256sum "$here/pyhmmer-0.12.0-simple-regions.patch" | cut -d' ' -f1)"
