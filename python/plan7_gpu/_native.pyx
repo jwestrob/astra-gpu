@@ -632,6 +632,17 @@ cdef extern from "forward_cuda.h" nogil:
         float download_milliseconds
         float total_milliseconds
 
+    ctypedef struct plan7_forward_provenance:
+        uint64_t database_generation
+        uint64_t batch_generation
+        uint64_t row_hash
+        uint64_t special_hash
+        uint64_t continuation_hash
+        uint64_t pass_count
+        uint64_t special_count
+        uint64_t generation_f3_bits
+        uint64_t integrity_tag
+
     ctypedef struct plan7_forward_output:
         pass
 
@@ -725,6 +736,196 @@ cdef extern from "forward_cuda.h" nogil:
 
     const plan7_forward_statistics *plan7_forward_output_statistics(
         const plan7_forward_output *output,
+    )
+
+    const plan7_forward_provenance *plan7_forward_output_provenance(
+        const plan7_forward_output *output,
+    )
+
+
+cdef extern from "backward_domain_cuda.h" nogil:
+    cdef enum plan7_backward_domain_abi:
+        PLAN7_BACKWARD_DOMAIN_RECORD_VERSION
+        PLAN7_BACKWARD_DOMAIN_RECORD_SIZE
+        PLAN7_BACKWARD_DOMAIN_POSTERIOR_SIZE
+        PLAN7_BACKWARD_DOMAIN_REGION_SIZE
+        PLAN7_BACKWARD_DOMAIN_MAX_POSTERIOR_BYTES
+        PLAN7_BACKWARD_DOMAIN_MAX_ROW_WORK_CELLS
+        PLAN7_BACKWARD_DOMAIN_MAX_RUN_WORK_CELLS
+
+    cdef enum plan7_backward_domain_route:
+        PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED
+        PLAN7_BACKWARD_DOMAIN_NO_REGIONS
+        PLAN7_BACKWARD_DOMAIN_SIMPLE
+
+    cdef enum plan7_backward_domain_status:
+        PLAN7_BACKWARD_DOMAIN_OK
+        PLAN7_BACKWARD_DOMAIN_ERANGE
+        PLAN7_BACKWARD_DOMAIN_ENORESULT
+        PLAN7_BACKWARD_DOMAIN_EMPTY
+
+    ctypedef struct plan7_backward_domain_candidate:
+        uint32_t profile_index
+        uint32_t sequence_index
+
+    ctypedef struct plan7_backward_domain_result:
+        uint32_t profile_index
+        uint32_t sequence_index
+        float backward_score
+        float nexpected
+        uint32_t uncertain_count
+        uint32_t region_count
+        uint32_t multidomain_count
+        uint8_t status
+        uint8_t route
+        uint8_t has_own_scales
+        uint8_t reserved
+
+    ctypedef struct plan7_domain_posterior:
+        float btot
+        float etot
+        float mocc
+
+    ctypedef struct plan7_simple_region:
+        uint32_t begin
+        uint32_t end
+
+    ctypedef struct plan7_backward_domain_provenance:
+        plan7_forward_provenance forward
+        uint64_t threshold_hash
+        uint64_t result_hash
+        uint64_t region_hash
+        uint64_t candidate_count
+        uint64_t region_count
+
+    ctypedef struct plan7_backward_domain_statistics:
+        uint64_t candidate_count
+        uint64_t device_result_count
+        uint64_t cpu_required_count
+        uint64_t work_cells
+        uint64_t dp_workspace_bytes
+        uint64_t backward_special_workspace_bytes
+        uint64_t forward_special_workspace_bytes
+        uint64_t posterior_bytes
+        uint64_t simple_region_bytes
+        uint64_t output_byte_limit
+        uint64_t output_cap_fallback_count
+        uint64_t work_cap_fallback_count
+        uint64_t posterior_omitted_count
+        uint64_t own_scale_count
+        uint64_t threshold_uncertain_count
+        uint64_t no_region_count
+        uint64_t simple_count
+        uint64_t multidomain_fallback_count
+        float kernel_milliseconds
+        float upload_milliseconds
+        float download_milliseconds
+        float total_milliseconds
+
+    ctypedef struct plan7_backward_domain_output:
+        pass
+
+    int plan7_backward_domain_run(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_candidate *candidates,
+        size_t candidate_count,
+        const plan7_forward_provenance *provenance,
+        const uint64_t *forward_offsets,
+        const float *forward_specials,
+        size_t forward_special_count,
+        float rt1,
+        float rt2,
+        float rt3,
+        float guard_band,
+        uint64_t posterior_byte_budget,
+        plan7_backward_domain_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_backward_domain_unsealed_test_run(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_candidate *candidates,
+        size_t candidate_count,
+        const uint64_t *forward_offsets,
+        const float *forward_specials,
+        size_t forward_special_count,
+        float rt1,
+        float rt2,
+        float rt3,
+        float guard_band,
+        uint64_t posterior_byte_budget,
+        plan7_backward_domain_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_backward_domain_output_destroy(
+        plan7_backward_domain_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    size_t plan7_backward_domain_output_result_count(
+        const plan7_backward_domain_output *output,
+    )
+
+    const plan7_backward_domain_result *plan7_backward_domain_output_results(
+        const plan7_backward_domain_output *output,
+    )
+
+    const uint64_t *plan7_backward_domain_output_posterior_offsets(
+        const plan7_backward_domain_output *output,
+    )
+
+    size_t plan7_backward_domain_output_posterior_count(
+        const plan7_backward_domain_output *output,
+    )
+
+    const plan7_domain_posterior *plan7_backward_domain_output_posteriors(
+        const plan7_backward_domain_output *output,
+    )
+
+    const uint64_t *plan7_backward_domain_output_region_offsets(
+        const plan7_backward_domain_output *output,
+    )
+
+    size_t plan7_backward_domain_output_region_count(
+        const plan7_backward_domain_output *output,
+    )
+
+    const plan7_simple_region *plan7_backward_domain_output_regions(
+        const plan7_backward_domain_output *output,
+    )
+
+    const plan7_backward_domain_provenance *plan7_backward_domain_output_provenance(
+        const plan7_backward_domain_output *output,
+    )
+
+    const plan7_backward_domain_statistics *plan7_backward_domain_output_statistics(
+        const plan7_backward_domain_output *output,
+    )
+
+    int plan7_backward_domain_cpu_oracle(
+        uintptr_t source_profile_pointer,
+        const uint8_t *residues,
+        size_t residue_count,
+        const float *forward_specials,
+        size_t forward_special_count,
+        float rt1,
+        float rt2,
+        float rt3,
+        float guard_band,
+        plan7_backward_domain_result *result,
+        plan7_domain_posterior *posteriors,
+        size_t posterior_count,
+        plan7_simple_region *regions,
+        size_t region_capacity,
+        size_t *region_count,
+        char *error,
+        size_t error_size,
     )
 
 
@@ -1147,6 +1348,176 @@ def pack_striped_scores(
     return packed_scores
 
 
+cdef class ForwardProvenance:
+    """Opaque identity binding gathered Forward rows to resident inputs."""
+
+    cdef plan7_forward_provenance _value
+
+    def __cinit__(self):
+        self._value.database_generation = 0
+        self._value.batch_generation = 0
+        self._value.row_hash = 0
+        self._value.special_hash = 0
+        self._value.continuation_hash = 0
+        self._value.pass_count = 0
+        self._value.special_count = 0
+        self._value.generation_f3_bits = 0
+        self._value.integrity_tag = 0
+
+    @property
+    def pass_count(self):
+        return self._value.pass_count
+
+    @property
+    def special_count(self):
+        return self._value.special_count
+
+    def __reduce__(self):
+        raise TypeError("Forward provenance tokens cannot be serialized")
+
+    def _tampered_for_test(self, field):
+        """Return a corrupt copy for native provenance rejection tests."""
+        cdef ForwardProvenance token
+        token = ForwardProvenance.__new__(ForwardProvenance)
+        token._value = self._value
+        if field == "continuation_hash":
+            token._value.continuation_hash ^= 1
+        elif field == "generation_f3_bits":
+            token._value.generation_f3_bits ^= 1
+        elif field == "integrity_tag":
+            token._value.integrity_tag ^= 1
+        else:
+            raise ValueError("unknown provenance field")
+        return token
+
+
+cdef ForwardProvenance _forward_provenance_from_output(
+    const plan7_forward_output *output,
+):
+    cdef const plan7_forward_provenance *native
+    cdef ForwardProvenance token
+    native = plan7_forward_output_provenance(output)
+    if native == NULL:
+        raise RuntimeError("Forward provenance is null")
+    token = ForwardProvenance.__new__(ForwardProvenance)
+    token._value = native[0]
+    return token
+
+
+cdef class BackwardDomainProvenance:
+    """Opaque seal for one compact Backward/domain continuation journal."""
+
+    cdef plan7_backward_domain_provenance _value
+
+    def __cinit__(self):
+        self._value.candidate_count = 0
+        self._value.region_count = 0
+
+    @property
+    def candidate_count(self):
+        return self._value.candidate_count
+
+    @property
+    def region_count(self):
+        return self._value.region_count
+
+    def __reduce__(self):
+        raise TypeError("Backward/domain provenance tokens cannot be serialized")
+
+
+cdef BackwardDomainProvenance _backward_provenance_from_output(
+    const plan7_backward_domain_output *output,
+):
+    cdef const plan7_backward_domain_provenance *native
+    cdef BackwardDomainProvenance token
+    native = plan7_backward_domain_output_provenance(output)
+    if native == NULL:
+        raise RuntimeError("Backward/domain provenance is null")
+    token = BackwardDomainProvenance.__new__(BackwardDomainProvenance)
+    token._value = native[0]
+    return token
+
+
+def backward_domain_cpu_oracle_raw(
+    OptimizedProfile profile,
+    const uint8_t[::1] residues,
+    const float[::1] forward_specials,
+    float rt1=0.25,
+    float rt2=0.10,
+    float rt3=0.20,
+    float guard_band=2.0e-4,
+):
+    """Run pristine HMMER BackwardParser + DomainDecoding for one row."""
+    cdef plan7_backward_domain_result result
+    cdef size_t posterior_count
+    cdef size_t posterior_bytes
+    cdef bytes result_storage
+    cdef bytes posterior_storage
+    cdef plan7_domain_posterior *posterior_pointer
+    cdef size_t region_capacity
+    cdef size_t region_count = 0
+    cdef size_t region_bytes
+    cdef bytes region_storage
+    cdef plan7_simple_region *region_pointer
+    cdef char error[512]
+    cdef int status
+
+    if residues.shape[0] == 0:
+        raise ValueError("Backward/domain CPU oracle requires a nonempty target")
+    if residues.shape[0] > (<size_t> -1) - 1:
+        raise OverflowError("Backward/domain posterior length overflows size_t")
+    posterior_count = <size_t> residues.shape[0] + 1
+    if posterior_count > (<size_t> -1) // sizeof(plan7_domain_posterior):
+        raise OverflowError("Backward/domain posterior size overflows size_t")
+    posterior_bytes = posterior_count * sizeof(plan7_domain_posterior)
+    if posterior_bytes > <size_t> PY_SSIZE_T_MAX:
+        raise OverflowError("Backward/domain posterior exceeds Python limits")
+    posterior_storage = PyBytes_FromStringAndSize(NULL, posterior_bytes)
+    posterior_pointer = <plan7_domain_posterior *> PyBytes_AS_STRING(
+        posterior_storage
+    )
+    region_capacity = <size_t> residues.shape[0]
+    if region_capacity > (<size_t> PY_SSIZE_T_MAX // sizeof(plan7_simple_region)):
+        raise OverflowError("Backward/domain region output exceeds Python limits")
+    region_bytes = region_capacity * sizeof(plan7_simple_region)
+    region_storage = PyBytes_FromStringAndSize(NULL, region_bytes)
+    region_pointer = <plan7_simple_region *> PyBytes_AS_STRING(region_storage)
+    error[0] = 0
+    with nogil:
+        status = plan7_backward_domain_cpu_oracle(
+            <uintptr_t> profile._om,
+            &residues[0],
+            <size_t> residues.shape[0],
+            &forward_specials[0] if forward_specials.shape[0] else NULL,
+            <size_t> forward_specials.shape[0],
+            rt1,
+            rt2,
+            rt3,
+            guard_band,
+            &result,
+            posterior_pointer,
+            posterior_count,
+            region_pointer if region_capacity else NULL,
+            region_capacity,
+            &region_count,
+            error,
+            sizeof(error),
+        )
+    if status != 0:
+        raise RuntimeError(error.decode("utf-8", "replace"))
+    result_storage = PyBytes_FromStringAndSize(
+        <const char *> &result, sizeof(plan7_backward_domain_result)
+    )
+    if region_count > region_capacity:
+        raise RuntimeError("Backward/domain oracle region count exceeds capacity")
+    region_storage = region_storage[: region_count * sizeof(plan7_simple_region)]
+    return (
+        result_storage,
+        memoryview(posterior_storage).cast("f"),
+        memoryview(region_storage).cast("I"),
+    )
+
+
 cdef class ProfileSelection:
     """Immutable pointer-free host pack for an ordered profile slice.
 
@@ -1455,7 +1826,7 @@ cdef class ViterbiProfiles:
 
 
 cdef class ForwardProfiles:
-    """Device-resident exact Forward profiles for F3 classification.
+    """Device-resident exact Forward snapshots for F3 and later stages.
 
     Operations must not overlap each other or ``close``. Concurrent ``close``
     calls are safe.
@@ -1469,15 +1840,33 @@ cdef class ForwardProfiles:
         self._owners = ()
 
     def __init__(self, profiles):
-        cdef tuple owners = tuple(profiles)
+        cdef tuple owners
         cdef vector[uintptr_t] pointers
         cdef OptimizedProfile profile
+        cdef ProfileSelection selection
         cdef object value
         cdef char error[512]
         cdef int status
 
         if self._database != NULL:
             raise RuntimeError("Forward profiles are already initialized")
+        if isinstance(profiles, ProfileSelection):
+            selection = profiles
+            if selection._selection == NULL:
+                raise RuntimeError("profile selection is closed")
+            error[0] = 0
+            with nogil:
+                status = plan7_profile_selection_stage_forward(
+                    selection._selection,
+                    &self._database,
+                    error,
+                    sizeof(error),
+                )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
+            self._owners = (selection,)
+            return
+        owners = tuple(profiles)
         pointers.reserve(len(owners))
         for value in owners:
             if not isinstance(value, OptimizedProfile):
@@ -2343,7 +2732,8 @@ cdef class SequenceBatch:
         cdef size_t special_count
         cdef size_t special_bytes
         cdef size_t profile_index
-        cdef tuple owners = tuple(source_profiles)
+        cdef bint sealed_source = source_profiles is None
+        cdef tuple owners = () if sealed_source else tuple(source_profiles)
         cdef vector[uintptr_t] source_pointers
         cdef OptimizedProfile source_profile
         cdef object value
@@ -2358,6 +2748,7 @@ cdef class SequenceBatch:
         cdef object offsets
         cdef object specials
         cdef dict statistics
+        cdef ForwardProvenance provenance
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
@@ -2368,25 +2759,26 @@ cdef class SequenceBatch:
         profile_count = <size_t> candidate_offsets.shape[0] - 1
         if <size_t> filter_scores.shape[0] != candidate_count:
             raise ValueError("Forward candidate score lengths differ")
-        if len(owners) != profile_count:
+        if not sealed_source and len(owners) != profile_count:
             raise ValueError("source and Forward profile counts differ")
         if plan7_forward_database_profile_count(
             forward_profiles._database
         ) != profile_count:
             raise ValueError("Forward profile and candidate row counts differ")
-        source_pointers.reserve(profile_count)
-        for profile_index in range(profile_count):
-            value = owners[profile_index]
-            if not isinstance(value, OptimizedProfile):
-                raise TypeError(
-                    "source profiles must be OptimizedProfile objects"
-                )
-            if value is not forward_profiles._owners[profile_index]:
-                raise ValueError(
-                    "source profile identity differs from Forward profile row"
-                )
-            source_profile = value
-            source_pointers.push_back(<uintptr_t> source_profile._om)
+        if not sealed_source:
+            source_pointers.reserve(profile_count)
+            for profile_index in range(profile_count):
+                value = owners[profile_index]
+                if not isinstance(value, OptimizedProfile):
+                    raise TypeError(
+                        "source profiles must be OptimizedProfile objects"
+                    )
+                if value is not forward_profiles._owners[profile_index]:
+                    raise ValueError(
+                        "source profile identity differs from Forward profile row"
+                    )
+                source_profile = value
+                source_pointers.push_back(<uintptr_t> source_profile._om)
         if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
             raise RuntimeError("array('Q') is not native uint64")
         if _FLOAT_ARRAY_TEMPLATE.itemsize != sizeof(float):
@@ -2399,7 +2791,7 @@ cdef class SequenceBatch:
         status = plan7_forward_run_batch_workspace(
             forward_profiles._database,
             self._batch,
-            source_pointers.data() if profile_count else NULL,
+            source_pointers.data() if source_pointers.size() else NULL,
             profile_count,
             &candidate_offsets[0],
             &candidate_indices[0] if candidate_count else NULL,
@@ -2494,10 +2886,287 @@ cdef class SequenceBatch:
                 "download_ms": native_statistics.download_milliseconds,
                 "total_ms": native_statistics.total_milliseconds,
             }
+            provenance = _forward_provenance_from_output(output)
+            statistics.update({
+                "database_generation": provenance._value.database_generation,
+                "batch_generation": provenance._value.batch_generation,
+                "row_hash": provenance._value.row_hash,
+                "special_hash": provenance._value.special_hash,
+                "continuation_hash": provenance._value.continuation_hash,
+                "pass_count": provenance._value.pass_count,
+                "special_count": provenance._value.special_count,
+                "_provenance": provenance,
+            })
             return records, offsets, specials, statistics
         finally:
             if output != NULL:
                 plan7_forward_output_destroy(&output, NULL, 0)
+
+    def backward_domain_many_raw(
+        self,
+        const uint32_t[::1] candidate_profiles,
+        const uint32_t[::1] candidate_indices,
+        const uint64_t[::1] forward_offsets,
+        const float[::1] forward_specials,
+        ForwardProfiles forward_profiles,
+        ForwardProvenance provenance,
+        float rt1=0.25,
+        float rt2=0.10,
+        float rt3=0.20,
+        float guard_band=2.0e-4,
+        uint64_t posterior_byte_budget=(384 * 1024 * 1024),
+        bint _unsealed_test=False,
+    ):
+        """Run CUDA BackwardParser and domain posterior decoding."""
+        cdef size_t candidate_count = <size_t> candidate_indices.shape[0]
+        cdef vector[plan7_backward_domain_candidate] candidates
+        cdef size_t candidate
+        cdef plan7_backward_domain_output *output = NULL
+        cdef const plan7_backward_domain_result *native_results
+        cdef const uint64_t *native_offsets
+        cdef const plan7_domain_posterior *native_posteriors
+        cdef const uint64_t *native_region_offsets
+        cdef const plan7_simple_region *native_regions
+        cdef const plan7_backward_domain_statistics *native_statistics
+        cdef size_t result_count
+        cdef size_t result_bytes
+        cdef size_t offset_bytes
+        cdef size_t posterior_count
+        cdef size_t posterior_bytes
+        cdef size_t region_count
+        cdef size_t region_bytes
+        cdef bytes records
+        cdef bytes offset_storage
+        cdef bytes posterior_storage
+        cdef bytes region_offset_storage
+        cdef bytes region_storage
+        cdef object offsets
+        cdef object posteriors
+        cdef object region_offsets
+        cdef object regions
+        cdef dict statistics
+        cdef BackwardDomainProvenance output_provenance
+        cdef char error[512]
+        cdef int status
+
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        if forward_profiles._database == NULL:
+            raise RuntimeError("Forward profiles are closed")
+        if <size_t> candidate_profiles.shape[0] != candidate_count:
+            raise ValueError("Backward/domain candidate lengths differ")
+        if <size_t> forward_offsets.shape[0] != candidate_count + 1:
+            raise ValueError("Backward/domain Forward offsets have wrong length")
+        if sizeof(plan7_backward_domain_result) != (
+            PLAN7_BACKWARD_DOMAIN_RECORD_SIZE
+        ):
+            raise RuntimeError("Backward/domain result ABI size mismatch")
+        if sizeof(plan7_domain_posterior) != (
+            PLAN7_BACKWARD_DOMAIN_POSTERIOR_SIZE
+        ):
+            raise RuntimeError("Backward/domain posterior ABI size mismatch")
+        if sizeof(plan7_simple_region) != PLAN7_BACKWARD_DOMAIN_REGION_SIZE:
+            raise RuntimeError("Backward/domain region ABI size mismatch")
+        candidates.resize(candidate_count)
+        for candidate in range(candidate_count):
+            candidates[candidate].profile_index = candidate_profiles[candidate]
+            candidates[candidate].sequence_index = candidate_indices[candidate]
+
+        error[0] = 0
+        if _unsealed_test:
+            with nogil:
+                status = plan7_backward_domain_unsealed_test_run(
+                    forward_profiles._database,
+                    self._batch,
+                    candidates.data() if candidate_count else NULL,
+                    candidate_count,
+                    &forward_offsets[0],
+                    &forward_specials[0] if forward_specials.shape[0] else NULL,
+                    <size_t> forward_specials.shape[0],
+                    rt1,
+                    rt2,
+                    rt3,
+                    guard_band,
+                    posterior_byte_budget,
+                    &output,
+                    error,
+                    sizeof(error),
+                )
+        else:
+            with nogil:
+                status = plan7_backward_domain_run(
+                    forward_profiles._database,
+                    self._batch,
+                    candidates.data() if candidate_count else NULL,
+                    candidate_count,
+                    &provenance._value,
+                    &forward_offsets[0],
+                    &forward_specials[0] if forward_specials.shape[0] else NULL,
+                    <size_t> forward_specials.shape[0],
+                    rt1,
+                    rt2,
+                    rt3,
+                    guard_band,
+                    posterior_byte_budget,
+                    &output,
+                    error,
+                    sizeof(error),
+                )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        try:
+            result_count = plan7_backward_domain_output_result_count(output)
+            if result_count != candidate_count:
+                raise RuntimeError("Backward/domain result count changed")
+            if result_count > (
+                <size_t> PY_SSIZE_T_MAX // sizeof(plan7_backward_domain_result)
+            ):
+                raise OverflowError("Backward/domain results exceed Python limits")
+            result_bytes = result_count * sizeof(plan7_backward_domain_result)
+            records = PyBytes_FromStringAndSize(NULL, result_bytes)
+            native_results = plan7_backward_domain_output_results(output)
+            if result_bytes:
+                if native_results == NULL:
+                    raise RuntimeError("Backward/domain result storage is null")
+                memcpy(PyBytes_AS_STRING(records), native_results, result_bytes)
+
+            native_offsets = (
+                plan7_backward_domain_output_posterior_offsets(output)
+            )
+            if native_offsets == NULL:
+                raise RuntimeError("Backward/domain posterior offsets are null")
+            if result_count > (
+                <size_t> PY_SSIZE_T_MAX // sizeof(uint64_t)
+            ) - 1:
+                raise OverflowError(
+                    "Backward/domain posterior offsets exceed Python limits"
+                )
+            offset_bytes = (result_count + 1) * sizeof(uint64_t)
+            offset_storage = PyBytes_FromStringAndSize(NULL, offset_bytes)
+            memcpy(
+                PyBytes_AS_STRING(offset_storage),
+                native_offsets,
+                offset_bytes,
+            )
+            offsets = memoryview(offset_storage).cast("Q")
+
+            posterior_count = (
+                plan7_backward_domain_output_posterior_count(output)
+            )
+            if posterior_count > (
+                <size_t> PY_SSIZE_T_MAX // sizeof(plan7_domain_posterior)
+            ):
+                raise OverflowError(
+                    "Backward/domain posterior output exceeds Python limits"
+                )
+            posterior_bytes = (
+                posterior_count * sizeof(plan7_domain_posterior)
+            )
+            posterior_storage = PyBytes_FromStringAndSize(NULL, posterior_bytes)
+            native_posteriors = plan7_backward_domain_output_posteriors(output)
+            if posterior_bytes:
+                if native_posteriors == NULL:
+                    raise RuntimeError("Backward/domain posterior storage is null")
+                memcpy(
+                    PyBytes_AS_STRING(posterior_storage),
+                    native_posteriors,
+                    posterior_bytes,
+                )
+            posteriors = memoryview(posterior_storage).cast("f")
+
+            native_region_offsets = (
+                plan7_backward_domain_output_region_offsets(output)
+            )
+            if native_region_offsets == NULL:
+                raise RuntimeError("Backward/domain region offsets are null")
+            region_offset_storage = PyBytes_FromStringAndSize(NULL, offset_bytes)
+            memcpy(
+                PyBytes_AS_STRING(region_offset_storage),
+                native_region_offsets,
+                offset_bytes,
+            )
+            region_offsets = memoryview(region_offset_storage).cast("Q")
+
+            region_count = plan7_backward_domain_output_region_count(output)
+            if region_count > (
+                <size_t> PY_SSIZE_T_MAX // sizeof(plan7_simple_region)
+            ):
+                raise OverflowError(
+                    "Backward/domain region output exceeds Python limits"
+                )
+            region_bytes = region_count * sizeof(plan7_simple_region)
+            region_storage = PyBytes_FromStringAndSize(NULL, region_bytes)
+            native_regions = plan7_backward_domain_output_regions(output)
+            if region_bytes:
+                if native_regions == NULL:
+                    raise RuntimeError("Backward/domain region storage is null")
+                memcpy(
+                    PyBytes_AS_STRING(region_storage),
+                    native_regions,
+                    region_bytes,
+                )
+            regions = memoryview(region_storage).cast("I")
+
+            native_statistics = plan7_backward_domain_output_statistics(output)
+            if native_statistics == NULL:
+                raise RuntimeError("Backward/domain statistics are null")
+            statistics = {
+                "candidate_count": native_statistics.candidate_count,
+                "device_result_count": native_statistics.device_result_count,
+                "cpu_required_count": native_statistics.cpu_required_count,
+                "work_cells": native_statistics.work_cells,
+                "dp_workspace_bytes": native_statistics.dp_workspace_bytes,
+                "backward_special_workspace_bytes": (
+                    native_statistics.backward_special_workspace_bytes
+                ),
+                "forward_special_workspace_bytes": (
+                    native_statistics.forward_special_workspace_bytes
+                ),
+                "posterior_bytes": native_statistics.posterior_bytes,
+                "simple_region_bytes": native_statistics.simple_region_bytes,
+                "output_byte_limit": native_statistics.output_byte_limit,
+                "output_cap_fallback_count": (
+                    native_statistics.output_cap_fallback_count
+                ),
+                "work_cap_fallback_count": (
+                    native_statistics.work_cap_fallback_count
+                ),
+                "posterior_omitted_count": (
+                    native_statistics.posterior_omitted_count
+                ),
+                "own_scale_count": native_statistics.own_scale_count,
+                "threshold_uncertain_count": (
+                    native_statistics.threshold_uncertain_count
+                ),
+                "no_region_count": native_statistics.no_region_count,
+                "simple_count": native_statistics.simple_count,
+                "multidomain_fallback_count": (
+                    native_statistics.multidomain_fallback_count
+                ),
+                "kernel_ms": native_statistics.kernel_milliseconds,
+                "upload_ms": native_statistics.upload_milliseconds,
+                "download_ms": native_statistics.download_milliseconds,
+                "total_ms": native_statistics.total_milliseconds,
+                "unsealed_test": bool(_unsealed_test),
+            }
+            output_provenance = _backward_provenance_from_output(output)
+            statistics.update({
+                "threshold_hash": output_provenance._value.threshold_hash,
+                "result_hash": output_provenance._value.result_hash,
+                "region_hash": output_provenance._value.region_hash,
+                "_provenance": output_provenance,
+            })
+            return (
+                records,
+                offsets,
+                posteriors,
+                region_offsets,
+                regions,
+                statistics,
+            )
+        finally:
+            if output != NULL:
+                plan7_backward_domain_output_destroy(&output, NULL, 0)
 
     def forward_profile_selection_raw(
         self,
@@ -2554,6 +3223,7 @@ cdef class SequenceBatch:
         cdef carray row_offsets
         cdef carray expected_indices
         cdef dict statistics
+        cdef ForwardProvenance provenance
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
@@ -2672,41 +3342,6 @@ cdef class SequenceBatch:
         expected_indices = clone(_UINT32_ARRAY_TEMPLATE, candidate_count, False)
         for cursor in range(candidate_count):
             expected_indices.data.as_uints[cursor] = candidate_indices[cursor]
-        if candidate_count == 0:
-            generation_f3.value = f3
-            offset_storage = bytes(sizeof(uint64_t))
-            special_offsets = memoryview(offset_storage).cast("Q")
-            special_storage = b""
-            specials = memoryview(special_storage).cast("f")
-            statistics = {
-                "generation_f3_bits": generation_f3.bits,
-                "candidate_count": 0,
-                "survivor_count": 0,
-                "work_cells": 0,
-                "dp_workspace_bytes": 0,
-                "xmx_workspace_bytes": 0,
-                "gather_workspace_bytes": 0,
-                "gathered_xmx_bytes": 0,
-                "output_byte_limit": (
-                    min(gathered_byte_budget, PLAN7_FORWARD_MAX_GATHERED_BYTES)
-                    & ~<uint64_t> 3
-                ),
-                "output_cap_fallback_count": 0,
-                "kernel_ms": 0.0,
-                "classification_ms": 0.0,
-                "gather_ms": 0.0,
-                "download_ms": 0.0,
-                "total_ms": 0.0,
-            }
-            return (
-                b"",
-                row_offsets,
-                expected_indices,
-                special_offsets,
-                specials,
-                statistics,
-            )
-
         error[0] = 0
         with nogil:
             status = plan7_profile_selection_stage_forward(
@@ -2812,6 +3447,17 @@ cdef class SequenceBatch:
                 "download_ms": native_statistics.download_milliseconds,
                 "total_ms": native_statistics.total_milliseconds,
             }
+            provenance = _forward_provenance_from_output(output)
+            statistics.update({
+                "database_generation": provenance._value.database_generation,
+                "batch_generation": provenance._value.batch_generation,
+                "row_hash": provenance._value.row_hash,
+                "special_hash": provenance._value.special_hash,
+                "continuation_hash": provenance._value.continuation_hash,
+                "pass_count": provenance._value.pass_count,
+                "special_count": provenance._value.special_count,
+                "_provenance": provenance,
+            })
             return (
                 records,
                 row_offsets,
@@ -3312,3 +3958,23 @@ FORWARD_STATUS_OK = PLAN7_FORWARD_OK
 FORWARD_STATUS_ERANGE = PLAN7_FORWARD_ERANGE
 FORWARD_STATUS_ENORESULT = PLAN7_FORWARD_ENORESULT
 FORWARD_STATUS_EMPTY = PLAN7_FORWARD_EMPTY
+BACKWARD_DOMAIN_RECORD_VERSION = PLAN7_BACKWARD_DOMAIN_RECORD_VERSION
+BACKWARD_DOMAIN_RESULT_SIZE = sizeof(plan7_backward_domain_result)
+BACKWARD_DOMAIN_POSTERIOR_SIZE = sizeof(plan7_domain_posterior)
+BACKWARD_DOMAIN_REGION_SIZE = sizeof(plan7_simple_region)
+BACKWARD_DOMAIN_MAX_POSTERIOR_BYTES = (
+    PLAN7_BACKWARD_DOMAIN_MAX_POSTERIOR_BYTES
+)
+BACKWARD_DOMAIN_MAX_ROW_WORK_CELLS = (
+    PLAN7_BACKWARD_DOMAIN_MAX_ROW_WORK_CELLS
+)
+BACKWARD_DOMAIN_MAX_RUN_WORK_CELLS = (
+    PLAN7_BACKWARD_DOMAIN_MAX_RUN_WORK_CELLS
+)
+BACKWARD_DOMAIN_CPU_REQUIRED = PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED
+BACKWARD_DOMAIN_NO_REGIONS = PLAN7_BACKWARD_DOMAIN_NO_REGIONS
+BACKWARD_DOMAIN_SIMPLE = PLAN7_BACKWARD_DOMAIN_SIMPLE
+BACKWARD_DOMAIN_STATUS_OK = PLAN7_BACKWARD_DOMAIN_OK
+BACKWARD_DOMAIN_STATUS_ERANGE = PLAN7_BACKWARD_DOMAIN_ERANGE
+BACKWARD_DOMAIN_STATUS_ENORESULT = PLAN7_BACKWARD_DOMAIN_ENORESULT
+BACKWARD_DOMAIN_STATUS_EMPTY = PLAN7_BACKWARD_DOMAIN_EMPTY

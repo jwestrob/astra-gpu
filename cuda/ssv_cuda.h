@@ -151,6 +151,7 @@ typedef struct plan7_ssv_memory_snapshot {
 /* Immutable device-input view for sibling CUDA stages. The owning sequence
  * batch must outlive every use of this view. */
 typedef struct plan7_ssv_sequence_batch_view {
+  uint64_t generation_id;
   int device_ordinal;
   int alphabet_size;
   int host_float_environment_valid;

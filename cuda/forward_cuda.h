@@ -55,6 +55,21 @@ typedef struct plan7_forward_statistics {
   float total_milliseconds;
 } plan7_forward_statistics;
 
+/* Sealed identity of the exact resident profile database, sequence batch,
+ * ordered F3-pass rows, and gathered Forward special-state bits. Later
+ * stages must validate all fields before doing work. */
+typedef struct plan7_forward_provenance {
+  uint64_t database_generation;
+  uint64_t batch_generation;
+  uint64_t row_hash;
+  uint64_t special_hash;
+  uint64_t continuation_hash;
+  uint64_t pass_count;
+  uint64_t special_count;
+  uint64_t generation_f3_bits;
+  uint64_t integrity_tag;
+} plan7_forward_provenance;
+
 typedef struct plan7_forward_database plan7_forward_database;
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 typedef struct plan7_forward_output plan7_forward_output;
@@ -73,6 +88,27 @@ typedef struct plan7_forward_snapshot_profile {
   float nj;
   int32_t mode;
 } plan7_forward_snapshot_profile;
+
+/* Read-only internal view shared with later CUDA pipeline stages. Public
+ * callers should treat every pointer as opaque device storage. */
+typedef struct plan7_forward_device_profile {
+  uint64_t emission_offset;
+  uint64_t transition_offset;
+  uint32_t q;
+  uint32_t model_length;
+  float e_move;
+  float e_loop;
+} plan7_forward_device_profile;
+
+typedef struct plan7_forward_device_view {
+  uint64_t generation_id;
+  int32_t device_ordinal;
+  int32_t alphabet_size;
+  size_t profile_count;
+  const plan7_forward_device_profile *profiles;
+  const float *emissions;
+  const float *transitions;
+} plan7_forward_device_view;
 
 enum plan7_forward_workspace_capacity {
   PLAN7_FORWARD_CAPACITY_CANDIDATE_PROFILES = 0,
@@ -138,6 +174,19 @@ float plan7_forward_database_pack_milliseconds(
 
 float plan7_forward_database_upload_milliseconds(
   const plan7_forward_database *database);
+
+int plan7_forward_database_get_device_view(
+  const plan7_forward_database *database,
+  plan7_forward_device_view *view,
+  char *error,
+  size_t error_size);
+
+int plan7_forward_database_get_profile_snapshot(
+  const plan7_forward_database *database,
+  size_t profile_index,
+  plan7_forward_snapshot_profile *profile,
+  char *error,
+  size_t error_size);
 
 int plan7_forward_workspace_create(plan7_forward_workspace **workspace,
                                    char *error,
@@ -219,6 +268,15 @@ const float *plan7_forward_output_specials(
   const plan7_forward_output *output);
 const plan7_forward_statistics *plan7_forward_output_statistics(
   const plan7_forward_output *output);
+const plan7_forward_provenance *plan7_forward_output_provenance(
+  const plan7_forward_output *output);
+
+/* Validates the complete opaque token, including continuation_hash and the
+ * generation threshold. The integrity tag detects accidental mixing and
+ * mutation inside a trusted process; it is not a cryptographic MAC. */
+int plan7_forward_database_validate_provenance(
+  const plan7_forward_database *database,
+  const plan7_forward_provenance *provenance);
 
 #ifdef __cplusplus
 }

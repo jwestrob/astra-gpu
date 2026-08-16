@@ -43,6 +43,8 @@ static_assert(sizeof(plan7_forward_snapshot_profile) == 48 &&
               offsetof(plan7_forward_snapshot_profile, e_move) == 24 &&
               offsetof(plan7_forward_snapshot_profile, mode) == 44,
               "Forward snapshot descriptor ABI changed");
+static_assert(sizeof(plan7_forward_provenance) == 72,
+              "Forward provenance ABI changed");
 
 namespace {
 
@@ -75,16 +77,7 @@ struct ForwardProfile {
   uintptr_t alphabet_pointer;
 };
 
-struct ForwardDeviceProfile {
-  uint64_t emission_offset;
-  uint64_t transition_offset;
-  uint32_t q;
-  uint32_t model_length;
-  float e_move;
-  float e_loop;
-};
-
-static_assert(sizeof(ForwardDeviceProfile) == 32,
+static_assert(sizeof(plan7_forward_device_profile) == 32,
               "Forward device descriptor must stay cache-compact");
 static_assert(p7O_NTRANS == 8,
               "Forward transition-row footprint changed");
@@ -110,6 +103,35 @@ union DoubleBits {
   double value;
   uint64_t bits;
 };
+
+constexpr uint64_t kHashOffset = UINT64_C(1469598103934665603);
+constexpr uint64_t kHashPrime = UINT64_C(1099511628211);
+std::atomic<uint64_t> next_forward_database_generation{1};
+
+uint64_t allocate_forward_database_generation() {
+  uint64_t generation = next_forward_database_generation.fetch_add(
+      1, std::memory_order_relaxed);
+  if (generation == 0)
+    generation = next_forward_database_generation.fetch_add(
+        1, std::memory_order_relaxed);
+  return generation;
+}
+
+uint64_t hash_byte(uint64_t hash, uint8_t value) {
+  return (hash ^ value) * kHashPrime;
+}
+
+uint64_t hash_u32(uint64_t hash, uint32_t value) {
+  for (unsigned shift = 0; shift != 32; shift += 8)
+    hash = hash_byte(hash, static_cast<uint8_t>(value >> shift));
+  return hash;
+}
+
+uint64_t hash_u64(uint64_t hash, uint64_t value) {
+  for (unsigned shift = 0; shift != 64; shift += 8)
+    hash = hash_byte(hash, static_cast<uint8_t>(value >> shift));
+  return hash;
+}
 
 void set_error(char *error, size_t error_size, const char *message) {
   if (error != nullptr && error_size != 0)
@@ -251,7 +273,7 @@ __device__ __forceinline__ float sse_horizontal_sum(float value,
 
 __global__ void forward_kernel(
     const uint8_t *residues, const uint64_t *sequence_offsets,
-    const ForwardDeviceProfile *profiles, const float *emissions,
+    const plan7_forward_device_profile *profiles, const float *emissions,
     const float *transitions, const uint32_t *candidate_profiles,
     const uint32_t *candidate_sequences,
     const ForwardLengthTransitions *length_transitions,
@@ -273,7 +295,7 @@ __global__ void forward_kernel(
 
   const uint32_t profile_index = candidate_profiles[candidate];
   const uint32_t sequence_index = candidate_sequences[candidate];
-  const ForwardDeviceProfile profile = profiles[profile_index];
+  const plan7_forward_device_profile profile = profiles[profile_index];
   const int q_count = static_cast<int>(profile.q);
   const uint64_t sequence_start = sequence_offsets[sequence_index];
   const int sequence_length = static_cast<int>(
@@ -473,15 +495,17 @@ struct RunBuffers {
 }  // namespace
 
 struct plan7_forward_database {
+  uint64_t generation_id;
+  uint64_t provenance_salt;
   int device_ordinal;
   int alphabet_size;
   bool sealed_source;
   std::vector<ForwardProfile> host_profiles;
-  std::vector<ForwardDeviceProfile> host_device_profiles;
+  std::vector<plan7_forward_device_profile> host_device_profiles;
   std::vector<uintptr_t> source_profile_pointers;
   std::vector<float> host_emissions;
   std::vector<float> host_transitions;
-  ForwardDeviceProfile *device_profiles;
+  plan7_forward_device_profile *device_profiles;
   float *device_emissions;
   float *device_transitions;
   uint64_t device_bytes;
@@ -522,9 +546,87 @@ struct plan7_forward_output {
   std::vector<uint64_t> special_offsets;
   std::vector<float> specials;
   plan7_forward_statistics statistics;
+  plan7_forward_provenance provenance;
 };
 
 namespace {
+
+uint64_t provenance_integrity_tag(
+    const plan7_forward_database *database,
+    const plan7_forward_provenance &provenance) {
+  uint64_t hash = hash_u64(database->provenance_salt,
+                           UINT64_C(0x46574450));
+  hash = hash_u64(hash, provenance.database_generation);
+  hash = hash_u64(hash, provenance.batch_generation);
+  hash = hash_u64(hash, provenance.row_hash);
+  hash = hash_u64(hash, provenance.special_hash);
+  hash = hash_u64(hash, provenance.continuation_hash);
+  hash = hash_u64(hash, provenance.pass_count);
+  hash = hash_u64(hash, provenance.special_count);
+  return hash_u64(hash, provenance.generation_f3_bits);
+}
+
+bool seal_forward_provenance(
+    plan7_forward_output *output,
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch_view &batch,
+    const std::vector<uint32_t> *candidate_profiles,
+    const float *filter_scores, uint64_t generation_f3_bits) {
+  if (output == nullptr || database == nullptr) return false;
+  plan7_forward_provenance sealed{};
+  sealed.database_generation = database->generation_id;
+  sealed.batch_generation = batch.generation_id;
+  uint64_t row_hash = hash_u64(kHashOffset, UINT64_C(0x524f5753));
+  uint64_t special_hash = hash_u64(kHashOffset, UINT64_C(0x584d5821));
+  uint64_t continuation_hash =
+      hash_u64(kHashOffset, UINT64_C(0x434f4e54));
+  if (output->special_offsets.size() != output->results.size() + 1)
+    return false;
+  for (size_t candidate = 0; candidate < output->results.size(); ++candidate) {
+    if (output->results[candidate].action != PLAN7_FORWARD_DEFINITE_PASS)
+      continue;
+    if (candidate_profiles == nullptr ||
+        candidate >= candidate_profiles->size() ||
+        output->special_offsets[candidate] >
+            output->special_offsets[candidate + 1] ||
+        output->special_offsets[candidate + 1] > output->specials.size())
+      return false;
+    row_hash = hash_u32(row_hash, (*candidate_profiles)[candidate]);
+    row_hash = hash_u32(row_hash,
+                        output->results[candidate].sequence_index);
+    if (filter_scores == nullptr) return false;
+    FloatBits fwdsc_bits{};
+    FloatBits filtersc_bits{};
+    fwdsc_bits.value = output->results[candidate].fwdsc;
+    filtersc_bits.value = filter_scores[candidate];
+    continuation_hash = hash_u32(continuation_hash, fwdsc_bits.bits);
+    continuation_hash = hash_u32(continuation_hash, filtersc_bits.bits);
+    continuation_hash = hash_u32(
+        continuation_hash,
+        static_cast<uint32_t>(output->results[candidate].status) |
+            (static_cast<uint32_t>(output->results[candidate].action) << 8) |
+            (static_cast<uint32_t>(output->results[candidate].reserved) << 16));
+    const uint64_t begin = output->special_offsets[candidate];
+    const uint64_t end = output->special_offsets[candidate + 1];
+    special_hash = hash_u64(special_hash, end - begin);
+    for (uint64_t cell = begin; cell < end; ++cell) {
+      FloatBits bits{};
+      bits.value = output->specials[static_cast<size_t>(cell)];
+      special_hash = hash_u32(special_hash, bits.bits);
+    }
+    ++sealed.pass_count;
+  }
+  sealed.special_count = output->specials.size();
+  sealed.generation_f3_bits = generation_f3_bits;
+  sealed.row_hash = hash_u64(row_hash, sealed.pass_count);
+  sealed.special_hash = hash_u64(special_hash, sealed.special_count);
+  continuation_hash = hash_u64(continuation_hash, sealed.pass_count);
+  sealed.continuation_hash = hash_u64(
+      continuation_hash, sealed.generation_f3_bits);
+  sealed.integrity_tag = provenance_integrity_tag(database, sealed);
+  output->provenance = sealed;
+  return true;
+}
 
 template <typename T>
 int grow_forward_workspace_buffer(T **buffer, size_t *capacity,
@@ -730,6 +832,12 @@ extern "C" int plan7_forward_database_create(
     return -1;
   }
   created->device_ordinal = current_device;
+  created->generation_id = allocate_forward_database_generation();
+  created->provenance_salt = hash_u64(
+      hash_u64(kHashOffset, created->generation_id),
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(created.get())) ^
+          static_cast<uint64_t>(
+              std::chrono::steady_clock::now().time_since_epoch().count()));
   created->alphabet_size = -1;
   created->sealed_source = false;
   created->device_profiles = nullptr;
@@ -887,7 +995,7 @@ extern "C" int plan7_forward_database_create(
   size_t profile_bytes;
   size_t emission_bytes;
   size_t transition_bytes;
-  if (!checked_bytes(profile_count, sizeof(ForwardDeviceProfile),
+  if (!checked_bytes(profile_count, sizeof(plan7_forward_device_profile),
                      &profile_bytes) ||
       !checked_bytes(created->host_emissions.size(), sizeof(float),
                      &emission_bytes) ||
@@ -964,6 +1072,12 @@ extern "C" int plan7_forward_database_create_snapshot(
     return -1;
   }
   created->device_ordinal = current_device;
+  created->generation_id = allocate_forward_database_generation();
+  created->provenance_salt = hash_u64(
+      hash_u64(kHashOffset, created->generation_id),
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(created.get())) ^
+          static_cast<uint64_t>(
+              std::chrono::steady_clock::now().time_since_epoch().count()));
   created->alphabet_size = alphabet_size;
   created->sealed_source = true;
   created->device_profiles = nullptr;
@@ -1050,7 +1164,7 @@ extern "C" int plan7_forward_database_create_snapshot(
   size_t profile_bytes;
   size_t emission_bytes;
   size_t transition_bytes;
-  if (!checked_bytes(profile_count, sizeof(ForwardDeviceProfile),
+  if (!checked_bytes(profile_count, sizeof(plan7_forward_device_profile),
                      &profile_bytes) ||
       !checked_bytes(emission_count, sizeof(float), &emission_bytes) ||
       !checked_bytes(transition_count, sizeof(float), &transition_bytes)) {
@@ -1166,6 +1280,54 @@ extern "C" float plan7_forward_database_upload_milliseconds(
   return database == nullptr ? 0.0f : database->upload_milliseconds;
 }
 
+extern "C" int plan7_forward_database_get_device_view(
+    const plan7_forward_database *database,
+    plan7_forward_device_view *view, char *error, size_t error_size) {
+  if (database == nullptr || view == nullptr) {
+    set_error(error, error_size, "invalid Forward device view request");
+    return -1;
+  }
+  std::memset(view, 0, sizeof(*view));
+  if (!database->host_profiles.empty() &&
+      (database->device_profiles == nullptr ||
+       database->device_emissions == nullptr ||
+       database->device_transitions == nullptr)) {
+    set_error(error, error_size, "Forward device storage is null");
+    return -1;
+  }
+  view->generation_id = database->generation_id;
+  view->device_ordinal = database->device_ordinal;
+  view->alphabet_size = database->alphabet_size;
+  view->profile_count = database->host_profiles.size();
+  view->profiles = database->device_profiles;
+  view->emissions = database->device_emissions;
+  view->transitions = database->device_transitions;
+  return 0;
+}
+
+extern "C" int plan7_forward_database_get_profile_snapshot(
+    const plan7_forward_database *database, size_t profile_index,
+    plan7_forward_snapshot_profile *profile,
+    char *error, size_t error_size) {
+  if (database == nullptr || profile == nullptr ||
+      profile_index >= database->host_profiles.size()) {
+    set_error(error, error_size, "invalid Forward profile snapshot request");
+    return -1;
+  }
+  const ForwardProfile &source = database->host_profiles[profile_index];
+  *profile = {source.emission_offset,
+              source.transition_offset,
+              source.q,
+              source.model_length,
+              source.e_move,
+              source.e_loop,
+              source.f_tau,
+              source.f_lambda,
+              source.nj,
+              source.mode};
+  return 0;
+}
+
 extern "C" int plan7_forward_workspace_create(
     plan7_forward_workspace **workspace, char *error, size_t error_size) {
   if (workspace == nullptr || *workspace != nullptr) {
@@ -1250,7 +1412,8 @@ extern "C" int plan7_forward_run_with_workspace(
   if (output == nullptr || *output != nullptr || workspace == nullptr ||
       database == nullptr || batch == nullptr ||
       (profile_count != 0 &&
-       (source_profile_pointers == nullptr || candidate_offsets == nullptr)) ||
+       (candidate_offsets == nullptr ||
+        (!database->sealed_source && source_profile_pointers == nullptr))) ||
       (candidate_count != 0 &&
        (candidate_indices == nullptr || filter_scores == nullptr)) ||
       database->host_profiles.size() != profile_count) {
@@ -1265,6 +1428,39 @@ extern "C" int plan7_forward_run_with_workspace(
     set_error(error, error_size, "Forward candidate count exceeds uint32");
     return -1;
   }
+
+  /* Snapshot every raw caller array once. Classification and continuation
+   * sealing must consume the same filter bits, and validated offsets/indexes
+   * must not be mutable while the GIL is released. */
+  std::vector<uintptr_t> source_pointer_snapshot;
+  std::vector<uint64_t> candidate_offset_snapshot;
+  std::vector<uint32_t> candidate_index_snapshot;
+  std::vector<float> filter_score_snapshot;
+  try {
+    if (source_profile_pointers != nullptr && profile_count != 0)
+      source_pointer_snapshot.assign(
+          source_profile_pointers, source_profile_pointers + profile_count);
+    if (profile_count != 0)
+      candidate_offset_snapshot.assign(
+          candidate_offsets, candidate_offsets + profile_count + 1);
+    if (candidate_count != 0) {
+      candidate_index_snapshot.assign(
+          candidate_indices, candidate_indices + candidate_count);
+      filter_score_snapshot.assign(
+          filter_scores, filter_scores + candidate_count);
+    }
+  } catch (...) {
+    set_error(error, error_size, "Forward immutable input snapshot failed");
+    return -1;
+  }
+  source_profile_pointers = source_pointer_snapshot.empty()
+      ? nullptr : source_pointer_snapshot.data();
+  candidate_offsets = candidate_offset_snapshot.empty()
+      ? nullptr : candidate_offset_snapshot.data();
+  candidate_indices = candidate_index_snapshot.empty()
+      ? nullptr : candidate_index_snapshot.data();
+  filter_scores = filter_score_snapshot.empty()
+      ? nullptr : filter_score_snapshot.data();
   if (profile_count != 0 &&
       (candidate_offsets[0] != 0 ||
        candidate_offsets[profile_count] != candidate_count)) {
@@ -1310,10 +1506,12 @@ extern "C" int plan7_forward_run_with_workspace(
       set_error(error, error_size, "invalid Forward candidate offsets");
       return -1;
     }
-    if (source_profile_pointers[profile] !=
-            database->source_profile_pointers[profile] ||
+    if ((source_profile_pointers != nullptr &&
+         source_profile_pointers[profile] !=
+             database->source_profile_pointers[profile]) ||
         (!database->sealed_source &&
-         !live_profile_matches_snapshot(database, profile))) {
+         (source_profile_pointers == nullptr ||
+          !live_profile_matches_snapshot(database, profile)))) {
       set_error(error, error_size,
                 "Forward database does not match the source profile row");
       return -1;
@@ -1360,12 +1558,22 @@ extern "C" int plan7_forward_run_with_workspace(
     }
   }
   if (candidate_count == 0) {
+    if (!seal_forward_provenance(created.get(), database, batch_view, nullptr,
+                                 filter_scores, generation_f3.bits)) {
+      set_error(error, error_size, "Forward provenance sealing failed");
+      return -1;
+    }
     *output = created.release();
     return 0;
   }
   if (!std::isfinite(f3) || f3 < 0.0 || batch_view.alphabet_size != 29 ||
       !batch_view.host_float_environment_valid ||
       plan7_bias_environment_attested(nullptr, 0) != 1) {
+    if (!seal_forward_provenance(created.get(), database, batch_view, nullptr,
+                                 filter_scores, generation_f3.bits)) {
+      set_error(error, error_size, "Forward provenance sealing failed");
+      return -1;
+    }
     *output = created.release();
     return 0;
   }
@@ -1762,6 +1970,12 @@ extern "C" int plan7_forward_run_with_workspace(
   created->statistics.total_milliseconds =
       std::chrono::duration<float, std::milli>(
           std::chrono::steady_clock::now() - total_begin).count();
+  if (!seal_forward_provenance(created.get(), database, batch_view,
+                               &host_candidate_profiles, filter_scores,
+                               generation_f3.bits)) {
+    set_error(error, error_size, "Forward provenance sealing failed");
+    return -1;
+  }
   *output = created.release();
   return 0;
 }
@@ -1852,4 +2066,19 @@ extern "C" const float *plan7_forward_output_specials(
 extern "C" const plan7_forward_statistics *
 plan7_forward_output_statistics(const plan7_forward_output *output) {
   return output == nullptr ? nullptr : &output->statistics;
+}
+
+extern "C" const plan7_forward_provenance *
+plan7_forward_output_provenance(const plan7_forward_output *output) {
+  return output == nullptr ? nullptr : &output->provenance;
+}
+
+extern "C" int plan7_forward_database_validate_provenance(
+    const plan7_forward_database *database,
+    const plan7_forward_provenance *provenance) {
+  if (database == nullptr || provenance == nullptr ||
+      provenance->database_generation != database->generation_id)
+    return 0;
+  return provenance->integrity_tag ==
+         provenance_integrity_tag(database, *provenance);
 }

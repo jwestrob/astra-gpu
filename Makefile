@@ -34,6 +34,7 @@ CUDA_OBJ := $(BUILD_DIR)/cuda/ssv_cuda.o
 BIAS_CUDA_OBJ := $(BUILD_DIR)/cuda/bias_cuda.o
 POSTFILTER_CUDA_OBJ := $(BUILD_DIR)/cuda/postfilter_cuda.o
 FORWARD_CUDA_OBJ := $(BUILD_DIR)/cuda/forward_cuda.o
+BACKWARD_DOMAIN_CUDA_OBJ := $(BUILD_DIR)/cuda/backward_domain_cuda.o
 CUDA_MODULE := python/plan7_gpu/_native$(PYTHON_EXT_SUFFIX)
 PIPELINE_C := $(BUILD_DIR)/pipeline/_pipeline.c
 PIPELINE_OBJ := $(BUILD_DIR)/pipeline/_pipeline.o
@@ -83,7 +84,8 @@ $(BIAS_ATTEST_BIN): oracle/bias_log_attestation.cu
 		-o $@ $< -lgomp
 
 $(CYTHON_CPP): python/plan7_gpu/_native.pyx cuda/ssv_cuda.h cuda/bias_cuda.h \
-		cuda/postfilter_cuda.h cuda/forward_cuda.h $(PYHMMER_ABI_STAMP) \
+		cuda/postfilter_cuda.h cuda/forward_cuda.h cuda/backward_domain_cuda.h \
+		$(PYHMMER_ABI_STAMP) \
 		$(PYHMMER_PACKAGE_DIR)/plan7.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/impl/p7_oprofile.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/impl_sse/p7_oprofile.pxd
@@ -98,7 +100,7 @@ $(CYTHON_CPP): python/plan7_gpu/_native.pyx cuda/ssv_cuda.h cuda/bias_cuda.h \
 		-E PYHMMER_ABI_SHA256=$(PYHMMER_ABI_SHA256) -o $@ $<
 
 $(CYTHON_OBJ): $(CYTHON_CPP) cuda/ssv_cuda.h cuda/bias_cuda.h \
-		cuda/postfilter_cuda.h cuda/forward_cuda.h
+		cuda/postfilter_cuda.h cuda/forward_cuda.h cuda/backward_domain_cuda.h
 	$(CXX) -O3 -g -std=c++17 -fPIC -Wall -Wextra $(PYHMMER_SIMD_CFLAGS) \
 		-Icuda $$($(PYTHON)-config --includes) \
 		-I$(PYHMMER_INCLUDE) -I$(PYHMMER_EASEL_INCLUDE) \
@@ -139,11 +141,24 @@ $(FORWARD_CUDA_OBJ): cuda/forward_cuda.cu cuda/forward_cuda.h \
 		-I$(PYHMMER_EASEL_INCLUDE) -I$(PYHMMER_INCLUDE)/libhmmer \
 		-c -o $@ $<
 
+$(BACKWARD_DOMAIN_CUDA_OBJ): cuda/backward_domain_cuda.cu \
+		cuda/backward_domain_cuda.h cuda/forward_cuda.h cuda/ssv_cuda.h \
+		$(PYHMMER_INCLUDE)/libhmmer/hmmer.h \
+		$(PYHMMER_INCLUDE)/libhmmer/impl_sse/impl_sse.h \
+		$(PYHMMER_EASEL_INCLUDE)/easel.h
+	mkdir -p $(@D)
+	$(NVCC) -O3 -g -std=c++17 -Xcompiler=-fPIC,-pthread \
+		$(CUDA_ARCH_FLAGS) -Icuda -I$(PYHMMER_INCLUDE) \
+		-I$(PYHMMER_EASEL_INCLUDE) -I$(PYHMMER_INCLUDE)/libhmmer \
+		-c -o $@ $<
+
 $(CUDA_MODULE): $(CYTHON_OBJ) $(CUDA_OBJ) $(BIAS_CUDA_OBJ) \
 		$(POSTFILTER_CUDA_OBJ) $(FORWARD_CUDA_OBJ) \
+		$(BACKWARD_DOMAIN_CUDA_OBJ) \
 		$(PYHMMER_HMMER_LIB) $(PYHMMER_EASEL_LIB)
 	$(NVCC) -shared $(CUDA_ARCH_FLAGS) -o $@ $(CYTHON_OBJ) $(CUDA_OBJ) \
 		$(BIAS_CUDA_OBJ) $(POSTFILTER_CUDA_OBJ) $(FORWARD_CUDA_OBJ) \
+		$(BACKWARD_DOMAIN_CUDA_OBJ) \
 		-L$(PYHMMER_LIB_DIR) -Xlinker --no-as-needed -llibhmmer -llibeasel \
 		-ldl -lpthread \
 		-Xlinker -rpath -Xlinker $(PYHMMER_LIB_DIR)

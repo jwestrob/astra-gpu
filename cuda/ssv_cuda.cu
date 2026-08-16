@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+
 extern "C" {
 #include <easel.h>
 #include <esl_gumbel.h>
@@ -17,6 +19,7 @@ extern "C" {
 #include <string.h>
 
 struct plan7_ssv_sequence_batch {
+  uint64_t generation_id;
   int device_ordinal;
   int alphabet_size;
   size_t sequence_count;
@@ -74,6 +77,22 @@ struct plan7_ssv_sequence_batch {
   plan7_postfilter_workspace *postfilter_workspace;
   plan7_forward_workspace *forward_workspace;
 };
+
+namespace {
+
+std::atomic<uint64_t> next_sequence_batch_generation{1};
+
+uint64_t allocate_sequence_batch_generation()
+{
+  uint64_t generation = next_sequence_batch_generation.fetch_add(
+    1, std::memory_order_relaxed);
+  if (generation == 0)
+    generation = next_sequence_batch_generation.fetch_add(
+      1, std::memory_order_relaxed);
+  return generation;
+}
+
+}  // namespace
 
 static_assert(sizeof(plan7_ssv_result) == 6,
               "plan7_ssv_result ABI size changed");
@@ -1229,6 +1248,7 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
   }
   batch->alphabet_size = alphabet_size;
   batch->device_ordinal = device_ordinal;
+  batch->generation_id = allocate_sequence_batch_generation();
   batch->sequence_count = sequence_count;
   batch->host_float_environment_valid =
     plan7_bias_host_environment_attested();
@@ -1341,6 +1361,7 @@ plan7_ssv_sequence_batch_get_view(const plan7_ssv_sequence_batch *batch,
     set_error(error, error_size, "sequence batch input storage is null");
     return -1;
   }
+  view->generation_id = batch->generation_id;
   view->device_ordinal = batch->device_ordinal;
   view->alphabet_size = batch->alphabet_size;
   view->host_float_environment_valid =
