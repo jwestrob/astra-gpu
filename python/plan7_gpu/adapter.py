@@ -1515,6 +1515,10 @@ class SequenceBatch:
         *,
         pipeline: Any | None = None,
         domain_guard: float = 2.0e-4,
+        _rescore_compact_byte_budget: int = 0,
+        _rescore_matrix_byte_budget: int = 0,
+        _rescore_trace_byte_budget: int = 0,
+        _rescore_test_fault: int = 0,
     ) -> CandidateBatch:
         """Build a sealed selection batch with bounded Forward results."""
         try:
@@ -1533,7 +1537,21 @@ class SequenceBatch:
                 bias_filter,
                 pipeline,
                 domain_guard,
+                _rescore_compact_byte_budget,
+                _rescore_matrix_byte_budget,
+                _rescore_trace_byte_budget,
+                _rescore_test_fault,
             )
+        if any(
+            value != 0
+            for value in (
+                _rescore_compact_byte_budget,
+                _rescore_matrix_byte_budget,
+                _rescore_trace_byte_budget,
+                _rescore_test_fault,
+            )
+        ):
+            raise ValueError("domain-rescore controls require a pipeline")
         return self._postfilter_selection(
             selection, F1, (f2, f3, bias_filter)
         )
@@ -1547,6 +1565,10 @@ class SequenceBatch:
         bias_filter: bool,
         pipeline: Any,
         domain_guard: float,
+        rescore_compact_byte_budget: int,
+        rescore_matrix_byte_budget: int,
+        rescore_trace_byte_budget: int,
+        rescore_test_fault: int,
     ) -> CandidateBatch:
         """Build one opaque fused Forward/domain continuation batch."""
         from . import _pipeline  # type: ignore[attr-defined]
@@ -1562,6 +1584,30 @@ class SequenceBatch:
             guard = float(domain_guard)
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError("continuation thresholds must be real numbers") from error
+        normalized_controls = []
+        for name, value in (
+            ("rescore compact byte budget", rescore_compact_byte_budget),
+            ("rescore matrix byte budget", rescore_matrix_byte_budget),
+            ("rescore trace byte budget", rescore_trace_byte_budget),
+            ("rescore test fault", rescore_test_fault),
+        ):
+            if isinstance(value, bool):
+                raise TypeError(f"{name} must be a nonnegative integer")
+            try:
+                normalized = operator.index(value)
+            except TypeError as error:
+                raise TypeError(
+                    f"{name} must be a nonnegative integer"
+                ) from error
+            if normalized < 0:
+                raise ValueError(f"{name} must be nonnegative")
+            normalized_controls.append(normalized)
+        (
+            rescore_compact_byte_budget,
+            rescore_matrix_byte_budget,
+            rescore_trace_byte_budget,
+            rescore_test_fault,
+        ) = normalized_controls
         if (
             not math.isfinite(threshold)
             or not 0.0 <= threshold < 1.0
@@ -1595,11 +1641,26 @@ class SequenceBatch:
         states = [_pair_state(pair) for pair in selection_state.pairs]
         unique_locks = {id(state.lock): state.lock for state in states}
         capsule: Any | None = None
+        compact_tail_fingerprint = 0
 
         with _lease_pipeline(pipeline):
             _pipeline._validate_simple_region_generation_bound(
                 pipeline, threshold, f2, f3, bias_filter, guard
             )
+            compact_seam_available = (
+                _pipeline._compact_domains_seam_available()
+            )
+            if (
+                any(normalized_controls)
+                and not compact_seam_available
+            ):
+                raise RuntimeError(
+                    "domain-rescore controls require the compact-domain seam"
+                )
+            if compact_seam_available:
+                compact_tail_fingerprint = (
+                    _pipeline._compact_tail_fingerprint_bound(pipeline)
+                )
 
             # Native generation is fully self-contained. Capture it under the
             # selection/sequence locks, then release them before pair locks to
@@ -1640,6 +1701,19 @@ class SequenceBatch:
                             f3,
                             guard,
                             gathered_byte_budget=_FORWARD_SPECIAL_BYTE_BUDGET,
+                            rescore_compact_byte_budget=(
+                                rescore_compact_byte_budget
+                            ),
+                            rescore_matrix_byte_budget=(
+                                rescore_matrix_byte_budget
+                            ),
+                            rescore_trace_byte_budget=(
+                                rescore_trace_byte_budget
+                            ),
+                            _rescore_test_fault=rescore_test_fault,
+                            generation_tail_fingerprint=(
+                                compact_tail_fingerprint
+                            ),
                         )
                     )
 

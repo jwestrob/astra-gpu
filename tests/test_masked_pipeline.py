@@ -1,4 +1,5 @@
 import importlib.util
+import ctypes
 import gc
 import io
 import json
@@ -463,6 +464,35 @@ class MaskedPipelineTests(unittest.TestCase):
         else:
             self.assertFalse(_pipeline._filter_and_forward_scores_seam_available())
 
+    def test_compact_resolver_rejects_legacy_abi_pair(self):
+        library = (
+            Path(pyhmmer.__file__).resolve().parent.parent
+            / "pyhmmer.libs"
+            / "liblibhmmer.so"
+        )
+        hmmer = ctypes.CDLL(str(library))
+        legacy = all(
+            hasattr(hmmer, symbol)
+            for symbol in (
+                "p7_PipelineFromFilterForwardAndCompactDomains",
+                "p7_pipeline_CompactTailFingerprint",
+            )
+        )
+        current = all(
+            hasattr(hmmer, symbol)
+            for symbol in (
+                "p7_PipelineFromFilterForwardAndCompactDomainsV2",
+                "p7_pipeline_CompactTailFingerprintV2",
+            )
+        )
+        if not legacy or current:
+            self.skipTest("loaded HMMER is not the legacy-only compact ABI")
+        self.assertFalse(_pipeline._compact_domains_seam_available())
+        state = _pipeline._continuation_seam_cache_info()["compact_domains"]
+        self.assertTrue(state["resolved"])
+        self.assertFalse(state["available"])
+        self.assertFalse(state["same_dso"])
+
     def test_continuation_seam_cache_handles_concurrent_first_use(self):
         extension = sorted(PACKAGE_DIR.glob("_pipeline*.so"))[0]
         code = r"""
@@ -481,11 +511,13 @@ assert all(not state["resolved"] for state in before.values()), before
 barrier = Barrier(32)
 def first_use(index):
     barrier.wait()
-    if index % 3 == 0:
+    if index % 4 == 0:
         return "filter", module._filter_scores_seam_available()
-    if index % 3 == 1:
+    if index % 4 == 1:
         return "forward", module._filter_and_forward_scores_seam_available()
-    return "simple_regions", module._simple_regions_seam_available()
+    if index % 4 == 2:
+        return "simple_regions", module._simple_regions_seam_available()
+    return "compact_domains", module._compact_domains_seam_available()
 
 with ThreadPoolExecutor(max_workers=32) as executor:
     results = list(executor.map(first_use, range(32)))
@@ -494,6 +526,7 @@ for _ in range(1000):
     assert module._filter_scores_seam_available() == after_first["filter"]["available"]
     assert module._filter_and_forward_scores_seam_available() == after_first["forward"]["available"]
     assert module._simple_regions_seam_available() == after_first["simple_regions"]["available"]
+    assert module._compact_domains_seam_available() == after_first["compact_domains"]["available"]
 after_repeat = module._continuation_seam_cache_info()
 assert after_repeat == after_first, (after_first, after_repeat)
 assert all(value == after_first[name]["available"] for name, value in results)
@@ -523,6 +556,10 @@ print(json.dumps(after_repeat, sort_keys=True))
         self.assertEqual(
             child["simple_regions"]["available"],
             _pipeline._simple_regions_seam_available(),
+        )
+        self.assertEqual(
+            child["compact_domains"]["available"],
+            _pipeline._compact_domains_seam_available(),
         )
 
     def test_forward_selector_keeps_exact_f2_survivors(self):

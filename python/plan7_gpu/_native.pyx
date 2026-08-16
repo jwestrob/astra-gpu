@@ -1143,6 +1143,11 @@ cdef extern from "continuation_journal.h":
         PLAN7_CONTINUATION_JOURNAL_MAGIC
         PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
 
+    cdef enum plan7_continuation_compact_route:
+        PLAN7_CONTINUATION_COMPACT_NONE
+        PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+        PLAN7_CONTINUATION_COMPACT_DEVICE
+
     ctypedef struct plan7_continuation_journal_row:
         uint32_t profile_index
         uint32_t sequence_index
@@ -1163,6 +1168,10 @@ cdef extern from "continuation_journal.h":
         uint8_t domain_route
         uint8_t has_own_scales
         uint8_t reserved
+        uint32_t compact_result_count
+        uint8_t compact_route
+        uint8_t reserved2[3]
+        uint32_t reserved3
 
     ctypedef struct plan7_continuation_journal:
         uint32_t magic
@@ -1170,6 +1179,9 @@ cdef extern from "continuation_journal.h":
         uint16_t header_size
         uint32_t row_size
         uint32_t region_size
+        uint32_t compact_result_size
+        uint32_t compact_trace_step_size
+        uint32_t compact_null2_stride
         uint64_t total_bytes
         uint64_t session_id
         uint64_t selection_id
@@ -1179,6 +1191,19 @@ cdef extern from "continuation_journal.h":
         uint64_t row_count
         uint64_t special_count
         uint64_t region_count
+        uint64_t compact_result_count
+        uint64_t compact_trace_offset_count
+        uint64_t compact_trace_count
+        uint64_t compact_null2_count
+        uint64_t generation_tail_fingerprint
+        uint64_t rescore_simple_row_count
+        uint64_t rescore_device_result_count
+        uint64_t rescore_cpu_required_count
+        uint64_t rescore_numeric_fallback_count
+        uint64_t rescore_cap_fallback_count
+        uint64_t rescore_global_cpu_fallback_count
+        uint64_t rescore_compact_output_byte_limit
+        uint64_t rescore_compact_output_bytes
         uint64_t generation_f1_bits
         uint64_t generation_f2_bits
         uint64_t generation_f3_bits
@@ -1187,6 +1212,8 @@ cdef extern from "continuation_journal.h":
         uint32_t rt3_bits
         uint32_t guard_band_bits
         uint8_t generation_bias_filter
+        uint8_t generation_compact_domains
+        uint8_t compact_global_fallback
         uint8_t sequence_content_fingerprint[32]
         uint64_t postfilter_offsets_offset
         uint64_t postfilter_records_offset
@@ -1201,8 +1228,14 @@ cdef extern from "continuation_journal.h":
         uint64_t specials_offset
         uint64_t region_offsets_offset
         uint64_t regions_offset
+        uint64_t compact_row_offsets_offset
+        uint64_t compact_results_offset
+        uint64_t compact_trace_offsets_offset
+        uint64_t compact_traces_offset
+        uint64_t compact_null2_offset
         plan7_forward_provenance forward
         plan7_backward_domain_provenance backward
+        plan7_domain_rescore_provenance rescore
         uint64_t integrity_tag
 
     uint64_t plan7_continuation_journal_integrity(
@@ -1268,6 +1301,8 @@ cdef object _build_continuation_journal_capsule(
     const uint64_t *pass_special_offsets,
     const plan7_forward_output *forward_output,
     const plan7_backward_domain_output *domain_output,
+    const plan7_domain_rescore_output *rescore_output,
+    uint64_t generation_tail_fingerprint,
     double f1,
     double f2,
     double f3,
@@ -1284,14 +1319,31 @@ cdef object _build_continuation_journal_capsule(
     cdef const uint64_t *domain_region_offsets
     cdef const plan7_simple_region *domain_regions
     cdef const plan7_backward_domain_provenance *domain_provenance
+    cdef const plan7_domain_rescore_result *rescore_results = NULL
+    cdef const uint64_t *rescore_trace_offsets = NULL
+    cdef const plan7_domain_rescore_trace_step *rescore_traces = NULL
+    cdef const float *rescore_null2 = NULL
+    cdef const plan7_domain_rescore_provenance *rescore_provenance = NULL
+    cdef const plan7_domain_rescore_statistics *rescore_statistics = NULL
     cdef size_t forward_count
     cdef size_t special_count
     cdef size_t domain_count
     cdef size_t region_count
+    cdef size_t compact_result_count = 0
+    cdef size_t compact_trace_count = 0
+    cdef size_t compact_null2_count = 0
     cdef size_t cursor = sizeof(plan7_continuation_journal)
     cdef size_t row
     cdef size_t source
     cdef size_t profile
+    cdef size_t simple_row_count = 0
+    cdef size_t device_result_count = 0
+    cdef size_t cpu_required_count = 0
+    cdef size_t compact_bytes = 0
+    cdef size_t region_begin
+    cdef size_t region_end
+    cdef uint8_t row_action
+    cdef const plan7_domain_rescore_result *compact_result
     cdef uint64_t profile_offsets_offset = 0
     cdef uint64_t identity_tokens_offset = 0
     cdef uint64_t profile_fingerprints_offset = 0
@@ -1305,6 +1357,11 @@ cdef object _build_continuation_journal_capsule(
     cdef uint64_t specials_offset = 0
     cdef uint64_t region_offsets_offset = 0
     cdef uint64_t regions_offset = 0
+    cdef uint64_t compact_row_offsets_offset = 0
+    cdef uint64_t compact_results_offset = 0
+    cdef uint64_t compact_trace_offsets_offset = 0
+    cdef uint64_t compact_traces_offset = 0
+    cdef uint64_t compact_null2_offset = 0
     cdef plan7_continuation_journal *journal = NULL
     cdef plan7_continuation_journal_row *rows
     cdef uint64_t *target_u64
@@ -1320,6 +1377,32 @@ cdef object _build_continuation_journal_capsule(
     region_count = plan7_backward_domain_output_region_count(domain_output)
     if domain_count != pass_count:
         raise RuntimeError("Backward/domain journal result count changed")
+    if rescore_output != NULL:
+        compact_result_count = plan7_domain_rescore_output_result_count(
+            rescore_output
+        )
+        compact_trace_count = plan7_domain_rescore_output_trace_count(
+            rescore_output
+        )
+        compact_null2_count = plan7_domain_rescore_output_null2_count(
+            rescore_output
+        )
+        rescore_results = plan7_domain_rescore_output_results(rescore_output)
+        rescore_trace_offsets = (
+            plan7_domain_rescore_output_trace_offsets(rescore_output)
+        )
+        rescore_traces = plan7_domain_rescore_output_traces(rescore_output)
+        rescore_null2 = plan7_domain_rescore_output_null2(rescore_output)
+        rescore_provenance = (
+            plan7_domain_rescore_output_provenance(rescore_output)
+        )
+        rescore_statistics = (
+            plan7_domain_rescore_output_statistics(rescore_output)
+        )
+        if generation_tail_fingerprint == 0:
+            raise RuntimeError("compact-domain tail fingerprint is zero")
+    elif generation_tail_fingerprint != 0:
+        raise RuntimeError("compact-domain tail fingerprint has no output")
     if sizeof(uintptr_t) != sizeof(uint64_t):
         raise RuntimeError("profile identity tokens require a 64-bit process")
     if not (
@@ -1377,6 +1460,28 @@ cdef object _build_continuation_journal_capsule(
             &cursor, region_count, sizeof(plan7_simple_region),
             &regions_offset,
         )
+        and _journal_append_storage(
+            &cursor, pass_count + 1, sizeof(uint64_t),
+            &compact_row_offsets_offset,
+        )
+        and _journal_append_storage(
+            &cursor, compact_result_count,
+            sizeof(plan7_domain_rescore_result),
+            &compact_results_offset,
+        )
+        and _journal_append_storage(
+            &cursor, compact_result_count + 1, sizeof(uint64_t),
+            &compact_trace_offsets_offset,
+        )
+        and _journal_append_storage(
+            &cursor, compact_trace_count,
+            sizeof(plan7_domain_rescore_trace_step),
+            &compact_traces_offset,
+        )
+        and _journal_append_storage(
+            &cursor, compact_null2_count, sizeof(float),
+            &compact_null2_offset,
+        )
     ):
         raise OverflowError("continuation journal size overflows size_t")
 
@@ -1415,6 +1520,113 @@ cdef object _build_continuation_journal_capsule(
     ):
         raise RuntimeError("continuation journal provenance counts differ")
 
+    for row in range(pass_count):
+        if domain_results[row].route == PLAN7_BACKWARD_DOMAIN_SIMPLE:
+            simple_row_count += 1
+    if rescore_output != NULL:
+        if (
+            rescore_provenance == NULL
+            or rescore_statistics == NULL
+            or rescore_trace_offsets == NULL
+            or (compact_result_count and rescore_results == NULL)
+            or (compact_trace_count and rescore_traces == NULL)
+            or (compact_null2_count and rescore_null2 == NULL)
+            or compact_result_count
+            > PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES
+            // sizeof(plan7_domain_rescore_result)
+            or compact_trace_count
+            > PLAN7_DOMAIN_RESCORE_MAX_TRACE_BYTES
+            // sizeof(plan7_domain_rescore_trace_step)
+            or compact_result_count
+            > (<size_t> -1) // PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+            or compact_null2_count
+            != compact_result_count * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+            or compact_result_count not in (0, region_count)
+            or memcmp(
+                &rescore_provenance.backward,
+                domain_provenance,
+                sizeof(plan7_backward_domain_provenance),
+            ) != 0
+            or rescore_provenance.result_count != compact_result_count
+            or rescore_provenance.trace_count != compact_trace_count
+            or rescore_provenance.null2_count != compact_null2_count
+            or rescore_statistics.upstream_row_count != pass_count
+            or rescore_statistics.simple_row_count != simple_row_count
+            or rescore_statistics.region_count != region_count
+            or rescore_statistics.device_result_count
+            + rescore_statistics.cpu_required_count != region_count
+            or rescore_statistics.numeric_fallback_count
+            + rescore_statistics.cap_fallback_count
+            != rescore_statistics.cpu_required_count
+            or rescore_statistics.global_cpu_fallback_count
+            not in (0, region_count)
+            or rescore_statistics.compact_output_byte_limit < sizeof(uint64_t)
+            or rescore_statistics.compact_output_byte_limit
+            > PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES
+            or rescore_statistics.compact_output_bytes
+            > rescore_statistics.compact_output_byte_limit
+        ):
+            raise RuntimeError("compact-domain provenance or caps differ")
+        compact_bytes = (
+            compact_result_count * sizeof(plan7_domain_rescore_result)
+            + (compact_result_count + 1) * sizeof(uint64_t)
+            + compact_trace_count * sizeof(plan7_domain_rescore_trace_step)
+            + compact_null2_count * sizeof(float)
+        )
+        if rescore_statistics.compact_output_bytes != compact_bytes:
+            raise RuntimeError("compact-domain output byte count differs")
+        if compact_result_count == 0:
+            if (
+                rescore_statistics.device_result_count != 0
+                or rescore_statistics.cpu_required_count != region_count
+                or rescore_statistics.global_cpu_fallback_count != region_count
+                or compact_trace_count != 0
+            ):
+                raise RuntimeError("compact-domain global fallback differs")
+        else:
+            if rescore_statistics.global_cpu_fallback_count != 0:
+                raise RuntimeError("compact-domain fallback accounting differs")
+            for row in range(pass_count):
+                region_begin = domain_region_offsets[row]
+                region_end = domain_region_offsets[row + 1]
+                if region_begin == region_end:
+                    continue
+                row_action = rescore_results[region_begin].action
+                for source in range(region_begin, region_end):
+                    compact_result = &rescore_results[source]
+                    if (
+                        compact_result.row_index != row
+                        or compact_result.profile_index
+                        != domain_results[row].profile_index
+                        or compact_result.sequence_index
+                        != domain_results[row].sequence_index
+                        or compact_result.envelope_begin
+                        != domain_regions[source].begin
+                        or compact_result.envelope_end
+                        != domain_regions[source].end
+                        or compact_result.action != row_action
+                        or compact_result.action not in (
+                            PLAN7_DOMAIN_RESCORE_CPU_REQUIRED,
+                            PLAN7_DOMAIN_RESCORE_DEVICE_RESULT,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "compact-domain result order or row atomicity differs"
+                        )
+                    if compact_result.action == (
+                        PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+                    ):
+                        device_result_count += 1
+                    else:
+                        cpu_required_count += 1
+            if (
+                device_result_count
+                != rescore_statistics.device_result_count
+                or cpu_required_count
+                != rescore_statistics.cpu_required_count
+            ):
+                raise RuntimeError("compact-domain action counts differ")
+
     journal = <plan7_continuation_journal *> calloc(1, cursor)
     if journal == NULL:
         raise MemoryError("continuation journal allocation failed")
@@ -1424,6 +1636,11 @@ cdef object _build_continuation_journal_capsule(
         journal.header_size = sizeof(plan7_continuation_journal)
         journal.row_size = sizeof(plan7_continuation_journal_row)
         journal.region_size = sizeof(plan7_simple_region)
+        journal.compact_result_size = sizeof(plan7_domain_rescore_result)
+        journal.compact_trace_step_size = sizeof(
+            plan7_domain_rescore_trace_step
+        )
+        journal.compact_null2_stride = PLAN7_DOMAIN_RESCORE_NULL2_COUNT
         journal.total_bytes = cursor
         journal.session_id = view.session_id
         journal.selection_id = view.selection_id
@@ -1433,6 +1650,36 @@ cdef object _build_continuation_journal_capsule(
         journal.row_count = pass_count
         journal.special_count = special_count
         journal.region_count = region_count
+        journal.compact_result_count = compact_result_count
+        journal.compact_trace_offset_count = compact_result_count + 1
+        journal.compact_trace_count = compact_trace_count
+        journal.compact_null2_count = compact_null2_count
+        journal.generation_tail_fingerprint = generation_tail_fingerprint
+        if rescore_output != NULL:
+            journal.rescore_simple_row_count = (
+                rescore_statistics.simple_row_count
+            )
+            journal.rescore_device_result_count = (
+                rescore_statistics.device_result_count
+            )
+            journal.rescore_cpu_required_count = (
+                rescore_statistics.cpu_required_count
+            )
+            journal.rescore_numeric_fallback_count = (
+                rescore_statistics.numeric_fallback_count
+            )
+            journal.rescore_cap_fallback_count = (
+                rescore_statistics.cap_fallback_count
+            )
+            journal.rescore_global_cpu_fallback_count = (
+                rescore_statistics.global_cpu_fallback_count
+            )
+            journal.rescore_compact_output_byte_limit = (
+                rescore_statistics.compact_output_byte_limit
+            )
+            journal.rescore_compact_output_bytes = (
+                rescore_statistics.compact_output_bytes
+            )
         double_encoded.value = f1
         journal.generation_f1_bits = double_encoded.bits
         double_encoded.value = f2
@@ -1448,6 +1695,13 @@ cdef object _build_continuation_journal_capsule(
         float_encoded.value = guard_band
         journal.guard_band_bits = float_encoded.bits
         journal.generation_bias_filter = <uint8_t> bias_filter
+        journal.generation_compact_domains = <uint8_t> (
+            rescore_output != NULL
+        )
+        if rescore_output != NULL:
+            journal.compact_global_fallback = <uint8_t> (
+                rescore_statistics.global_cpu_fallback_count != 0
+            )
         memcpy(
             journal.sequence_content_fingerprint,
             sequence_content_fingerprint,
@@ -1466,8 +1720,15 @@ cdef object _build_continuation_journal_capsule(
         journal.specials_offset = specials_offset
         journal.region_offsets_offset = region_offsets_offset
         journal.regions_offset = regions_offset
+        journal.compact_row_offsets_offset = compact_row_offsets_offset
+        journal.compact_results_offset = compact_results_offset
+        journal.compact_trace_offsets_offset = compact_trace_offsets_offset
+        journal.compact_traces_offset = compact_traces_offset
+        journal.compact_null2_offset = compact_null2_offset
         journal.forward = forward_provenance[0]
         journal.backward = domain_provenance[0]
+        if rescore_output != NULL:
+            journal.rescore = rescore_provenance[0]
 
         memcpy(
             <uint8_t *> journal + postfilter_offsets_offset,
@@ -1535,6 +1796,36 @@ cdef object _build_continuation_journal_capsule(
                 domain_regions,
                 region_count * sizeof(plan7_simple_region),
             )
+        if compact_result_count:
+            memcpy(
+                <uint8_t *> journal + compact_row_offsets_offset,
+                domain_region_offsets,
+                (pass_count + 1) * sizeof(uint64_t),
+            )
+            memcpy(
+                <uint8_t *> journal + compact_results_offset,
+                rescore_results,
+                compact_result_count * sizeof(plan7_domain_rescore_result),
+            )
+        if rescore_output != NULL:
+            memcpy(
+                <uint8_t *> journal + compact_trace_offsets_offset,
+                rescore_trace_offsets,
+                (compact_result_count + 1) * sizeof(uint64_t),
+            )
+        if compact_trace_count:
+            memcpy(
+                <uint8_t *> journal + compact_traces_offset,
+                rescore_traces,
+                compact_trace_count
+                * sizeof(plan7_domain_rescore_trace_step),
+            )
+        if compact_null2_count:
+            memcpy(
+                <uint8_t *> journal + compact_null2_offset,
+                rescore_null2,
+                compact_null2_count * sizeof(float),
+            )
 
         rows = <plan7_continuation_journal_row *> (
             <uint8_t *> journal + rows_offset
@@ -1571,6 +1862,33 @@ cdef object _build_continuation_journal_capsule(
             rows[row].domain_route = domain_results[row].route
             rows[row].has_own_scales = domain_results[row].has_own_scales
             rows[row].reserved = domain_results[row].reserved
+            region_begin = domain_region_offsets[row]
+            region_end = domain_region_offsets[row + 1]
+            if region_end - region_begin > <size_t> 0xffffffff:
+                raise RuntimeError("compact-domain row count exceeds uint32")
+            if compact_result_count:
+                rows[row].compact_result_count = <uint32_t> (
+                    region_end - region_begin
+                )
+                if region_begin != region_end:
+                    if rescore_results[region_begin].action == (
+                        PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+                    ):
+                        rows[row].compact_route = (
+                            PLAN7_CONTINUATION_COMPACT_DEVICE
+                        )
+                    else:
+                        rows[row].compact_route = (
+                            PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                        )
+            elif (
+                rescore_output != NULL
+                and rescore_statistics.global_cpu_fallback_count != 0
+                and region_begin != region_end
+            ):
+                rows[row].compact_route = (
+                    PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                )
 
         journal.integrity_tag = plan7_continuation_journal_integrity(journal)
         capsule = PyCapsule_New(
@@ -4190,6 +4508,7 @@ cdef class SequenceBatch:
         uint64_t rescore_matrix_byte_budget,
         uint64_t rescore_trace_byte_budget,
         int rescore_test_fault,
+        uint64_t generation_tail_fingerprint,
         double generation_f1,
         bint generation_bias_filter,
         float rt1,
@@ -4509,7 +4828,10 @@ cdef class SequenceBatch:
                     )
                 if status != 0:
                     raise RuntimeError(error.decode("utf-8", "replace"))
-                if rescore_simple_diagnostic:
+                if (
+                    rescore_simple_diagnostic
+                    or generation_tail_fingerprint != 0
+                ):
                     if rescore_test_fault != 0:
                         error[0] = 0
                         with nogil:
@@ -4525,9 +4847,6 @@ cdef class SequenceBatch:
                             raise RuntimeError(
                                 error.decode("utf-8", "replace")
                             )
-                    upstream_payload = _backward_domain_route_payload_from_output(
-                        domain_output
-                    )
                     error[0] = 0
                     with nogil:
                         status = plan7_domain_rescore_run(
@@ -4543,10 +4862,16 @@ cdef class SequenceBatch:
                         )
                     if status != 0:
                         raise RuntimeError(error.decode("utf-8", "replace"))
-                    rescore_payload = _domain_rescore_payload_from_output(
-                        rescore_output
-                    )
-                    rescore_payload = rescore_payload + (upstream_payload,)
+                    if rescore_simple_diagnostic:
+                        upstream_payload = (
+                            _backward_domain_route_payload_from_output(
+                                domain_output
+                            )
+                        )
+                        rescore_payload = _domain_rescore_payload_from_output(
+                            rescore_output
+                        )
+                        rescore_payload = rescore_payload + (upstream_payload,)
                 profile_fingerprint_storage = b"".join(selection._fingerprints)
                 profile_fingerprint_view = profile_fingerprint_storage
                 sequence_fingerprint_view = self._content_fingerprint
@@ -4575,6 +4900,12 @@ cdef class SequenceBatch:
                     pass_special_offsets.data(),
                     output,
                     domain_output,
+                    (
+                        rescore_output
+                        if generation_tail_fingerprint != 0
+                        else NULL
+                    ),
+                    generation_tail_fingerprint,
                     generation_f1,
                     f2,
                     f3,
@@ -4754,6 +5085,7 @@ cdef class SequenceBatch:
             0,
             0,
             0,
+            0,
             0.02,
             True,
             <float> 0.25,
@@ -4775,6 +5107,7 @@ cdef class SequenceBatch:
         uint64_t rescore_trace_byte_budget=0,
         uint64_t rescore_compact_byte_budget=0,
         int _rescore_test_fault=0,
+        uint64_t generation_tail_fingerprint=0,
     ):
         """Run the fused package-internal path and return one opaque seal.
 
@@ -4818,6 +5151,7 @@ cdef class SequenceBatch:
             rescore_matrix_byte_budget,
             rescore_trace_byte_budget,
             _rescore_test_fault,
+            generation_tail_fingerprint,
             f1,
             True,
             <float> 0.25,

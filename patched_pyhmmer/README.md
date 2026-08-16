@@ -42,7 +42,7 @@ Forward/Backward, posterior decoding, null2, optimal-accuracy, display, and
 shared hit-scoring path. Uncertain, clustered, nonfinite, or otherwise
 unsupported rows must remain on the existing Forward continuation.
 
-The compact-domain seam is the narrower continuation for simple envelopes
+The V2 compact-domain seam is the narrower continuation for simple envelopes
 that have also been rescored outside HMMER. It consumes the CUDA journal ABI
 directly: one pointer-free 64-byte result per domain, 29 binary32 null2 odds,
 64-bit offsets, and a flat 16-byte optimal-accuracy trace-step array. Result
@@ -62,14 +62,27 @@ stock unihit trace. The live profile/background length state, floating-point
 environment, filter gates, and a canonical continuation-option fingerprint
 are rechecked at the boundary.
 
-This patch supplies only the pinned HMMER boundary and its direct parity
-probe. Product integration is intentionally still blocked: the final opaque
-adapter must seal the complete external score/status tuple, route and compact
-payloads, profile and target content identities, thresholds, and background
-fingerprint as one immutable generation. It must authenticate those content
-hashes before calling HMMER and preserve original row order. The HMMER seam
-then independently checks the compact payload and the live HMMER state, but
-cannot derive or authenticate the adapter's hidden cross-object hashes itself.
+The V2 call also receives the authenticated final target count. Before any
+mutation, its final-call guard propagates a conservative score interval through
+the stock full-target, reconstruction, and domain formulas and checks every
+report/include score or E-value boundary, including dynamic final `Z` and every
+possible integer dynamic `domZ`. A threshold-adjacent row returns
+`eslEINACCURATE`; the adapter then reruns the whole ordinary `p7_Pipeline()` so
+no GPU Forward or postfilter value survives the fallback. Guard policy is bound
+by `p7_pipeline_CompactTailFingerprintV2()`.
+
+The opaque production adapter integration is present. It seals and
+authenticates the complete external score/status tuple, route and compact
+payloads, profile/selection/target generations and content identities,
+thresholds, background, result/null2/trace hashes, ordering, and caps before
+calling HMMER. Compact trace offsets are rebased per row without Python payload
+copies. Unsupported rows retain their exact simple-region, Forward, or full
+CPU routes, and the adapter preserves original row order and accounting.
+
+Only `p7_PipelineFromFilterForwardAndCompactDomainsV2()` and
+`p7_pipeline_CompactTailFingerprintV2()` form the current compact ABI pair.
+The old unversioned symbols are deliberately absent, so mixed old/new wheels
+fail closed at symbol resolution.
 
 ## Build and test
 

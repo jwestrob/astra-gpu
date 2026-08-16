@@ -51,7 +51,7 @@ except ImportError:
 
 
 DATA = Path(pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
-JOURNAL_CAPSULE_NAME = b"plan7_gpu._native._continuation_journal_v1"
+JOURNAL_CAPSULE_NAME = b"plan7_gpu._native._continuation_journal_v2"
 
 
 class ContinuationJournalPrefix(ctypes.Structure):
@@ -61,6 +61,9 @@ class ContinuationJournalPrefix(ctypes.Structure):
         ("header_size", ctypes.c_uint16),
         ("row_size", ctypes.c_uint32),
         ("region_size", ctypes.c_uint32),
+        ("compact_result_size", ctypes.c_uint32),
+        ("compact_trace_step_size", ctypes.c_uint32),
+        ("compact_null2_stride", ctypes.c_uint32),
         ("total_bytes", ctypes.c_uint64),
         ("session_id", ctypes.c_uint64),
         ("selection_id", ctypes.c_uint64),
@@ -70,6 +73,19 @@ class ContinuationJournalPrefix(ctypes.Structure):
         ("row_count", ctypes.c_uint64),
         ("special_count", ctypes.c_uint64),
         ("region_count", ctypes.c_uint64),
+        ("compact_result_count", ctypes.c_uint64),
+        ("compact_trace_offset_count", ctypes.c_uint64),
+        ("compact_trace_count", ctypes.c_uint64),
+        ("compact_null2_count", ctypes.c_uint64),
+        ("generation_tail_fingerprint", ctypes.c_uint64),
+        ("rescore_simple_row_count", ctypes.c_uint64),
+        ("rescore_device_result_count", ctypes.c_uint64),
+        ("rescore_cpu_required_count", ctypes.c_uint64),
+        ("rescore_numeric_fallback_count", ctypes.c_uint64),
+        ("rescore_cap_fallback_count", ctypes.c_uint64),
+        ("rescore_global_cpu_fallback_count", ctypes.c_uint64),
+        ("rescore_compact_output_byte_limit", ctypes.c_uint64),
+        ("rescore_compact_output_bytes", ctypes.c_uint64),
         ("generation_f1_bits", ctypes.c_uint64),
         ("generation_f2_bits", ctypes.c_uint64),
         ("generation_f3_bits", ctypes.c_uint64),
@@ -78,7 +94,9 @@ class ContinuationJournalPrefix(ctypes.Structure):
         ("rt3_bits", ctypes.c_uint32),
         ("guard_band_bits", ctypes.c_uint32),
         ("generation_bias_filter", ctypes.c_uint8),
-        ("reserved", ctypes.c_uint8 * 7),
+        ("generation_compact_domains", ctypes.c_uint8),
+        ("compact_global_fallback", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 5),
         ("sequence_content_fingerprint", ctypes.c_uint8 * 32),
         ("postfilter_offsets_offset", ctypes.c_uint64),
         ("postfilter_records_offset", ctypes.c_uint64),
@@ -93,21 +111,25 @@ class ContinuationJournalPrefix(ctypes.Structure):
         ("specials_offset", ctypes.c_uint64),
         ("region_offsets_offset", ctypes.c_uint64),
         ("regions_offset", ctypes.c_uint64),
+        ("compact_row_offsets_offset", ctypes.c_uint64),
+        ("compact_results_offset", ctypes.c_uint64),
+        ("compact_trace_offsets_offset", ctypes.c_uint64),
+        ("compact_traces_offset", ctypes.c_uint64),
+        ("compact_null2_offset", ctypes.c_uint64),
     ]
 
 
-def tamper_first_journal_sequence_index(capsule):
+def continuation_journal_address(capsule):
     get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
     get_pointer.argtypes = (ctypes.py_object, ctypes.c_char_p)
     get_pointer.restype = ctypes.c_void_p
     address = get_pointer(capsule, JOURNAL_CAPSULE_NAME)
     if not address:
         raise RuntimeError("test journal capsule has no storage")
-    header = ContinuationJournalPrefix.from_address(address)
-    if header.row_count == 0:
-        raise RuntimeError("test journal has no rows")
-    ctypes.c_uint32.from_address(address + header.rows_offset + 4).value = 0xFFFFFFFF
+    return address
 
+
+def refresh_journal_integrity(address, header):
     integrity_offset = header.header_size - ctypes.sizeof(ctypes.c_uint64)
     storage = (ctypes.c_uint8 * header.total_bytes).from_address(address)
     value = 1469598103934665603
@@ -116,6 +138,27 @@ def tamper_first_journal_sequence_index(capsule):
     for index in range(header.header_size, header.total_bytes):
         value = ((value ^ storage[index]) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     ctypes.c_uint64.from_address(address + integrity_offset).value = value
+
+
+def tamper_first_journal_sequence_index(capsule):
+    address = continuation_journal_address(capsule)
+    header = ContinuationJournalPrefix.from_address(address)
+    if header.row_count == 0:
+        raise RuntimeError("test journal has no rows")
+    ctypes.c_uint32.from_address(address + header.rows_offset + 4).value = 0xFFFFFFFF
+    refresh_journal_integrity(address, header)
+
+
+def tamper_first_compact_forward_score(capsule):
+    address = continuation_journal_address(capsule)
+    header = ContinuationJournalPrefix.from_address(address)
+    if header.compact_result_count == 0:
+        raise RuntimeError("test journal has no compact results")
+    score = ctypes.c_uint32.from_address(
+        address + header.compact_results_offset + 36
+    )
+    score.value ^= 1
+    refresh_journal_integrity(address, header)
 
 
 def cuda_available():
@@ -140,6 +183,10 @@ def forward_seam_available():
 
 def simple_region_seam_available():
     return _pipeline is not None and _pipeline._simple_regions_seam_available()
+
+
+def compact_domain_seam_available():
+    return _pipeline is not None and _pipeline._compact_domains_seam_available()
 
 
 class ProfileSessionFixture:
@@ -617,6 +664,18 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
     postfilter_seam_available(), "private filter-score seam is available"
 )
 class StockCudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
+    def test_compact_pair_is_absent_and_frozen_on_stock_abi(self):
+        self.assertFalse(compact_domain_seam_available())
+        self.assertFalse(compact_domain_seam_available())
+        info = _pipeline._continuation_seam_cache_info()["compact_domains"]
+        self.assertTrue(info["resolved"])
+        self.assertFalse(info["available"])
+        self.assertFalse(info["same_dso"])
+        self.assertEqual(info["resolutions"], 1)
+        self.assertEqual(info["dlopen_calls"], info["dlclose_calls"])
+        with self.assertRaisesRegex(RuntimeError, "compact-domain seam"):
+            _pipeline._compact_tail_fingerprint_bound(self.pipeline())
+
     def test_postfilter_apis_require_private_continuation_seam(self):
         with ProfileSession(self.pairs) as session:
             with session.select([2]) as selection:
@@ -654,15 +713,38 @@ class StockCudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
 )
 class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
     @staticmethod
-    def mint_continuation_capsule(selection, batch, options, guard=2.0e-4):
+    def mint_continuation_capsule(
+        selection,
+        batch,
+        options,
+        guard=2.0e-4,
+        *,
+        pipeline=None,
+        compact_budget=0,
+        matrix_budget=0,
+        trace_budget=0,
+        test_fault=0,
+    ):
         selection_state = _profile_selection_state(selection)
         sequence_state = _sequence_state(batch)
+        tail_fingerprint = (
+            _pipeline._compact_tail_fingerprint_bound(pipeline)
+            if pipeline is not None
+            else 0
+        )
         return sequence_state.native._postfilter_forward_domain_selection_sealed(
             selection_state.native,
             options["F1"],
             options["F2"],
             options["F3"],
             guard,
+            _native.FORWARD_MAX_GATHERED_BYTES,
+            False,
+            matrix_budget,
+            trace_budget,
+            compact_budget,
+            test_fault,
+            tail_fingerprint,
         )
 
     @staticmethod
@@ -1380,3 +1462,329 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                 self.semantic_pipeline_state(actual),
                 self.semantic_pipeline_state(expected),
             )
+
+
+@unittest.skipUnless(cuda_available(), "CUDA backend or device unavailable")
+@unittest.skipUnless(
+    compact_domain_seam_available(),
+    "private compact-domain seam is unavailable",
+)
+class CompactDomainProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(
+            prefix="plan7-compact-session-test-"
+        )
+        data = Path(pyhmmer.__file__).parent / "tests" / "data"
+        hmms = []
+        for name in ("RREFam.hmm", "Thioesterase.hmm", "KR.hmm", "LuxC.hmm"):
+            with pyhmmer.plan7.HMMFile(data / "hmms" / "txt" / name) as source:
+                hmms.append(source.read())
+        cls.base = Path(cls.temporary.name) / "models"
+        pyhmmer.hmmer.hmmpress(hmms, cls.base)
+        cls.pairs = load_pressed_profiles(cls.base)
+        cls.alphabet = hmms[0].alphabet
+        sequences = []
+        with pyhmmer.easel.SequenceFile(
+            data / "seqs" / "938293.PRJEB85.HG003687.faa",
+            digital=True,
+            alphabet=cls.alphabet,
+        ) as source:
+            for sequence in source:
+                sequences.append(sequence)
+                if len(sequences) == 4:
+                    break
+        consensus = hmms[1].consensus
+        if isinstance(consensus, bytes):
+            consensus = consensus.decode()
+        consensus = consensus.replace("-", "")
+        sequences.append(
+            pyhmmer.easel.TextSequence(
+                name=b"two-domain-probe",
+                sequence=consensus + "X" * 100 + consensus,
+            ).digitize(cls.alphabet)
+        )
+        cls.targets = pyhmmer.easel.DigitalSequenceBlock(
+            cls.alphabet, sequences
+        )
+        cls.options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        cls.selection_indices = (3, 1, 0)
+
+    def assert_hits_close(self, actual, expected):
+        self.assertEqual(len(actual), len(expected))
+        for actual_hit, expected_hit in zip(actual, expected, strict=True):
+            self.assertEqual(actual_hit.name, expected_hit.name)
+            self.assertEqual(actual_hit.accession, expected_hit.accession)
+            self.assertEqual(actual_hit.reported, expected_hit.reported)
+            self.assertEqual(actual_hit.included, expected_hit.included)
+            self.assertAlmostEqual(
+                actual_hit.score, expected_hit.score, delta=2.0e-4
+            )
+            self.assertAlmostEqual(
+                actual_hit.bias, expected_hit.bias, delta=2.0e-4
+            )
+            self.assertEqual(len(actual_hit.domains), len(expected_hit.domains))
+            for actual_domain, expected_domain in zip(
+                actual_hit.domains, expected_hit.domains, strict=True
+            ):
+                self.assertEqual(
+                    (actual_domain.env_from, actual_domain.env_to),
+                    (expected_domain.env_from, expected_domain.env_to),
+                )
+                self.assertEqual(
+                    (
+                        actual_domain.alignment.target_from,
+                        actual_domain.alignment.target_to,
+                        actual_domain.alignment.hmm_from,
+                        actual_domain.alignment.hmm_to,
+                    ),
+                    (
+                        expected_domain.alignment.target_from,
+                        expected_domain.alignment.target_to,
+                        expected_domain.alignment.hmm_from,
+                        expected_domain.alignment.hmm_to,
+                    ),
+                )
+                self.assertAlmostEqual(
+                    actual_domain.score,
+                    expected_domain.score,
+                    delta=2.0e-4,
+                )
+                self.assertAlmostEqual(
+                    actual_domain.correction,
+                    expected_domain.correction,
+                    delta=2.0e-4,
+                )
+
+    def assert_batch_matches_cpu(self, candidates, pairs, reuse_count=2):
+        actual_pipeline = self.pipeline(**self.options)
+        expected_pipeline = self.pipeline(**self.options)
+        for _ in range(reuse_count):
+            for row, pair in enumerate(pairs):
+                actual = candidates.search(row, actual_pipeline)
+                expected = expected_pipeline.search_hmm(pair.hmm, self.targets)
+                self.assert_hits_close(actual, expected)
+                self.assertEqual(
+                    self.semantic_pipeline_state(actual),
+                    self.semantic_pipeline_state(expected),
+                )
+
+    def test_production_compact_path_is_near_exact_multi_domain_and_reusable(self):
+        pairs = tuple(self.pairs[index] for index in self.selection_indices)
+        with ProfileSession(self.pairs) as session:
+            with session.select(self.selection_indices) as selection:
+                with SequenceBatch(self.targets) as batch:
+                    legacy = batch._postfilter_forward_selection(
+                        selection, **self.options, bias_filter=True
+                    )
+                    fused = batch._postfilter_forward_selection(
+                        selection,
+                        **self.options,
+                        bias_filter=True,
+                        pipeline=self.pipeline(**self.options),
+                    )
+                    statistics = (
+                        _pipeline._sealed_continuation_statistics_bound(
+                            _candidate_state(fused).sealed_postfilter
+                        )
+                    )
+                    self.assertEqual(_candidate_state(fused).pairs, pairs)
+                    self.assertEqual(
+                        [fused.candidate_count(row) for row in range(len(pairs))],
+                        [legacy.candidate_count(row) for row in range(len(pairs))],
+                    )
+
+        self.assertTrue(statistics["compact_enabled"])
+        self.assertGreater(statistics["compact_simple_row_count"], 0)
+        self.assertGreater(statistics["compact_device_result_count"], 0)
+        self.assertEqual(
+            statistics["compact_device_result_count"]
+            + statistics["compact_cpu_required_count"],
+            statistics["compact_cap_fallback_count"]
+            + statistics["compact_numeric_fallback_count"]
+            + statistics["compact_device_result_count"],
+        )
+        self.assert_batch_matches_cpu(fused, pairs)
+
+        thioesterase_row = self.selection_indices.index(1)
+        multi = fused.search(
+            thioesterase_row, self.pipeline(**self.options)
+        )
+        probe = next(
+            hit for hit in multi if hit.name == "two-domain-probe"
+        )
+        self.assertGreaterEqual(len(probe.domains), 2)
+
+        cache = _pipeline._continuation_seam_cache_info()["compact_domains"]
+        self.assertTrue(cache["available"])
+        self.assertTrue(cache["same_dso"])
+        self.assertEqual(cache["resolutions"], 1)
+        self.assertEqual(cache["dlopen_calls"], cache["dlclose_calls"])
+
+    def test_threshold_adjacent_device_row_retries_full_pipeline_exactly(self):
+        pair = self.pairs[0]
+        targets = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [self.targets[-1]]
+        )
+        baseline = self.pipeline(**self.options).search_hmm(pair.hmm, targets)
+        self.assertEqual([hit.name for hit in baseline], ["two-domain-probe"])
+        self.assertGreaterEqual(len(baseline[0].domains), 2)
+
+        cases = (
+            ("target_score", {"T": baseline[0].score}),
+            (
+                "dynamic_domain_evalue",
+                {"domE": baseline[0].domains[0].i_evalue},
+            ),
+        )
+        for label, threshold in cases:
+            with self.subTest(label=label):
+                options = {**self.options, **threshold}
+                with ProfileSession(self.pairs) as session:
+                    with session.select([0]) as selection:
+                        with SequenceBatch(targets) as batch:
+                            candidates = batch._postfilter_forward_selection(
+                                selection,
+                                **self.options,
+                                bias_filter=True,
+                                pipeline=self.pipeline(**options),
+                            )
+                            statistics = (
+                                _pipeline._sealed_continuation_statistics_bound(
+                                    _candidate_state(candidates).sealed_postfilter
+                                )
+                            )
+
+                self.assertTrue(statistics["compact_enabled"])
+                self.assertGreater(
+                    statistics["compact_device_result_count"], 0
+                )
+                actual = candidates.search(0, self.pipeline(**options))
+                expected = self.pipeline(**options).search_hmm(pair.hmm, targets)
+                self.assertEqual(self.hits_bytes(actual), self.hits_bytes(expected))
+                self.assertEqual(
+                    self.semantic_pipeline_state(actual),
+                    self.semantic_pipeline_state(expected),
+                )
+
+    def test_global_cap_and_numeric_rows_fall_back_without_missed_calls(self):
+        pairs = tuple(self.pairs[index] for index in self.selection_indices)
+        with ProfileSession(self.pairs) as session:
+            with session.select(self.selection_indices) as selection:
+                with SequenceBatch(self.targets) as batch:
+                    capped = batch._postfilter_forward_selection(
+                        selection,
+                        **self.options,
+                        bias_filter=True,
+                        pipeline=self.pipeline(**self.options),
+                        _rescore_compact_byte_budget=1,
+                    )
+                    capped_statistics = (
+                        _pipeline._sealed_continuation_statistics_bound(
+                            _candidate_state(capped).sealed_postfilter
+                        )
+                    )
+                    numeric = batch._postfilter_forward_selection(
+                        selection,
+                        **self.options,
+                        bias_filter=True,
+                        pipeline=self.pipeline(**self.options),
+                        _rescore_test_fault=(
+                            _native.BACKWARD_DOMAIN_TEST_FORCE_SIMPLE_OWN_SCALE
+                        ),
+                    )
+                    numeric_statistics = (
+                        _pipeline._sealed_continuation_statistics_bound(
+                            _candidate_state(numeric).sealed_postfilter
+                        )
+                    )
+
+        self.assertGreater(
+            capped_statistics["compact_global_cpu_fallback_count"], 0
+        )
+        self.assertEqual(capped_statistics["compact_device_result_count"], 0)
+        self.assertEqual(
+            capped_statistics["compact_cap_fallback_count"],
+            capped_statistics["compact_global_cpu_fallback_count"],
+        )
+        self.assertGreater(
+            numeric_statistics["compact_numeric_fallback_count"], 0
+        )
+        self.assertGreater(numeric_statistics["cpu_required_count"], 0)
+        self.assert_batch_matches_cpu(capped, pairs, reuse_count=1)
+        self.assert_batch_matches_cpu(numeric, pairs, reuse_count=1)
+
+    def test_compact_hash_tail_and_selection_cross_binding_fail_closed(self):
+        with ProfileSession(self.pairs) as session:
+            with session.select(self.selection_indices) as selection:
+                with session.select((1, 3, 0)) as other_selection:
+                    with SequenceBatch(self.targets) as batch:
+                        generation_pipeline = self.pipeline(**self.options)
+                        capsule = CudaProfileSessionTests.mint_continuation_capsule(
+                            selection,
+                            batch,
+                            self.options,
+                            pipeline=generation_pipeline,
+                        )
+                        tamper_first_compact_forward_score(capsule)
+                        with self.assertRaisesRegex(
+                            ValueError, "compact hashes differ"
+                        ):
+                            CudaProfileSessionTests.seal_continuation_capsule(
+                                capsule,
+                                selection,
+                                batch,
+                                generation_pipeline,
+                                self.options,
+                            )
+
+                        capsule = CudaProfileSessionTests.mint_continuation_capsule(
+                            selection,
+                            batch,
+                            self.options,
+                            pipeline=generation_pipeline,
+                        )
+                        tail_drift = self.pipeline(
+                            **self.options, null2=False
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "compact provenance differs"
+                        ):
+                            CudaProfileSessionTests.seal_continuation_capsule(
+                                capsule,
+                                selection,
+                                batch,
+                                tail_drift,
+                                self.options,
+                            )
+
+                        capsule = CudaProfileSessionTests.mint_continuation_capsule(
+                            selection,
+                            batch,
+                            self.options,
+                            pipeline=generation_pipeline,
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "selection identity differs"
+                        ):
+                            CudaProfileSessionTests.seal_continuation_capsule(
+                                capsule,
+                                other_selection,
+                                batch,
+                                generation_pipeline,
+                                self.options,
+                            )
+
+                        actual = generation_pipeline.search_hmm(
+                            self.pairs[1].hmm, self.targets
+                        )
+                        expected = self.pipeline(**self.options).search_hmm(
+                            self.pairs[1].hmm, self.targets
+                        )
+                        self.assertEqual(
+                            self.hits_bytes(actual), self.hits_bytes(expected)
+                        )
+                        self.assertEqual(
+                            self.semantic_pipeline_state(actual),
+                            self.semantic_pipeline_state(expected),
+                        )

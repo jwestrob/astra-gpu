@@ -149,7 +149,7 @@ def compare_compact_domains(
     hmm,
     sequences,
     options: dict,
-    expected_routes: tuple[int, int, int, int] | None,
+    expected_routes: tuple[int, int, int, int, int] | None,
     repetitions: int = 1,
 ) -> None:
     standard_pipeline = plan7.Pipeline(hmm.alphabet, **options)
@@ -384,7 +384,7 @@ def main() -> None:
         hmm,
         route_sequences,
         all_pass,
-        (1, 1, 0, 2),
+        (1, 1, 0, 2, 0),
     )
     compare_compact_domains(
         "external compact domains current options",
@@ -399,15 +399,89 @@ def main() -> None:
             "incT": -100.0,
             "incdomT": -100.0,
         },
-        (1, 1, 0, 2),
+        (1, 1, 0, 2, 0),
     )
     compare_compact_domains(
         "external compact domains fixed search spaces",
         hmm,
         route_sequences,
         {**all_pass, "Z": 123.0, "domZ": 17.0},
-        (1, 1, 0, 2),
+        (1, 1, 0, 2, 0),
     )
+
+    guard_sequence = None
+    guard_baseline = None
+    for sequence in route_sequences:
+        one_sequence = easel.DigitalSequenceBlock(hmm.alphabet, [sequence])
+        baseline = plan7.Pipeline(
+            hmm.alphabet, **all_pass,
+        ).search_hmm(hmm, one_sequence)
+        if not baseline:
+            continue
+        optimized = hmm.to_profile(
+            plan7.Background(hmm.alphabet),
+            L=400,
+        ).to_optimized()
+        _, routes = seam_probe.search_compact_domains(
+            plan7.Pipeline(hmm.alphabet, **all_pass),
+            hmm,
+            optimized,
+            one_sequence,
+        )
+        if routes[3] == 1:
+            guard_sequence = one_sequence
+            guard_baseline = baseline
+            break
+    assert guard_sequence is not None
+    assert guard_baseline is not None
+
+    target_guard_options = {
+        **all_pass,
+        "T": guard_baseline[0].score,
+    }
+    target_guard_standard = plan7.Pipeline(
+        hmm.alphabet, **target_guard_options,
+    ).search_hmm(hmm, guard_sequence)
+    optimized = hmm.to_profile(
+        plan7.Background(hmm.alphabet),
+        L=400,
+    ).to_optimized()
+    target_guard_resumed, routes = seam_probe.search_compact_domains(
+        plan7.Pipeline(hmm.alphabet, **target_guard_options),
+        hmm,
+        optimized,
+        guard_sequence,
+        0.002,
+    )
+    assert routes == (0, 0, 0, 0, 1)
+    assert tables(target_guard_standard) == tables(target_guard_resumed)
+    assert pipeline_state(target_guard_standard) == pipeline_state(
+        target_guard_resumed,
+    )
+
+    domain_guard_options = {
+        **all_pass,
+        "domE": guard_baseline[0].domains[0].i_evalue,
+    }
+    domain_guard_standard = plan7.Pipeline(
+        hmm.alphabet, **domain_guard_options,
+    ).search_hmm(hmm, guard_sequence)
+    optimized = hmm.to_profile(
+        plan7.Background(hmm.alphabet),
+        L=400,
+    ).to_optimized()
+    domain_guard_resumed, routes = seam_probe.search_compact_domains(
+        plan7.Pipeline(hmm.alphabet, **domain_guard_options),
+        hmm,
+        optimized,
+        guard_sequence,
+    )
+    assert routes == (0, 0, 0, 0, 1)
+    assert tables(domain_guard_standard) == tables(domain_guard_resumed)
+    assert pipeline_state(domain_guard_standard) == pipeline_state(
+        domain_guard_resumed,
+    )
+
     compact_fixture = easel.DigitalSequenceBlock(
         hmm.alphabet,
         [all_sequences[index] for index in range(80)],
@@ -441,7 +515,7 @@ def main() -> None:
         hmm,
         multidomain_fixture,
         multidomain_options,
-        (0, 0, 0, 1),
+        (0, 0, 0, 1, 0),
     )
     invalid_sequence = easel.DigitalSequenceBlock(
         hmm.alphabet,
@@ -475,7 +549,7 @@ def main() -> None:
     assert status == seam_probe.GPU_VITERBI_OK
     assert changed
 
-    for corruption in range(41):
+    for corruption in (*range(41), *range(42, 47)):
         optimized = hmm.to_profile(
             plan7.Background(hmm.alphabet),
             L=400,
@@ -489,6 +563,20 @@ def main() -> None:
         )
         assert status == seam_probe.HMMER_EINVAL, corruption
         assert not changed, corruption
+    for adjacency in range(47, 57):
+        optimized = hmm.to_profile(
+            plan7.Background(hmm.alphabet),
+            L=400,
+        ).to_optimized()
+        status, changed = seam_probe.invalid_compact_domains_status(
+            plan7.Pipeline(hmm.alphabet, **all_pass),
+            hmm,
+            optimized,
+            invalid_sequence,
+            adjacency,
+        )
+        assert status == seam_probe.HMMER_EINACCURATE, adjacency
+        assert not changed, adjacency
     optimized = hmm.to_profile(
         plan7.Background(hmm.alphabet),
         L=400,

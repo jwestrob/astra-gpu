@@ -67,10 +67,20 @@ for symbol in \
   p7_PipelineFromFilterScores \
   p7_PipelineFromFilterAndForwardScores \
   p7_PipelineFromFilterAndForwardSimpleRegions \
-  p7_PipelineFromFilterForwardAndCompactDomains \
-  p7_pipeline_CompactTailFingerprint; do
+  p7_PipelineFromFilterForwardAndCompactDomainsV2 \
+  p7_pipeline_CompactTailFingerprintV2 \
+  p7_domaindef_ByExternalCompactDomainsV2; do
   if ! rg -q "[[:space:]]${symbol}$" <<<"$defined_symbols"; then
     echo "patched HMMER library is missing $symbol" >&2
+    exit 1
+  fi
+done
+for legacy_symbol in \
+  p7_PipelineFromFilterForwardAndCompactDomains \
+  p7_pipeline_CompactTailFingerprint \
+  p7_domaindef_ByExternalCompactDomains; do
+  if rg -q "[[:space:]]${legacy_symbol}$" <<<"$defined_symbols"; then
+    echo "patched HMMER library unexpectedly exports legacy ABI $legacy_symbol" >&2
     exit 1
   fi
 done
@@ -88,7 +98,7 @@ print(package.parent / "pyhmmer.libs" / "liblibhmmer.so")
 PY
 )
 if nm -D --defined-only "$stock_library" | \
-    rg -q '[[:space:]]p7_PipelineFromFilter(AndForwardSimpleRegions|ForwardAndCompactDomains)$'; then
+    rg -q '[[:space:]]p7_PipelineFromFilter(AndForwardSimpleRegions|ForwardAndCompactDomains(V[0-9]+)?)$'; then
   echo "stock HMMER unexpectedly exports a private domain seam" >&2
   exit 1
 fi

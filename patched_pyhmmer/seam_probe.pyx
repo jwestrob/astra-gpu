@@ -4,10 +4,19 @@ from libc.stddef cimport size_t
 from libc.stdint cimport uint8_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcmp, memcpy, memset
-from libc.math cimport fabsf, logf
+from libc.math cimport exp, fabsf, log, logf
 
-from libeasel cimport eslEINVAL, eslEMEM, eslENORESULT, eslERANGE, eslOK
+from libeasel cimport (
+    eslCONST_LOG2,
+    eslEINACCURATE,
+    eslEINVAL,
+    eslEMEM,
+    eslENORESULT,
+    eslERANGE,
+    eslOK,
+)
 from libeasel.sq cimport ESL_SQ
+from libhmmer cimport p7_FLAMBDA, p7_FTAU
 from libhmmer.impl_sse cimport p7_MSVFilter
 from libhmmer.impl.p7_omx cimport P7_OMX, p7_omx_GrowTo
 from libhmmer.impl.p7_oprofile cimport (
@@ -21,8 +30,10 @@ from libhmmer.p7_domain cimport P7_DOMAIN
 from libhmmer.p7_bg cimport (
     P7_BG,
     p7_bg_FilterScore,
+    p7_bg_NullOne,
     p7_bg_SetLength,
 )
+from libhmmer.logsum cimport p7_FLogsum
 from libhmmer.p7_pipeline cimport (
     P7_PIPELINE,
     P7_PIPELINE_COMPACT_DOMAIN,
@@ -33,15 +44,18 @@ from libhmmer.p7_pipeline cimport (
     p7_DOMAIN_NO_REGIONS,
     p7_DOMAIN_SIMPLE,
     p7_SEARCH_SEQS,
+    p7_ZSETBY_NTARGETS,
+    p7_ZSETBY_OPTION,
     p7_VIT_CPU,
     p7_VIT_EXTERNAL,
     p7_VIT_NONE,
+    p7_Pipeline,
     p7_PipelineFromMSV,
     p7_PipelineFromFilterScores,
     p7_PipelineFromFilterAndForwardScores,
     p7_PipelineFromFilterAndForwardSimpleRegions,
-    p7_PipelineFromFilterForwardAndCompactDomains,
-    p7_pipeline_CompactTailFingerprint,
+    p7_PipelineFromFilterForwardAndCompactDomainsV2,
+    p7_pipeline_CompactTailFingerprintV2,
     p7_pipeline_Reuse,
     p7_pipeline_domain_route_e,
     p7_pipeline_vitmode_e,
@@ -65,6 +79,10 @@ cdef extern from "fenv.h" nogil:
     int fesetround(int round)
 
 
+cdef extern from "esl_exponential.h" nogil:
+    double esl_exp_logsurv(double x, double mu, double lambda_)
+
+
 cdef enum:
     GPU_VITERBI_NOT_RUN_C = -1
     FORWARD_SPECIAL_CELLS = 6
@@ -74,6 +92,7 @@ GPU_VITERBI_OK = eslOK
 GPU_VITERBI_ERANGE = eslERANGE
 GPU_VITERBI_ENORESULT = eslENORESULT
 HMMER_EINVAL = eslEINVAL
+HMMER_EINACCURATE = eslEINACCURATE
 
 
 cdef extern from "impl_sse/impl_sse.h" nogil:
@@ -705,6 +724,7 @@ cdef int _loop_compact_domains(
     size_t n_targets,
     P7_TOPHITS* th,
     uint64_t* route_counts,
+    float compact_fwd_delta,
 ) noexcept nogil:
     cdef P7_PIPELINE_SIMPLE_REGION* regions = NULL
     cdef P7_PIPELINE_COMPACT_DOMAIN* domains = NULL
@@ -734,6 +754,7 @@ cdef int _loop_compact_domains(
     route_counts[1] = 0
     route_counts[2] = 0
     route_counts[3] = 0
+    route_counts[4] = 0
     status = p7_pli_NewModel(pli, om, bg)
     if status == eslOK:
         for t in range(n_targets):
@@ -797,6 +818,8 @@ cdef int _loop_compact_domains(
                 )
                 route_counts[1] += 1
             else:
+                xmx_count = <uint64_t> (sq[t].n + 1) * FORWARD_SPECIAL_CELLS
+                forward_xmx = <float*> malloc(xmx_count * sizeof(float))
                 trace_capacity = (
                     <uint64_t> sq[t].n
                     + region_count * (<uint64_t> om.M + 6)
@@ -814,11 +837,12 @@ cdef int _loop_compact_domains(
                     trace_capacity * sizeof(P7_PIPELINE_COMPACT_TRACE_STEP)
                 )
                 if (
-                    domains == NULL or null2 == NULL
+                    forward_xmx == NULL or domains == NULL or null2 == NULL
                     or trace_offsets == NULL or traces == NULL
                 ):
                     status = eslEMEM
                     break
+                memcpy(forward_xmx, pli.oxf.xmx, xmx_count * sizeof(float))
                 status = _build_compact_domains(
                     pli, om, sq[t], regions, region_count,
                     <uint32_t> t, 0, <uint32_t> t,
@@ -828,19 +852,26 @@ cdef int _loop_compact_domains(
                 if status != eslOK:
                     break
                 generation_tail_fingerprint = (
-                    p7_pipeline_CompactTailFingerprint(pli)
+                    p7_pipeline_CompactTailFingerprintV2(pli)
                 )
-                status = p7_PipelineFromFilterForwardAndCompactDomains(
+                status = p7_PipelineFromFilterForwardAndCompactDomainsV2(
                     pli, om, bg, sq[t], NULL, th,
-                    usc, filtersc, vfsc, fwdsc,
+                    usc, filtersc, vfsc, fwdsc + compact_fwd_delta,
                     generation_tail_fingerprint,
+                    <uint64_t> n_targets,
                     <uint32_t> t, 0, <uint32_t> t, nexpected,
                     domains, region_count,
                     trace_offsets, region_count + 1,
                     traces, trace_count,
                     null2, region_count * p7_COMPACT_NULL2_COUNT,
                 )
-                route_counts[3] += 1
+                if status == eslEINACCURATE:
+                    status = p7_Pipeline(
+                        pli, om, bg, sq[t], NULL, th,
+                    )
+                    route_counts[4] += 1
+                else:
+                    route_counts[3] += 1
 
             free(forward_xmx)
             forward_xmx = NULL
@@ -1264,6 +1295,7 @@ cdef int _invalid_compact_domains(
     cdef size_t dcl_size
     cdef size_t snapshot_size
     cdef uint64_t generation_tail_fingerprint
+    cdef uint64_t final_target_count = 1
     cdef uint64_t trace_capacity
     cdef uint64_t trace_count
     cdef uint64_t trace_offset_count = 2
@@ -1271,8 +1303,20 @@ cdef int _invalid_compact_domains(
     cdef uint64_t supplied_null2_count = 29
     cdef float filtersc
     cdef float fwdsc
+    cdef float nullsc
+    cdef float sequence_correction
+    cdef float sequence_compensation
+    cdef float target_score
+    cdef float domain_score
+    cdef float reconstruction_score
+    cdef float bias
+    cdef float value
+    cdef float y
+    cdef float sum_next
     cdef float usc
     cdef float vfsc
+    cdef double target_probability
+    cdef double domain_probability
     cdef int first_match = -1
     cdef int original_rounding = -1
     cdef int status
@@ -1326,7 +1370,7 @@ cdef int _invalid_compact_domains(
         free(traces)
         return status
     supplied_trace_count = trace_count
-    generation_tail_fingerprint = p7_pipeline_CompactTailFingerprint(pli)
+    generation_tail_fingerprint = p7_pipeline_CompactTailFingerprintV2(pli)
     for z in range(<int> trace_count):
         if traces[z].state == p7T_M:
             first_match = z
@@ -1431,6 +1475,137 @@ cdef int _invalid_compact_domains(
         supplied_null2_count -= 1
     elif corruption == 40:
         domain.oa_score += 0.01
+    elif corruption == 42:
+        final_target_count = 0
+    elif corruption == 43:
+        final_target_count = 9007199254740993
+    elif corruption == 44:
+        final_target_count = 2
+        pli.Z = 1.5
+        generation_tail_fingerprint = (
+            p7_pipeline_CompactTailFingerprintV2(pli)
+        )
+    elif corruption == 45:
+        pli.Z = 0.0
+        generation_tail_fingerprint = (
+            p7_pipeline_CompactTailFingerprintV2(pli)
+        )
+    elif corruption == 46:
+        pli.Z = 2.0
+        generation_tail_fingerprint = (
+            p7_pipeline_CompactTailFingerprintV2(pli)
+        )
+    elif 47 <= corruption <= 56:
+        status = p7_bg_NullOne(bg, sq.dsq, sq.n, &nullsc)
+        if status != eslOK:
+            free(traces)
+            return status
+
+        sequence_correction = 0.0
+        sequence_compensation = 0.0
+        for z in range(sq.n + 1):
+            value = 0.0 if z == 0 else logf(null2[sq.dsq[z]])
+            y = value - sequence_compensation
+            sum_next = sequence_correction + y
+            sequence_compensation = (
+                (sum_next-sequence_correction)-y
+            )
+            sequence_correction = sum_next
+
+        if pli.do_null2:
+            bias = p7_FLogsum(
+                0.0, log(bg.omega) + sequence_correction,
+            )
+        else:
+            bias = 0.0
+        target_score = (fwdsc - (nullsc + bias)) / eslCONST_LOG2
+
+        if (
+            (pli.do_null2 and
+             domain.forward_score-domain.domain_correction > 0.0)
+            or (not pli.do_null2 and domain.forward_score > 0.0)
+        ):
+            if pli.do_null2:
+                bias = p7_FLogsum(
+                    0.0, log(bg.omega) + domain.domain_correction,
+                )
+            else:
+                bias = 0.0
+            reconstruction_score = (
+                domain.forward_score - (nullsc + bias)
+            ) / eslCONST_LOG2
+            if reconstruction_score > target_score:
+                target_score = reconstruction_score
+
+        if pli.do_null2:
+            bias = p7_FLogsum(
+                0.0, log(bg.omega) + domain.domain_correction,
+            )
+        else:
+            bias = 0.0
+        domain_score = (
+            domain.forward_score - (nullsc + bias)
+        ) / eslCONST_LOG2
+        target_probability = exp(esl_exp_logsurv(
+            target_score,
+            om.evparam[<int> p7_FTAU],
+            om.evparam[<int> p7_FLAMBDA],
+        ))
+        domain_probability = exp(esl_exp_logsurv(
+            domain_score,
+            om.evparam[<int> p7_FTAU],
+            om.evparam[<int> p7_FLAMBDA],
+        ))
+
+        final_target_count = 7
+        pli.use_bit_cutoffs = 0
+        pli.by_E = False
+        pli.inc_by_E = False
+        pli.dom_by_E = False
+        pli.incdom_by_E = False
+        pli.T = -1.0e300
+        pli.incT = -1.0e300
+        pli.domT = -1.0e300
+        pli.incdomT = -1.0e300
+        if corruption == 47:
+            pli.T = target_score
+        elif corruption == 48:
+            pli.incT = target_score
+        elif corruption == 49:
+            pli.domT = domain_score
+        elif corruption == 50:
+            pli.incdomT = domain_score
+        elif corruption == 55:
+            pli.T = target_score + 0.001
+        else:
+            pli.by_E = True
+            pli.inc_by_E = True
+            pli.dom_by_E = True
+            pli.incdom_by_E = True
+            pli.E = 1.0e300
+            pli.incE = 1.0e300
+            pli.domE = 1.0e300
+            pli.incdomE = 1.0e300
+            if corruption == 51:
+                pli.Z_setby = p7_ZSETBY_NTARGETS
+                pli.E = target_probability * 7.0
+            elif corruption == 52:
+                pli.Z_setby = p7_ZSETBY_OPTION
+                pli.Z = 5.0
+                pli.incE = target_probability * 5.0
+            elif corruption == 53:
+                pli.domZ_setby = p7_ZSETBY_NTARGETS
+                pli.domE = domain_probability * 3.0
+            elif corruption == 54:
+                pli.domZ_setby = p7_ZSETBY_OPTION
+                pli.domZ = 5.0
+                pli.incdomE = domain_probability * 5.0
+            else:
+                pli.domZ_setby = p7_ZSETBY_NTARGETS
+                pli.domE = domain_probability * 3.0 * (1.0 + 1.0e-6)
+        generation_tail_fingerprint = (
+            p7_pipeline_CompactTailFingerprintV2(pli)
+        )
     elif corruption != 41:
         free(traces)
         return eslEINVAL
@@ -1473,10 +1648,11 @@ cdef int _invalid_compact_domains(
     offset += n2sc_size
     memcpy(snapshot + offset, pli.ddef.dcl, dcl_size)
 
-    status = p7_PipelineFromFilterForwardAndCompactDomains(
+    status = p7_PipelineFromFilterForwardAndCompactDomainsV2(
         pli, om, bg, sq, NULL, th,
         usc, filtersc, vfsc, fwdsc,
         generation_tail_fingerprint,
+        final_target_count,
         0, 0, 0, 1.0,
         &domain, 1,
         trace_offsets, trace_offset_count,
@@ -1663,10 +1839,11 @@ def search_compact_domains(
     HMM query,
     OptimizedProfile optimized_profile,
     DigitalSequenceBlock sequences,
+    float compact_fwd_delta=0.0,
 ):
     """Exercise compact-domain continuation with a pristine CPU oracle."""
     cdef TopHits hits = TopHits(query)
-    cdef uint64_t route_counts[4]
+    cdef uint64_t route_counts[5]
     cdef int status
 
     with nogil:
@@ -1680,6 +1857,7 @@ def search_compact_domains(
             sequences._length,
             hits._th,
             route_counts,
+            compact_fwd_delta,
         )
         if status == eslOK:
             hits._sort_by_key()
@@ -1690,7 +1868,7 @@ def search_compact_domains(
     hits._empty = False
     return hits, (
         route_counts[0], route_counts[1],
-        route_counts[2], route_counts[3],
+        route_counts[2], route_counts[3], route_counts[4],
     )
 
 

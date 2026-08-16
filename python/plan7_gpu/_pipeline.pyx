@@ -25,7 +25,14 @@ from cpython.pycapsule cimport (
 )
 from cpython.pyport cimport PY_SSIZE_T_MAX
 
-from libeasel cimport eslCONST_LOG2, eslERRBUFSIZE, eslEINVAL, eslERANGE, eslOK
+from libeasel cimport (
+    eslCONST_LOG2,
+    eslERRBUFSIZE,
+    eslEINACCURATE,
+    eslEINVAL,
+    eslERANGE,
+    eslOK,
+)
 from libeasel.sq cimport ESL_SQ
 from libhmmer cimport p7_MLAMBDA, p7_MMU, p7_VLAMBDA, p7_VMU
 from libhmmer.impl.p7_oprofile cimport (
@@ -85,6 +92,25 @@ cdef extern from "continuation_journal.h":
         PLAN7_CONTINUATION_JOURNAL_MAGIC
         PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
 
+    cdef enum plan7_domain_rescore_abi:
+        PLAN7_DOMAIN_RESCORE_RECORD_VERSION
+        PLAN7_DOMAIN_RESCORE_RECORD_SIZE
+        PLAN7_DOMAIN_RESCORE_TRACE_STEP_SIZE
+        PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+        PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES
+        PLAN7_DOMAIN_RESCORE_MAX_TRACE_BYTES
+
+    cdef enum plan7_domain_rescore_action:
+        PLAN7_DOMAIN_RESCORE_CPU_REQUIRED
+        PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+
+    cdef enum plan7_domain_rescore_status:
+        PLAN7_DOMAIN_RESCORE_OK
+        PLAN7_DOMAIN_RESCORE_ERANGE
+        PLAN7_DOMAIN_RESCORE_ENORESULT
+        PLAN7_DOMAIN_RESCORE_ECAP
+        PLAN7_DOMAIN_RESCORE_EMPTY
+
     ctypedef struct plan7_forward_provenance:
         uint64_t database_generation
         uint64_t batch_generation
@@ -103,6 +129,48 @@ cdef extern from "continuation_journal.h":
         uint64_t region_hash
         uint64_t candidate_count
         uint64_t region_count
+
+    ctypedef struct plan7_domain_rescore_result:
+        uint32_t row_index
+        uint32_t profile_index
+        uint32_t sequence_index
+        uint32_t envelope_begin
+        uint32_t envelope_end
+        uint32_t alignment_begin
+        uint32_t alignment_end
+        uint32_t model_begin
+        uint32_t model_end
+        float forward_score
+        float backward_score
+        float oa_score
+        float domain_correction
+        float score_consistency
+        uint8_t status
+        uint8_t action
+        uint8_t has_own_scales
+        uint8_t reserved
+        uint32_t reserved2
+
+    ctypedef struct plan7_domain_rescore_trace_step:
+        uint32_t sequence_position
+        uint32_t model_position
+        float posterior
+        uint8_t state
+        uint8_t reserved[3]
+
+    ctypedef struct plan7_domain_rescore_provenance:
+        plan7_backward_domain_provenance backward
+        uint64_t result_hash
+        uint64_t trace_hash
+        uint64_t null2_hash
+        uint64_t result_count
+        uint64_t trace_count
+        uint64_t null2_count
+
+    cdef enum plan7_continuation_compact_route:
+        PLAN7_CONTINUATION_COMPACT_NONE
+        PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+        PLAN7_CONTINUATION_COMPACT_DEVICE
 
     ctypedef struct plan7_simple_region:
         uint32_t begin
@@ -128,6 +196,10 @@ cdef extern from "continuation_journal.h":
         uint8_t domain_route
         uint8_t has_own_scales
         uint8_t reserved
+        uint32_t compact_result_count
+        uint8_t compact_route
+        uint8_t reserved2[3]
+        uint32_t reserved3
 
     ctypedef struct plan7_continuation_journal:
         uint32_t magic
@@ -135,6 +207,9 @@ cdef extern from "continuation_journal.h":
         uint16_t header_size
         uint32_t row_size
         uint32_t region_size
+        uint32_t compact_result_size
+        uint32_t compact_trace_step_size
+        uint32_t compact_null2_stride
         uint64_t total_bytes
         uint64_t session_id
         uint64_t selection_id
@@ -144,6 +219,19 @@ cdef extern from "continuation_journal.h":
         uint64_t row_count
         uint64_t special_count
         uint64_t region_count
+        uint64_t compact_result_count
+        uint64_t compact_trace_offset_count
+        uint64_t compact_trace_count
+        uint64_t compact_null2_count
+        uint64_t generation_tail_fingerprint
+        uint64_t rescore_simple_row_count
+        uint64_t rescore_device_result_count
+        uint64_t rescore_cpu_required_count
+        uint64_t rescore_numeric_fallback_count
+        uint64_t rescore_cap_fallback_count
+        uint64_t rescore_global_cpu_fallback_count
+        uint64_t rescore_compact_output_byte_limit
+        uint64_t rescore_compact_output_bytes
         uint64_t generation_f1_bits
         uint64_t generation_f2_bits
         uint64_t generation_f3_bits
@@ -152,6 +240,8 @@ cdef extern from "continuation_journal.h":
         uint32_t rt3_bits
         uint32_t guard_band_bits
         uint8_t generation_bias_filter
+        uint8_t generation_compact_domains
+        uint8_t compact_global_fallback
         uint8_t sequence_content_fingerprint[32]
         uint64_t postfilter_offsets_offset
         uint64_t postfilter_records_offset
@@ -166,12 +256,31 @@ cdef extern from "continuation_journal.h":
         uint64_t specials_offset
         uint64_t region_offsets_offset
         uint64_t regions_offset
+        uint64_t compact_row_offsets_offset
+        uint64_t compact_results_offset
+        uint64_t compact_trace_offsets_offset
+        uint64_t compact_traces_offset
+        uint64_t compact_null2_offset
         plan7_forward_provenance forward
         plan7_backward_domain_provenance backward
+        plan7_domain_rescore_provenance rescore
         uint64_t integrity_tag
 
     uint64_t plan7_continuation_journal_integrity(
         const plan7_continuation_journal *journal,
+    ) nogil
+
+    int plan7_continuation_journal_rescore_hashes(
+        const plan7_domain_rescore_result *results,
+        uint64_t result_count,
+        const uint64_t *trace_offsets,
+        const plan7_domain_rescore_trace_step *traces,
+        uint64_t trace_count,
+        const float *null2,
+        uint64_t null2_count,
+        uint64_t *result_hash_out,
+        uint64_t *trace_hash_out,
+        uint64_t *null2_hash_out,
     ) nogil
 
 
@@ -300,6 +409,37 @@ ctypedef int (*_pipeline_from_filter_and_forward_simple_regions_f)(
     uint64_t,
 ) noexcept nogil
 
+ctypedef uint64_t (*_pipeline_compact_tail_fingerprint_f)(
+    const P7_PIPELINE*,
+) noexcept nogil
+
+ctypedef int (*_pipeline_from_filter_forward_compact_domains_f)(
+    P7_PIPELINE*,
+    P7_OPROFILE*,
+    P7_BG*,
+    const ESL_SQ*,
+    const ESL_SQ*,
+    P7_TOPHITS*,
+    float,
+    float,
+    float,
+    float,
+    uint64_t,
+    uint64_t,
+    uint32_t,
+    uint32_t,
+    uint32_t,
+    float,
+    const plan7_domain_rescore_result*,
+    uint64_t,
+    const uint64_t*,
+    uint64_t,
+    const plan7_domain_rescore_trace_step*,
+    uint64_t,
+    const float*,
+    uint64_t,
+) noexcept nogil
+
 
 cdef union _float_bits:
     float value
@@ -363,15 +503,29 @@ cdef class _SealedPostfilterBatch:
     cdef const uint8_t[::1] _journal_rows
     cdef const uint64_t[::1] _journal_region_offsets
     cdef const uint8_t[::1] _journal_regions
+    cdef const uint64_t[::1] _journal_compact_row_offsets
+    cdef const uint8_t[::1] _journal_compact_results
+    cdef const uint64_t[::1] _journal_compact_trace_offsets
+    cdef const uint8_t[::1] _journal_compact_traces
+    cdef const float[::1] _journal_compact_null2
     cdef double _f1
     cdef uint64_t _generation_f2_bits
     cdef uint64_t _generation_f3_bits
     cdef bint _generation_bias_filter
     cdef uint32_t _journal_guard_bits
+    cdef uint64_t _generation_tail_fingerprint
+    cdef uint64_t _rescore_simple_row_count
+    cdef uint64_t _rescore_device_result_count
+    cdef uint64_t _rescore_cpu_required_count
+    cdef uint64_t _rescore_numeric_fallback_count
+    cdef uint64_t _rescore_cap_fallback_count
+    cdef uint64_t _rescore_global_cpu_fallback_count
     cdef _pipeline_tail_snapshot _pipeline_options
     cdef _pipeline_from_filter_scores_f _filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam
     cdef _pipeline_from_filter_and_forward_simple_regions_f _simple_regions_seam
+    cdef _pipeline_compact_tail_fingerprint_f _compact_tail_fingerprint
+    cdef _pipeline_from_filter_forward_compact_domains_f _compact_domains_seam
 
     def __cinit__(self):
         self._ready = False
@@ -413,12 +567,16 @@ cdef class _ContinuationJournalStorage:
 cdef _pipeline_from_filter_scores_f _filter_scores_seam_cache = NULL
 cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam_cache = NULL
 cdef _pipeline_from_filter_and_forward_simple_regions_f _simple_regions_seam_cache = NULL
+cdef _pipeline_compact_tail_fingerprint_f _compact_tail_fingerprint_cache = NULL
+cdef _pipeline_from_filter_forward_compact_domains_f _compact_domains_seam_cache = NULL
 cdef bint _filter_scores_seam_resolved = False
 cdef bint _forward_scores_seam_resolved = False
 cdef bint _simple_regions_seam_resolved = False
+cdef bint _compact_domains_seam_resolved = False
 cdef bint _filter_scores_same_dso = False
 cdef bint _forward_scores_same_dso = False
 cdef bint _simple_regions_same_dso = False
+cdef bint _compact_domains_same_dso = False
 cdef uint64_t _filter_scores_resolutions = 0
 cdef uint64_t _forward_scores_resolutions = 0
 cdef uint64_t _filter_scores_dlopen_calls = 0
@@ -428,6 +586,9 @@ cdef uint64_t _forward_scores_dlclose_calls = 0
 cdef uint64_t _simple_regions_resolutions = 0
 cdef uint64_t _simple_regions_dlopen_calls = 0
 cdef uint64_t _simple_regions_dlclose_calls = 0
+cdef uint64_t _compact_domains_resolutions = 0
+cdef uint64_t _compact_domains_dlopen_calls = 0
+cdef uint64_t _compact_domains_dlclose_calls = 0
 
 _continuation_seam_resolve_lock = _Lock()
 cdef uint8_t _consumed_journal_sentinel = 0
@@ -634,6 +795,89 @@ def _simple_regions_seam_available():
     return _cached_simple_regions_seam() != NULL
 
 
+cdef void _resolve_compact_domain_seams() noexcept nogil:
+    global _compact_domains_dlopen_calls
+    global _compact_domains_dlclose_calls
+    global _compact_domains_same_dso
+    global _compact_domains_seam_cache
+    global _compact_tail_fingerprint_cache
+    cdef Dl_info info
+    cdef Dl_info domain_info
+    cdef Dl_info fingerprint_info
+    cdef void* handle
+    cdef void* domain_symbol
+    cdef void* fingerprint_symbol
+
+    if dladdr(<const void*> p7_Pipeline, &info) == 0 or info.dli_fname == NULL:
+        return
+    _compact_domains_dlopen_calls += 1
+    handle = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_NOW)
+    if handle == NULL:
+        return
+    domain_symbol = dlsym(
+        handle, "p7_PipelineFromFilterForwardAndCompactDomainsV2"
+    )
+    fingerprint_symbol = dlsym(
+        handle, "p7_pipeline_CompactTailFingerprintV2"
+    )
+    if (
+        domain_symbol == NULL
+        or fingerprint_symbol == NULL
+        or dladdr(domain_symbol, &domain_info) == 0
+        or dladdr(fingerprint_symbol, &fingerprint_info) == 0
+        or domain_info.dli_fbase != info.dli_fbase
+        or fingerprint_info.dli_fbase != info.dli_fbase
+    ):
+        _compact_domains_dlclose_calls += 1
+        dlclose(handle)
+        return
+    _compact_domains_same_dso = True
+    _compact_domains_seam_cache = (
+        <_pipeline_from_filter_forward_compact_domains_f> domain_symbol
+    )
+    _compact_tail_fingerprint_cache = (
+        <_pipeline_compact_tail_fingerprint_f> fingerprint_symbol
+    )
+    _compact_domains_dlclose_calls += 1
+    dlclose(handle)
+
+
+cdef _pipeline_from_filter_forward_compact_domains_f _cached_compact_domains_seam():
+    global _compact_domains_resolutions
+    global _compact_domains_seam_resolved
+
+    if not _compact_domains_seam_resolved:
+        with _continuation_seam_resolve_lock:
+            if not _compact_domains_seam_resolved:
+                _compact_domains_resolutions += 1
+                with nogil:
+                    _resolve_compact_domain_seams()
+                _compact_domains_seam_resolved = True
+    return _compact_domains_seam_cache
+
+
+def _compact_domains_seam_available():
+    """Return whether the same-DSO compact-domain seam pair is loaded."""
+    return (
+        _cached_compact_domains_seam() != NULL
+        and _compact_tail_fingerprint_cache != NULL
+    )
+
+
+def _compact_tail_fingerprint_bound(Pipeline pipeline):
+    """Capture the exact same-DSO compact-tail option fingerprint."""
+    cdef uint64_t fingerprint
+    if _cached_compact_domains_seam() == NULL:
+        raise RuntimeError("the private compact-domain seam is unavailable")
+    if _compact_tail_fingerprint_cache == NULL:
+        raise RuntimeError("the compact-tail fingerprint seam is unavailable")
+    with nogil:
+        fingerprint = _compact_tail_fingerprint_cache(pipeline._pli)
+    if fingerprint == 0:
+        raise ValueError("pipeline compact-tail options are invalid")
+    return fingerprint
+
+
 def _continuation_seam_cache_info():
     """Return private resolver state for concurrency and lifetime tests."""
     return {
@@ -660,6 +904,17 @@ def _continuation_seam_cache_info():
             "resolutions": _simple_regions_resolutions,
             "dlopen_calls": _simple_regions_dlopen_calls,
             "dlclose_calls": _simple_regions_dlclose_calls,
+        },
+        "compact_domains": {
+            "resolved": bool(_compact_domains_seam_resolved),
+            "available": (
+                _compact_domains_seam_cache != NULL
+                and _compact_tail_fingerprint_cache != NULL
+            ),
+            "same_dso": bool(_compact_domains_same_dso),
+            "resolutions": _compact_domains_resolutions,
+            "dlopen_calls": _compact_domains_dlopen_calls,
+            "dlclose_calls": _compact_domains_dlclose_calls,
         },
     }
 
@@ -1288,6 +1543,16 @@ cdef int _search_loop_postfilter_forward(
     uint64_t generation_f3_bits,
     int generation_bias_filter,
     _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam,
+    const uint64_t* journal_compact_row_offsets,
+    const uint8_t* journal_compact_result_bytes,
+    const uint64_t* compact_trace_offsets,
+    const uint8_t* compact_trace_bytes,
+    const float* compact_null2,
+    uint64_t journal_row_base,
+    uint64_t generation_tail_fingerprint,
+    _pipeline_compact_tail_fingerprint_f compact_tail_fingerprint,
+    _pipeline_from_filter_forward_compact_domains_f compact_domains_seam,
+    uint64_t* compact_rebased_offsets,
 ) except 1 nogil:
     cdef _postfilter_result postfilter
     cdef _forward_result forward
@@ -1304,11 +1569,30 @@ cdef int _search_loop_postfilter_forward(
     cdef bint has_forward
     cdef bint used_forward_seam
     cdef bint used_simple_regions_seam
+    cdef bint used_compact_domains_seam
+    cdef bint compact_generation_matches = False
     cdef bint has_journal
     cdef plan7_continuation_journal_row journal
     cdef const plan7_simple_region* regions = NULL
     cdef uint64_t region_start
     cdef uint64_t region_stop
+    cdef uint64_t compact_start
+    cdef uint64_t compact_stop
+    cdef uint64_t compact_count
+    cdef uint64_t compact_index
+    cdef uint64_t compact_trace_base
+    cdef uint64_t compact_trace_stop
+    cdef const plan7_domain_rescore_result* compact_domains = NULL
+    cdef const plan7_domain_rescore_trace_step* compact_traces = NULL
+    cdef const float* compact_row_null2 = NULL
+
+    if (
+        compact_tail_fingerprint != NULL
+        and compact_domains_seam != NULL
+        and generation_tail_fingerprint != 0
+        and compact_tail_fingerprint(pli) == generation_tail_fingerprint
+    ):
+        compact_generation_matches = True
 
     status = p7_pli_NewModel(pli, om, bg)
     if status == eslEINVAL:
@@ -1362,6 +1646,7 @@ cdef int _search_loop_postfilter_forward(
 
         used_forward_seam = False
         used_simple_regions_seam = False
+        used_compact_domains_seam = False
         if postfilter.action == BIAS_CPU_REQUIRED:
             status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
         elif isnan(postfilter.filtersc):
@@ -1393,27 +1678,124 @@ cdef int _search_loop_postfilter_forward(
                         journal_region_bytes
                         + region_start * sizeof(plan7_simple_region)
                     )
-                status = simple_regions_seam(
-                    pli,
-                    om,
-                    bg,
-                    sq[t],
-                    NULL,
-                    th,
-                    journal.usc,
-                    journal.filtersc,
-                    journal.vfsc,
-                    journal.fwdsc,
-                    generation_f1_bits,
-                    generation_f2_bits,
-                    generation_f3_bits,
-                    generation_bias_filter,
-                    journal.domain_route,
-                    journal.nexpected,
-                    regions,
-                    region_stop - region_start,
-                )
-                used_simple_regions_seam = True
+                compact_start = journal_compact_row_offsets[journal_cursor]
+                compact_stop = journal_compact_row_offsets[journal_cursor + 1]
+                compact_count = compact_stop - compact_start
+                if (
+                    journal.domain_route == DOMAIN_SIMPLE
+                    and journal.compact_route
+                    == PLAN7_CONTINUATION_COMPACT_DEVICE
+                    and compact_count != 0
+                    and compact_generation_matches
+                    and compact_rebased_offsets != NULL
+                ):
+                    compact_trace_base = compact_trace_offsets[compact_start]
+                    compact_trace_stop = compact_trace_offsets[compact_stop]
+                    for compact_index in range(compact_count + 1):
+                        compact_rebased_offsets[compact_index] = (
+                            compact_trace_offsets[
+                                compact_start + compact_index
+                            ]
+                            - compact_trace_base
+                        )
+                    compact_domains = (
+                        <const plan7_domain_rescore_result *> (
+                            journal_compact_result_bytes
+                            + compact_start
+                            * sizeof(plan7_domain_rescore_result)
+                        )
+                    )
+                    compact_traces = (
+                        <const plan7_domain_rescore_trace_step *> (
+                            compact_trace_bytes
+                            + compact_trace_base
+                            * sizeof(plan7_domain_rescore_trace_step)
+                        )
+                    )
+                    compact_row_null2 = (
+                        compact_null2
+                        + compact_start * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+                    )
+                    status = compact_domains_seam(
+                        pli,
+                        om,
+                        bg,
+                        sq[t],
+                        NULL,
+                        th,
+                        journal.usc,
+                        journal.filtersc,
+                        journal.vfsc,
+                        journal.fwdsc,
+                        generation_tail_fingerprint,
+                        n_targets,
+                        <uint32_t> (journal_row_base + journal_cursor),
+                        journal.profile_index,
+                        journal.sequence_index,
+                        journal.nexpected,
+                        compact_domains,
+                        compact_count,
+                        compact_rebased_offsets,
+                        compact_count + 1,
+                        compact_traces,
+                        compact_trace_stop - compact_trace_base,
+                        compact_row_null2,
+                        compact_count * PLAN7_DOMAIN_RESCORE_NULL2_COUNT,
+                    )
+                    used_compact_domains_seam = True
+                    if status == eslEINACCURATE:
+                        # The guard covers uncertainty in both the compact
+                        # domains and the upstream Forward score. Recompute
+                        # the entire native pipeline so the retry is exact.
+                        status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
+                        used_compact_domains_seam = False
+                    elif status == eslEINVAL:
+                        xmx_count = (
+                            special_offsets[forward_cursor + 1]
+                            - special_offsets[forward_cursor]
+                        )
+                        if xmx_count == 0:
+                            xmx = NULL
+                        else:
+                            xmx = specials + special_offsets[forward_cursor]
+                        status = forward_scores_seam(
+                            pli,
+                            om,
+                            bg,
+                            sq[t],
+                            NULL,
+                            th,
+                            usc,
+                            postfilter.filtersc,
+                            postfilter.vfsc,
+                            forward.fwdsc,
+                            xmx,
+                            xmx_count,
+                        )
+                        used_compact_domains_seam = False
+                        used_forward_seam = True
+                else:
+                    status = simple_regions_seam(
+                        pli,
+                        om,
+                        bg,
+                        sq[t],
+                        NULL,
+                        th,
+                        journal.usc,
+                        journal.filtersc,
+                        journal.vfsc,
+                        journal.fwdsc,
+                        generation_f1_bits,
+                        generation_f2_bits,
+                        generation_f3_bits,
+                        generation_bias_filter,
+                        journal.domain_route,
+                        journal.nexpected,
+                        regions,
+                        region_stop - region_start,
+                    )
+                    used_simple_regions_seam = True
             elif has_forward and forward.action != FORWARD_CPU_REQUIRED:
                 xmx_count = (
                     special_offsets[forward_cursor + 1]
@@ -1461,6 +1843,11 @@ cdef int _search_loop_postfilter_forward(
                 raise UnexpectedError(
                     status,
                     "p7_PipelineFromFilterAndForwardSimpleRegions",
+                )
+            elif used_compact_domains_seam:
+                raise UnexpectedError(
+                    status,
+                    "p7_PipelineFromFilterForwardAndCompactDomainsV2",
                 )
             elif used_forward_seam:
                 raise UnexpectedError(
@@ -1721,6 +2108,16 @@ cdef TopHits _search_postfilter_forward_validated(
             0,
             0,
             NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            0,
+            0,
+            NULL,
+            NULL,
+            NULL,
         )
         hits._sort_by_key()
         hits._threshold(pipeline)
@@ -1742,6 +2139,13 @@ cdef TopHits _search_postfilter_forward_journal_validated(
     const uint8_t[::1] journal_rows,
     const uint64_t[::1] journal_region_offsets,
     const uint8_t[::1] journal_regions,
+    const uint64_t[::1] journal_compact_row_offsets,
+    const uint8_t[::1] journal_compact_results,
+    const uint64_t[::1] journal_compact_trace_offsets,
+    const uint8_t[::1] journal_compact_traces,
+    const float[::1] journal_compact_null2,
+    uint64_t journal_row_base,
+    uint64_t generation_tail_fingerprint,
     const uint64_t* residue_offsets,
     uint64_t generation_f1_bits,
     uint64_t generation_f2_bits,
@@ -1750,12 +2154,19 @@ cdef TopHits _search_postfilter_forward_journal_validated(
     _pipeline_from_filter_scores_f filter_scores_seam,
     _pipeline_from_filter_and_forward_scores_f forward_scores_seam,
     _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam,
+    _pipeline_compact_tail_fingerprint_f compact_tail_fingerprint,
+    _pipeline_from_filter_forward_compact_domains_f compact_domains_seam,
 ):
     cdef const uint8_t* postfilter_ptr = NULL
     cdef const uint8_t* forward_ptr = NULL
     cdef const float* special_ptr = NULL
     cdef const uint8_t* journal_ptr = NULL
     cdef const uint8_t* region_ptr = NULL
+    cdef const uint8_t* compact_result_ptr = NULL
+    cdef const uint8_t* compact_trace_ptr = NULL
+    cdef const float* compact_null2_ptr = NULL
+    cdef uint64_t* compact_rebased_offsets = NULL
+    cdef size_t compact_profile_count
     cdef size_t postfilter_count = (
         <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
     )
@@ -1778,36 +2189,68 @@ cdef TopHits _search_postfilter_forward_journal_validated(
         journal_ptr = &journal_rows[0]
     if journal_regions.shape[0]:
         region_ptr = &journal_regions[0]
+    if journal_compact_results.shape[0]:
+        compact_result_ptr = &journal_compact_results[0]
+    if journal_compact_traces.shape[0]:
+        compact_trace_ptr = &journal_compact_traces[0]
+    if journal_compact_null2.shape[0]:
+        compact_null2_ptr = &journal_compact_null2[0]
+    compact_profile_count = <size_t> (
+        journal_compact_row_offsets[journal_count]
+        - journal_compact_row_offsets[0]
+    )
+    if compact_profile_count > (<size_t> -1) // sizeof(uint64_t) - 1:
+        raise OverflowError("compact trace-offset scratch size overflows")
+    compact_rebased_offsets = <uint64_t*> malloc(
+        (compact_profile_count + 1) * sizeof(uint64_t)
+    )
+    if compact_rebased_offsets == NULL:
+        raise MemoryError("compact trace-offset scratch allocation failed")
 
+    try:
+        with nogil:
+            pipeline._pli.mode = p7_SEARCH_SEQS
+            pipeline._pli.nseqs = 0
+            _search_loop_postfilter_forward(
+                pipeline._pli,
+                optimized_profile._om,
+                pipeline.background._bg,
+                <const ESL_SQ**> sequences._refs,
+                sequences._length,
+                postfilter_ptr,
+                postfilter_count,
+                forward_ptr,
+                forward_count,
+                &special_offsets[0],
+                special_ptr,
+                residue_offsets,
+                hits._th,
+                filter_scores_seam,
+                forward_scores_seam,
+                journal_ptr,
+                journal_count,
+                &journal_region_offsets[0],
+                region_ptr,
+                generation_f1_bits,
+                generation_f2_bits,
+                generation_f3_bits,
+                generation_bias_filter,
+                simple_regions_seam,
+                &journal_compact_row_offsets[0],
+                compact_result_ptr,
+                &journal_compact_trace_offsets[0],
+                compact_trace_ptr,
+                compact_null2_ptr,
+                journal_row_base,
+                generation_tail_fingerprint,
+                compact_tail_fingerprint,
+                compact_domains_seam,
+                compact_rebased_offsets,
+            )
+    finally:
+        free(compact_rebased_offsets)
+        compact_rebased_offsets = NULL
     with nogil:
-        pipeline._pli.mode = p7_SEARCH_SEQS
-        pipeline._pli.nseqs = 0
-        _search_loop_postfilter_forward(
-            pipeline._pli,
-            optimized_profile._om,
-            pipeline.background._bg,
-            <const ESL_SQ**> sequences._refs,
-            sequences._length,
-            postfilter_ptr,
-            postfilter_count,
-            forward_ptr,
-            forward_count,
-            &special_offsets[0],
-            special_ptr,
-            residue_offsets,
-            hits._th,
-            filter_scores_seam,
-            forward_scores_seam,
-            journal_ptr,
-            journal_count,
-            &journal_region_offsets[0],
-            region_ptr,
-            generation_f1_bits,
-            generation_f2_bits,
-            generation_f3_bits,
-            generation_bias_filter,
-            simple_regions_seam,
-        )
         hits._sort_by_key()
         hits._threshold(pipeline)
 
@@ -2391,6 +2834,7 @@ cdef tuple _consume_validate_continuation_journal(
     uint64_t generation_f2_bits,
     uint64_t generation_f3_bits,
     bint generation_bias_filter,
+    uint64_t expected_tail_fingerprint,
 ):
     cdef plan7_continuation_journal *journal
     cdef size_t cursor
@@ -2408,6 +2852,19 @@ cdef tuple _consume_validate_continuation_journal(
     cdef size_t region
     cdef size_t region_start
     cdef size_t region_stop
+    cdef size_t compact_start
+    cdef size_t compact_stop
+    cdef size_t compact_index
+    cdef size_t trace_start
+    cdef size_t trace_stop
+    cdef size_t simple_row_count = 0
+    cdef size_t device_result_count = 0
+    cdef size_t cpu_required_count = 0
+    cdef size_t compact_bytes
+    cdef size_t residue
+    cdef uint8_t compact_row_action
+    cdef uint8_t expected_compact_route
+    cdef float null2_value
     cdef uint32_t previous_sequence
     cdef uint32_t previous_end
     cdef uint32_t guard_bits
@@ -2415,6 +2872,7 @@ cdef tuple _consume_validate_continuation_journal(
     cdef _forward_result forward
     cdef plan7_continuation_journal_row journal_row
     cdef plan7_simple_region interval
+    cdef plan7_domain_rescore_result compact_result
     cdef OptimizedProfile optimized_profile
     cdef float computed_usc
     cdef _float_bits expected_float
@@ -2436,6 +2894,14 @@ cdef tuple _consume_validate_continuation_journal(
     cdef const uint64_t[::1] journal_special_offset_view
     cdef const uint64_t[::1] region_offset_view
     cdef const uint8_t[::1] region_view
+    cdef const uint64_t[::1] compact_row_offset_view
+    cdef const uint8_t[::1] compact_result_view
+    cdef const uint64_t[::1] compact_trace_offset_view
+    cdef const uint8_t[::1] compact_trace_view
+    cdef const float[::1] compact_null2_view
+    cdef uint64_t observed_result_hash = 0
+    cdef uint64_t observed_trace_hash = 0
+    cdef uint64_t observed_null2_hash = 0
 
     if not PyCapsule_IsValid(
         capsule, PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME
@@ -2452,6 +2918,12 @@ cdef tuple _consume_validate_continuation_journal(
         or journal.header_size != sizeof(plan7_continuation_journal)
         or journal.row_size != sizeof(plan7_continuation_journal_row)
         or journal.region_size != sizeof(plan7_simple_region)
+        or journal.compact_result_size
+        != sizeof(plan7_domain_rescore_result)
+        or journal.compact_trace_step_size
+        != sizeof(plan7_domain_rescore_trace_step)
+        or journal.compact_null2_stride
+        != PLAN7_DOMAIN_RESCORE_NULL2_COUNT
         or journal.total_bytes < sizeof(plan7_continuation_journal)
         or journal.total_bytes > <uint64_t> (<size_t> -1)
         or journal.total_bytes > <uint64_t> PY_SSIZE_T_MAX
@@ -2462,6 +2934,11 @@ cdef tuple _consume_validate_continuation_journal(
         or journal.row_count > <uint64_t> (<size_t> -1) - 1
         or journal.special_count > <uint64_t> (<size_t> -1)
         or journal.region_count > <uint64_t> (<size_t> -1)
+        or journal.compact_result_count > <uint64_t> (<size_t> -1) - 1
+        or journal.compact_trace_offset_count
+        > <uint64_t> (<size_t> -1)
+        or journal.compact_trace_count > <uint64_t> (<size_t> -1)
+        or journal.compact_null2_count > <uint64_t> (<size_t> -1)
     ):
         raise ValueError("continuation journal ABI header is invalid")
     cursor = sizeof(plan7_continuation_journal)
@@ -2518,6 +2995,28 @@ cdef tuple _consume_validate_continuation_journal(
         and _journal_expected_segment(
             &cursor, journal.regions_offset,
             journal.region_count, sizeof(plan7_simple_region),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_row_offsets_offset,
+            journal.row_count + 1, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_results_offset,
+            journal.compact_result_count,
+            sizeof(plan7_domain_rescore_result),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_trace_offsets_offset,
+            journal.compact_trace_offset_count, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_traces_offset,
+            journal.compact_trace_count,
+            sizeof(plan7_domain_rescore_trace_step),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_null2_offset,
+            journal.compact_null2_count, sizeof(float),
         )
         and cursor == <size_t> journal.total_bytes
     ):
@@ -2593,6 +3092,75 @@ cdef tuple _consume_validate_continuation_journal(
         ) != 0
     ):
         raise ValueError("continuation journal native provenance differs")
+    if journal.generation_compact_domains > 1:
+        raise ValueError("continuation journal compact-domain flag is invalid")
+    if not journal.generation_compact_domains:
+        if (
+            journal.generation_tail_fingerprint != 0
+            or journal.compact_result_count != 0
+            or journal.compact_trace_offset_count != 1
+            or journal.compact_trace_count != 0
+            or journal.compact_null2_count != 0
+            or journal.rescore_simple_row_count != 0
+            or journal.rescore_device_result_count != 0
+            or journal.rescore_cpu_required_count != 0
+            or journal.rescore_numeric_fallback_count != 0
+            or journal.rescore_cap_fallback_count != 0
+            or journal.rescore_global_cpu_fallback_count != 0
+            or journal.rescore_compact_output_byte_limit != 0
+            or journal.rescore_compact_output_bytes != 0
+            or journal.compact_global_fallback != 0
+            or journal.rescore.result_hash != 0
+            or journal.rescore.trace_hash != 0
+            or journal.rescore.null2_hash != 0
+            or journal.rescore.result_count != 0
+            or journal.rescore.trace_count != 0
+            or journal.rescore.null2_count != 0
+        ):
+            raise ValueError("disabled compact-domain journal carries output")
+    elif (
+        journal.generation_tail_fingerprint == 0
+        or expected_tail_fingerprint == 0
+        or journal.generation_tail_fingerprint != expected_tail_fingerprint
+        or journal.compact_trace_offset_count
+        != journal.compact_result_count + 1
+        or journal.compact_global_fallback > 1
+        or memcmp(
+            &journal.rescore.backward,
+            &journal.backward,
+            sizeof(plan7_backward_domain_provenance),
+        ) != 0
+        or journal.rescore.result_count != journal.compact_result_count
+        or journal.rescore.trace_count != journal.compact_trace_count
+        or journal.rescore.null2_count != journal.compact_null2_count
+        or journal.rescore_simple_row_count > journal.row_count
+        or journal.rescore_device_result_count
+        + journal.rescore_cpu_required_count != journal.region_count
+        or journal.rescore_numeric_fallback_count
+        + journal.rescore_cap_fallback_count
+        != journal.rescore_cpu_required_count
+        or journal.rescore_global_cpu_fallback_count
+        not in (0, journal.region_count)
+        or bool(journal.compact_global_fallback)
+        != (journal.rescore_global_cpu_fallback_count != 0)
+        or journal.rescore_compact_output_byte_limit < sizeof(uint64_t)
+        or journal.rescore_compact_output_byte_limit
+        > PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES
+        or journal.rescore_compact_output_bytes
+        > journal.rescore_compact_output_byte_limit
+        or journal.compact_result_count
+        > PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES
+        // sizeof(plan7_domain_rescore_result)
+        or journal.compact_trace_count
+        > PLAN7_DOMAIN_RESCORE_MAX_TRACE_BYTES
+        // sizeof(plan7_domain_rescore_trace_step)
+        or journal.compact_result_count
+        > (<uint64_t> -1) // PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+        or journal.compact_null2_count
+        != journal.compact_result_count * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+        or journal.compact_result_count not in (0, journal.region_count)
+    ):
+        raise ValueError("continuation journal compact provenance differs")
 
     storage = _ContinuationJournalStorage.__new__(_ContinuationJournalStorage)
     storage._data = <uint8_t *> journal
@@ -2661,6 +3229,33 @@ cdef tuple _consume_validate_continuation_journal(
         journal.regions_offset
         + <size_t> journal.region_count * sizeof(plan7_simple_region)
     ]
+    compact_row_offset_view = storage_view[
+        journal.compact_row_offsets_offset:
+        journal.compact_row_offsets_offset
+        + (<size_t> journal.row_count + 1) * sizeof(uint64_t)
+    ].cast("Q")
+    compact_result_view = storage_view[
+        journal.compact_results_offset:
+        journal.compact_results_offset
+        + <size_t> journal.compact_result_count
+        * sizeof(plan7_domain_rescore_result)
+    ]
+    compact_trace_offset_view = storage_view[
+        journal.compact_trace_offsets_offset:
+        journal.compact_trace_offsets_offset
+        + <size_t> journal.compact_trace_offset_count * sizeof(uint64_t)
+    ].cast("Q")
+    compact_trace_view = storage_view[
+        journal.compact_traces_offset:
+        journal.compact_traces_offset
+        + <size_t> journal.compact_trace_count
+        * sizeof(plan7_domain_rescore_trace_step)
+    ]
+    compact_null2_view = storage_view[
+        journal.compact_null2_offset:
+        journal.compact_null2_offset
+        + <size_t> journal.compact_null2_count * sizeof(float)
+    ].cast("f")
 
     if (
         postfilter_offset_view[0] != 0
@@ -2689,6 +3284,73 @@ cdef tuple _consume_validate_continuation_journal(
         region_offset_view[journal.row_count] != journal.region_count
     ):
         raise ValueError("continuation journal region offsets do not span storage")
+    if compact_row_offset_view[0] != 0 or (
+        compact_row_offset_view[journal.row_count]
+        != journal.compact_result_count
+    ):
+        raise ValueError("continuation journal compact rows do not span storage")
+    if compact_trace_offset_view[0] != 0 or (
+        compact_trace_offset_view[journal.compact_trace_offset_count - 1]
+        != journal.compact_trace_count
+    ):
+        raise ValueError("continuation journal compact traces do not span storage")
+    if journal.generation_compact_domains:
+        compact_bytes = (
+            <size_t> journal.compact_result_count
+            * sizeof(plan7_domain_rescore_result)
+            + (<size_t> journal.compact_result_count + 1) * sizeof(uint64_t)
+            + <size_t> journal.compact_trace_count
+            * sizeof(plan7_domain_rescore_trace_step)
+            + <size_t> journal.compact_null2_count * sizeof(float)
+        )
+        if compact_bytes != journal.rescore_compact_output_bytes:
+            raise ValueError("continuation journal compact byte count differs")
+        if not plan7_continuation_journal_rescore_hashes(
+            (
+                <const plan7_domain_rescore_result *> &compact_result_view[0]
+                if journal.compact_result_count
+                else NULL
+            ),
+            journal.compact_result_count,
+            &compact_trace_offset_view[0],
+            (
+                <const plan7_domain_rescore_trace_step *> &compact_trace_view[0]
+                if journal.compact_trace_count
+                else NULL
+            ),
+            journal.compact_trace_count,
+            &compact_null2_view[0] if journal.compact_null2_count else NULL,
+            journal.compact_null2_count,
+            &observed_result_hash,
+            &observed_trace_hash,
+            &observed_null2_hash,
+        ):
+            raise ValueError("continuation journal compact hashes are invalid")
+        if (
+            observed_result_hash != journal.rescore.result_hash
+            or observed_trace_hash != journal.rescore.trace_hash
+            or observed_null2_hash != journal.rescore.null2_hash
+        ):
+            raise ValueError("continuation journal compact hashes differ")
+        if journal.compact_result_count == 0:
+            if (
+                journal.compact_trace_count != 0
+                or journal.rescore_device_result_count != 0
+                or journal.rescore_cpu_required_count != journal.region_count
+                or journal.rescore_global_cpu_fallback_count
+                != journal.region_count
+            ):
+                raise ValueError(
+                    "continuation journal global compact fallback differs"
+                )
+        elif journal.rescore_global_cpu_fallback_count != 0:
+            raise ValueError("continuation journal compact fallback differs")
+    else:
+        for row in range(<size_t> journal.row_count + 1):
+            if compact_row_offset_view[row] != 0:
+                raise ValueError("disabled compact journal has row offsets")
+        if compact_trace_offset_view[0] != 0:
+            raise ValueError("disabled compact journal has trace offsets")
     for profile in range(profile_count):
         if (
             identity_token_view[profile] == 0
@@ -2809,6 +3471,15 @@ cdef tuple _consume_validate_continuation_journal(
                     DOMAIN_CPU_REQUIRED, DOMAIN_NO_REGIONS, DOMAIN_SIMPLE
                 )
                 or journal_row.has_own_scales > 1
+                or journal_row.compact_route not in (
+                    PLAN7_CONTINUATION_COMPACT_NONE,
+                    PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED,
+                    PLAN7_CONTINUATION_COMPACT_DEVICE,
+                )
+                or journal_row.reserved2[0] != 0
+                or journal_row.reserved2[1] != 0
+                or journal_row.reserved2[2] != 0
+                or journal_row.reserved3 != 0
             ):
                 raise ValueError("continuation journal domain record is invalid")
             if journal_row.domain_route == DOMAIN_CPU_REQUIRED:
@@ -2817,7 +3488,6 @@ cdef tuple _consume_validate_continuation_journal(
             else:
                 if (
                     journal_row.domain_status != DOMAIN_OK
-                    or journal_row.has_own_scales
                     or journal_row.uncertain_count != 0
                     or journal_row.multidomain_count != 0
                     or not isfinite(journal_row.backward_score)
@@ -2826,7 +3496,7 @@ cdef tuple _consume_validate_continuation_journal(
                     or journal_row.nexpected
                     > <float> sequences._refs[journal_row.sequence_index].n
                 ):
-                    raise ValueError("device domain route is not continuation-safe")
+                    raise ValueError("domain route is not continuation-safe")
                 if journal_row.domain_route == DOMAIN_NO_REGIONS:
                     if journal_row.region_count != 0 or region_start != region_stop:
                         raise ValueError("no-region route carries intervals")
@@ -2852,10 +3522,169 @@ cdef tuple _consume_validate_continuation_journal(
                 ):
                     raise ValueError("continuation journal intervals are invalid")
                 previous_end = interval.end
+
+            compact_start = <size_t> compact_row_offset_view[row]
+            compact_stop = <size_t> compact_row_offset_view[row + 1]
+            if (
+                compact_start > compact_stop
+                or compact_stop > journal.compact_result_count
+                or journal_row.compact_result_count
+                != compact_stop - compact_start
+            ):
+                raise ValueError(
+                    "continuation journal compact row offsets are not monotone"
+                )
+            if journal_row.domain_route == DOMAIN_SIMPLE:
+                simple_row_count += 1
+            if journal.compact_result_count == 0:
+                if compact_start != 0 or compact_stop != 0:
+                    raise ValueError("empty compact output carries row results")
+            elif (
+                compact_start != region_start
+                or compact_stop != region_stop
+            ):
+                raise ValueError("compact results differ from simple regions")
+
+            expected_compact_route = PLAN7_CONTINUATION_COMPACT_NONE
+            if (
+                journal.compact_global_fallback
+                and journal_row.domain_route == DOMAIN_SIMPLE
+                and region_start != region_stop
+            ):
+                expected_compact_route = (
+                    PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                )
+            if compact_start != compact_stop:
+                compact_row_action = 255
+            for compact_index in range(compact_start, compact_stop):
+                memcpy(
+                    &compact_result,
+                    &compact_result_view[
+                        compact_index * sizeof(plan7_domain_rescore_result)
+                    ],
+                    sizeof(plan7_domain_rescore_result),
+                )
+                memcpy(
+                    &interval,
+                    &region_view[
+                        compact_index * sizeof(plan7_simple_region)
+                    ],
+                    sizeof(plan7_simple_region),
+                )
+                trace_start = <size_t> compact_trace_offset_view[compact_index]
+                trace_stop = <size_t> compact_trace_offset_view[
+                    compact_index + 1
+                ]
+                if (
+                    trace_start > trace_stop
+                    or trace_stop > journal.compact_trace_count
+                    or compact_result.row_index != row
+                    or compact_result.profile_index != profile
+                    or compact_result.sequence_index
+                    != journal_row.sequence_index
+                    or compact_result.envelope_begin != interval.begin
+                    or compact_result.envelope_end != interval.end
+                    or compact_result.action not in (
+                        PLAN7_DOMAIN_RESCORE_CPU_REQUIRED,
+                        PLAN7_DOMAIN_RESCORE_DEVICE_RESULT,
+                    )
+                    or compact_result.status not in (
+                        PLAN7_DOMAIN_RESCORE_OK,
+                        PLAN7_DOMAIN_RESCORE_ERANGE,
+                        PLAN7_DOMAIN_RESCORE_ENORESULT,
+                        PLAN7_DOMAIN_RESCORE_ECAP,
+                        PLAN7_DOMAIN_RESCORE_EMPTY,
+                    )
+                    or compact_result.has_own_scales > 1
+                    or compact_result.reserved != 0
+                    or compact_result.reserved2 != 0
+                ):
+                    raise ValueError("continuation compact result is invalid")
+                if compact_index == compact_start:
+                    compact_row_action = compact_result.action
+                elif compact_result.action != compact_row_action:
+                    raise ValueError("continuation compact row is not atomic")
+
+                if compact_result.action == (
+                    PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+                ):
+                    if (
+                        compact_result.status != PLAN7_DOMAIN_RESCORE_OK
+                        or compact_result.has_own_scales
+                        or not isfinite(compact_result.forward_score)
+                        or not isfinite(compact_result.backward_score)
+                        or not isfinite(compact_result.oa_score)
+                        or not isfinite(compact_result.domain_correction)
+                        or not isfinite(compact_result.score_consistency)
+                        or compact_result.score_consistency < 0.0
+                        or compact_result.score_consistency > 2.0e-3
+                        or compact_result.alignment_begin
+                        < compact_result.envelope_begin
+                        or compact_result.alignment_begin
+                        > compact_result.alignment_end
+                        or compact_result.alignment_end
+                        > compact_result.envelope_end
+                        or compact_result.model_begin < 1
+                        or compact_result.model_begin
+                        > compact_result.model_end
+                        or compact_result.model_end
+                        > <uint32_t> optimized_profile._om.M
+                        or trace_start == trace_stop
+                    ):
+                        raise ValueError(
+                            "continuation device compact result is invalid"
+                        )
+                    for residue in range(PLAN7_DOMAIN_RESCORE_NULL2_COUNT):
+                        null2_value = compact_null2_view[
+                            compact_index
+                            * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+                            + residue
+                        ]
+                        if not isfinite(null2_value) or null2_value <= 0.0:
+                            raise ValueError(
+                                "continuation compact null2 is invalid"
+                            )
+                    device_result_count += 1
+                else:
+                    if trace_start != trace_stop:
+                        raise ValueError(
+                            "CPU compact fallback carries a trace"
+                        )
+                    for residue in range(PLAN7_DOMAIN_RESCORE_NULL2_COUNT):
+                        if not isnan(compact_null2_view[
+                            compact_index
+                            * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+                            + residue
+                        ]):
+                            raise ValueError(
+                                "CPU compact fallback carries null2"
+                            )
+                    cpu_required_count += 1
+            if compact_start != compact_stop:
+                if compact_row_action == PLAN7_DOMAIN_RESCORE_DEVICE_RESULT:
+                    expected_compact_route = PLAN7_CONTINUATION_COMPACT_DEVICE
+                else:
+                    expected_compact_route = (
+                        PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                    )
+            if journal_row.compact_route != expected_compact_route:
+                raise ValueError("continuation compact row route differs")
             row += 1
             forward_cursor += 1
         if row != row_stop:
             raise ValueError("continuation journal has an extra Forward row")
+
+    if journal.generation_compact_domains and (
+        simple_row_count != journal.rescore_simple_row_count
+        or (
+            journal.compact_result_count != 0
+            and (
+                device_result_count != journal.rescore_device_result_count
+                or cpu_required_count != journal.rescore_cpu_required_count
+            )
+        )
+    ):
+        raise ValueError("continuation compact route accounting differs")
 
     if PyCapsule_SetDestructor(
         capsule, <PyCapsule_Destructor> NULL
@@ -2884,7 +3713,20 @@ cdef tuple _consume_validate_continuation_journal(
         row_view,
         region_offset_view,
         region_view,
+        compact_row_offset_view,
+        compact_result_view,
+        compact_trace_offset_view,
+        compact_trace_view,
+        compact_null2_view,
         guard_bits,
+        journal.generation_tail_fingerprint,
+        journal.generation_compact_domains,
+        journal.rescore_simple_row_count,
+        journal.rescore_device_result_count,
+        journal.rescore_cpu_required_count,
+        journal.rescore_numeric_fallback_count,
+        journal.rescore_cap_fallback_count,
+        journal.rescore_global_cpu_fallback_count,
     )
 
 
@@ -2971,6 +3813,11 @@ def _seal_postfilter_batch_bound(
     cdef object empty_journal_rows = b""
     cdef object empty_journal_region_offsets = bytes(sizeof(uint64_t))
     cdef object empty_journal_regions = b""
+    cdef object empty_journal_compact_row_offsets = bytes(sizeof(uint64_t))
+    cdef object empty_journal_compact_results = b""
+    cdef object empty_journal_compact_trace_offsets = bytes(sizeof(uint64_t))
+    cdef object empty_journal_compact_traces = b""
+    cdef object empty_journal_compact_null2 = b""
     cdef const uint8_t[::1] journal_storage_view = empty_journal_storage
     cdef const uint64_t[::1] journal_profile_offset_view = memoryview(
         empty_journal_profile_offsets
@@ -2980,6 +3827,21 @@ def _seal_postfilter_batch_bound(
         empty_journal_region_offsets
     ).cast("Q")
     cdef const uint8_t[::1] journal_region_view = empty_journal_regions
+    cdef const uint64_t[::1] journal_compact_row_offset_view = memoryview(
+        empty_journal_compact_row_offsets
+    ).cast("Q")
+    cdef const uint8_t[::1] journal_compact_result_view = (
+        empty_journal_compact_results
+    )
+    cdef const uint64_t[::1] journal_compact_trace_offset_view = memoryview(
+        empty_journal_compact_trace_offsets
+    ).cast("Q")
+    cdef const uint8_t[::1] journal_compact_trace_view = (
+        empty_journal_compact_traces
+    )
+    cdef const float[::1] journal_compact_null2_view = memoryview(
+        empty_journal_compact_null2
+    ).cast("f")
     cdef uint32_t journal_guard_bits = 0
     cdef uint64_t expected_session_id = 0
     cdef uint64_t expected_selection_id = 0
@@ -3167,16 +4029,32 @@ def _seal_postfilter_batch_bound(
     sealed._journal_rows = journal_row_view
     sealed._journal_region_offsets = journal_region_offset_view
     sealed._journal_regions = journal_region_view
+    sealed._journal_compact_row_offsets = journal_compact_row_offset_view
+    sealed._journal_compact_results = journal_compact_result_view
+    sealed._journal_compact_trace_offsets = (
+        journal_compact_trace_offset_view
+    )
+    sealed._journal_compact_traces = journal_compact_trace_view
+    sealed._journal_compact_null2 = journal_compact_null2_view
     sealed._f1 = f1
     sealed._generation_f2_bits = generation_f2_bits
     sealed._generation_f3_bits = generation_f3_bits
     sealed._generation_bias_filter = generation_bias_filter
     sealed._journal_guard_bits = journal_guard_bits
+    sealed._generation_tail_fingerprint = 0
+    sealed._rescore_simple_row_count = 0
+    sealed._rescore_device_result_count = 0
+    sealed._rescore_cpu_required_count = 0
+    sealed._rescore_numeric_fallback_count = 0
+    sealed._rescore_cap_fallback_count = 0
+    sealed._rescore_global_cpu_fallback_count = 0
     if continuation_journal is not None:
         sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
     sealed._forward_scores_seam = forward_scores_seam
     sealed._simple_regions_seam = simple_regions_seam
+    sealed._compact_tail_fingerprint = NULL
+    sealed._compact_domains_seam = NULL
     sealed._ready = True
     return sealed
 
@@ -3242,11 +4120,18 @@ def _seal_profile_selection_continuation_bound(
     cdef const uint8_t[::1] journal_row_view
     cdef const uint64_t[::1] journal_region_offset_view
     cdef const uint8_t[::1] journal_region_view
+    cdef const uint64_t[::1] journal_compact_row_offset_view
+    cdef const uint8_t[::1] journal_compact_result_view
+    cdef const uint64_t[::1] journal_compact_trace_offset_view
+    cdef const uint8_t[::1] journal_compact_trace_view
+    cdef const float[::1] journal_compact_null2_view
     cdef _pipeline_tail_snapshot pipeline_options
     cdef _SealedPostfilterBatch sealed
     cdef _pipeline_from_filter_scores_f filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f forward_scores_seam
     cdef _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam
+    cdef _pipeline_from_filter_forward_compact_domains_f compact_domains_seam
+    cdef _pipeline_compact_tail_fingerprint_f compact_tail_fingerprint
     cdef size_t profile
     cdef size_t postfilter_count
     cdef size_t forward_count
@@ -3262,6 +4147,15 @@ def _seal_profile_selection_continuation_bound(
     cdef uint32_t journal_guard_bits
     cdef _float_bits expected_guard
     cdef size_t frequency_bytes
+    cdef uint64_t expected_tail_fingerprint = 0
+    cdef uint64_t generation_tail_fingerprint = 0
+    cdef bint generation_compact_domains = False
+    cdef uint64_t rescore_simple_row_count = 0
+    cdef uint64_t rescore_device_result_count = 0
+    cdef uint64_t rescore_cpu_required_count = 0
+    cdef uint64_t rescore_numeric_fallback_count = 0
+    cdef uint64_t rescore_cap_fallback_count = 0
+    cdef uint64_t rescore_global_cpu_fallback_count = 0
 
     if type(pipeline) is not _pyhmmer.plan7.Pipeline:
         raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
@@ -3300,6 +4194,13 @@ def _seal_profile_selection_continuation_bound(
         guard_band,
     )
     _capture_pipeline_tail_options(pipeline, &pipeline_options)
+    compact_domains_seam = _cached_compact_domains_seam()
+    compact_tail_fingerprint = _compact_tail_fingerprint_cache
+    if compact_domains_seam != NULL and compact_tail_fingerprint != NULL:
+        with nogil:
+            expected_tail_fingerprint = compact_tail_fingerprint(
+                pipeline._pli
+            )
     frequency_bytes = <size_t> pipeline.background._bg.abc.K * sizeof(float)
     if (
         background_view.shape[0] != frequency_bytes + sizeof(float)
@@ -3362,6 +4263,7 @@ def _seal_profile_selection_continuation_bound(
         pipeline_options.f2_bits,
         pipeline_options.f3_bits,
         True,
+        expected_tail_fingerprint,
     )
     journal_storage_view = journal_values[0]
     postfilter_view = journal_values[1]
@@ -3374,7 +4276,20 @@ def _seal_profile_selection_continuation_bound(
     journal_row_view = journal_values[8]
     journal_region_offset_view = journal_values[9]
     journal_region_view = journal_values[10]
-    journal_guard_bits = journal_values[11]
+    journal_compact_row_offset_view = journal_values[11]
+    journal_compact_result_view = journal_values[12]
+    journal_compact_trace_offset_view = journal_values[13]
+    journal_compact_trace_view = journal_values[14]
+    journal_compact_null2_view = journal_values[15]
+    journal_guard_bits = journal_values[16]
+    generation_tail_fingerprint = journal_values[17]
+    generation_compact_domains = journal_values[18]
+    rescore_simple_row_count = journal_values[19]
+    rescore_device_result_count = journal_values[20]
+    rescore_cpu_required_count = journal_values[21]
+    rescore_numeric_fallback_count = journal_values[22]
+    rescore_cap_fallback_count = journal_values[23]
+    rescore_global_cpu_fallback_count = journal_values[24]
     expected_guard.value = <float> guard_band
     if journal_guard_bits != expected_guard.bits:
         raise ValueError("continuation journal guard band differs")
@@ -3453,15 +4368,37 @@ def _seal_profile_selection_continuation_bound(
     sealed._journal_rows = journal_row_view
     sealed._journal_region_offsets = journal_region_offset_view
     sealed._journal_regions = journal_region_view
+    sealed._journal_compact_row_offsets = journal_compact_row_offset_view
+    sealed._journal_compact_results = journal_compact_result_view
+    sealed._journal_compact_trace_offsets = (
+        journal_compact_trace_offset_view
+    )
+    sealed._journal_compact_traces = journal_compact_trace_view
+    sealed._journal_compact_null2 = journal_compact_null2_view
     sealed._f1 = f1
     sealed._generation_f2_bits = pipeline_options.f2_bits
     sealed._generation_f3_bits = pipeline_options.f3_bits
     sealed._generation_bias_filter = True
     sealed._journal_guard_bits = journal_guard_bits
+    sealed._generation_tail_fingerprint = generation_tail_fingerprint
+    sealed._rescore_simple_row_count = rescore_simple_row_count
+    sealed._rescore_device_result_count = rescore_device_result_count
+    sealed._rescore_cpu_required_count = rescore_cpu_required_count
+    sealed._rescore_numeric_fallback_count = rescore_numeric_fallback_count
+    sealed._rescore_cap_fallback_count = rescore_cap_fallback_count
+    sealed._rescore_global_cpu_fallback_count = (
+        rescore_global_cpu_fallback_count
+    )
     sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
     sealed._forward_scores_seam = forward_scores_seam
     sealed._simple_regions_seam = simple_regions_seam
+    sealed._compact_tail_fingerprint = (
+        compact_tail_fingerprint if generation_compact_domains else NULL
+    )
+    sealed._compact_domains_seam = (
+        compact_domains_seam if generation_compact_domains else NULL
+    )
     sealed._ready = True
     return sealed
 
@@ -3591,6 +4528,15 @@ def _search_hmm_sealed_postfilter_bound(
             ],
             sealed._journal_region_offsets[journal_start:journal_stop + 1],
             sealed._journal_regions,
+            sealed._journal_compact_row_offsets[
+                journal_start:journal_stop + 1
+            ],
+            sealed._journal_compact_results,
+            sealed._journal_compact_trace_offsets,
+            sealed._journal_compact_traces,
+            sealed._journal_compact_null2,
+            journal_start,
+            sealed._generation_tail_fingerprint,
             &sealed._residue_offsets[0],
             generation_f1.bits,
             sealed._generation_f2_bits,
@@ -3599,6 +4545,8 @@ def _search_hmm_sealed_postfilter_bound(
             sealed._filter_scores_seam,
             sealed._forward_scores_seam,
             sealed._simple_regions_seam,
+            sealed._compact_tail_fingerprint,
+            sealed._compact_domains_seam,
         )
     return _search_postfilter_forward_validated(
         pipeline,
@@ -3681,6 +4629,21 @@ def _sealed_continuation_statistics_bound(sealed_object):
         "simple_count": simple,
         "journal_bytes": sealed._journal_storage.shape[0],
         "guard_band_bits": sealed._journal_guard_bits,
+        "compact_enabled": sealed._compact_domains_seam != NULL,
+        "compact_simple_row_count": sealed._rescore_simple_row_count,
+        "compact_device_result_count": (
+            sealed._rescore_device_result_count
+        ),
+        "compact_cpu_required_count": (
+            sealed._rescore_cpu_required_count
+        ),
+        "compact_numeric_fallback_count": (
+            sealed._rescore_numeric_fallback_count
+        ),
+        "compact_cap_fallback_count": sealed._rescore_cap_fallback_count,
+        "compact_global_cpu_fallback_count": (
+            sealed._rescore_global_cpu_fallback_count
+        ),
     }
 
 

@@ -3,7 +3,12 @@
 This is the CPU/HMMER side of the simple-envelope CUDA rescore handoff. The
 outer adapter owns the immutable generation seal and content hashes. After it
 authenticates those, it calls
-`p7_PipelineFromFilterForwardAndCompactDomains()` in original target order.
+`p7_PipelineFromFilterForwardAndCompactDomainsV2()` in original target order.
+The V2 suffix is part of the ABI contract: this wheel intentionally exports
+neither the unversioned compact entry point nor its unversioned fingerprint.
+Consequently, an old adapter/new wheel or new adapter/old wheel sees the
+compact seam as unavailable and uses the ordinary CPU path instead of calling
+a shifted C signature.
 
 ## Record layout
 
@@ -56,8 +61,12 @@ agree with the alignment and model bounds in the result record.
 ## Boundary behavior
 
 The entry point also receives the sealed generation's four filter scores,
-posterior expected-domain count, row/profile/sequence identity, and the value
-of `p7_pipeline_CompactTailFingerprint()` captured for that generation.
+posterior expected-domain count, row/profile/sequence identity, final target
+count, and the value of `p7_pipeline_CompactTailFingerprintV2()` captured for
+that generation. `final_target_count` must be in `[1, 2^53]`; it supplies the
+exact final dynamic target search space and bounds every possible integer
+dynamic `domZ`. The live dynamic `Z` must be an integer in
+`[1, final_target_count]`.
 
 Before live state changes, HMMER validates every record, count, offset, trace
 transition, coordinate, posterior, null2 degeneracy, and option/floating-point
@@ -66,16 +75,33 @@ the OA score reconstructed from trace posteriors each use a `2e-3` absolute
 tolerance. Accepted input is staged into stock traces, domains, and alignment
 displays, then passed to the unchanged HMMER final tail.
 
-The caller must already have performed `p7_pli_NewModel()` and exactly one
-`p7_pli_NewSeq()` for the live target, but must not pre-increment survivor
-counters. This seam replays the score gates and owns the four `n_past_*`
-increments. `sequence_index` is an adapter-authenticated resident-batch
-identity; it is deliberately not compared with the `p7_pli_NewSeq()` ordinal.
+Guard version 1 also prevents a compact/GPU rounding difference from changing
+any final report or inclusion call. It encloses each accepted external score
+by `0.004` nats plus a `1e-5`-bit arithmetic margin, reconstructs HMMER's exact
+full-target, reconstruction, and per-domain score expressions (including the
+ordered Kahan null2 sum), and checks target/domain report and inclusion
+predicates before allocation or live-state mutation. Score thresholds include
+model-specific GA/TC/NC values already loaded by `p7_pli_NewModel()`. E-value
+thresholds use the current and final target `Z`; fixed `domZ` is checked
+directly, while dynamic `domZ` binary-searches the exact rounded-double
+predicate over every possible integer in `[1, final_target_count]`. The guard
+version and both error constants are included in the V2 tail fingerprint.
 
-`eslEINVAL` means the adapter must discard the entire row payload and use the
-ordinary CPU continuation. Validation failures do not change pipeline
-counters, matrices, domain-definition state, or TopHits. Allocation errors
-retain normal HMMER semantics and are not part of that transactional promise.
+The caller must already have performed `p7_pli_NewModel()` and exactly one
+target's `p7_pli_NewSeq()` accounting (the sparse adapter performs that same
+accounting directly), but must not pre-increment survivor counters. This seam
+replays the score gates and owns the four `n_past_*` increments.
+`sequence_index` is an adapter-authenticated resident-batch identity; it is
+deliberately not compared with the pipeline target ordinal.
+
+`eslEINVAL` means the adapter must discard the entire row payload and use its
+authenticated ordinary Forward/CPU continuation. `eslEINACCURATE` is distinct:
+the payload is valid, but a final call is threshold-adjacent, so the adapter
+must rerun the whole ordinary `p7_Pipeline()` for the row and must not reuse the
+GPU Forward score or any postfilter state. Both statuses are returned before
+survivor counters, matrices, domain-definition state, or TopHits change.
+Allocation errors retain normal HMMER semantics and are not part of that
+transactional promise.
 
 The adapter must authenticate its profile, target, background, result, null2,
 and trace hashes before this call. The C seam validates live HMMER
