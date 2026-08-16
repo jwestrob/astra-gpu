@@ -85,6 +85,7 @@ $(BIAS_ATTEST_BIN): oracle/bias_log_attestation.cu
 
 $(CYTHON_CPP): python/plan7_gpu/_native.pyx cuda/ssv_cuda.h cuda/bias_cuda.h \
 		cuda/postfilter_cuda.h cuda/forward_cuda.h cuda/backward_domain_cuda.h \
+		cuda/continuation_journal.h \
 		$(PYHMMER_ABI_STAMP) \
 		$(PYHMMER_PACKAGE_DIR)/plan7.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/impl/p7_oprofile.pxd \
@@ -100,7 +101,8 @@ $(CYTHON_CPP): python/plan7_gpu/_native.pyx cuda/ssv_cuda.h cuda/bias_cuda.h \
 		-E PYHMMER_ABI_SHA256=$(PYHMMER_ABI_SHA256) -o $@ $<
 
 $(CYTHON_OBJ): $(CYTHON_CPP) cuda/ssv_cuda.h cuda/bias_cuda.h \
-		cuda/postfilter_cuda.h cuda/forward_cuda.h cuda/backward_domain_cuda.h
+		cuda/postfilter_cuda.h cuda/forward_cuda.h cuda/backward_domain_cuda.h \
+		cuda/continuation_journal.h
 	$(CXX) -O3 -g -std=c++17 -fPIC -Wall -Wextra $(PYHMMER_SIMD_CFLAGS) \
 		-Icuda $$($(PYTHON)-config --includes) \
 		-I$(PYHMMER_INCLUDE) -I$(PYHMMER_EASEL_INCLUDE) \
@@ -168,6 +170,8 @@ $(PYHMMER_ABI_STAMP):
 	touch $@
 
 $(PIPELINE_C): python/plan7_gpu/_pipeline.pyx python/plan7_gpu/_abi.py \
+		cuda/continuation_journal.h cuda/backward_domain_cuda.h \
+		cuda/forward_cuda.h cuda/ssv_cuda.h \
 		$(PYHMMER_ABI_STAMP) \
 		$(PYHMMER_PACKAGE_DIR)/plan7.pxd \
 		$(PYHMMER_PACKAGE_DIR)/easel.pxd \
@@ -189,6 +193,7 @@ $(PIPELINE_C): python/plan7_gpu/_pipeline.pyx python/plan7_gpu/_abi.py \
 $(PIPELINE_OBJ): $(PIPELINE_C)
 	$(CC) -O3 -g -std=c11 -fPIC $(PYHMMER_SIMD_CFLAGS) \
 		$$($(PYTHON)-config --includes) \
+		-Icuda \
 		-I$(PYHMMER_INCLUDE) -I$(PYHMMER_EASEL_INCLUDE) \
 		-I$(PYHMMER_INCLUDE)/libhmmer -c -o $@ $<
 

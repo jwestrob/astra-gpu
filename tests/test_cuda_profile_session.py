@@ -28,6 +28,7 @@ try:
     from plan7_gpu.adapter import (
         _candidate_state,
         _pair_state,
+        _profile_session_state,
         _profile_selection_state,
         _sequence_state,
     )
@@ -39,6 +40,7 @@ except ImportError:
     _native = None
     _candidate_state = None
     _pair_state = None
+    _profile_session_state = None
     _profile_selection_state = None
     _sequence_state = None
 
@@ -49,6 +51,71 @@ except ImportError:
 
 
 DATA = Path(pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
+JOURNAL_CAPSULE_NAME = b"plan7_gpu._native._continuation_journal_v1"
+
+
+class ContinuationJournalPrefix(ctypes.Structure):
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("version", ctypes.c_uint16),
+        ("header_size", ctypes.c_uint16),
+        ("row_size", ctypes.c_uint32),
+        ("region_size", ctypes.c_uint32),
+        ("total_bytes", ctypes.c_uint64),
+        ("session_id", ctypes.c_uint64),
+        ("selection_id", ctypes.c_uint64),
+        ("profile_count", ctypes.c_uint64),
+        ("postfilter_count", ctypes.c_uint64),
+        ("forward_count", ctypes.c_uint64),
+        ("row_count", ctypes.c_uint64),
+        ("special_count", ctypes.c_uint64),
+        ("region_count", ctypes.c_uint64),
+        ("generation_f1_bits", ctypes.c_uint64),
+        ("generation_f2_bits", ctypes.c_uint64),
+        ("generation_f3_bits", ctypes.c_uint64),
+        ("rt1_bits", ctypes.c_uint32),
+        ("rt2_bits", ctypes.c_uint32),
+        ("rt3_bits", ctypes.c_uint32),
+        ("guard_band_bits", ctypes.c_uint32),
+        ("generation_bias_filter", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 7),
+        ("sequence_content_fingerprint", ctypes.c_uint8 * 32),
+        ("postfilter_offsets_offset", ctypes.c_uint64),
+        ("postfilter_records_offset", ctypes.c_uint64),
+        ("forward_offsets_offset", ctypes.c_uint64),
+        ("forward_records_offset", ctypes.c_uint64),
+        ("forward_special_offsets_offset", ctypes.c_uint64),
+        ("profile_offsets_offset", ctypes.c_uint64),
+        ("identity_tokens_offset", ctypes.c_uint64),
+        ("profile_fingerprints_offset", ctypes.c_uint64),
+        ("rows_offset", ctypes.c_uint64),
+        ("special_offsets_offset", ctypes.c_uint64),
+        ("specials_offset", ctypes.c_uint64),
+        ("region_offsets_offset", ctypes.c_uint64),
+        ("regions_offset", ctypes.c_uint64),
+    ]
+
+
+def tamper_first_journal_sequence_index(capsule):
+    get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+    get_pointer.argtypes = (ctypes.py_object, ctypes.c_char_p)
+    get_pointer.restype = ctypes.c_void_p
+    address = get_pointer(capsule, JOURNAL_CAPSULE_NAME)
+    if not address:
+        raise RuntimeError("test journal capsule has no storage")
+    header = ContinuationJournalPrefix.from_address(address)
+    if header.row_count == 0:
+        raise RuntimeError("test journal has no rows")
+    ctypes.c_uint32.from_address(address + header.rows_offset + 4).value = 0xFFFFFFFF
+
+    integrity_offset = header.header_size - ctypes.sizeof(ctypes.c_uint64)
+    storage = (ctypes.c_uint8 * header.total_bytes).from_address(address)
+    value = 1469598103934665603
+    for index in range(integrity_offset):
+        value = ((value ^ storage[index]) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    for index in range(header.header_size, header.total_bytes):
+        value = ((value ^ storage[index]) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    ctypes.c_uint64.from_address(address + integrity_offset).value = value
 
 
 def cuda_available():
@@ -69,6 +136,10 @@ def forward_seam_available():
         _pipeline is not None
         and _pipeline._filter_and_forward_scores_seam_available()
     )
+
+
+def simple_region_seam_available():
+    return _pipeline is not None and _pipeline._simple_regions_seam_available()
 
 
 class ProfileSessionFixture:
@@ -124,11 +195,79 @@ class ProfileSessionFixture:
     def hits_bytes(hits):
         output = io.BytesIO()
         hits.write(output, format="targets", header=True)
+        hits.write(output, format="domains", header=True)
         return output.getvalue()
+
+    @staticmethod
+    def semantic_pipeline_state(hits):
+        fields = (
+            "Z_setby",
+            "domZ_setby",
+            "n_past_msv",
+            "n_past_bias",
+            "n_past_vit",
+            "n_past_fwd",
+            "pos_past_msv",
+            "pos_past_bias",
+            "pos_past_vit",
+            "pos_past_fwd",
+            "mode",
+            "W",
+        )
+        top_fields = (
+            "Z",
+            "domZ",
+            "searched_models",
+            "searched_nodes",
+            "searched_residues",
+            "searched_sequences",
+        )
+        pipeline = hits.__getstate__()["pipeline"]
+        return (
+            tuple(pipeline[field] for field in fields),
+            tuple(getattr(hits, field) for field in top_fields),
+        )
 
 
 @unittest.skipUnless(_native is not None, "CUDA extension unavailable")
 class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
+    def test_session_retains_original_profiles_without_database_copies(self):
+        with ProfileSession(self.pairs, pack_workers=0) as session:
+            state = _profile_session_state(session)
+            pair_states = tuple(_pair_state(pair) for pair in self.pairs)
+            self.assertTrue(
+                all(
+                    query is pair_state.hmm
+                    for query, pair_state in zip(
+                        state.queries, pair_states, strict=True
+                    )
+                )
+            )
+            self.assertTrue(
+                all(
+                    profile is pair_state.optimized_profile
+                    for profile, pair_state in zip(
+                        state.profiles, pair_states, strict=True
+                    )
+                )
+            )
+            self.assertEqual(
+                sum(map(len, state.profile_fingerprints)), 32 * len(self.pairs)
+            )
+
+    def test_sequence_batch_rejects_virtual_copy_sources(self):
+        target = self.targets[0]
+
+        class AliasingSequence:
+            alphabet = target.alphabet
+
+            @staticmethod
+            def copy():
+                return target
+
+        with self.assertRaisesRegex(TypeError, "exact DigitalSequence"):
+            SequenceBatch([AliasingSequence()], alphabet=self.alphabet)
+
     def test_snapshot_statistics_and_ordered_noncontiguous_selection(self):
         session = ProfileSession(self.pairs)
         try:
@@ -496,6 +635,17 @@ class StockCudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                         batch._postfilter_forward_selection(
                             selection, 0.02, 1.0, 1.0, True
                         )
+                    with self.assertRaisesRegex(
+                        RuntimeError, "project-private HMMER seams"
+                    ):
+                        batch._postfilter_forward_selection(
+                            selection,
+                            0.02,
+                            1.0,
+                            1.0,
+                            True,
+                            pipeline=self.pipeline(F1=0.02, F2=1.0, F3=1.0),
+                        )
 
 
 @unittest.skipUnless(cuda_available(), "CUDA backend or device unavailable")
@@ -503,6 +653,59 @@ class StockCudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
     postfilter_seam_available(), "private filter-score seam is unavailable"
 )
 class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
+    @staticmethod
+    def mint_continuation_capsule(selection, batch, options, guard=2.0e-4):
+        selection_state = _profile_selection_state(selection)
+        sequence_state = _sequence_state(batch)
+        return sequence_state.native._postfilter_forward_domain_selection_sealed(
+            selection_state.native,
+            options["F1"],
+            options["F2"],
+            options["F3"],
+            guard,
+        )
+
+    @staticmethod
+    def seal_continuation_capsule(
+        capsule, selection, batch, pipeline, options, guard=2.0e-4
+    ):
+        selection_state = _profile_selection_state(selection)
+        sequence_state = _sequence_state(batch)
+        return _pipeline._seal_profile_selection_continuation_bound(
+            selection_state.queries,
+            selection_state.profiles,
+            sequence_state.targets,
+            memoryview(sequence_state.residue_offsets).cast("Q"),
+            options["F1"],
+            memoryview(selection_state.background_fingerprint),
+            capsule,
+            selection_state.native.identity,
+            memoryview(
+                selection_state.native._identity_tokens_for_seal()
+            ).cast("Q"),
+            memoryview(b"".join(selection_state.profile_fingerprints)),
+            sequence_state.native_generation,
+            memoryview(sequence_state.content_fingerprint),
+            pipeline,
+            guard,
+        )
+
+    def test_sequence_batch_owns_an_independent_exact_target_copy(self):
+        source = self.targets[0].copy()
+        original = memoryview(source.sequence).cast("B").tobytes()
+        with SequenceBatch([source]) as batch:
+            state = _sequence_state(batch)
+            source.sequence[0] = (source.sequence[0] + 1) % self.alphabet.K
+            self.assertEqual(
+                memoryview(state.targets[0].sequence).cast("B").tobytes(),
+                original,
+            )
+            generation, fingerprint = (
+                state.native._generation_and_content_for_seal()
+            )
+            self.assertEqual(generation, state.native_generation)
+            self.assertEqual(fingerprint, state.content_fingerprint)
+
     def test_noncontiguous_selection_matches_live_path_exactly(self):
         with ProfileSession(self.pairs) as session:
             with session.select([2, 0]) as selection:
@@ -608,6 +811,227 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                 self.assertEqual(
                     self.hits_bytes(actual_hits), self.hits_bytes(expected_hits)
                 )
+
+    @unittest.skipUnless(
+        simple_region_seam_available(),
+        "private simple-region seam is unavailable",
+    )
+    def test_fused_domain_selection_is_exact_opaque_and_lifetime_safe(self):
+        options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        before = _native._sealed_journal_transport_statistics()
+        session = ProfileSession(self.pairs, pack_workers=1)
+        selection = session.select([2, 0])
+        batch = SequenceBatch(self.targets)
+        legacy = batch._postfilter_forward_selection(
+            selection,
+            options["F1"],
+            options["F2"],
+            options["F3"],
+            True,
+        )
+        generation_pipeline = self.pipeline(**options)
+        fused = batch._postfilter_forward_selection(
+            selection,
+            options["F1"],
+            options["F2"],
+            options["F3"],
+            True,
+            pipeline=generation_pipeline,
+        )
+        route_statistics = _pipeline._sealed_continuation_statistics_bound(
+            _candidate_state(fused).sealed_postfilter
+        )
+        after = _native._sealed_journal_transport_statistics()
+        self.assertEqual(after["build_count"], before["build_count"] + 1)
+        self.assertGreater(after["payload_bytes"], before["payload_bytes"])
+        self.assertEqual(after["duplicate_python_bytes"], 0)
+        self.assertEqual(
+            route_statistics["row_count"],
+            route_statistics["cpu_required_count"]
+            + route_statistics["no_region_count"]
+            + route_statistics["simple_count"],
+        )
+        self.assertGreater(route_statistics["cpu_required_count"], 0)
+        self.assertGreater(
+            route_statistics["no_region_count"]
+            + route_statistics["simple_count"],
+            0,
+        )
+        self.assertEqual(
+            [fused.candidate_count(row) for row in range(2)],
+            [legacy.candidate_count(row) for row in range(2)],
+        )
+        batch.close()
+        selection.close()
+        session.close()
+
+        actual_pipeline = self.pipeline(**options)
+        expected_pipeline = self.pipeline(**options)
+        for reuse in range(2):
+            for row, pair in enumerate((self.pairs[2], self.pairs[0])):
+                with self.subTest(row=row, reuse=reuse):
+                    actual = fused.search(row, actual_pipeline)
+                    expected = expected_pipeline.search_hmm(pair.hmm, self.targets)
+                    self.assertEqual(
+                        self.hits_bytes(actual), self.hits_bytes(expected)
+                    )
+                    self.assertEqual(
+                        self.semantic_pipeline_state(actual),
+                        self.semantic_pipeline_state(expected),
+                    )
+
+        actual_pipeline = self.pipeline(**options, null2=False)
+        expected_pipeline = self.pipeline(**options, null2=False)
+        for row, pair in enumerate((self.pairs[2], self.pairs[0])):
+            with self.subTest(tail_mismatch="null2", row=row):
+                actual = fused.search(row, actual_pipeline)
+                expected = expected_pipeline.search_hmm(pair.hmm, self.targets)
+                self.assertEqual(self.hits_bytes(actual), self.hits_bytes(expected))
+                self.assertEqual(
+                    self.semantic_pipeline_state(actual),
+                    self.semantic_pipeline_state(expected),
+                )
+
+        expected = [
+            self.hits_bytes(self.pipeline(**options).search_hmm(pair.hmm, self.targets))
+            for pair in (self.pairs[2], self.pairs[0])
+        ]
+        barrier = threading.Barrier(8)
+        failures = []
+
+        def search(worker_index):
+            try:
+                barrier.wait()
+                row = worker_index % 2
+                hits = fused.search(row, self.pipeline(**options))
+                self.assertEqual(self.hits_bytes(hits), expected[row])
+            except BaseException as error:
+                failures.append(error)
+
+        workers = [
+            threading.Thread(target=search, args=(index,)) for index in range(8)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(20)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        if failures:
+            raise failures[0]
+
+    @unittest.skipUnless(
+        simple_region_seam_available(),
+        "private simple-region seam is unavailable",
+    )
+    def test_fused_domain_selection_rejects_pair_and_mode_drift(self):
+        options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        with ProfileSession(self.pairs, pack_workers=0) as session:
+            with session.select([0]) as selection:
+                with SequenceBatch(self.targets) as batch:
+                    selection_state = _profile_selection_state(selection)
+                    pair_state = _pair_state(self.pairs[0])
+                    original_profiles = selection_state.profiles
+                    impostor = pair_state.optimized_profile.copy()
+                    impostor.rfv[0, 1] += 0.25
+                    selection_state.profiles = (impostor,)
+                    pipeline = self.pipeline(**options)
+                    try:
+                        with self.assertRaisesRegex(
+                            ValueError, "selected pair objects differ"
+                        ):
+                            batch._postfilter_forward_selection(
+                                selection,
+                                options["F1"],
+                                options["F2"],
+                                options["F3"],
+                                True,
+                                pipeline=pipeline,
+                            )
+                    finally:
+                        selection_state.profiles = original_profiles
+
+                    pair_state.optimized_profile.multihit = False
+                    try:
+                        with self.assertRaisesRegex(ValueError, "local multihit"):
+                            batch._postfilter_forward_selection(
+                                selection,
+                                options["F1"],
+                                options["F2"],
+                                options["F3"],
+                                True,
+                                pipeline=pipeline,
+                            )
+                    finally:
+                        pair_state.optimized_profile.multihit = True
+
+                    actual = pipeline.search_hmm(self.pairs[0].hmm, self.targets)
+                    expected = self.pipeline(**options).search_hmm(
+                        self.pairs[0].hmm, self.targets
+                    )
+                    self.assertEqual(self.hits_bytes(actual), self.hits_bytes(expected))
+                    self.assertEqual(
+                        self.semantic_pipeline_state(actual),
+                        self.semantic_pipeline_state(expected),
+                    )
+
+    @unittest.skipUnless(
+        simple_region_seam_available(),
+        "private simple-region seam is unavailable",
+    )
+    def test_fused_capsule_rejects_target_rebinding_and_bad_index(self):
+        options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        altered_targets = [sequence.copy() for sequence in self.targets]
+        altered_targets[0].sequence[0] = (
+            altered_targets[0].sequence[0] + 1
+        ) % self.alphabet.K
+
+        with ProfileSession(self.pairs, pack_workers=0) as session:
+            with session.select([0]) as selection:
+                with SequenceBatch(self.targets) as original_batch:
+                    with SequenceBatch(altered_targets) as altered_batch:
+                        pipeline = self.pipeline(**options)
+                        capsule = self.mint_continuation_capsule(
+                            selection, original_batch, options
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "target content differs"
+                        ):
+                            self.seal_continuation_capsule(
+                                capsule,
+                                selection,
+                                altered_batch,
+                                pipeline,
+                                options,
+                            )
+
+                        capsule = self.mint_continuation_capsule(
+                            selection, original_batch, options
+                        )
+                        tamper_first_journal_sequence_index(capsule)
+                        with self.assertRaisesRegex(
+                            ValueError, "Forward identity differs"
+                        ):
+                            self.seal_continuation_capsule(
+                                capsule,
+                                selection,
+                                original_batch,
+                                pipeline,
+                                options,
+                            )
+
+                        actual = pipeline.search_hmm(
+                            self.pairs[0].hmm, self.targets
+                        )
+                        expected = self.pipeline(**options).search_hmm(
+                            self.pairs[0].hmm, self.targets
+                        )
+                        self.assertEqual(
+                            self.hits_bytes(actual), self.hits_bytes(expected)
+                        )
+                        self.assertEqual(
+                            self.semantic_pipeline_state(actual),
+                            self.semantic_pipeline_state(expected),
+                        )
 
     @unittest.skipUnless(
         forward_seam_available(), "private Forward-score seam is unavailable"
@@ -908,8 +1332,20 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
         libc.fegetround.restype = ctypes.c_int
         libc.fesetround.argtypes = [ctypes.c_int]
         original = libc.fegetround()
+        fused_pipeline = None
         try:
             self.assertEqual(libc.fesetround(0x400), 0)
+            if simple_region_seam_available():
+                fused_pipeline = self.pipeline(F1=0.02, F2=1.0, F3=1.0)
+                with self.assertRaisesRegex(RuntimeError, "floating-point"):
+                    batch._postfilter_forward_selection(
+                        selection,
+                        0.02,
+                        1.0,
+                        1.0,
+                        True,
+                        pipeline=fused_pipeline,
+                    )
             if forward_seam_available():
                 candidates = batch._postfilter_forward_selection(
                     selection, 0.02, 1.0, 1.0, True
@@ -934,3 +1370,13 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
         actual = candidates.search(0, self.pipeline())
         expected = self.pipeline().search_hmm(self.pairs[0].hmm, self.targets)
         self.assertEqual(self.hits_bytes(actual), self.hits_bytes(expected))
+        if fused_pipeline is not None:
+            actual = fused_pipeline.search_hmm(self.pairs[0].hmm, self.targets)
+            expected = self.pipeline(F1=0.02, F2=1.0, F3=1.0).search_hmm(
+                self.pairs[0].hmm, self.targets
+            )
+            self.assertEqual(self.hits_bytes(actual), self.hits_bytes(expected))
+            self.assertEqual(
+                self.semantic_pipeline_state(actual),
+                self.semantic_pipeline_state(expected),
+            )

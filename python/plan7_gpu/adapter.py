@@ -17,6 +17,11 @@ from weakref import WeakKeyDictionary
 import pyhmmer
 
 from . import _native  # type: ignore[attr-defined]
+from ._fingerprint import (
+    optimized_profile_fingerprint,
+    sequence_block_content_fingerprint,
+    sequence_content_fingerprint,
+)
 
 _MISSING = object()
 _PIPELINE_LEASES_LOCK = Lock()
@@ -81,7 +86,13 @@ class _CutoffSnapshot(NamedTuple):
 
 
 class _PairState:
-    __slots__ = ("hmm", "optimized_profile", "background_fingerprint", "lock")
+    __slots__ = (
+        "hmm",
+        "optimized_profile",
+        "profile_fingerprint",
+        "background_fingerprint",
+        "lock",
+    )
 
     def __init__(
         self,
@@ -91,6 +102,9 @@ class _PairState:
     ) -> None:
         self.hmm = hmm
         self.optimized_profile = optimized_profile
+        self.profile_fingerprint = optimized_profile_fingerprint(
+            optimized_profile
+        )
         self.background_fingerprint = background_fingerprint
         self.lock = Lock()
 
@@ -192,22 +206,50 @@ def _new_pressed_profile_pair(
 
 
 class _ProfileSessionState:
-    __slots__ = ("pairs", "alphabet", "native", "lock")
+    __slots__ = (
+        "pairs",
+        "alphabet",
+        "native",
+        "lock",
+        "queries",
+        "profiles",
+        "profile_fingerprints",
+        "background_fingerprint",
+    )
 
     def __init__(
         self,
         pairs: tuple[PressedProfilePair, ...],
         alphabet: Any,
         native: Any,
+        queries: tuple[Any, ...],
+        profiles: tuple[Any, ...],
+        profile_fingerprints: tuple[bytes, ...],
+        background_fingerprint: bytes,
     ) -> None:
         self.pairs = pairs
         self.alphabet = alphabet
         self.native = native
         self.lock = Lock()
+        self.queries = queries
+        self.profiles = profiles
+        self.profile_fingerprints = profile_fingerprints
+        self.background_fingerprint = background_fingerprint
 
 
 class _ProfileSelectionState:
-    __slots__ = ("owner", "pairs", "indices", "alphabet", "native", "lock")
+    __slots__ = (
+        "owner",
+        "pairs",
+        "indices",
+        "alphabet",
+        "native",
+        "lock",
+        "queries",
+        "profiles",
+        "profile_fingerprints",
+        "background_fingerprint",
+    )
 
     def __init__(
         self,
@@ -216,6 +258,10 @@ class _ProfileSelectionState:
         indices: tuple[int, ...],
         alphabet: Any,
         native: Any,
+        queries: tuple[Any, ...],
+        profiles: tuple[Any, ...],
+        profile_fingerprints: tuple[bytes, ...],
+        background_fingerprint: bytes,
     ) -> None:
         self.owner = owner
         self.pairs = pairs
@@ -223,6 +269,10 @@ class _ProfileSelectionState:
         self.alphabet = alphabet
         self.native = native
         self.lock = Lock()
+        self.queries = queries
+        self.profiles = profiles
+        self.profile_fingerprints = profile_fingerprints
+        self.background_fingerprint = background_fingerprint
 
 
 _PROFILE_SESSION_STATES: WeakKeyDictionary[Any, _ProfileSessionState] = (
@@ -341,15 +391,42 @@ class ProfileSession:
                 raise ValueError(
                     "profile session background is not the canonical hmmpress background"
                 )
-            profiles = [state.optimized_profile for state in states]
+            if any(
+                not state.optimized_profile.local
+                or not state.optimized_profile.multihit
+                for state in states
+            ):
+                raise ValueError(
+                    "profile sessions require local multihit optimized profiles"
+                )
+            queries = tuple(state.hmm for state in states)
+            profiles = tuple(state.optimized_profile for state in states)
+            profile_fingerprints = tuple(
+                state.profile_fingerprint for state in states
+            )
             native = _native.ProfileSession(
                 profiles,
                 memoryview(background.residue_frequencies),
                 build_worker_count,
                 selection_worker_count,
+                profile_fingerprints,
             )
+            if (
+                native._fingerprints_for_seal()
+                != b"".join(profile_fingerprints)
+            ):
+                native.close()
+                raise RuntimeError(
+                    "native optimized-profile fingerprints changed"
+                )
         _PROFILE_SESSION_STATES[self] = _ProfileSessionState(
-            pairs, alphabet, native
+            pairs,
+            alphabet,
+            native,
+            queries,
+            profiles,
+            profile_fingerprints,
+            background_fingerprint,
         )
 
     def __len__(self) -> int:
@@ -394,12 +471,25 @@ class ProfileSession:
             native = state.native.select(normalized_indices)
         selection = object.__new__(ProfileSelection)
         selected_pairs = tuple(state.pairs[index] for index in normalized_indices)
+        selected_queries = tuple(
+            state.queries[index] for index in normalized_indices
+        )
+        selected_profiles = tuple(
+            state.profiles[index] for index in normalized_indices
+        )
+        selected_fingerprints = tuple(
+            state.profile_fingerprints[index] for index in normalized_indices
+        )
         _PROFILE_SELECTION_STATES[selection] = _ProfileSelectionState(
             self,
             selected_pairs,
             normalized_indices,
             state.alphabet,
             native,
+            selected_queries,
+            selected_profiles,
+            selected_fingerprints,
+            state.background_fingerprint,
         )
         return selection
 
@@ -822,6 +912,14 @@ class CandidateBatch:
         """Return the number of targets retained in one bound row."""
         row_index = self._row_index(row)
         state = _candidate_state(self)
+        if state.sealed_postfilter is not None:
+            from . import _pipeline  # type: ignore[attr-defined]
+
+            return int(
+                _pipeline._sealed_postfilter_candidate_count_bound(
+                    state.sealed_postfilter, row_index
+                )
+            )
         if state.postfilter_records is not None:
             offsets = memoryview(state.offsets).cast("Q")
             return offsets[row_index + 1] - offsets[row_index]
@@ -988,7 +1086,15 @@ def _new_candidate_batch(
 
 
 class _SequenceState:
-    __slots__ = ("alphabet", "native", "lock", "targets", "residue_offsets")
+    __slots__ = (
+        "alphabet",
+        "native",
+        "lock",
+        "targets",
+        "residue_offsets",
+        "native_generation",
+        "content_fingerprint",
+    )
 
     def __init__(
         self,
@@ -996,12 +1102,16 @@ class _SequenceState:
         native: Any,
         targets: Any,
         residue_offsets: bytes,
+        native_generation: int,
+        content_fingerprint: bytes,
     ) -> None:
         self.alphabet = alphabet
         self.native = native
         self.lock = Lock()
         self.targets = targets
         self.residue_offsets = residue_offsets
+        self.native_generation = native_generation
+        self.content_fingerprint = content_fingerprint
 
 
 _SEQUENCE_STATES: WeakKeyDictionary[Any, _SequenceState] = WeakKeyDictionary()
@@ -1034,6 +1144,13 @@ class SequenceBatch:
         if alphabet is None:
             raise ValueError("an alphabet is required for an empty sequence batch")
 
+        if any(
+            type(sequence) is not pyhmmer.easel.DigitalSequence
+            for sequence in sequence_list
+        ):
+            raise TypeError(
+                "sequence batches require exact DigitalSequence objects"
+            )
         target_sequences = [sequence.copy() for sequence in sequence_list]
         residues = bytearray()
         offsets = array("Q", [0])
@@ -1047,12 +1164,25 @@ class SequenceBatch:
             offsets.append(len(residues))
         targets = pyhmmer.easel.DigitalSequenceBlock(alphabet, target_sequences)
 
+        content_fingerprint = sequence_content_fingerprint(
+            alphabet.Kp, residues, offsets
+        )
+        if sequence_block_content_fingerprint(targets) != content_fingerprint:
+            raise RuntimeError("copied target content fingerprint changed")
         native = _native.SequenceBatch(residues, offsets, alphabet.Kp)
+        native_generation, native_content_fingerprint = (
+            native._generation_and_content_for_seal()
+        )
+        if native_content_fingerprint != content_fingerprint:
+            native.close()
+            raise RuntimeError("native target content fingerprint changed")
         _SEQUENCE_STATES[self] = _SequenceState(
             alphabet,
             native,
             targets,
             offsets.tobytes(),
+            native_generation,
+            content_fingerprint,
         )
 
     @property
@@ -1382,6 +1512,9 @@ class SequenceBatch:
         F2: float,
         F3: float,
         bias_filter: bool,
+        *,
+        pipeline: Any | None = None,
+        domain_guard: float = 2.0e-4,
     ) -> CandidateBatch:
         """Build a sealed selection batch with bounded Forward results."""
         try:
@@ -1391,8 +1524,178 @@ class SequenceBatch:
             raise ValueError("Forward thresholds must be real numbers") from error
         if type(bias_filter) is not bool:
             raise TypeError("bias_filter must be bool")
+        if pipeline is not None:
+            return self._postfilter_forward_domain_selection(
+                selection,
+                F1,
+                f2,
+                f3,
+                bias_filter,
+                pipeline,
+                domain_guard,
+            )
         return self._postfilter_selection(
             selection, F1, (f2, f3, bias_filter)
+        )
+
+    def _postfilter_forward_domain_selection(
+        self,
+        selection: ProfileSelection,
+        F1: float,
+        f2: float,
+        f3: float,
+        bias_filter: bool,
+        pipeline: Any,
+        domain_guard: float,
+    ) -> CandidateBatch:
+        """Build one opaque fused Forward/domain continuation batch."""
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        if type(pipeline) is not pyhmmer.plan7.Pipeline:
+            raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+        if type(selection) is not ProfileSelection:
+            raise TypeError(
+                "profile continuation requires ProfileSession.select output"
+            )
+        try:
+            threshold = float(F1)
+            guard = float(domain_guard)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("continuation thresholds must be real numbers") from error
+        if (
+            not math.isfinite(threshold)
+            or not 0.0 <= threshold < 1.0
+            or not math.isfinite(f2)
+            or not 0.0 <= f2 <= 1.0
+            or not math.isfinite(f3)
+            or not 0.0 <= f3 <= 1.0
+            or not math.isfinite(guard)
+            or not 2.0e-4 <= guard <= 1.0
+        ):
+            raise ValueError("invalid fused continuation thresholds")
+        if not bias_filter:
+            raise ValueError("fused continuation requires bias filtering")
+        if not _native.bias_host_environment_attested():
+            raise RuntimeError(
+                "fused continuation requires the attested floating-point environment"
+            )
+        if (
+            not _pipeline._filter_scores_seam_available()
+            or not _pipeline._filter_and_forward_scores_seam_available()
+            or not _pipeline._simple_regions_seam_available()
+        ):
+            raise RuntimeError(
+                "fused continuation requires the project-private HMMER seams"
+            )
+
+        sequence_state = _sequence_state(self)
+        selection_state = _profile_selection_state(selection)
+        if selection_state.alphabet != sequence_state.alphabet:
+            raise ValueError("profile and sequence alphabets differ")
+        states = [_pair_state(pair) for pair in selection_state.pairs]
+        unique_locks = {id(state.lock): state.lock for state in states}
+        capsule: Any | None = None
+
+        with _lease_pipeline(pipeline):
+            _pipeline._validate_simple_region_generation_bound(
+                pipeline, threshold, f2, f3, bias_filter, guard
+            )
+
+            # Native generation is fully self-contained. Capture it under the
+            # selection/sequence locks, then release them before pair locks to
+            # preserve the package-wide pair -> sequence lock order.
+            with selection_state.lock:
+                if selection_state.native.closed:
+                    raise RuntimeError("profile selection is closed")
+                with sequence_state.lock:
+                    if sequence_state.native.closed:
+                        raise RuntimeError("sequence batch is closed")
+                    native_generation, native_content = (
+                        sequence_state.native._generation_and_content_for_seal()
+                    )
+                    if (
+                        native_generation != sequence_state.native_generation
+                        or native_content != sequence_state.content_fingerprint
+                    ):
+                        raise RuntimeError("native target identity changed")
+                    selection_identity = selection_state.native.identity
+                    identity_tokens = (
+                        selection_state.native._identity_tokens_for_seal()
+                    )
+                    native_profile_fingerprints = (
+                        selection_state.native._fingerprints_for_seal()
+                    )
+                    expected_profile_fingerprints = b"".join(
+                        selection_state.profile_fingerprints
+                    )
+                    if native_profile_fingerprints != expected_profile_fingerprints:
+                        raise RuntimeError(
+                            "native profile selection fingerprint changed"
+                        )
+                    capsule = (
+                        sequence_state.native._postfilter_forward_domain_selection_sealed(
+                            selection_state.native,
+                            threshold,
+                            f2,
+                            f3,
+                            guard,
+                            gathered_byte_budget=_FORWARD_SPECIAL_BYTE_BUDGET,
+                        )
+                    )
+
+            with ExitStack() as locks:
+                for lock_id in sorted(unique_locks):
+                    locks.enter_context(unique_locks[lock_id])
+                if any(
+                    selection_state.queries[index] is not state.hmm
+                    or selection_state.profiles[index]
+                    is not state.optimized_profile
+                    for index, state in enumerate(states)
+                ):
+                    raise ValueError("selected pair objects differ")
+                if tuple(
+                    state.profile_fingerprint for state in states
+                ) != selection_state.profile_fingerprints:
+                    raise ValueError(
+                        "selected pair optimized-profile snapshots differ"
+                    )
+                if any(
+                    state.background_fingerprint
+                    != selection_state.background_fingerprint
+                    for state in states
+                ):
+                    raise ValueError("selected pair backgrounds differ")
+                sealed_postfilter = (
+                    _pipeline._seal_profile_selection_continuation_bound(
+                        selection_state.queries,
+                        selection_state.profiles,
+                        sequence_state.targets,
+                        memoryview(sequence_state.residue_offsets).cast("Q"),
+                        threshold,
+                        memoryview(selection_state.background_fingerprint),
+                        capsule,
+                        selection_identity,
+                        memoryview(identity_tokens).cast("Q"),
+                        memoryview(expected_profile_fingerprints),
+                        native_generation,
+                        memoryview(sequence_state.content_fingerprint),
+                        pipeline,
+                        guard,
+                    )
+                )
+                capsule = None
+
+        offsets = array("Q", [0]) * (len(selection_state.pairs) + 1)
+        return _new_candidate_batch(
+            selection_state.pairs,
+            sequence_state.targets,
+            sequence_state.residue_offsets,
+            array("I"),
+            offsets,
+            bytes(len(selection_state.pairs)),
+            array("I"),
+            threshold,
+            sealed_postfilter=sealed_postfilter,
         )
 
     def _postfilter_selection(

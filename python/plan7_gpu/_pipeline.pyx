@@ -10,9 +10,20 @@ loading it against an unsupported private ABI.
 
 from libc.stddef cimport size_t
 from libc.math cimport isfinite, isnan
-from libc.stdint cimport int16_t, uint8_t, uint16_t, uint32_t, uint64_t
+from libc.stdint cimport int16_t, int32_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcmp, memcpy
+from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
+from cpython.buffer cimport Py_buffer, PyBuffer_FillInfo
+from cpython.pycapsule cimport (
+    PyCapsule_Destructor,
+    PyCapsule_GetPointer,
+    PyCapsule_IsValid,
+    PyCapsule_SetDestructor,
+    PyCapsule_SetName,
+    PyCapsule_SetPointer,
+)
+from cpython.pyport cimport PY_SSIZE_T_MAX
 
 from libeasel cimport eslCONST_LOG2, eslERRBUFSIZE, eslEINVAL, eslERANGE, eslOK
 from libeasel.sq cimport ESL_SQ
@@ -48,7 +59,6 @@ import importlib.util as _importlib_util
 from pathlib import Path as _Path
 from threading import Lock as _Lock
 
-
 cdef extern from "dlfcn.h" nogil:
     ctypedef struct Dl_info:
         const char* dli_fname
@@ -64,6 +74,105 @@ cdef extern from "dlfcn.h" nogil:
 
 cdef extern from "esl_gumbel.h" nogil:
     double esl_gumbel_surv(double, double, double)
+
+
+cdef extern from "continuation_journal.h":
+    const char *PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME
+    const char *PLAN7_CONTINUATION_JOURNAL_CONSUMED_NAME
+
+    cdef enum plan7_continuation_journal_abi:
+        PLAN7_CONTINUATION_JOURNAL_VERSION
+        PLAN7_CONTINUATION_JOURNAL_MAGIC
+        PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
+
+    ctypedef struct plan7_forward_provenance:
+        uint64_t database_generation
+        uint64_t batch_generation
+        uint64_t row_hash
+        uint64_t special_hash
+        uint64_t continuation_hash
+        uint64_t pass_count
+        uint64_t special_count
+        uint64_t generation_f3_bits
+        uint64_t integrity_tag
+
+    ctypedef struct plan7_backward_domain_provenance:
+        plan7_forward_provenance forward
+        uint64_t threshold_hash
+        uint64_t result_hash
+        uint64_t region_hash
+        uint64_t candidate_count
+        uint64_t region_count
+
+    ctypedef struct plan7_simple_region:
+        uint32_t begin
+        uint32_t end
+
+    ctypedef struct plan7_continuation_journal_row:
+        uint32_t profile_index
+        uint32_t sequence_index
+        float usc
+        float filtersc
+        float vfsc
+        float fwdsc
+        float backward_score
+        float nexpected
+        uint32_t uncertain_count
+        uint32_t region_count
+        uint32_t multidomain_count
+        uint8_t postfilter_status
+        uint8_t postfilter_action
+        uint8_t forward_status
+        uint8_t forward_action
+        uint8_t domain_status
+        uint8_t domain_route
+        uint8_t has_own_scales
+        uint8_t reserved
+
+    ctypedef struct plan7_continuation_journal:
+        uint32_t magic
+        uint16_t version
+        uint16_t header_size
+        uint32_t row_size
+        uint32_t region_size
+        uint64_t total_bytes
+        uint64_t session_id
+        uint64_t selection_id
+        uint64_t profile_count
+        uint64_t postfilter_count
+        uint64_t forward_count
+        uint64_t row_count
+        uint64_t special_count
+        uint64_t region_count
+        uint64_t generation_f1_bits
+        uint64_t generation_f2_bits
+        uint64_t generation_f3_bits
+        uint32_t rt1_bits
+        uint32_t rt2_bits
+        uint32_t rt3_bits
+        uint32_t guard_band_bits
+        uint8_t generation_bias_filter
+        uint8_t sequence_content_fingerprint[32]
+        uint64_t postfilter_offsets_offset
+        uint64_t postfilter_records_offset
+        uint64_t forward_offsets_offset
+        uint64_t forward_records_offset
+        uint64_t forward_special_offsets_offset
+        uint64_t profile_offsets_offset
+        uint64_t identity_tokens_offset
+        uint64_t profile_fingerprints_offset
+        uint64_t rows_offset
+        uint64_t special_offsets_offset
+        uint64_t specials_offset
+        uint64_t region_offsets_offset
+        uint64_t regions_offset
+        plan7_forward_provenance forward
+        plan7_backward_domain_provenance backward
+        uint64_t integrity_tag
+
+    uint64_t plan7_continuation_journal_integrity(
+        const plan7_continuation_journal *journal,
+    ) nogil
 
 
 _abi_spec = _importlib_util.spec_from_file_location(
@@ -106,6 +215,13 @@ cdef enum:
     FORWARD_ERANGE = 16
     FORWARD_ENORESULT = 19
     FORWARD_EMPTY = 255
+    DOMAIN_CPU_REQUIRED = 0
+    DOMAIN_NO_REGIONS = 1
+    DOMAIN_SIMPLE = 2
+    DOMAIN_OK = 0
+    DOMAIN_ERANGE = 16
+    DOMAIN_ENORESULT = 19
+    DOMAIN_EMPTY = 255
     P7_VIT_EXTERNAL = 1
     P7_VIT_CPU = 2
 
@@ -163,6 +279,27 @@ ctypedef int (*_pipeline_from_filter_and_forward_scores_f)(
     uint64_t,
 ) noexcept nogil
 
+ctypedef int (*_pipeline_from_filter_and_forward_simple_regions_f)(
+    P7_PIPELINE*,
+    P7_OPROFILE*,
+    P7_BG*,
+    const ESL_SQ*,
+    const ESL_SQ*,
+    P7_TOPHITS*,
+    float,
+    float,
+    float,
+    float,
+    uint64_t,
+    uint64_t,
+    uint64_t,
+    int,
+    int,
+    float,
+    const plan7_simple_region*,
+    uint64_t,
+) noexcept nogil
+
 
 cdef union _float_bits:
     float value
@@ -172,6 +309,37 @@ cdef union _float_bits:
 cdef union _double_bits:
     double value
     uint64_t bits
+
+
+cdef struct _pipeline_tail_snapshot:
+    uint64_t f1_bits
+    uint64_t f2_bits
+    uint64_t f3_bits
+    uint64_t E_bits
+    uint64_t T_bits
+    uint64_t domE_bits
+    uint64_t domT_bits
+    uint64_t incE_bits
+    uint64_t incT_bits
+    uint64_t incdomE_bits
+    uint64_t incdomT_bits
+    uint64_t Z_bits
+    uint64_t domZ_bits
+    uint32_t rt1_bits
+    uint32_t rt2_bits
+    uint32_t rt3_bits
+    int32_t do_biasfilter
+    int32_t do_null2
+    int32_t do_alignment_score_calc
+    int32_t by_E
+    int32_t dom_by_E
+    int32_t inc_by_E
+    int32_t incdom_by_E
+    int32_t use_bit_cutoffs
+    int32_t Z_setby
+    int32_t domZ_setby
+    int32_t mode
+    int32_t long_targets
 
 
 cdef class _SealedPostfilterBatch:
@@ -190,12 +358,20 @@ cdef class _SealedPostfilterBatch:
     cdef const float[::1] _specials
     cdef const uint8_t[::1] _row_has_external
     cdef const uint8_t[::1] _background_fingerprint
+    cdef const uint8_t[::1] _journal_storage
+    cdef const uint64_t[::1] _journal_profile_offsets
+    cdef const uint8_t[::1] _journal_rows
+    cdef const uint64_t[::1] _journal_region_offsets
+    cdef const uint8_t[::1] _journal_regions
     cdef double _f1
     cdef uint64_t _generation_f2_bits
     cdef uint64_t _generation_f3_bits
     cdef bint _generation_bias_filter
+    cdef uint32_t _journal_guard_bits
+    cdef _pipeline_tail_snapshot _pipeline_options
     cdef _pipeline_from_filter_scores_f _filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam
+    cdef _pipeline_from_filter_and_forward_simple_regions_f _simple_regions_seam
 
     def __cinit__(self):
         self._ready = False
@@ -207,20 +383,54 @@ cdef class _SealedPostfilterBatch:
         raise TypeError("sealed post-filter batches cannot be pickled")
 
 
+cdef class _ContinuationJournalStorage:
+    """Read-only buffer exporting one transferred native journal allocation."""
+
+    cdef uint8_t *_data
+    cdef Py_ssize_t _size
+    cdef bint _owns
+
+    def __cinit__(self):
+        self._data = NULL
+        self._size = 0
+        self._owns = False
+
+    def __dealloc__(self):
+        if self._owns and self._data != NULL:
+            free(self._data)
+
+    def __getbuffer__(self, Py_buffer *view, int flags):
+        if self._data == NULL:
+            raise BufferError("continuation journal storage is unavailable")
+        PyBuffer_FillInfo(
+            view, self, self._data, self._size, 1, flags
+        )
+
+    def __releasebuffer__(self, Py_buffer *view):
+        pass
+
+
 cdef _pipeline_from_filter_scores_f _filter_scores_seam_cache = NULL
 cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam_cache = NULL
+cdef _pipeline_from_filter_and_forward_simple_regions_f _simple_regions_seam_cache = NULL
 cdef bint _filter_scores_seam_resolved = False
 cdef bint _forward_scores_seam_resolved = False
+cdef bint _simple_regions_seam_resolved = False
 cdef bint _filter_scores_same_dso = False
 cdef bint _forward_scores_same_dso = False
+cdef bint _simple_regions_same_dso = False
 cdef uint64_t _filter_scores_resolutions = 0
 cdef uint64_t _forward_scores_resolutions = 0
 cdef uint64_t _filter_scores_dlopen_calls = 0
 cdef uint64_t _forward_scores_dlopen_calls = 0
 cdef uint64_t _filter_scores_dlclose_calls = 0
 cdef uint64_t _forward_scores_dlclose_calls = 0
+cdef uint64_t _simple_regions_resolutions = 0
+cdef uint64_t _simple_regions_dlopen_calls = 0
+cdef uint64_t _simple_regions_dlclose_calls = 0
 
 _continuation_seam_resolve_lock = _Lock()
+cdef uint8_t _consumed_journal_sentinel = 0
 
 
 def _bias_filter_score_bits(
@@ -373,6 +583,57 @@ def _filter_and_forward_scores_seam_available():
     return _cached_filter_and_forward_scores_seam() != NULL
 
 
+cdef _pipeline_from_filter_and_forward_simple_regions_f _resolve_simple_regions_seam() noexcept nogil:
+    global _simple_regions_dlopen_calls
+    global _simple_regions_dlclose_calls
+    global _simple_regions_same_dso
+    cdef Dl_info info
+    cdef Dl_info symbol_info
+    cdef void* handle
+    cdef void* symbol
+
+    if dladdr(<const void*> p7_Pipeline, &info) == 0 or info.dli_fname == NULL:
+        return NULL
+    _simple_regions_dlopen_calls += 1
+    handle = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_NOW)
+    if handle == NULL:
+        return NULL
+    symbol = dlsym(
+        handle, "p7_PipelineFromFilterAndForwardSimpleRegions"
+    )
+    if (
+        symbol == NULL
+        or dladdr(symbol, &symbol_info) == 0
+        or symbol_info.dli_fbase != info.dli_fbase
+    ):
+        _simple_regions_dlclose_calls += 1
+        dlclose(handle)
+        return NULL
+    _simple_regions_same_dso = True
+    _simple_regions_dlclose_calls += 1
+    dlclose(handle)
+    return <_pipeline_from_filter_and_forward_simple_regions_f> symbol
+
+
+cdef _pipeline_from_filter_and_forward_simple_regions_f _cached_simple_regions_seam():
+    global _simple_regions_resolutions
+    global _simple_regions_seam_cache
+    global _simple_regions_seam_resolved
+
+    if not _simple_regions_seam_resolved:
+        with _continuation_seam_resolve_lock:
+            if not _simple_regions_seam_resolved:
+                _simple_regions_resolutions += 1
+                _simple_regions_seam_cache = _resolve_simple_regions_seam()
+                _simple_regions_seam_resolved = True
+    return _simple_regions_seam_cache
+
+
+def _simple_regions_seam_available():
+    """Return whether the guarded simple-region continuation seam is loaded."""
+    return _cached_simple_regions_seam() != NULL
+
+
 def _continuation_seam_cache_info():
     """Return private resolver state for concurrency and lifetime tests."""
     return {
@@ -392,7 +653,172 @@ def _continuation_seam_cache_info():
             "dlopen_calls": _forward_scores_dlopen_calls,
             "dlclose_calls": _forward_scores_dlclose_calls,
         },
+        "simple_regions": {
+            "resolved": bool(_simple_regions_seam_resolved),
+            "available": _simple_regions_seam_cache != NULL,
+            "same_dso": bool(_simple_regions_same_dso),
+            "resolutions": _simple_regions_resolutions,
+            "dlopen_calls": _simple_regions_dlopen_calls,
+            "dlclose_calls": _simple_regions_dlclose_calls,
+        },
     }
+
+
+cdef void _capture_pipeline_tail_options(
+    Pipeline pipeline,
+    _pipeline_tail_snapshot *snapshot,
+) except *:
+    cdef _double_bits encoded_double
+    cdef _float_bits encoded_float
+    cdef P7_PIPELINE *pli = pipeline._pli
+
+    if pli == NULL or pli.ddef == NULL:
+        raise RuntimeError("pipeline domain state is unavailable")
+    encoded_double.value = pli.F1
+    snapshot.f1_bits = encoded_double.bits
+    encoded_double.value = pli.F2
+    snapshot.f2_bits = encoded_double.bits
+    encoded_double.value = pli.F3
+    snapshot.f3_bits = encoded_double.bits
+    encoded_double.value = pli.E
+    snapshot.E_bits = encoded_double.bits
+    encoded_double.value = pli.T
+    snapshot.T_bits = encoded_double.bits
+    encoded_double.value = pli.domE
+    snapshot.domE_bits = encoded_double.bits
+    encoded_double.value = pli.domT
+    snapshot.domT_bits = encoded_double.bits
+    encoded_double.value = pli.incE
+    snapshot.incE_bits = encoded_double.bits
+    encoded_double.value = pli.incT
+    snapshot.incT_bits = encoded_double.bits
+    encoded_double.value = pli.incdomE
+    snapshot.incdomE_bits = encoded_double.bits
+    encoded_double.value = pli.incdomT
+    snapshot.incdomT_bits = encoded_double.bits
+    encoded_double.value = pli.Z
+    snapshot.Z_bits = encoded_double.bits
+    encoded_double.value = pli.domZ
+    snapshot.domZ_bits = encoded_double.bits
+    encoded_float.value = pli.ddef.rt1
+    snapshot.rt1_bits = encoded_float.bits
+    encoded_float.value = pli.ddef.rt2
+    snapshot.rt2_bits = encoded_float.bits
+    encoded_float.value = pli.ddef.rt3
+    snapshot.rt3_bits = encoded_float.bits
+    snapshot.do_biasfilter = pli.do_biasfilter
+    snapshot.do_null2 = pli.do_null2
+    snapshot.do_alignment_score_calc = pli.do_alignment_score_calc
+    snapshot.by_E = pli.by_E
+    snapshot.dom_by_E = pli.dom_by_E
+    snapshot.inc_by_E = pli.inc_by_E
+    snapshot.incdom_by_E = pli.incdom_by_E
+    snapshot.use_bit_cutoffs = pli.use_bit_cutoffs
+    snapshot.Z_setby = pli.Z_setby
+    snapshot.domZ_setby = pli.domZ_setby
+    snapshot.mode = pli.mode
+    snapshot.long_targets = pli.long_targets
+
+
+cdef bint _pipeline_tail_options_match(
+    const _pipeline_tail_snapshot *expected,
+    Pipeline pipeline,
+) except -1:
+    cdef _pipeline_tail_snapshot observed
+    _capture_pipeline_tail_options(pipeline, &observed)
+    if (
+        observed.f1_bits != expected.f1_bits
+        or observed.f2_bits != expected.f2_bits
+        or observed.f3_bits != expected.f3_bits
+        or observed.E_bits != expected.E_bits
+        or observed.domE_bits != expected.domE_bits
+        or observed.incE_bits != expected.incE_bits
+        or observed.incdomE_bits != expected.incdomE_bits
+        or observed.rt1_bits != expected.rt1_bits
+        or observed.rt2_bits != expected.rt2_bits
+        or observed.rt3_bits != expected.rt3_bits
+        or observed.do_biasfilter != expected.do_biasfilter
+        or observed.do_null2 != expected.do_null2
+        or observed.do_alignment_score_calc
+        != expected.do_alignment_score_calc
+        or observed.by_E != expected.by_E
+        or observed.dom_by_E != expected.dom_by_E
+        or observed.inc_by_E != expected.inc_by_E
+        or observed.incdom_by_E != expected.incdom_by_E
+        or observed.use_bit_cutoffs != expected.use_bit_cutoffs
+        or observed.Z_setby != expected.Z_setby
+        or observed.domZ_setby != expected.domZ_setby
+        or observed.mode != expected.mode
+        or observed.long_targets != expected.long_targets
+    ):
+        return False
+    if expected.use_bit_cutoffs == 0 and (
+        observed.T_bits != expected.T_bits
+        or observed.domT_bits != expected.domT_bits
+        or observed.incT_bits != expected.incT_bits
+        or observed.incdomT_bits != expected.incdomT_bits
+    ):
+        return False
+    if expected.Z_setby != p7_ZSETBY_NTARGETS and (
+        observed.Z_bits != expected.Z_bits
+    ):
+        return False
+    if expected.domZ_setby != p7_ZSETBY_NTARGETS and (
+        observed.domZ_bits != expected.domZ_bits
+    ):
+        return False
+    return True
+
+
+def _validate_simple_region_generation_bound(
+    Pipeline pipeline,
+    double f1,
+    double f2,
+    double f3,
+    bias_filter,
+    double guard_band,
+):
+    """Validate product-domain options without mutating the pipeline."""
+    cdef _pipeline_tail_snapshot snapshot
+    cdef _double_bits encoded
+    cdef _float_bits observed_float
+    cdef _float_bits expected_float
+
+    if type(bias_filter) is not bool or not bias_filter:
+        raise ValueError("simple-region generation requires bias filtering")
+    if (
+        not isfinite(f1) or f1 < 0.0 or f1 > 1.0
+        or not isfinite(f2) or f2 < 0.0 or f2 > 1.0
+        or not isfinite(f3) or f3 < 0.0 or f3 > 1.0
+        or not isfinite(guard_band)
+        or guard_band < 2.0e-4 or guard_band > 1.0
+    ):
+        raise ValueError("invalid simple-region generation thresholds")
+    _capture_pipeline_tail_options(pipeline, &snapshot)
+    encoded.value = f1
+    if encoded.bits != snapshot.f1_bits:
+        raise ValueError("pipeline F1 differs from journal generation F1")
+    encoded.value = f2
+    if encoded.bits != snapshot.f2_bits:
+        raise ValueError("pipeline F2 differs from journal generation F2")
+    encoded.value = f3
+    if encoded.bits != snapshot.f3_bits:
+        raise ValueError("pipeline F3 differs from journal generation F3")
+    if not snapshot.do_biasfilter:
+        raise ValueError("pipeline bias filter is disabled")
+    if snapshot.mode != p7_SEARCH_SEQS or snapshot.long_targets:
+        raise ValueError("simple-region generation requires sequence-search mode")
+    expected_float.value = <float> 0.25
+    if snapshot.rt1_bits != expected_float.bits:
+        raise ValueError("pipeline rt1 is not the calibrated default")
+    expected_float.value = <float> 0.10
+    if snapshot.rt2_bits != expected_float.bits:
+        raise ValueError("pipeline rt2 is not the calibrated default")
+    expected_float.value = <float> 0.20
+    if snapshot.rt3_bits != expected_float.bits:
+        raise ValueError("pipeline rt3 is not the calibrated default")
+    observed_float.value = <float> guard_band
+    return (0.25, 0.10, 0.20, observed_float.value)
 
 
 def _select_forward_inputs_bound(
@@ -853,6 +1279,15 @@ cdef int _search_loop_postfilter_forward(
     P7_TOPHITS* th,
     _pipeline_from_filter_scores_f filter_scores_seam,
     _pipeline_from_filter_and_forward_scores_f forward_scores_seam,
+    const uint8_t* journal_bytes,
+    size_t journal_count,
+    const uint64_t* journal_region_offsets,
+    const uint8_t* journal_region_bytes,
+    uint64_t generation_f1_bits,
+    uint64_t generation_f2_bits,
+    uint64_t generation_f3_bits,
+    int generation_bias_filter,
+    _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam,
 ) except 1 nogil:
     cdef _postfilter_result postfilter
     cdef _forward_result forward
@@ -862,11 +1297,18 @@ cdef int _search_loop_postfilter_forward(
     cdef int status
     cdef size_t cursor
     cdef size_t forward_cursor = 0
+    cdef size_t journal_cursor = 0
     cdef size_t previous_end = 0
     cdef size_t target_end
     cdef size_t t
     cdef bint has_forward
     cdef bint used_forward_seam
+    cdef bint used_simple_regions_seam
+    cdef bint has_journal
+    cdef plan7_continuation_journal_row journal
+    cdef const plan7_simple_region* regions = NULL
+    cdef uint64_t region_start
+    cdef uint64_t region_stop
 
     status = p7_pli_NewModel(pli, om, bg)
     if status == eslEINVAL:
@@ -908,7 +1350,18 @@ cdef int _search_loop_postfilter_forward(
             )
             has_forward = forward.sequence_index == postfilter.sequence_index
 
+        has_journal = False
+        if journal_cursor < journal_count:
+            memcpy(
+                &journal,
+                journal_bytes
+                + journal_cursor * sizeof(plan7_continuation_journal_row),
+                sizeof(plan7_continuation_journal_row),
+            )
+            has_journal = journal.sequence_index == postfilter.sequence_index
+
         used_forward_seam = False
+        used_simple_regions_seam = False
         if postfilter.action == BIAS_CPU_REQUIRED:
             status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
         elif isnan(postfilter.filtersc):
@@ -917,7 +1370,51 @@ cdef int _search_loop_postfilter_forward(
             usc = <float> postfilter.msv_numerator
             usc = usc / om.scale_b
             usc = usc - <float> 3.0
-            if has_forward and forward.action != FORWARD_CPU_REQUIRED:
+            if (
+                has_forward
+                and has_journal
+                and forward.action == FORWARD_DEFINITE_PASS
+                and simple_regions_seam != NULL
+                and journal.domain_status == DOMAIN_OK
+                and (
+                    journal.domain_route == DOMAIN_NO_REGIONS
+                    or journal.domain_route == DOMAIN_SIMPLE
+                )
+                and not journal.has_own_scales
+                and journal.uncertain_count == 0
+                and journal.multidomain_count == 0
+            ):
+                region_start = journal_region_offsets[journal_cursor]
+                region_stop = journal_region_offsets[journal_cursor + 1]
+                if region_start == region_stop:
+                    regions = NULL
+                else:
+                    regions = <const plan7_simple_region *> (
+                        journal_region_bytes
+                        + region_start * sizeof(plan7_simple_region)
+                    )
+                status = simple_regions_seam(
+                    pli,
+                    om,
+                    bg,
+                    sq[t],
+                    NULL,
+                    th,
+                    journal.usc,
+                    journal.filtersc,
+                    journal.vfsc,
+                    journal.fwdsc,
+                    generation_f1_bits,
+                    generation_f2_bits,
+                    generation_f3_bits,
+                    generation_bias_filter,
+                    journal.domain_route,
+                    journal.nexpected,
+                    regions,
+                    region_stop - region_start,
+                )
+                used_simple_regions_seam = True
+            elif has_forward and forward.action != FORWARD_CPU_REQUIRED:
                 xmx_count = (
                     special_offsets[forward_cursor + 1]
                     - special_offsets[forward_cursor]
@@ -957,8 +1454,15 @@ cdef int _search_loop_postfilter_forward(
 
         if has_forward:
             forward_cursor += 1
+        if has_journal:
+            journal_cursor += 1
         if status == eslEINVAL:
-            if used_forward_seam:
+            if used_simple_regions_seam:
+                raise UnexpectedError(
+                    status,
+                    "p7_PipelineFromFilterAndForwardSimpleRegions",
+                )
+            elif used_forward_seam:
                 raise UnexpectedError(
                     status, "p7_PipelineFromFilterAndForwardScores"
                 )
@@ -972,6 +1476,9 @@ cdef int _search_loop_postfilter_forward(
 
         p7_pipeline_Reuse(pli)
         previous_end = target_end
+
+    if journal_cursor != journal_count:
+        raise ValueError("continuation journal row was not consumed")
 
     if previous_end < n_targets:
         if not pli.long_targets:
@@ -1205,6 +1712,101 @@ cdef TopHits _search_postfilter_forward_validated(
             hits._th,
             filter_scores_seam,
             forward_scores_seam,
+            NULL,
+            0,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            0,
+            NULL,
+        )
+        hits._sort_by_key()
+        hits._threshold(pipeline)
+
+    hits._query = query
+    hits._empty = False
+    return hits
+
+
+cdef TopHits _search_postfilter_forward_journal_validated(
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+    const uint8_t[::1] postfilter_records,
+    const uint8_t[::1] forward_records,
+    const uint64_t[::1] special_offsets,
+    const float[::1] specials,
+    const uint8_t[::1] journal_rows,
+    const uint64_t[::1] journal_region_offsets,
+    const uint8_t[::1] journal_regions,
+    const uint64_t* residue_offsets,
+    uint64_t generation_f1_bits,
+    uint64_t generation_f2_bits,
+    uint64_t generation_f3_bits,
+    int generation_bias_filter,
+    _pipeline_from_filter_scores_f filter_scores_seam,
+    _pipeline_from_filter_and_forward_scores_f forward_scores_seam,
+    _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam,
+):
+    cdef const uint8_t* postfilter_ptr = NULL
+    cdef const uint8_t* forward_ptr = NULL
+    cdef const float* special_ptr = NULL
+    cdef const uint8_t* journal_ptr = NULL
+    cdef const uint8_t* region_ptr = NULL
+    cdef size_t postfilter_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+    cdef size_t forward_count = (
+        <size_t> forward_records.shape[0] // sizeof(_forward_result)
+    )
+    cdef size_t journal_count = (
+        <size_t> journal_rows.shape[0]
+        // sizeof(plan7_continuation_journal_row)
+    )
+    cdef TopHits hits = TopHits(query)
+
+    if postfilter_records.shape[0]:
+        postfilter_ptr = &postfilter_records[0]
+    if forward_records.shape[0]:
+        forward_ptr = &forward_records[0]
+    if specials.shape[0]:
+        special_ptr = &specials[0]
+    if journal_rows.shape[0]:
+        journal_ptr = &journal_rows[0]
+    if journal_regions.shape[0]:
+        region_ptr = &journal_regions[0]
+
+    with nogil:
+        pipeline._pli.mode = p7_SEARCH_SEQS
+        pipeline._pli.nseqs = 0
+        _search_loop_postfilter_forward(
+            pipeline._pli,
+            optimized_profile._om,
+            pipeline.background._bg,
+            <const ESL_SQ**> sequences._refs,
+            sequences._length,
+            postfilter_ptr,
+            postfilter_count,
+            forward_ptr,
+            forward_count,
+            &special_offsets[0],
+            special_ptr,
+            residue_offsets,
+            hits._th,
+            filter_scores_seam,
+            forward_scores_seam,
+            journal_ptr,
+            journal_count,
+            &journal_region_offsets[0],
+            region_ptr,
+            generation_f1_bits,
+            generation_f2_bits,
+            generation_f3_bits,
+            generation_bias_filter,
+            simple_regions_seam,
         )
         hits._sort_by_key()
         hits._threshold(pipeline)
@@ -1749,6 +2351,543 @@ cdef object _immutable_owned_view(object value, str expected_format):
     return memoryview(view.cast("B").tobytes()).cast(expected_format)
 
 
+cdef bint _journal_expected_segment(
+    size_t *cursor,
+    uint64_t observed_offset,
+    uint64_t count,
+    size_t item_size,
+) noexcept:
+    cdef size_t aligned
+    cdef size_t native_count
+    cdef size_t byte_count
+    if count > <uint64_t> (<size_t> -1):
+        return False
+    native_count = <size_t> count
+    if cursor[0] > (<size_t> -1) - 7:
+        return False
+    aligned = (cursor[0] + 7) & ~<size_t> 7
+    if observed_offset != <uint64_t> aligned:
+        return False
+    if native_count != 0 and item_size > (<size_t> -1) // native_count:
+        return False
+    byte_count = native_count * item_size
+    if aligned > (<size_t> -1) - byte_count:
+        return False
+    cursor[0] = aligned + byte_count
+    return True
+
+
+cdef tuple _consume_validate_continuation_journal(
+    object capsule,
+    tuple profiles,
+    DigitalSequenceBlock sequences,
+    uint64_t expected_session_id,
+    uint64_t expected_selection_id,
+    const uint64_t[::1] expected_identity_tokens,
+    const uint8_t[::1] expected_profile_fingerprints,
+    uint64_t expected_batch_generation,
+    const uint8_t[::1] expected_sequence_fingerprint,
+    double f1,
+    uint64_t generation_f2_bits,
+    uint64_t generation_f3_bits,
+    bint generation_bias_filter,
+):
+    cdef plan7_continuation_journal *journal
+    cdef size_t cursor
+    cdef size_t profile_count = len(profiles)
+    cdef size_t postfilter_count
+    cdef size_t forward_count
+    cdef size_t profile
+    cdef size_t row
+    cdef size_t row_start
+    cdef size_t row_stop
+    cdef size_t postfilter_cursor
+    cdef size_t postfilter_stop
+    cdef size_t forward_cursor
+    cdef size_t forward_stop
+    cdef size_t region
+    cdef size_t region_start
+    cdef size_t region_stop
+    cdef uint32_t previous_sequence
+    cdef uint32_t previous_end
+    cdef uint32_t guard_bits
+    cdef _postfilter_result postfilter
+    cdef _forward_result forward
+    cdef plan7_continuation_journal_row journal_row
+    cdef plan7_simple_region interval
+    cdef OptimizedProfile optimized_profile
+    cdef float computed_usc
+    cdef _float_bits expected_float
+    cdef _float_bits observed_float
+    cdef _double_bits expected_double
+    cdef object tokens = set()
+    cdef _ContinuationJournalStorage storage
+    cdef object storage_view
+    cdef const uint8_t[::1] postfilter_view
+    cdef const uint64_t[::1] postfilter_offset_view
+    cdef const uint8_t[::1] forward_view
+    cdef const uint64_t[::1] forward_offset_view
+    cdef const uint64_t[::1] special_offset_view
+    cdef const float[::1] special_view
+    cdef const uint64_t[::1] profile_offset_view
+    cdef const uint64_t[::1] identity_token_view
+    cdef const uint8_t[::1] profile_fingerprint_view
+    cdef const uint8_t[::1] row_view
+    cdef const uint64_t[::1] journal_special_offset_view
+    cdef const uint64_t[::1] region_offset_view
+    cdef const uint8_t[::1] region_view
+
+    if not PyCapsule_IsValid(
+        capsule, PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME
+    ):
+        raise TypeError("continuation journal capsule is invalid or consumed")
+    journal = <plan7_continuation_journal *> PyCapsule_GetPointer(
+        capsule, PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME
+    )
+    if journal == NULL:
+        raise TypeError("continuation journal capsule has no storage")
+    if (
+        journal.magic != PLAN7_CONTINUATION_JOURNAL_MAGIC
+        or journal.version != PLAN7_CONTINUATION_JOURNAL_VERSION
+        or journal.header_size != sizeof(plan7_continuation_journal)
+        or journal.row_size != sizeof(plan7_continuation_journal_row)
+        or journal.region_size != sizeof(plan7_simple_region)
+        or journal.total_bytes < sizeof(plan7_continuation_journal)
+        or journal.total_bytes > <uint64_t> (<size_t> -1)
+        or journal.total_bytes > <uint64_t> PY_SSIZE_T_MAX
+        or journal.profile_count != profile_count
+        or journal.profile_count > <uint64_t> (<size_t> -1) - 1
+        or journal.postfilter_count > <uint64_t> (<size_t> -1)
+        or journal.forward_count > <uint64_t> (<size_t> -1) - 1
+        or journal.row_count > <uint64_t> (<size_t> -1) - 1
+        or journal.special_count > <uint64_t> (<size_t> -1)
+        or journal.region_count > <uint64_t> (<size_t> -1)
+    ):
+        raise ValueError("continuation journal ABI header is invalid")
+    cursor = sizeof(plan7_continuation_journal)
+    if not (
+        _journal_expected_segment(
+            &cursor, journal.postfilter_offsets_offset,
+            journal.profile_count + 1, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.postfilter_records_offset,
+            journal.postfilter_count, sizeof(_postfilter_result),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.forward_offsets_offset,
+            journal.profile_count + 1, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.forward_records_offset,
+            journal.forward_count, sizeof(_forward_result),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.forward_special_offsets_offset,
+            journal.forward_count + 1, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.profile_offsets_offset,
+            journal.profile_count + 1, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.identity_tokens_offset,
+            journal.profile_count, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.profile_fingerprints_offset,
+            journal.profile_count,
+            PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+        )
+        and _journal_expected_segment(
+            &cursor, journal.rows_offset,
+            journal.row_count, sizeof(plan7_continuation_journal_row),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.special_offsets_offset,
+            journal.row_count + 1, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.specials_offset,
+            journal.special_count, sizeof(float),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.region_offsets_offset,
+            journal.row_count + 1, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.regions_offset,
+            journal.region_count, sizeof(plan7_simple_region),
+        )
+        and cursor == <size_t> journal.total_bytes
+    ):
+        raise ValueError("continuation journal storage layout is invalid")
+    if (
+        journal.integrity_tag == 0
+        or journal.integrity_tag
+        != plan7_continuation_journal_integrity(journal)
+    ):
+        raise ValueError("continuation journal integrity check failed")
+    if (
+        journal.session_id == 0
+        or journal.selection_id == 0
+        or journal.session_id != expected_session_id
+        or journal.selection_id != expected_selection_id
+        or journal.profile_count != profile_count
+    ):
+        raise ValueError("continuation journal selection identity differs")
+    if expected_identity_tokens.shape[0] != profile_count:
+        raise ValueError("continuation journal profile identity count differs")
+    if expected_profile_fingerprints.shape[0] != (
+        profile_count * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
+    ):
+        raise ValueError("continuation journal profile fingerprint count differs")
+    if expected_sequence_fingerprint.shape[0] != 32:
+        raise ValueError("sequence content fingerprint has the wrong size")
+    if memcmp(
+        journal.sequence_content_fingerprint,
+        &expected_sequence_fingerprint[0],
+        32,
+    ) != 0:
+        raise ValueError("continuation journal target content differs")
+    expected_double.value = f1
+    if journal.generation_f1_bits != expected_double.bits:
+        raise ValueError("continuation journal F1 provenance differs")
+    if (
+        journal.generation_f2_bits != generation_f2_bits
+        or journal.generation_f3_bits != generation_f3_bits
+        or journal.generation_bias_filter != <uint8_t> generation_bias_filter
+        or not generation_bias_filter
+    ):
+        raise ValueError("continuation journal filter provenance differs")
+    expected_float.value = <float> 0.25
+    if journal.rt1_bits != expected_float.bits:
+        raise ValueError("continuation journal rt1 differs")
+    expected_float.value = <float> 0.10
+    if journal.rt2_bits != expected_float.bits:
+        raise ValueError("continuation journal rt2 differs")
+    expected_float.value = <float> 0.20
+    if journal.rt3_bits != expected_float.bits:
+        raise ValueError("continuation journal rt3 differs")
+    observed_float.bits = journal.guard_band_bits
+    guard_bits = journal.guard_band_bits
+    if (
+        not isfinite(observed_float.value)
+        or observed_float.value < <float> 2.0e-4
+        or observed_float.value > <float> 1.0
+    ):
+        raise ValueError("continuation journal guard band is invalid")
+    if (
+        journal.forward.database_generation == 0
+        or journal.forward.batch_generation == 0
+        or journal.forward.batch_generation != expected_batch_generation
+        or journal.forward.pass_count != journal.row_count
+        or journal.forward.special_count != journal.special_count
+        or journal.forward.generation_f3_bits != generation_f3_bits
+        or journal.backward.candidate_count != journal.row_count
+        or journal.backward.region_count != journal.region_count
+        or memcmp(
+            &journal.forward,
+            &journal.backward.forward,
+            sizeof(plan7_forward_provenance),
+        ) != 0
+    ):
+        raise ValueError("continuation journal native provenance differs")
+
+    storage = _ContinuationJournalStorage.__new__(_ContinuationJournalStorage)
+    storage._data = <uint8_t *> journal
+    storage._size = <Py_ssize_t> journal.total_bytes
+    storage_view = memoryview(storage).cast("B")
+    postfilter_offset_view = storage_view[
+        journal.postfilter_offsets_offset:
+        journal.postfilter_offsets_offset
+        + (profile_count + 1) * sizeof(uint64_t)
+    ].cast("Q")
+    postfilter_view = storage_view[
+        journal.postfilter_records_offset:
+        journal.postfilter_records_offset
+        + <size_t> journal.postfilter_count * sizeof(_postfilter_result)
+    ]
+    forward_offset_view = storage_view[
+        journal.forward_offsets_offset:
+        journal.forward_offsets_offset
+        + (profile_count + 1) * sizeof(uint64_t)
+    ].cast("Q")
+    forward_view = storage_view[
+        journal.forward_records_offset:
+        journal.forward_records_offset
+        + <size_t> journal.forward_count * sizeof(_forward_result)
+    ]
+    special_offset_view = storage_view[
+        journal.forward_special_offsets_offset:
+        journal.forward_special_offsets_offset
+        + (<size_t> journal.forward_count + 1) * sizeof(uint64_t)
+    ].cast("Q")
+    profile_offset_view = storage_view[
+        journal.profile_offsets_offset:
+        journal.profile_offsets_offset + (profile_count + 1) * sizeof(uint64_t)
+    ].cast("Q")
+    identity_token_view = storage_view[
+        journal.identity_tokens_offset:
+        journal.identity_tokens_offset + profile_count * sizeof(uint64_t)
+    ].cast("Q")
+    profile_fingerprint_view = storage_view[
+        journal.profile_fingerprints_offset:
+        journal.profile_fingerprints_offset
+        + profile_count * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
+    ]
+    row_view = storage_view[
+        journal.rows_offset:
+        journal.rows_offset
+        + <size_t> journal.row_count * sizeof(plan7_continuation_journal_row)
+    ]
+    journal_special_offset_view = storage_view[
+        journal.special_offsets_offset:
+        journal.special_offsets_offset
+        + (<size_t> journal.row_count + 1) * sizeof(uint64_t)
+    ].cast("Q")
+    special_view = storage_view[
+        journal.specials_offset:
+        journal.specials_offset
+        + <size_t> journal.special_count * sizeof(float)
+    ].cast("f")
+    region_offset_view = storage_view[
+        journal.region_offsets_offset:
+        journal.region_offsets_offset
+        + (<size_t> journal.row_count + 1) * sizeof(uint64_t)
+    ].cast("Q")
+    region_view = storage_view[
+        journal.regions_offset:
+        journal.regions_offset
+        + <size_t> journal.region_count * sizeof(plan7_simple_region)
+    ]
+
+    if (
+        postfilter_offset_view[0] != 0
+        or postfilter_offset_view[profile_count] != journal.postfilter_count
+    ):
+        raise ValueError("continuation journal post-filter offsets do not span rows")
+    if (
+        forward_offset_view[0] != 0
+        or forward_offset_view[profile_count] != journal.forward_count
+    ):
+        raise ValueError("continuation journal Forward offsets do not span rows")
+    if (
+        special_offset_view[0] != 0
+        or special_offset_view[journal.forward_count] != journal.special_count
+    ):
+        raise ValueError("continuation journal Forward specials do not span storage")
+    if profile_offset_view[0] != 0 or (
+        profile_offset_view[profile_count] != journal.row_count
+    ):
+        raise ValueError("continuation journal profile offsets do not span rows")
+    if journal_special_offset_view[0] != 0 or (
+        journal_special_offset_view[journal.row_count] != journal.special_count
+    ):
+        raise ValueError("continuation journal special offsets do not span storage")
+    if region_offset_view[0] != 0 or (
+        region_offset_view[journal.row_count] != journal.region_count
+    ):
+        raise ValueError("continuation journal region offsets do not span storage")
+    for profile in range(profile_count):
+        if (
+            identity_token_view[profile] == 0
+            or identity_token_view[profile] in tokens
+        ):
+            raise ValueError("continuation journal profile identity is invalid")
+        if identity_token_view[profile] != expected_identity_tokens[profile]:
+            raise ValueError("continuation journal profile identity differs")
+        tokens.add(identity_token_view[profile])
+    if profile_count and memcmp(
+        &profile_fingerprint_view[0],
+        &expected_profile_fingerprints[0],
+        profile_count * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+    ) != 0:
+        raise ValueError("continuation journal optimized-profile snapshot differs")
+
+    postfilter_count = <size_t> journal.postfilter_count
+    forward_count = <size_t> journal.forward_count
+
+    for profile in range(profile_count):
+        row_start = <size_t> profile_offset_view[profile]
+        row_stop = <size_t> profile_offset_view[profile + 1]
+        if row_start > row_stop or row_stop > journal.row_count:
+            raise ValueError("continuation journal profile offsets are not monotone")
+        postfilter_cursor = <size_t> postfilter_offset_view[profile]
+        postfilter_stop = <size_t> postfilter_offset_view[profile + 1]
+        forward_cursor = <size_t> forward_offset_view[profile]
+        forward_stop = <size_t> forward_offset_view[profile + 1]
+        if (
+            postfilter_cursor > postfilter_stop
+            or postfilter_stop > postfilter_count
+            or forward_cursor > forward_stop
+            or forward_stop > forward_count
+        ):
+            raise ValueError("continuation journal row offsets are not monotone")
+        row = row_start
+        while forward_cursor < forward_stop:
+            memcpy(
+                &forward,
+                &forward_view[forward_cursor * sizeof(_forward_result)],
+                sizeof(_forward_result),
+            )
+            if forward.action != FORWARD_DEFINITE_PASS:
+                forward_cursor += 1
+                continue
+            if row >= row_stop:
+                raise ValueError("continuation journal omits a Forward pass")
+            memcpy(
+                &journal_row,
+                &row_view[row * sizeof(plan7_continuation_journal_row)],
+                sizeof(plan7_continuation_journal_row),
+            )
+            if (
+                journal_row.profile_index != profile
+                or journal_row.sequence_index >= sequences._length
+                or journal_row.sequence_index != forward.sequence_index
+                or journal_row.forward_status != forward.status
+                or journal_row.forward_action != forward.action
+            ):
+                raise ValueError("continuation journal Forward identity differs")
+            expected_float.value = forward.fwdsc
+            observed_float.value = journal_row.fwdsc
+            if expected_float.bits != observed_float.bits:
+                raise ValueError("continuation journal Forward score differs")
+            while postfilter_cursor < postfilter_stop:
+                memcpy(
+                    &postfilter,
+                    &postfilter_view[
+                        postfilter_cursor * sizeof(_postfilter_result)
+                    ],
+                    sizeof(_postfilter_result),
+                )
+                if postfilter.sequence_index >= journal_row.sequence_index:
+                    break
+                postfilter_cursor += 1
+            if (
+                postfilter_cursor == postfilter_stop
+                or postfilter.sequence_index != journal_row.sequence_index
+                or postfilter.msv_status != journal_row.postfilter_status
+                or postfilter.action != journal_row.postfilter_action
+                or postfilter.action != BIAS_DEFINITE_PASS
+            ):
+                raise ValueError("continuation journal post-filter identity differs")
+            expected_float.value = postfilter.filtersc
+            observed_float.value = journal_row.filtersc
+            if expected_float.bits != observed_float.bits:
+                raise ValueError("continuation journal bias score differs")
+            expected_float.value = postfilter.vfsc
+            observed_float.value = journal_row.vfsc
+            if expected_float.bits != observed_float.bits:
+                raise ValueError("continuation journal Viterbi score differs")
+            optimized_profile = <OptimizedProfile> profiles[profile]
+            computed_usc = <float> postfilter.msv_numerator
+            computed_usc = computed_usc / optimized_profile._om.scale_b
+            computed_usc = computed_usc - <float> 3.0
+            expected_float.value = computed_usc
+            observed_float.value = journal_row.usc
+            if expected_float.bits != observed_float.bits:
+                raise ValueError("continuation journal MSV score differs")
+            if (
+                journal_special_offset_view[row]
+                != special_offset_view[forward_cursor]
+                or journal_special_offset_view[row + 1]
+                != special_offset_view[forward_cursor + 1]
+            ):
+                raise ValueError("continuation journal Forward span differs")
+
+            region_start = <size_t> region_offset_view[row]
+            region_stop = <size_t> region_offset_view[row + 1]
+            if (
+                region_start > region_stop
+                or region_stop > journal.region_count
+                or journal_row.reserved != 0
+                or journal_row.domain_status not in (
+                    DOMAIN_OK, DOMAIN_ERANGE, DOMAIN_ENORESULT, DOMAIN_EMPTY
+                )
+                or journal_row.domain_route not in (
+                    DOMAIN_CPU_REQUIRED, DOMAIN_NO_REGIONS, DOMAIN_SIMPLE
+                )
+                or journal_row.has_own_scales > 1
+            ):
+                raise ValueError("continuation journal domain record is invalid")
+            if journal_row.domain_route == DOMAIN_CPU_REQUIRED:
+                if region_start != region_stop:
+                    raise ValueError("CPU domain route carries simple regions")
+            else:
+                if (
+                    journal_row.domain_status != DOMAIN_OK
+                    or journal_row.has_own_scales
+                    or journal_row.uncertain_count != 0
+                    or journal_row.multidomain_count != 0
+                    or not isfinite(journal_row.backward_score)
+                    or not isfinite(journal_row.nexpected)
+                    or journal_row.nexpected < 0.0
+                    or journal_row.nexpected
+                    > <float> sequences._refs[journal_row.sequence_index].n
+                ):
+                    raise ValueError("device domain route is not continuation-safe")
+                if journal_row.domain_route == DOMAIN_NO_REGIONS:
+                    if journal_row.region_count != 0 or region_start != region_stop:
+                        raise ValueError("no-region route carries intervals")
+                elif (
+                    region_start == region_stop
+                    or journal_row.region_count != region_stop - region_start
+                ):
+                    raise ValueError("simple domain route has invalid intervals")
+
+            previous_end = 0
+            for region in range(region_start, region_stop):
+                memcpy(
+                    &interval,
+                    &region_view[region * sizeof(plan7_simple_region)],
+                    sizeof(plan7_simple_region),
+                )
+                if (
+                    interval.begin < 1
+                    or interval.begin > interval.end
+                    or interval.end
+                    > <uint32_t> sequences._refs[journal_row.sequence_index].n
+                    or (region != region_start and interval.begin <= previous_end)
+                ):
+                    raise ValueError("continuation journal intervals are invalid")
+                previous_end = interval.end
+            row += 1
+            forward_cursor += 1
+        if row != row_stop:
+            raise ValueError("continuation journal has an extra Forward row")
+
+    if PyCapsule_SetDestructor(
+        capsule, <PyCapsule_Destructor> NULL
+    ) != 0:
+        raise RuntimeError("cannot consume continuation journal capsule")
+    if PyCapsule_SetPointer(capsule, &_consumed_journal_sentinel) != 0:
+        storage._data = NULL
+        storage._size = 0
+        free(journal)
+        PyCapsule_SetName(capsule, PLAN7_CONTINUATION_JOURNAL_CONSUMED_NAME)
+        raise RuntimeError("cannot retire continuation journal capsule")
+    storage._owns = True
+    if PyCapsule_SetName(
+        capsule, PLAN7_CONTINUATION_JOURNAL_CONSUMED_NAME
+    ) != 0:
+        raise RuntimeError("cannot mark continuation journal consumed")
+    return (
+        storage_view,
+        postfilter_view,
+        postfilter_offset_view,
+        forward_view,
+        forward_offset_view,
+        special_offset_view,
+        special_view,
+        profile_offset_view,
+        row_view,
+        region_offset_view,
+        region_view,
+        guard_bits,
+    )
+
+
 def _seal_postfilter_batch_bound(
     queries,
     optimized_profiles,
@@ -1766,6 +2905,10 @@ def _seal_postfilter_batch_bound(
     uint64_t generation_f2_bits=0,
     uint64_t generation_f3_bits=0,
     generation_bias_filter=False,
+    continuation_journal=None,
+    selection_identity=None,
+    selection_identity_tokens=None,
+    domain_pipeline=None,
 ):
     """Seal one already-owned post-filter batch after one complete validation.
 
@@ -1820,6 +2963,32 @@ def _seal_postfilter_batch_bound(
     cdef _SealedPostfilterBatch sealed
     cdef _pipeline_from_filter_scores_f filter_scores_seam = NULL
     cdef _pipeline_from_filter_and_forward_scores_f forward_scores_seam = NULL
+    cdef _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam = NULL
+    cdef _pipeline_tail_snapshot pipeline_options
+    cdef object journal_values = None
+    cdef object empty_journal_storage = b""
+    cdef object empty_journal_profile_offsets = bytes(sizeof(uint64_t))
+    cdef object empty_journal_rows = b""
+    cdef object empty_journal_region_offsets = bytes(sizeof(uint64_t))
+    cdef object empty_journal_regions = b""
+    cdef const uint8_t[::1] journal_storage_view = empty_journal_storage
+    cdef const uint64_t[::1] journal_profile_offset_view = memoryview(
+        empty_journal_profile_offsets
+    ).cast("Q")
+    cdef const uint8_t[::1] journal_row_view = empty_journal_rows
+    cdef const uint64_t[::1] journal_region_offset_view = memoryview(
+        empty_journal_region_offsets
+    ).cast("Q")
+    cdef const uint8_t[::1] journal_region_view = empty_journal_regions
+    cdef uint32_t journal_guard_bits = 0
+    cdef uint64_t expected_session_id = 0
+    cdef uint64_t expected_selection_id = 0
+    cdef size_t frequency_bytes
+    cdef _double_bits generation_f1
+    cdef _float_bits expected_rt
+    cdef Pipeline journal_pipeline
+    cdef object expected_identity_owner
+    cdef const uint64_t[::1] expected_identity_view
 
     if postfilter_offset_view.shape[0] == 0:
         raise ValueError("post-filter row offsets need an initial zero")
@@ -1971,6 +3140,15 @@ def _seal_postfilter_batch_bound(
     if has_forward_storage:
         forward_scores_seam = _cached_filter_and_forward_scores_seam()
 
+    if (
+        continuation_journal is not None
+        or selection_identity is not None
+        or selection_identity_tokens is not None
+        or domain_pipeline is not None
+    ):
+        raise TypeError(
+            "continuation journals require the fused profile-selection factory"
+        )
     sealed = _SealedPostfilterBatch()
     sealed._queries = query_tuple
     sealed._optimized_profiles = profile_tuple
@@ -1984,12 +3162,306 @@ def _seal_postfilter_batch_bound(
     sealed._specials = special_view
     sealed._row_has_external = bytes(external_rows)
     sealed._background_fingerprint = background_view
+    sealed._journal_storage = journal_storage_view
+    sealed._journal_profile_offsets = journal_profile_offset_view
+    sealed._journal_rows = journal_row_view
+    sealed._journal_region_offsets = journal_region_offset_view
+    sealed._journal_regions = journal_region_view
     sealed._f1 = f1
     sealed._generation_f2_bits = generation_f2_bits
     sealed._generation_f3_bits = generation_f3_bits
     sealed._generation_bias_filter = generation_bias_filter
+    sealed._journal_guard_bits = journal_guard_bits
+    if continuation_journal is not None:
+        sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
     sealed._forward_scores_seam = forward_scores_seam
+    sealed._simple_regions_seam = simple_regions_seam
+    sealed._ready = True
+    return sealed
+
+
+def _seal_profile_selection_continuation_bound(
+    queries,
+    optimized_profiles,
+    DigitalSequenceBlock sequences,
+    residue_offsets,
+    double f1,
+    background_fingerprint,
+    continuation_journal,
+    selection_identity,
+    selection_identity_tokens,
+    profile_fingerprints,
+    uint64_t batch_generation,
+    sequence_content_fingerprint,
+    Pipeline pipeline,
+    double guard_band,
+):
+    """Consume one package-internal journal into an opaque continuation batch.
+
+    The capsule and underscore factory are trusted in-process transport. Their
+    integrity checks reject accidental corruption and cross-binding, not a
+    caller deliberately reaching private extension APIs or ctypes.
+    """
+    cdef tuple query_tuple = tuple(queries)
+    cdef tuple profile_tuple = tuple(optimized_profiles)
+    cdef size_t profile_count = len(profile_tuple)
+    cdef object residue_offset_owner = _immutable_owned_view(
+        residue_offsets, "Q"
+    )
+    cdef object background_owner = _immutable_owned_view(
+        background_fingerprint, "B"
+    )
+    cdef object identity_owner = _immutable_owned_view(
+        selection_identity_tokens, "Q"
+    )
+    cdef object profile_fingerprint_owner = _immutable_owned_view(
+        profile_fingerprints, "B"
+    )
+    cdef object sequence_fingerprint_owner = _immutable_owned_view(
+        sequence_content_fingerprint, "B"
+    )
+    cdef const uint64_t[::1] residue_offset_view = residue_offset_owner
+    cdef const uint8_t[::1] background_view = background_owner
+    cdef const uint64_t[::1] identity_view = identity_owner
+    cdef const uint8_t[::1] profile_fingerprint_view = (
+        profile_fingerprint_owner
+    )
+    cdef const uint8_t[::1] sequence_fingerprint_view = (
+        sequence_fingerprint_owner
+    )
+    cdef object journal_values
+    cdef const uint8_t[::1] journal_storage_view
+    cdef const uint8_t[::1] postfilter_view
+    cdef const uint64_t[::1] postfilter_offset_view
+    cdef const uint8_t[::1] forward_view
+    cdef const uint64_t[::1] forward_offset_view
+    cdef const uint64_t[::1] special_offset_view
+    cdef const float[::1] special_view
+    cdef const uint64_t[::1] journal_profile_offset_view
+    cdef const uint8_t[::1] journal_row_view
+    cdef const uint64_t[::1] journal_region_offset_view
+    cdef const uint8_t[::1] journal_region_view
+    cdef _pipeline_tail_snapshot pipeline_options
+    cdef _SealedPostfilterBatch sealed
+    cdef _pipeline_from_filter_scores_f filter_scores_seam
+    cdef _pipeline_from_filter_and_forward_scores_f forward_scores_seam
+    cdef _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam
+    cdef size_t profile
+    cdef size_t postfilter_count
+    cdef size_t forward_count
+    cdef size_t postfilter_start
+    cdef size_t postfilter_stop
+    cdef size_t forward_start
+    cdef size_t forward_stop
+    cdef bint has_direct = False
+    cdef bint row_has_external
+    cdef bytearray external_rows = bytearray(profile_count)
+    cdef uint64_t expected_session_id
+    cdef uint64_t expected_selection_id
+    cdef uint32_t journal_guard_bits
+    cdef _float_bits expected_guard
+    cdef size_t frequency_bytes
+
+    if type(pipeline) is not _pyhmmer.plan7.Pipeline:
+        raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+    if len(query_tuple) != profile_count:
+        raise ValueError("HMM count differs from optimized-profile count")
+    if (
+        type(selection_identity) is not tuple
+        or len(selection_identity) != 2
+        or type(selection_identity[0]) is not int
+        or type(selection_identity[1]) is not int
+    ):
+        raise TypeError("continuation selection identity is invalid")
+    expected_session_id = selection_identity[0]
+    expected_selection_id = selection_identity[1]
+    if expected_session_id == 0 or expected_selection_id == 0:
+        raise ValueError("continuation selection identity is zero")
+    if batch_generation == 0:
+        raise ValueError("continuation target generation is zero")
+    if sequence_fingerprint_view.shape[0] != 32:
+        raise ValueError("sequence content fingerprint has the wrong size")
+    if profile_fingerprint_view.shape[0] != (
+        profile_count * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
+    ):
+        raise ValueError("optimized-profile fingerprint storage has the wrong size")
+    if background_view.shape[0] != (
+        (<size_t> sequences.alphabet.K + 1) * sizeof(float)
+    ):
+        raise ValueError("canonical background fingerprint has the wrong size")
+    _validate_sealed_residue_offsets(sequences, residue_offset_view)
+    _validate_simple_region_generation_bound(
+        pipeline,
+        f1,
+        pipeline._pli.F2,
+        pipeline._pli.F3,
+        True,
+        guard_band,
+    )
+    _capture_pipeline_tail_options(pipeline, &pipeline_options)
+    frequency_bytes = <size_t> pipeline.background._bg.abc.K * sizeof(float)
+    if (
+        background_view.shape[0] != frequency_bytes + sizeof(float)
+        or memcmp(
+            &background_view[0],
+            pipeline.background._bg.f,
+            frequency_bytes,
+        ) != 0
+        or memcmp(
+            &background_view[frequency_bytes],
+            &pipeline.background._bg.omega,
+            sizeof(float),
+        ) != 0
+    ):
+        raise ValueError(
+            "pipeline background differs from journal generation"
+        )
+
+    # Reject every live PyHMMER object before consuming the one-shot capsule.
+    # The journal validator may safely dereference only after this completes.
+    for profile in range(profile_count):
+        if type(query_tuple[profile]) is not _pyhmmer.plan7.HMM:
+            raise TypeError("sealed queries must be exactly pyhmmer.plan7.HMM")
+        if (
+            type(profile_tuple[profile])
+            is not _pyhmmer.plan7.OptimizedProfile
+        ):
+            raise TypeError(
+                "sealed profiles must be exactly pyhmmer.plan7.OptimizedProfile"
+            )
+        if (
+            (<HMM> query_tuple[profile])._hmm == NULL
+            or (<OptimizedProfile> profile_tuple[profile])._om == NULL
+        ):
+            raise ValueError("sealed HMM/profile storage is unavailable")
+        if (
+            not profile_tuple[profile].local
+            or not profile_tuple[profile].multihit
+        ):
+            raise ValueError(
+                "sealed optimized profiles must be local multihit"
+            )
+        _validate_sealed_pair(
+            <HMM> query_tuple[profile],
+            <OptimizedProfile> profile_tuple[profile],
+            sequences,
+        )
+
+    journal_values = _consume_validate_continuation_journal(
+        continuation_journal,
+        profile_tuple,
+        sequences,
+        expected_session_id,
+        expected_selection_id,
+        identity_view,
+        profile_fingerprint_view,
+        batch_generation,
+        sequence_fingerprint_view,
+        f1,
+        pipeline_options.f2_bits,
+        pipeline_options.f3_bits,
+        True,
+    )
+    journal_storage_view = journal_values[0]
+    postfilter_view = journal_values[1]
+    postfilter_offset_view = journal_values[2]
+    forward_view = journal_values[3]
+    forward_offset_view = journal_values[4]
+    special_offset_view = journal_values[5]
+    special_view = journal_values[6]
+    journal_profile_offset_view = journal_values[7]
+    journal_row_view = journal_values[8]
+    journal_region_offset_view = journal_values[9]
+    journal_region_view = journal_values[10]
+    journal_guard_bits = journal_values[11]
+    expected_guard.value = <float> guard_band
+    if journal_guard_bits != expected_guard.bits:
+        raise ValueError("continuation journal guard band differs")
+
+    postfilter_count = (
+        <size_t> postfilter_view.shape[0] // sizeof(_postfilter_result)
+    )
+    forward_count = <size_t> forward_view.shape[0] // sizeof(_forward_result)
+    for profile in range(profile_count):
+        postfilter_start = <size_t> postfilter_offset_view[profile]
+        postfilter_stop = <size_t> postfilter_offset_view[profile + 1]
+        forward_start = <size_t> forward_offset_view[profile]
+        forward_stop = <size_t> forward_offset_view[profile + 1]
+        if (
+            postfilter_start > postfilter_stop
+            or postfilter_stop > postfilter_count
+            or forward_start > forward_stop
+            or forward_stop > forward_count
+        ):
+            raise ValueError("continuation row offsets are not monotone")
+        if _validate_postfilter_records(
+            <OptimizedProfile> profile_tuple[profile],
+            sequences,
+            postfilter_view[
+                postfilter_start * sizeof(_postfilter_result):
+                postfilter_stop * sizeof(_postfilter_result)
+            ],
+        ):
+            has_direct = True
+        row_has_external = _validate_forward_augmentation(
+            sequences,
+            postfilter_view[
+                postfilter_start * sizeof(_postfilter_result):
+                postfilter_stop * sizeof(_postfilter_result)
+            ],
+            forward_view[
+                forward_start * sizeof(_forward_result):
+                forward_stop * sizeof(_forward_result)
+            ],
+            special_offset_view[forward_start:forward_stop + 1],
+            special_view,
+        )
+        external_rows[profile] = <uint8_t> row_has_external
+
+    filter_scores_seam = _cached_filter_scores_seam()
+    forward_scores_seam = _cached_filter_and_forward_scores_seam()
+    simple_regions_seam = _cached_simple_regions_seam()
+    if has_direct and filter_scores_seam == NULL:
+        raise RuntimeError(
+            "continuation batches require the private filter-score seam"
+        )
+    if forward_count and forward_scores_seam == NULL:
+        raise RuntimeError(
+            "continuation batches require the private Forward seam"
+        )
+    if journal_row_view.shape[0] and simple_regions_seam == NULL:
+        raise RuntimeError(
+            "continuation batches require the private simple-region seam"
+        )
+
+    sealed = _SealedPostfilterBatch()
+    sealed._queries = query_tuple
+    sealed._optimized_profiles = profile_tuple
+    sealed._sequences = sequences
+    sealed._postfilter_records = postfilter_view
+    sealed._postfilter_offsets = postfilter_offset_view
+    sealed._residue_offsets = residue_offset_view
+    sealed._forward_records = forward_view
+    sealed._forward_offsets = forward_offset_view
+    sealed._special_offsets = special_offset_view
+    sealed._specials = special_view
+    sealed._row_has_external = bytes(external_rows)
+    sealed._background_fingerprint = background_view
+    sealed._journal_storage = journal_storage_view
+    sealed._journal_profile_offsets = journal_profile_offset_view
+    sealed._journal_rows = journal_row_view
+    sealed._journal_region_offsets = journal_region_offset_view
+    sealed._journal_regions = journal_region_view
+    sealed._f1 = f1
+    sealed._generation_f2_bits = pipeline_options.f2_bits
+    sealed._generation_f3_bits = pipeline_options.f3_bits
+    sealed._generation_bias_filter = True
+    sealed._journal_guard_bits = journal_guard_bits
+    sealed._pipeline_options = pipeline_options
+    sealed._filter_scores_seam = filter_scores_seam
+    sealed._forward_scores_seam = forward_scores_seam
+    sealed._simple_regions_seam = simple_regions_seam
     sealed._ready = True
     return sealed
 
@@ -2029,9 +3501,13 @@ def _search_hmm_sealed_postfilter_bound(
     cdef size_t postfilter_stop
     cdef size_t forward_start
     cdef size_t forward_stop
+    cdef size_t journal_start
+    cdef size_t journal_stop
     cdef _double_bits live_f2
     cdef _double_bits live_f3
+    cdef _double_bits generation_f1
     cdef bint use_forward
+    cdef bint use_journal
 
     if type(sealed_object) is not _SealedPostfilterBatch:
         raise TypeError("sealed batch has the wrong extension type")
@@ -2085,6 +3561,45 @@ def _search_hmm_sealed_postfilter_bound(
             &sealed._residue_offsets[0],
             sealed._filter_scores_seam,
         )
+    use_journal = (
+        sealed._journal_storage.shape[0] != 0
+        and sealed._simple_regions_seam != NULL
+        and _pipeline_tail_options_match(&sealed._pipeline_options, pipeline)
+    )
+    if use_journal:
+        journal_start = <size_t> sealed._journal_profile_offsets[row]
+        journal_stop = <size_t> sealed._journal_profile_offsets[row + 1]
+        generation_f1.value = sealed._f1
+        return _search_postfilter_forward_journal_validated(
+            pipeline,
+            query,
+            optimized_profile,
+            sealed._sequences,
+            sealed._postfilter_records[
+                postfilter_start * sizeof(_postfilter_result):
+                postfilter_stop * sizeof(_postfilter_result)
+            ],
+            sealed._forward_records[
+                forward_start * sizeof(_forward_result):
+                forward_stop * sizeof(_forward_result)
+            ],
+            sealed._special_offsets[forward_start:forward_stop + 1],
+            sealed._specials,
+            sealed._journal_rows[
+                journal_start * sizeof(plan7_continuation_journal_row):
+                journal_stop * sizeof(plan7_continuation_journal_row)
+            ],
+            sealed._journal_region_offsets[journal_start:journal_stop + 1],
+            sealed._journal_regions,
+            &sealed._residue_offsets[0],
+            generation_f1.bits,
+            sealed._generation_f2_bits,
+            sealed._generation_f3_bits,
+            sealed._generation_bias_filter,
+            sealed._filter_scores_seam,
+            sealed._forward_scores_seam,
+            sealed._simple_regions_seam,
+        )
     return _search_postfilter_forward_validated(
         pipeline,
         query,
@@ -2104,6 +3619,69 @@ def _search_hmm_sealed_postfilter_bound(
         sealed._filter_scores_seam,
         sealed._forward_scores_seam,
     )
+
+
+def _sealed_postfilter_candidate_count_bound(sealed_object, Py_ssize_t row):
+    """Return one opaque batch's authentic post-filter row count."""
+    cdef _SealedPostfilterBatch sealed
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    if row < 0 or row >= len(sealed._queries):
+        raise IndexError("sealed post-filter row out of range")
+    return sealed._postfilter_offsets[row + 1] - sealed._postfilter_offsets[row]
+
+
+def _sealed_continuation_statistics_bound(sealed_object):
+    """Return immutable route counts without exposing journal rows."""
+    cdef _SealedPostfilterBatch sealed
+    cdef plan7_continuation_journal_row journal_row
+    cdef size_t row
+    cdef size_t row_count
+    cdef size_t cpu_required = 0
+    cdef size_t no_regions = 0
+    cdef size_t simple = 0
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready or sealed._journal_storage.shape[0] == 0:
+        raise TypeError("sealed batch has no continuation journal")
+    row_count = (
+        <size_t> sealed._journal_rows.shape[0]
+        // sizeof(plan7_continuation_journal_row)
+    )
+    for row in range(row_count):
+        memcpy(
+            &journal_row,
+            &sealed._journal_rows[
+                row * sizeof(plan7_continuation_journal_row)
+            ],
+            sizeof(plan7_continuation_journal_row),
+        )
+        if (
+            journal_row.domain_status != DOMAIN_OK
+            or journal_row.domain_route == DOMAIN_CPU_REQUIRED
+            or journal_row.has_own_scales
+            or journal_row.uncertain_count != 0
+            or journal_row.multidomain_count != 0
+        ):
+            cpu_required += 1
+        elif journal_row.domain_route == DOMAIN_NO_REGIONS:
+            no_regions += 1
+        elif journal_row.domain_route == DOMAIN_SIMPLE:
+            simple += 1
+        else:
+            cpu_required += 1
+    return {
+        "row_count": row_count,
+        "cpu_required_count": cpu_required,
+        "no_region_count": no_regions,
+        "simple_count": simple,
+        "journal_bytes": sealed._journal_storage.shape[0],
+        "guard_band_bits": sealed._journal_guard_bits,
+    }
 
 
 def _search_hmm_candidates(

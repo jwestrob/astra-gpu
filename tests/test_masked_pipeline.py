@@ -481,9 +481,11 @@ assert all(not state["resolved"] for state in before.values()), before
 barrier = Barrier(32)
 def first_use(index):
     barrier.wait()
-    if index % 2:
+    if index % 3 == 0:
         return "filter", module._filter_scores_seam_available()
-    return "forward", module._filter_and_forward_scores_seam_available()
+    if index % 3 == 1:
+        return "forward", module._filter_and_forward_scores_seam_available()
+    return "simple_regions", module._simple_regions_seam_available()
 
 with ThreadPoolExecutor(max_workers=32) as executor:
     results = list(executor.map(first_use, range(32)))
@@ -491,6 +493,7 @@ after_first = module._continuation_seam_cache_info()
 for _ in range(1000):
     assert module._filter_scores_seam_available() == after_first["filter"]["available"]
     assert module._filter_and_forward_scores_seam_available() == after_first["forward"]["available"]
+    assert module._simple_regions_seam_available() == after_first["simple_regions"]["available"]
 after_repeat = module._continuation_seam_cache_info()
 assert after_repeat == after_first, (after_first, after_repeat)
 assert all(value == after_first[name]["available"] for name, value in results)
@@ -516,6 +519,10 @@ print(json.dumps(after_repeat, sort_keys=True))
         self.assertEqual(
             child["forward"]["available"],
             _pipeline._filter_and_forward_scores_seam_available(),
+        )
+        self.assertEqual(
+            child["simple_regions"]["available"],
+            _pipeline._simple_regions_seam_available(),
         )
 
     def test_forward_selector_keeps_exact_f2_survivors(self):

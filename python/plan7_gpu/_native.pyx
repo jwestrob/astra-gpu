@@ -3,9 +3,15 @@
 from libc.stddef cimport size_t
 from libc.stdint cimport int16_t, int32_t, uintptr_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.math cimport isfinite
-from libc.string cimport memcpy
+from libc.stdlib cimport calloc, free
+from libc.string cimport memcmp, memcpy
 from cpython.array cimport array as carray, clone
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
+from cpython.pycapsule cimport (
+    PyCapsule_GetPointer,
+    PyCapsule_IsValid,
+    PyCapsule_New,
+)
 from cpython.pyport cimport PY_SSIZE_T_MAX
 from libcpp.vector cimport vector
 from libeasel cimport eslCONST_LOG2
@@ -15,6 +21,10 @@ import array as _array
 import pyhmmer as _pyhmmer
 
 from . import _abi as _abi_module
+from ._fingerprint import (
+    optimized_profile_fingerprint as _profile_fingerprint,
+    sequence_content_fingerprint as _sequence_content_fingerprint,
+)
 
 
 PYHMMER_PRIVATE_ABI = "0.12.0"
@@ -36,6 +46,9 @@ if _runtime_abi_sha256 != PYHMMER_PRIVATE_ABI_SHA256:
 cdef carray _UINT32_ARRAY_TEMPLATE = _array.array("I")
 cdef carray _UINT64_ARRAY_TEMPLATE = _array.array("Q")
 cdef carray _FLOAT_ARRAY_TEMPLATE = _array.array("f")
+cdef uint64_t _sealed_journal_build_count = 0
+cdef uint64_t _sealed_journal_payload_bytes = 0
+cdef uint64_t _sealed_journal_duplicate_python_bytes = 0
 
 _DEVICE_CAPACITY_NAMES = (
     "input_residues",
@@ -196,6 +209,17 @@ cdef extern from "ssv_cuda.h" nogil:
     ctypedef struct plan7_ssv_sequence_batch:
         pass
 
+    ctypedef struct plan7_ssv_sequence_batch_view:
+        uint64_t generation_id
+        int device_ordinal
+        int alphabet_size
+        int host_float_environment_valid
+        size_t sequence_count
+        const uint64_t *host_lengths
+        const uint8_t *device_residues
+        const uint64_t *device_offsets
+        uint64_t input_device_bytes
+
     ctypedef struct plan7_ssv_workspace_statistics:
         uint64_t postfilter_device_bytes
         uint64_t postfilter_dp_capacity_bytes
@@ -319,6 +343,13 @@ cdef extern from "ssv_cuda.h" nogil:
 
     int plan7_ssv_sequence_batch_destroy(
         plan7_ssv_sequence_batch **batch,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_get_view(
+        const plan7_ssv_sequence_batch *batch,
+        plan7_ssv_sequence_batch_view *view,
         char *error,
         size_t error_size,
     )
@@ -929,6 +960,81 @@ cdef extern from "backward_domain_cuda.h" nogil:
     )
 
 
+cdef extern from "continuation_journal.h":
+    const char *PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME
+
+    cdef enum plan7_continuation_journal_abi:
+        PLAN7_CONTINUATION_JOURNAL_VERSION
+        PLAN7_CONTINUATION_JOURNAL_MAGIC
+        PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
+
+    ctypedef struct plan7_continuation_journal_row:
+        uint32_t profile_index
+        uint32_t sequence_index
+        float usc
+        float filtersc
+        float vfsc
+        float fwdsc
+        float backward_score
+        float nexpected
+        uint32_t uncertain_count
+        uint32_t region_count
+        uint32_t multidomain_count
+        uint8_t postfilter_status
+        uint8_t postfilter_action
+        uint8_t forward_status
+        uint8_t forward_action
+        uint8_t domain_status
+        uint8_t domain_route
+        uint8_t has_own_scales
+        uint8_t reserved
+
+    ctypedef struct plan7_continuation_journal:
+        uint32_t magic
+        uint16_t version
+        uint16_t header_size
+        uint32_t row_size
+        uint32_t region_size
+        uint64_t total_bytes
+        uint64_t session_id
+        uint64_t selection_id
+        uint64_t profile_count
+        uint64_t postfilter_count
+        uint64_t forward_count
+        uint64_t row_count
+        uint64_t special_count
+        uint64_t region_count
+        uint64_t generation_f1_bits
+        uint64_t generation_f2_bits
+        uint64_t generation_f3_bits
+        uint32_t rt1_bits
+        uint32_t rt2_bits
+        uint32_t rt3_bits
+        uint32_t guard_band_bits
+        uint8_t generation_bias_filter
+        uint8_t sequence_content_fingerprint[32]
+        uint64_t postfilter_offsets_offset
+        uint64_t postfilter_records_offset
+        uint64_t forward_offsets_offset
+        uint64_t forward_records_offset
+        uint64_t forward_special_offsets_offset
+        uint64_t profile_offsets_offset
+        uint64_t identity_tokens_offset
+        uint64_t profile_fingerprints_offset
+        uint64_t rows_offset
+        uint64_t special_offsets_offset
+        uint64_t specials_offset
+        uint64_t region_offsets_offset
+        uint64_t regions_offset
+        plan7_forward_provenance forward
+        plan7_backward_domain_provenance backward
+        uint64_t integrity_tag
+
+    uint64_t plan7_continuation_journal_integrity(
+        const plan7_continuation_journal *journal,
+    ) nogil
+
+
 cdef union float_bits:
     float value
     uint32_t bits
@@ -939,6 +1045,373 @@ cdef union double_bits:
     uint64_t bits
 
 
+cdef void _continuation_journal_capsule_destroy(object capsule) noexcept:
+    cdef void *pointer
+    if PyCapsule_IsValid(capsule, PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME):
+        pointer = PyCapsule_GetPointer(
+            capsule, PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME
+        )
+        if pointer != NULL:
+            free(pointer)
+
+
+cdef bint _journal_append_storage(
+    size_t *cursor,
+    size_t count,
+    size_t item_size,
+    uint64_t *offset,
+) noexcept:
+    cdef size_t aligned
+    cdef size_t byte_count
+    if cursor[0] > (<size_t> -1) - 7:
+        return False
+    aligned = (cursor[0] + 7) & ~<size_t> 7
+    if count != 0 and item_size > (<size_t> -1) // count:
+        return False
+    byte_count = count * item_size
+    if aligned > (<size_t> -1) - byte_count:
+        return False
+    offset[0] = <uint64_t> aligned
+    cursor[0] = aligned + byte_count
+    return True
+
+
+cdef object _build_continuation_journal_capsule(
+    const plan7_profile_selection_view *view,
+    const uint8_t *profile_fingerprints,
+    const uint8_t *sequence_content_fingerprint,
+    const plan7_postfilter_result *postfilter_records,
+    size_t postfilter_count,
+    const uint64_t *postfilter_offsets,
+    const plan7_postfilter_result *candidate_records,
+    const float *uncorrected_scores,
+    const uint32_t *candidate_profiles,
+    const size_t *pass_sources,
+    const uint64_t *forward_profile_offsets,
+    const uint64_t *profile_offsets,
+    size_t pass_count,
+    const uint64_t *pass_special_offsets,
+    const plan7_forward_output *forward_output,
+    const plan7_backward_domain_output *domain_output,
+    double f1,
+    double f2,
+    double f3,
+    bint bias_filter,
+    float rt1,
+    float rt2,
+    float rt3,
+    float guard_band,
+):
+    cdef const plan7_forward_result *forward_results
+    cdef const float *forward_specials
+    cdef const plan7_forward_provenance *forward_provenance
+    cdef const plan7_backward_domain_result *domain_results
+    cdef const uint64_t *domain_region_offsets
+    cdef const plan7_simple_region *domain_regions
+    cdef const plan7_backward_domain_provenance *domain_provenance
+    cdef size_t forward_count
+    cdef size_t special_count
+    cdef size_t domain_count
+    cdef size_t region_count
+    cdef size_t cursor = sizeof(plan7_continuation_journal)
+    cdef size_t row
+    cdef size_t source
+    cdef size_t profile
+    cdef uint64_t profile_offsets_offset = 0
+    cdef uint64_t identity_tokens_offset = 0
+    cdef uint64_t profile_fingerprints_offset = 0
+    cdef uint64_t postfilter_offsets_offset = 0
+    cdef uint64_t postfilter_records_offset = 0
+    cdef uint64_t forward_offsets_offset = 0
+    cdef uint64_t forward_records_offset = 0
+    cdef uint64_t forward_special_offsets_offset = 0
+    cdef uint64_t rows_offset = 0
+    cdef uint64_t special_offsets_offset = 0
+    cdef uint64_t specials_offset = 0
+    cdef uint64_t region_offsets_offset = 0
+    cdef uint64_t regions_offset = 0
+    cdef plan7_continuation_journal *journal = NULL
+    cdef plan7_continuation_journal_row *rows
+    cdef uint64_t *target_u64
+    cdef double_bits double_encoded
+    cdef float_bits float_encoded
+    cdef object capsule
+    global _sealed_journal_build_count
+    global _sealed_journal_payload_bytes
+
+    forward_count = plan7_forward_output_result_count(forward_output)
+    special_count = plan7_forward_output_special_count(forward_output)
+    domain_count = plan7_backward_domain_output_result_count(domain_output)
+    region_count = plan7_backward_domain_output_region_count(domain_output)
+    if domain_count != pass_count:
+        raise RuntimeError("Backward/domain journal result count changed")
+    if sizeof(uintptr_t) != sizeof(uint64_t):
+        raise RuntimeError("profile identity tokens require a 64-bit process")
+    if not (
+        _journal_append_storage(
+            &cursor, view.profile_count + 1, sizeof(uint64_t),
+            &postfilter_offsets_offset,
+        )
+        and _journal_append_storage(
+            &cursor, postfilter_count, sizeof(plan7_postfilter_result),
+            &postfilter_records_offset,
+        )
+        and _journal_append_storage(
+            &cursor, view.profile_count + 1, sizeof(uint64_t),
+            &forward_offsets_offset,
+        )
+        and _journal_append_storage(
+            &cursor, forward_count, sizeof(plan7_forward_result),
+            &forward_records_offset,
+        )
+        and _journal_append_storage(
+            &cursor, forward_count + 1, sizeof(uint64_t),
+            &forward_special_offsets_offset,
+        )
+        and
+        _journal_append_storage(
+            &cursor, view.profile_count + 1, sizeof(uint64_t),
+            &profile_offsets_offset,
+        )
+        and _journal_append_storage(
+            &cursor, view.profile_count, sizeof(uint64_t),
+            &identity_tokens_offset,
+        )
+        and _journal_append_storage(
+            &cursor,
+            view.profile_count,
+            PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+            &profile_fingerprints_offset,
+        )
+        and _journal_append_storage(
+            &cursor, pass_count, sizeof(plan7_continuation_journal_row),
+            &rows_offset,
+        )
+        and _journal_append_storage(
+            &cursor, pass_count + 1, sizeof(uint64_t),
+            &special_offsets_offset,
+        )
+        and _journal_append_storage(
+            &cursor, special_count, sizeof(float), &specials_offset,
+        )
+        and _journal_append_storage(
+            &cursor, pass_count + 1, sizeof(uint64_t),
+            &region_offsets_offset,
+        )
+        and _journal_append_storage(
+            &cursor, region_count, sizeof(plan7_simple_region),
+            &regions_offset,
+        )
+    ):
+        raise OverflowError("continuation journal size overflows size_t")
+
+    forward_results = plan7_forward_output_results(forward_output)
+    forward_specials = plan7_forward_output_specials(forward_output)
+    forward_provenance = plan7_forward_output_provenance(forward_output)
+    domain_results = plan7_backward_domain_output_results(domain_output)
+    domain_region_offsets = plan7_backward_domain_output_region_offsets(
+        domain_output
+    )
+    domain_regions = plan7_backward_domain_output_regions(domain_output)
+    domain_provenance = plan7_backward_domain_output_provenance(domain_output)
+    if (
+        forward_provenance == NULL
+        or domain_provenance == NULL
+        or domain_region_offsets == NULL
+        or (forward_count and forward_results == NULL)
+        or (special_count and forward_specials == NULL)
+        or (pass_count and domain_results == NULL)
+        or (region_count and domain_regions == NULL)
+    ):
+        raise RuntimeError("continuation journal source storage is incomplete")
+    if memcmp(
+        forward_provenance,
+        &domain_provenance.forward,
+        sizeof(plan7_forward_provenance),
+    ) != 0:
+        raise RuntimeError("Forward and Backward/domain provenance differ")
+    if (
+        forward_provenance.pass_count != pass_count
+        or forward_provenance.special_count != special_count
+        or domain_provenance.candidate_count != pass_count
+        or domain_provenance.region_count != region_count
+        or pass_special_offsets[pass_count] != special_count
+        or domain_region_offsets[pass_count] != region_count
+    ):
+        raise RuntimeError("continuation journal provenance counts differ")
+
+    journal = <plan7_continuation_journal *> calloc(1, cursor)
+    if journal == NULL:
+        raise MemoryError("continuation journal allocation failed")
+    try:
+        journal.magic = PLAN7_CONTINUATION_JOURNAL_MAGIC
+        journal.version = PLAN7_CONTINUATION_JOURNAL_VERSION
+        journal.header_size = sizeof(plan7_continuation_journal)
+        journal.row_size = sizeof(plan7_continuation_journal_row)
+        journal.region_size = sizeof(plan7_simple_region)
+        journal.total_bytes = cursor
+        journal.session_id = view.session_id
+        journal.selection_id = view.selection_id
+        journal.profile_count = view.profile_count
+        journal.postfilter_count = postfilter_count
+        journal.forward_count = forward_count
+        journal.row_count = pass_count
+        journal.special_count = special_count
+        journal.region_count = region_count
+        double_encoded.value = f1
+        journal.generation_f1_bits = double_encoded.bits
+        double_encoded.value = f2
+        journal.generation_f2_bits = double_encoded.bits
+        double_encoded.value = f3
+        journal.generation_f3_bits = double_encoded.bits
+        float_encoded.value = rt1
+        journal.rt1_bits = float_encoded.bits
+        float_encoded.value = rt2
+        journal.rt2_bits = float_encoded.bits
+        float_encoded.value = rt3
+        journal.rt3_bits = float_encoded.bits
+        float_encoded.value = guard_band
+        journal.guard_band_bits = float_encoded.bits
+        journal.generation_bias_filter = <uint8_t> bias_filter
+        memcpy(
+            journal.sequence_content_fingerprint,
+            sequence_content_fingerprint,
+            32,
+        )
+        journal.postfilter_offsets_offset = postfilter_offsets_offset
+        journal.postfilter_records_offset = postfilter_records_offset
+        journal.forward_offsets_offset = forward_offsets_offset
+        journal.forward_records_offset = forward_records_offset
+        journal.forward_special_offsets_offset = forward_special_offsets_offset
+        journal.profile_offsets_offset = profile_offsets_offset
+        journal.identity_tokens_offset = identity_tokens_offset
+        journal.profile_fingerprints_offset = profile_fingerprints_offset
+        journal.rows_offset = rows_offset
+        journal.special_offsets_offset = special_offsets_offset
+        journal.specials_offset = specials_offset
+        journal.region_offsets_offset = region_offsets_offset
+        journal.regions_offset = regions_offset
+        journal.forward = forward_provenance[0]
+        journal.backward = domain_provenance[0]
+
+        memcpy(
+            <uint8_t *> journal + postfilter_offsets_offset,
+            postfilter_offsets,
+            (view.profile_count + 1) * sizeof(uint64_t),
+        )
+        if postfilter_count:
+            memcpy(
+                <uint8_t *> journal + postfilter_records_offset,
+                postfilter_records,
+                postfilter_count * sizeof(plan7_postfilter_result),
+            )
+        memcpy(
+            <uint8_t *> journal + forward_offsets_offset,
+            forward_profile_offsets,
+            (view.profile_count + 1) * sizeof(uint64_t),
+        )
+        if forward_count:
+            memcpy(
+                <uint8_t *> journal + forward_records_offset,
+                forward_results,
+                forward_count * sizeof(plan7_forward_result),
+            )
+        memcpy(
+            <uint8_t *> journal + forward_special_offsets_offset,
+            plan7_forward_output_special_offsets(forward_output),
+            (forward_count + 1) * sizeof(uint64_t),
+        )
+        memcpy(
+            <uint8_t *> journal + profile_offsets_offset,
+            profile_offsets,
+            (view.profile_count + 1) * sizeof(uint64_t),
+        )
+        target_u64 = <uint64_t *> (
+            <uint8_t *> journal + identity_tokens_offset
+        )
+        for profile in range(view.profile_count):
+            target_u64[profile] = <uint64_t> view.identity_tokens[profile]
+        if view.profile_count:
+            memcpy(
+                <uint8_t *> journal + profile_fingerprints_offset,
+                profile_fingerprints,
+                view.profile_count
+                * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+            )
+        memcpy(
+            <uint8_t *> journal + special_offsets_offset,
+            pass_special_offsets,
+            (pass_count + 1) * sizeof(uint64_t),
+        )
+        if special_count:
+            memcpy(
+                <uint8_t *> journal + specials_offset,
+                forward_specials,
+                special_count * sizeof(float),
+            )
+        memcpy(
+            <uint8_t *> journal + region_offsets_offset,
+            domain_region_offsets,
+            (pass_count + 1) * sizeof(uint64_t),
+        )
+        if region_count:
+            memcpy(
+                <uint8_t *> journal + regions_offset,
+                domain_regions,
+                region_count * sizeof(plan7_simple_region),
+            )
+
+        rows = <plan7_continuation_journal_row *> (
+            <uint8_t *> journal + rows_offset
+        )
+        for row in range(pass_count):
+            source = pass_sources[row]
+            if source >= forward_count:
+                raise RuntimeError("continuation journal source index changed")
+            if (
+                forward_results[source].action
+                != PLAN7_FORWARD_DEFINITE_PASS
+                or domain_results[row].profile_index
+                != candidate_profiles[source]
+                or domain_results[row].sequence_index
+                != forward_results[source].sequence_index
+            ):
+                raise RuntimeError("continuation journal row identity changed")
+            rows[row].profile_index = domain_results[row].profile_index
+            rows[row].sequence_index = domain_results[row].sequence_index
+            rows[row].usc = uncorrected_scores[source]
+            rows[row].filtersc = candidate_records[source].filtersc
+            rows[row].vfsc = candidate_records[source].vfsc
+            rows[row].fwdsc = forward_results[source].fwdsc
+            rows[row].backward_score = domain_results[row].backward_score
+            rows[row].nexpected = domain_results[row].nexpected
+            rows[row].uncertain_count = domain_results[row].uncertain_count
+            rows[row].region_count = domain_results[row].region_count
+            rows[row].multidomain_count = domain_results[row].multidomain_count
+            rows[row].postfilter_status = candidate_records[source].msv_status
+            rows[row].postfilter_action = candidate_records[source].action
+            rows[row].forward_status = forward_results[source].status
+            rows[row].forward_action = forward_results[source].action
+            rows[row].domain_status = domain_results[row].status
+            rows[row].domain_route = domain_results[row].route
+            rows[row].has_own_scales = domain_results[row].has_own_scales
+            rows[row].reserved = domain_results[row].reserved
+
+        journal.integrity_tag = plan7_continuation_journal_integrity(journal)
+        capsule = PyCapsule_New(
+            journal,
+            PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME,
+            _continuation_journal_capsule_destroy,
+        )
+        _sealed_journal_build_count += 1
+        _sealed_journal_payload_bytes += <uint64_t> cursor
+        journal = NULL
+        return capsule
+    finally:
+        if journal != NULL:
+            free(journal)
+
+
 def bias_environment_attested():
     cdef char reason[512]
     cdef int attested
@@ -946,6 +1419,15 @@ def bias_environment_attested():
     with nogil:
         attested = plan7_bias_environment_attested(reason, sizeof(reason))
     return bool(attested), reason.decode("utf-8", "replace")
+
+
+def _sealed_journal_transport_statistics():
+    """Return implementation-only fused transport allocation counters."""
+    return {
+        "build_count": _sealed_journal_build_count,
+        "payload_bytes": _sealed_journal_payload_bytes,
+        "duplicate_python_bytes": _sealed_journal_duplicate_python_bytes,
+    }
 
 
 def bias_host_environment_attested():
@@ -1526,10 +2008,12 @@ cdef class ProfileSelection:
 
     cdef plan7_profile_selection *_selection
     cdef object _owner
+    cdef tuple _fingerprints
 
     def __cinit__(self):
         self._selection = NULL
         self._owner = None
+        self._fingerprints = ()
 
     def __dealloc__(self):
         if self._selection != NULL:
@@ -1562,6 +2046,25 @@ cdef class ProfileSelection:
         cdef plan7_profile_selection_view view = self._view()
         return view.session_id, view.selection_id
 
+    def _identity_tokens_for_seal(self):
+        """Return an immutable adapter-only identity snapshot."""
+        cdef plan7_profile_selection_view view = self._view()
+        cdef size_t byte_count
+        if sizeof(uintptr_t) != sizeof(uint64_t):
+            raise RuntimeError("profile identity tokens require a 64-bit process")
+        if view.profile_count and view.identity_tokens == NULL:
+            raise RuntimeError("profile selection identity storage is null")
+        if view.profile_count > (<size_t> PY_SSIZE_T_MAX // sizeof(uint64_t)):
+            raise OverflowError("profile identity snapshot exceeds Python limits")
+        byte_count = view.profile_count * sizeof(uint64_t)
+        return PyBytes_FromStringAndSize(
+            <const char *> view.identity_tokens, <Py_ssize_t> byte_count
+        )
+
+    def _fingerprints_for_seal(self):
+        """Return adapter-only ordered immutable profile fingerprints."""
+        return b"".join(self._fingerprints)
+
     @property
     def host_bytes(self):
         cdef plan7_profile_selection_view view = self._view()
@@ -1592,9 +2095,11 @@ cdef class ProfileSession:
     """
 
     cdef plan7_profile_session *_session
+    cdef tuple _fingerprints
 
     def __cinit__(self):
         self._session = NULL
+        self._fingerprints = ()
 
     def __init__(
         self,
@@ -1602,8 +2107,10 @@ cdef class ProfileSession:
         const float[::1] background,
         size_t build_worker_count,
         size_t selection_worker_count,
+        profile_fingerprints=None,
     ):
         cdef tuple owners = tuple(profiles)
+        cdef tuple fingerprints
         cdef vector[uintptr_t] pointers
         cdef OptimizedProfile profile
         cdef object value
@@ -1640,6 +2147,30 @@ cdef class ProfileSession:
             )
         if status != 0:
             raise ValueError(error.decode("utf-8", "replace"))
+        try:
+            if profile_fingerprints is None:
+                fingerprints = tuple(
+                    _profile_fingerprint(value) for value in owners
+                )
+            else:
+                fingerprints = tuple(profile_fingerprints)
+                if len(fingerprints) != len(owners):
+                    raise ValueError(
+                        "profile fingerprint count differs from profile count"
+                    )
+            if any(
+                type(value) is not bytes
+                or len(value)
+                != PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
+                for value in fingerprints
+            ):
+                raise RuntimeError(
+                    "optimized-profile fingerprint generation failed"
+                )
+            self._fingerprints = fingerprints
+        except:
+            plan7_profile_session_destroy(&self._session, NULL, 0)
+            raise
 
     def __dealloc__(self):
         if self._session != NULL:
@@ -1691,11 +2222,19 @@ cdef class ProfileSession:
             "forward_transition_bytes": statistics.forward_transition_bytes,
         }
 
+    def _fingerprints_for_seal(self):
+        """Return adapter-only immutable database profile fingerprints."""
+        if self._session == NULL:
+            raise RuntimeError("profile session is closed")
+        return b"".join(self._fingerprints)
+
     def select(self, values):
         cdef tuple requested = tuple(values)
         cdef vector[size_t] indices
         cdef object value
         cdef object indexed
+        cdef list selected_fingerprints = []
+        cdef size_t index
         cdef ProfileSelection selection
         cdef char error[512]
         cdef int status
@@ -1727,6 +2266,9 @@ cdef class ProfileSession:
         if status != 0:
             raise ValueError(error.decode("utf-8", "replace"))
         selection._owner = self
+        for index in range(indices.size()):
+            selected_fingerprints.append(self._fingerprints[indices[index]])
+        selection._fingerprints = tuple(selected_fingerprints)
         return selection
 
     def close(self):
@@ -1956,6 +2498,7 @@ cdef class SequenceBatch:
     cdef vector[uint64_t] _lengths
     cdef size_t _sequence_count
     cdef int _alphabet_size
+    cdef bytes _content_fingerprint
 
     def __cinit__(
         self,
@@ -1970,10 +2513,16 @@ cdef class SequenceBatch:
         self._batch = NULL
         self._sequence_count = 0
         self._alphabet_size = alphabet_size
+        self._content_fingerprint = b""
         if offsets.shape[0] == 0:
             raise ValueError("offsets must contain an initial zero")
         if alphabet_size < 1:
             raise ValueError("alphabet size must be positive")
+        self._content_fingerprint = _sequence_content_fingerprint(
+            alphabet_size, residues, offsets
+        )
+        if len(self._content_fingerprint) != 32:
+            raise RuntimeError("sequence content fingerprint generation failed")
         error[0] = 0
         with nogil:
             status = plan7_ssv_sequence_batch_create(
@@ -2004,6 +2553,21 @@ cdef class SequenceBatch:
     @property
     def closed(self):
         return self._batch == NULL
+
+    def _generation_and_content_for_seal(self):
+        """Return adapter-only native batch identity and residue digest."""
+        cdef plan7_ssv_sequence_batch_view view
+        cdef char error[512]
+        cdef int status
+        if self._batch == NULL:
+            raise RuntimeError("sequence batch is closed")
+        error[0] = 0
+        status = plan7_ssv_sequence_batch_get_view(
+            self._batch, &view, error, sizeof(error)
+        )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        return view.generation_id, self._content_fingerprint
 
     @property
     def workspace_statistics(self):
@@ -3168,7 +3732,7 @@ cdef class SequenceBatch:
             if output != NULL:
                 plan7_backward_domain_output_destroy(&output, NULL, 0)
 
-    def forward_profile_selection_raw(
+    cdef object _forward_profile_selection_raw(
         self,
         ProfileSelection selection,
         const uint8_t[::1] postfilter_records,
@@ -3176,13 +3740,28 @@ cdef class SequenceBatch:
         const uint64_t[::1] residue_offsets,
         double f2,
         double f3,
-        uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
+        uint64_t gathered_byte_budget,
+        bint sealed_domain_journal,
+        double generation_f1,
+        bint generation_bias_filter,
+        float rt1,
+        float rt2,
+        float rt3,
+        float guard_band,
     ):
         """Run selection-aware F2/F3 without reading a live optimized profile."""
         cdef plan7_profile_selection_view view = selection._view()
         cdef vector[uint64_t] candidate_offsets
         cdef vector[uint32_t] candidate_indices
         cdef vector[float] filter_scores
+        cdef vector[float] uncorrected_scores
+        cdef vector[plan7_postfilter_result] candidate_records
+        cdef vector[uint32_t] candidate_profiles
+        cdef vector[plan7_backward_domain_candidate] domain_candidates
+        cdef vector[size_t] pass_sources
+        cdef vector[uint64_t] pass_special_offsets
+        cdef vector[uint64_t] journal_profile_offsets
+        cdef plan7_backward_domain_candidate domain_candidate
         cdef plan7_postfilter_result record
         cdef float_bits vfsc_bits
         cdef double_bits generation_f3
@@ -3202,9 +3781,11 @@ cdef class SequenceBatch:
         cdef uint64_t sequence_length
         cdef plan7_forward_database *database = NULL
         cdef plan7_forward_output *output = NULL
+        cdef plan7_backward_domain_output *domain_output = NULL
         cdef const plan7_forward_result *native_results
         cdef const uint64_t *native_offsets
         cdef const float *native_specials
+        cdef const plan7_forward_provenance *native_provenance
         cdef const plan7_forward_statistics *native_statistics
         cdef char error[512]
         cdef char destroy_error[512]
@@ -3215,6 +3796,8 @@ cdef class SequenceBatch:
         cdef size_t offset_bytes
         cdef size_t special_count
         cdef size_t special_bytes
+        cdef size_t pass_count
+        cdef size_t source
         cdef bytes records
         cdef bytes offset_storage
         cdef bytes special_storage
@@ -3224,6 +3807,12 @@ cdef class SequenceBatch:
         cdef carray expected_indices
         cdef dict statistics
         cdef ForwardProvenance provenance
+        cdef object journal_capsule = None
+        cdef bytes profile_fingerprint_storage = b""
+        cdef const uint8_t[::1] profile_fingerprint_view
+        cdef const uint8_t[::1] sequence_fingerprint_view
+        cdef double_bits threshold_bits
+        cdef float_bits threshold_float_bits
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
@@ -3235,6 +3824,32 @@ cdef class SequenceBatch:
             raise RuntimeError("array('Q') is not native uint64")
         if _UINT32_ARRAY_TEMPLATE.itemsize != sizeof(uint32_t):
             raise RuntimeError("array('I') is not native uint32")
+        if sealed_domain_journal:
+            if (
+                not generation_bias_filter
+                or not isfinite(generation_f1)
+                or generation_f1 < 0.0
+                or generation_f1 > 1.0
+                or not isfinite(f2)
+                or f2 < 0.0
+                or f2 > 1.0
+                or not isfinite(f3)
+                or f3 < 0.0
+                or f3 > 1.0
+                or not isfinite(rt1)
+                or not isfinite(rt2)
+                or not isfinite(rt3)
+                or not isfinite(guard_band)
+                or guard_band < <float> 2.0e-4
+                or guard_band > <float> 1.0
+                or rt1 != <float> 0.25
+                or rt2 != <float> 0.10
+                or rt3 != <float> 0.20
+            ):
+                raise ValueError(
+                    "sealed domain journals require finite canonical thresholds "
+                    "with bias filtering and guard_band >= 2e-4"
+                )
         if postfilter_offsets.shape[0] != profile_count + 1:
             raise ValueError("post-filter row-offset count differs from selection")
         if postfilter_offsets[0] != 0:
@@ -3331,6 +3946,9 @@ cdef class SequenceBatch:
                     raise ValueError("Forward target exceeds HMMER's protein limit")
                 candidate_indices.push_back(record.sequence_index)
                 filter_scores.push_back(record.filtersc)
+                uncorrected_scores.push_back(usc)
+                candidate_records.push_back(record)
+                candidate_profiles.push_back(<uint32_t> profile_index)
             candidate_offsets.push_back(candidate_indices.size())
 
         candidate_count = candidate_indices.size()
@@ -3364,20 +3982,151 @@ cdef class SequenceBatch:
                     error,
                     sizeof(error),
                 )
+        if status != 0:
+            if database != NULL:
+                plan7_forward_database_destroy(&database, NULL, 0)
+            if output != NULL:
+                plan7_forward_output_destroy(&output, NULL, 0)
+            raise RuntimeError(error.decode("utf-8", "replace"))
+
+        if sealed_domain_journal:
+            try:
+                result_count = plan7_forward_output_result_count(output)
+                native_results = plan7_forward_output_results(output)
+                native_offsets = plan7_forward_output_special_offsets(output)
+                native_specials = plan7_forward_output_specials(output)
+                native_provenance = plan7_forward_output_provenance(output)
+                special_count = plan7_forward_output_special_count(output)
+                if result_count != candidate_count:
+                    raise RuntimeError("Forward result count changed")
+                if (
+                    native_offsets == NULL
+                    or native_provenance == NULL
+                    or (result_count and native_results == NULL)
+                    or (special_count and native_specials == NULL)
+                ):
+                    raise RuntimeError("Forward journal storage is incomplete")
+
+                pass_special_offsets.push_back(0)
+                journal_profile_offsets.push_back(0)
+                pass_count = 0
+                for profile_index in range(profile_count):
+                    start = <size_t> candidate_offsets[profile_index]
+                    stop = <size_t> candidate_offsets[profile_index + 1]
+                    for source in range(start, stop):
+                        if (
+                            native_results[source].action
+                            != PLAN7_FORWARD_DEFINITE_PASS
+                        ):
+                            continue
+                        if native_offsets[source] != pass_special_offsets.back():
+                            raise RuntimeError(
+                                "Forward pass special rows are not contiguous"
+                            )
+                        domain_candidate.profile_index = candidate_profiles[source]
+                        domain_candidate.sequence_index = candidate_indices[source]
+                        domain_candidates.push_back(domain_candidate)
+                        pass_sources.push_back(source)
+                        pass_special_offsets.push_back(native_offsets[source + 1])
+                        pass_count += 1
+                    journal_profile_offsets.push_back(pass_count)
+                if (
+                    pass_count != native_provenance.pass_count
+                    or pass_special_offsets[pass_count] != special_count
+                ):
+                    raise RuntimeError("Forward pass provenance count changed")
+
+                error[0] = 0
+                with nogil:
+                    status = plan7_backward_domain_run(
+                        database,
+                        self._batch,
+                        domain_candidates.data() if pass_count else NULL,
+                        pass_count,
+                        native_provenance,
+                        pass_special_offsets.data(),
+                        native_specials if special_count else NULL,
+                        special_count,
+                        rt1,
+                        rt2,
+                        rt3,
+                        guard_band,
+                        0,
+                        &domain_output,
+                        error,
+                        sizeof(error),
+                    )
+                if status != 0:
+                    raise RuntimeError(error.decode("utf-8", "replace"))
+                profile_fingerprint_storage = b"".join(selection._fingerprints)
+                profile_fingerprint_view = profile_fingerprint_storage
+                sequence_fingerprint_view = self._content_fingerprint
+                journal_capsule = _build_continuation_journal_capsule(
+                    &view,
+                    (
+                        &profile_fingerprint_view[0]
+                        if profile_fingerprint_view.shape[0]
+                        else NULL
+                    ),
+                    &sequence_fingerprint_view[0],
+                    (
+                        <const plan7_postfilter_result *> &postfilter_records[0]
+                        if record_count
+                        else NULL
+                    ),
+                    record_count,
+                    &postfilter_offsets[0],
+                    candidate_records.data() if candidate_count else NULL,
+                    uncorrected_scores.data() if candidate_count else NULL,
+                    candidate_profiles.data() if candidate_count else NULL,
+                    pass_sources.data() if pass_count else NULL,
+                    candidate_offsets.data(),
+                    journal_profile_offsets.data(),
+                    pass_count,
+                    pass_special_offsets.data(),
+                    output,
+                    domain_output,
+                    generation_f1,
+                    f2,
+                    f3,
+                    generation_bias_filter,
+                    rt1,
+                    rt2,
+                    rt3,
+                    guard_band,
+                )
+            except:
+                if domain_output != NULL:
+                    plan7_backward_domain_output_destroy(
+                        &domain_output, NULL, 0
+                    )
+                if database != NULL:
+                    plan7_forward_database_destroy(&database, NULL, 0)
+                if output != NULL:
+                    plan7_forward_output_destroy(&output, NULL, 0)
+                raise
+
         destroy_error[0] = 0
         if database != NULL:
             with nogil:
                 destroy_status = plan7_forward_database_destroy(
                     &database, destroy_error, sizeof(destroy_error)
                 )
-        if status != 0:
-            if output != NULL:
-                plan7_forward_output_destroy(&output, NULL, 0)
-            raise RuntimeError(error.decode("utf-8", "replace"))
         if destroy_status != 0:
+            if domain_output != NULL:
+                plan7_backward_domain_output_destroy(&domain_output, NULL, 0)
             if output != NULL:
                 plan7_forward_output_destroy(&output, NULL, 0)
             raise RuntimeError(destroy_error.decode("utf-8", "replace"))
+
+        if sealed_domain_journal:
+            if domain_output != NULL:
+                plan7_backward_domain_output_destroy(
+                    &domain_output, NULL, 0
+                )
+            if output != NULL:
+                plan7_forward_output_destroy(&output, NULL, 0)
+            return journal_capsule
 
         try:
             result_count = plan7_forward_output_result_count(output)
@@ -3458,7 +4207,7 @@ cdef class SequenceBatch:
                 "special_count": provenance._value.special_count,
                 "_provenance": provenance,
             })
-            return (
+            result = (
                 records,
                 row_offsets,
                 expected_indices,
@@ -3466,9 +4215,95 @@ cdef class SequenceBatch:
                 specials,
                 statistics,
             )
+            return result
         finally:
+            if domain_output != NULL:
+                plan7_backward_domain_output_destroy(&domain_output, NULL, 0)
             if output != NULL:
                 plan7_forward_output_destroy(&output, NULL, 0)
+
+    def forward_profile_selection_raw(
+        self,
+        ProfileSelection selection,
+        const uint8_t[::1] postfilter_records,
+        const uint64_t[::1] postfilter_offsets,
+        const uint64_t[::1] residue_offsets,
+        double f2,
+        double f3,
+        uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
+    ):
+        """Run diagnostic selection-aware F2/F3 without minting a seal."""
+        return self._forward_profile_selection_raw(
+            selection,
+            postfilter_records,
+            postfilter_offsets,
+            residue_offsets,
+            f2,
+            f3,
+            gathered_byte_budget,
+            False,
+            0.02,
+            True,
+            <float> 0.25,
+            <float> 0.10,
+            <float> 0.20,
+            <float> 2.0e-4,
+        )
+
+    def _postfilter_forward_domain_selection_sealed(
+        self,
+        ProfileSelection selection,
+        double f1,
+        double f2,
+        double f3,
+        float guard_band=2.0e-4,
+        uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
+    ):
+        """Run the fused package-internal path and return one opaque seal.
+
+        Underscore native entry points are trusted implementation details, not
+        a security boundary against deliberate same-process private API use.
+        """
+        cdef object postfilter_records
+        cdef object postfilter_offsets
+        cdef object result
+        cdef carray residue_offsets
+        cdef size_t index
+
+        postfilter_records, postfilter_offsets = (
+            self.postfilter_profile_selection_csr_raw(selection, f1)
+        )
+        residue_offsets = clone(
+            _UINT64_ARRAY_TEMPLATE, self._sequence_count + 1, False
+        )
+        residue_offsets.data.as_ulonglongs[0] = 0
+        for index in range(self._sequence_count):
+            if self._lengths[index] > (
+                (<uint64_t> -1)
+                - residue_offsets.data.as_ulonglongs[index]
+            ):
+                raise OverflowError("target residue prefix overflows uint64")
+            residue_offsets.data.as_ulonglongs[index + 1] = (
+                residue_offsets.data.as_ulonglongs[index]
+                + self._lengths[index]
+            )
+        result = self._forward_profile_selection_raw(
+            selection,
+            memoryview(postfilter_records),
+            memoryview(postfilter_offsets),
+            memoryview(residue_offsets),
+            f2,
+            f3,
+            gathered_byte_budget,
+            True,
+            f1,
+            True,
+            <float> 0.25,
+            <float> 0.10,
+            <float> 0.20,
+            guard_band,
+        )
+        return result
 
     cdef size_t _run_profile_selection_candidates(
         self,
