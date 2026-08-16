@@ -42,13 +42,34 @@ Forward/Backward, posterior decoding, null2, optimal-accuracy, display, and
 shared hit-scoring path. Uncertain, clustered, nonfinite, or otherwise
 unsupported rows must remain on the existing Forward continuation.
 
+The compact-domain seam is the narrower continuation for simple envelopes
+that have also been rescored outside HMMER. It consumes the CUDA journal ABI
+directly: one pointer-free 64-byte result per domain, 29 binary32 null2 odds,
+64-bit offsets, and a flat 16-byte optimal-accuracy trace-step array. Result
+and trace coordinates are one-based, inclusive, and target-global. The seam
+does not run MSV, Viterbi, Forward, Backward, DomainDecoding, isolated-envelope
+DP, null2, optimal-accuracy, or traceback. It validates the complete payload,
+reconstructs stock `P7_TRACE`, `P7_DOMAIN`, and `P7_ALIDISPLAY` objects, and
+enters the existing post-domain hit/scoring/TopHits tail.
+
+Malformed or stale compact payloads return `eslEINVAL` before survivor
+counters, reusable matrices/domain state, or TopHits change. The adapter must
+then use the existing CPU continuation for the whole row. Accepted records
+must have `status=eslOK`, `action=p7_COMPACT_DOMAIN_DEVICE_RESULT`, no private
+scales, exact row/profile/sequence identity, ordered envelopes, consistent
+Forward/Backward and OA values, canonical null2 degeneracies, and a complete
+stock unihit trace. The live profile/background length state, floating-point
+environment, filter gates, and a canonical continuation-option fingerprint
+are rechecked at the boundary.
+
 This patch supplies only the pinned HMMER boundary and its direct parity
 probe. Product integration is intentionally still blocked: the final opaque
-adapter must seal the complete external score/status tuple, route payload,
-profile identity, target identity, thresholds, and background fingerprint as
-one immutable generation. The HMMER seam additionally rejects stale live
-profile/background length configuration, but cannot establish that hidden
-cross-object provenance by itself.
+adapter must seal the complete external score/status tuple, route and compact
+payloads, profile and target content identities, thresholds, and background
+fingerprint as one immutable generation. It must authenticate those content
+hashes before calling HMMER and preserve original row order. The HMMER seam
+then independently checks the compact payload and the live HMMER state, but
+cannot derive or authenticate the adapter's hidden cross-object hashes itself.
 
 ## Build and test
 
@@ -71,10 +92,12 @@ private ABI fingerprint changes and intentionally forces `_pipeline` to be
 rebuilt. Regenerate pressed manifests after switching wheels.
 
 The test compares ordinary stock and patched PyHMMER byte-for-byte, then checks
-all four entry points, stage counters, F1/F2/F3 rejects, Viterbi elision,
+all continuation entry points, stage counters, Z/accounting state, F1/F2/F3
+rejects, Viterbi elision,
 ERANGE/ENORESULT fallback, `--nobias`, malformed Forward payloads, required
-symbols, a real Forward rescaling case, and that only one HMMER and one Easel
-library are mapped.
+symbols, a real Forward rescaling case, byte-exact compact-domain tables on a
+broad real-sequence fixture across pipeline reuse, fail-before-mutation compact
+payload corruptions, and that only one HMMER and one Easel library are mapped.
 
 For the installed `plan7_gpu._pipeline`, use a relative runpath
 `$ORIGIN/../pyhmmer.libs`; never retain the current absolute development

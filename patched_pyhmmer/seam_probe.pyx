@@ -1,9 +1,10 @@
 # cython: language_level=3
 
 from libc.stddef cimport size_t
-from libc.stdint cimport uint32_t, uint64_t
+from libc.stdint cimport uint8_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
-from libc.string cimport memcmp, memcpy
+from libc.string cimport memcmp, memcpy, memset
+from libc.math cimport fabsf, logf
 
 from libeasel cimport eslEINVAL, eslEMEM, eslENORESULT, eslERANGE, eslOK
 from libeasel.sq cimport ESL_SQ
@@ -12,9 +13,11 @@ from libhmmer.impl.p7_omx cimport P7_OMX, p7_omx_GrowTo
 from libhmmer.impl.p7_oprofile cimport (
     P7_OPROFILE,
     p7_oprofile_ReconfigLength,
+    p7_oprofile_ReconfigMultihit,
     p7_oprofile_ReconfigUnihit,
 )
 from libhmmer.p7_domaindef cimport P7_DOMAINDEF, p7_domaindef_GrowTo
+from libhmmer.p7_domain cimport P7_DOMAIN
 from libhmmer.p7_bg cimport (
     P7_BG,
     p7_bg_FilterScore,
@@ -22,7 +25,11 @@ from libhmmer.p7_bg cimport (
 )
 from libhmmer.p7_pipeline cimport (
     P7_PIPELINE,
+    P7_PIPELINE_COMPACT_DOMAIN,
+    P7_PIPELINE_COMPACT_TRACE_STEP,
     P7_PIPELINE_SIMPLE_REGION,
+    p7_COMPACT_DOMAIN_DEVICE_RESULT,
+    p7_COMPACT_NULL2_COUNT,
     p7_DOMAIN_NO_REGIONS,
     p7_DOMAIN_SIMPLE,
     p7_SEARCH_SEQS,
@@ -33,11 +40,18 @@ from libhmmer.p7_pipeline cimport (
     p7_PipelineFromFilterScores,
     p7_PipelineFromFilterAndForwardScores,
     p7_PipelineFromFilterAndForwardSimpleRegions,
+    p7_PipelineFromFilterForwardAndCompactDomains,
+    p7_pipeline_CompactTailFingerprint,
     p7_pipeline_Reuse,
     p7_pipeline_domain_route_e,
     p7_pipeline_vitmode_e,
     p7_pli_NewModel,
     p7_pli_NewSeq,
+)
+from libhmmer.p7_trace cimport (
+    P7_TRACE,
+    p7T_M,
+    p7_trace_Reuse,
 )
 from libhmmer.p7_tophits cimport P7_TOPHITS
 
@@ -90,6 +104,44 @@ cdef extern from "impl_sse/impl_sse.h" nogil:
         const P7_OMX *fwd,
         const P7_OMX *bck,
         P7_DOMAINDEF *ddef,
+    )
+    int p7_Forward(
+        const unsigned char *dsq,
+        int L,
+        const P7_OPROFILE *om,
+        P7_OMX *ox,
+        float *ret_sc,
+    )
+    int p7_Backward(
+        const unsigned char *dsq,
+        int L,
+        const P7_OPROFILE *om,
+        const P7_OMX *fwd,
+        P7_OMX *bck,
+        float *ret_sc,
+    )
+    int p7_Decoding(
+        const P7_OPROFILE *om,
+        const P7_OMX *fwd,
+        P7_OMX *bck,
+        P7_OMX *pp,
+    )
+    int p7_OptimalAccuracy(
+        const P7_OPROFILE *om,
+        const P7_OMX *pp,
+        P7_OMX *ox,
+        float *ret_e,
+    )
+    int p7_OATrace(
+        const P7_OPROFILE *om,
+        const P7_OMX *pp,
+        const P7_OMX *ox,
+        P7_TRACE *tr,
+    )
+    int p7_Null2_ByExpectation(
+        const P7_OPROFILE *om,
+        const P7_OMX *pp,
+        float *null2,
     )
 
 
@@ -383,6 +435,157 @@ cdef int _extract_domain_route(
     return eslOK
 
 
+cdef int _build_compact_domains(
+    P7_PIPELINE* pli,
+    P7_OPROFILE* om,
+    const ESL_SQ* sq,
+    const P7_PIPELINE_SIMPLE_REGION* regions,
+    uint64_t region_count,
+    uint32_t row_index,
+    uint32_t profile_index,
+    uint32_t sequence_index,
+    P7_PIPELINE_COMPACT_DOMAIN* domains,
+    float* null2,
+    uint64_t* trace_offsets,
+    P7_PIPELINE_COMPACT_TRACE_STEP* traces,
+    uint64_t trace_capacity,
+    uint64_t* ret_trace_count,
+) noexcept nogil:
+    """Build a pristine CPU oracle payload for the compact seam tests."""
+    cdef P7_PIPELINE_COMPACT_DOMAIN* domain
+    cdef P7_PIPELINE_COMPACT_TRACE_STEP* step
+    cdef P7_TRACE* trace = pli.ddef.tr
+    cdef float* domain_null2
+    cdef float backward_score
+    cdef float correction
+    cdef float forward_score
+    cdef float oa_score
+    cdef uint64_t trace_used = 0
+    cdef uint64_t d
+    cdef int first_match
+    cdef int first_model
+    cdef int last_match
+    cdef int last_model
+    cdef int restore_status
+    cdef int status
+    cdef int i
+    cdef int j
+    cdef int L
+    cdef int pos
+    cdef int z
+
+    ret_trace_count[0] = 0
+    if (
+        pli == NULL or om == NULL or sq == NULL or trace == NULL
+        or regions == NULL or region_count == 0 or domains == NULL
+        or null2 == NULL or trace_offsets == NULL or traces == NULL
+    ):
+        return eslEINVAL
+    status = p7_oprofile_ReconfigUnihit(om, sq.n)
+    if status != eslOK:
+        return status
+    for d in range(region_count):
+        i = <int> regions[d].i
+        j = <int> regions[d].j
+        L = j - i + 1
+        if i <= 0 or L <= 0 or j > sq.n:
+            status = eslEINVAL
+            break
+        status = p7_omx_GrowTo(pli.fwd, om.M, L, L)
+        if status != eslOK:
+            break
+        status = p7_omx_GrowTo(pli.bck, om.M, L, L)
+        if status != eslOK:
+            break
+        status = p7_Forward(
+            sq.dsq + i - 1, L, om, pli.fwd, &forward_score,
+        )
+        if status != eslOK:
+            break
+        status = p7_Backward(
+            sq.dsq + i - 1, L, om, pli.fwd, pli.bck,
+            &backward_score,
+        )
+        if status != eslOK:
+            break
+        status = p7_Decoding(om, pli.fwd, pli.bck, pli.bck)
+        if status != eslOK:
+            break
+        status = p7_OptimalAccuracy(om, pli.bck, pli.fwd, &oa_score)
+        if status != eslOK:
+            break
+        status = p7_OATrace(om, pli.bck, pli.fwd, trace)
+        if status != eslOK:
+            break
+        domain_null2 = null2 + d * p7_COMPACT_NULL2_COUNT
+        status = p7_Null2_ByExpectation(om, pli.bck, domain_null2)
+        if status != eslOK:
+            break
+        if (
+            trace.N < 0 or <uint64_t> trace.N > trace_capacity
+            or trace_used > trace_capacity - <uint64_t> trace.N
+        ):
+            status = eslERANGE
+            break
+
+        domain = domains + d
+        memset(domain, 0, sizeof(P7_PIPELINE_COMPACT_DOMAIN))
+        domain.row_index = row_index
+        domain.profile_index = profile_index
+        domain.sequence_index = sequence_index
+        domain.envelope_begin = <uint32_t> i
+        domain.envelope_end = <uint32_t> j
+        domain.forward_score = forward_score
+        domain.backward_score = backward_score
+        domain.oa_score = oa_score
+        domain.score_consistency = fabsf(forward_score - backward_score)
+        domain.status = <uint8_t> eslOK
+        domain.action = <uint8_t> p7_COMPACT_DOMAIN_DEVICE_RESULT
+        domain.has_own_scales = <uint8_t> pli.bck.has_own_scales
+
+        trace_offsets[d] = trace_used
+        first_match = 0
+        first_model = 0
+        last_match = 0
+        last_model = 0
+        for z in range(trace.N):
+            step = traces + trace_used + <uint64_t> z
+            memset(step, 0, sizeof(P7_PIPELINE_COMPACT_TRACE_STEP))
+            step.state = <uint8_t> trace.st[z]
+            step.model_position = <uint32_t> trace.k[z]
+            if trace.i[z] > 0:
+                step.sequence_position = <uint32_t> (trace.i[z] + i - 1)
+            step.posterior = trace.pp[z]
+            if trace.st[z] == p7T_M:
+                if first_match == 0:
+                    first_match = <int> step.sequence_position
+                    first_model = <int> step.model_position
+                last_match = <int> step.sequence_position
+                last_model = <int> step.model_position
+        if first_match == 0:
+            status = eslENORESULT
+            break
+        trace_used += <uint64_t> trace.N
+        domain.alignment_begin = <uint32_t> first_match
+        domain.alignment_end = <uint32_t> last_match
+        domain.model_begin = <uint32_t> first_model
+        domain.model_end = <uint32_t> last_model
+        correction = 0.0
+        for pos in range(i, j + 1):
+            correction += logf(domain_null2[sq.dsq[pos]])
+        domain.domain_correction = correction
+        p7_trace_Reuse(trace)
+
+    if status == eslOK:
+        trace_offsets[region_count] = trace_used
+        ret_trace_count[0] = trace_used
+    p7_trace_Reuse(trace)
+    restore_status = p7_oprofile_ReconfigMultihit(om, sq.n)
+    if status == eslOK:
+        status = restore_status
+    return status
+
+
 cdef int _loop_simple_regions(
     P7_PIPELINE* pli,
     P7_OPROFILE* om,
@@ -490,6 +693,178 @@ cdef int _loop_simple_regions(
                 break
 
     free(forward_xmx)
+    free(regions)
+    return status
+
+
+cdef int _loop_compact_domains(
+    P7_PIPELINE* pli,
+    P7_OPROFILE* om,
+    P7_BG* bg,
+    const ESL_SQ** sq,
+    size_t n_targets,
+    P7_TOPHITS* th,
+    uint64_t* route_counts,
+) noexcept nogil:
+    cdef P7_PIPELINE_SIMPLE_REGION* regions = NULL
+    cdef P7_PIPELINE_COMPACT_DOMAIN* domains = NULL
+    cdef P7_PIPELINE_COMPACT_TRACE_STEP* traces = NULL
+    cdef uint64_t* trace_offsets = NULL
+    cdef float* null2 = NULL
+    cdef float* forward_xmx = NULL
+    cdef _double_bits f1_bits
+    cdef _double_bits f2_bits
+    cdef _double_bits f3_bits
+    cdef uint64_t generation_tail_fingerprint
+    cdef uint64_t region_count
+    cdef uint64_t trace_capacity
+    cdef uint64_t trace_count
+    cdef uint64_t xmx_count
+    cdef float filtersc
+    cdef float fwdsc
+    cdef float nexpected
+    cdef float usc
+    cdef float vfsc
+    cdef p7_pipeline_domain_route_e route
+    cdef int status
+    cdef size_t t
+    cdef bint clustered
+
+    route_counts[0] = 0
+    route_counts[1] = 0
+    route_counts[2] = 0
+    route_counts[3] = 0
+    status = p7_pli_NewModel(pli, om, bg)
+    if status == eslOK:
+        for t in range(n_targets):
+            status = p7_pli_NewSeq(pli, sq[t])
+            if status != eslOK:
+                break
+            status = p7_bg_SetLength(bg, sq[t].n)
+            if status != eslOK:
+                break
+            status = p7_oprofile_ReconfigLength(om, sq[t].n)
+            if status != eslOK:
+                break
+            status = p7_omx_GrowTo(pli.oxf, om.M, 0, sq[t].n)
+            if status != eslOK:
+                break
+            status = p7_MSVFilter(sq[t].dsq, sq[t].n, om, pli.oxf, &usc)
+            if status != eslOK:
+                break
+            status = p7_bg_FilterScore(bg, sq[t].dsq, sq[t].n, &filtersc)
+            if status != eslOK:
+                break
+            status = p7_ViterbiFilter(
+                sq[t].dsq, sq[t].n, om, pli.oxf, &vfsc,
+            )
+            if status != eslOK:
+                break
+            status = p7_ForwardParser(
+                sq[t].dsq, sq[t].n, om, pli.oxf, &fwdsc,
+            )
+            if status != eslOK:
+                break
+            status = _extract_domain_route(
+                pli, om, sq[t], &regions, &region_count,
+                &nexpected, &clustered,
+            )
+            if status != eslOK:
+                break
+
+            if clustered:
+                xmx_count = <uint64_t> (sq[t].n + 1) * FORWARD_SPECIAL_CELLS
+                forward_xmx = <float*> malloc(xmx_count * sizeof(float))
+                if forward_xmx == NULL:
+                    status = eslEMEM
+                    break
+                memcpy(forward_xmx, pli.oxf.xmx, xmx_count * sizeof(float))
+                status = p7_PipelineFromFilterAndForwardScores(
+                    pli, om, bg, sq[t], NULL, th,
+                    usc, filtersc, vfsc, fwdsc, forward_xmx, xmx_count,
+                )
+                route_counts[0] += 1
+            elif region_count == 0:
+                f1_bits.value = pli.F1
+                f2_bits.value = pli.F2
+                f3_bits.value = pli.F3
+                route = p7_DOMAIN_NO_REGIONS
+                status = p7_PipelineFromFilterAndForwardSimpleRegions(
+                    pli, om, bg, sq[t], NULL, th,
+                    usc, filtersc, vfsc, fwdsc,
+                    f1_bits.bits, f2_bits.bits, f3_bits.bits,
+                    pli.do_biasfilter, route, nexpected, NULL, 0,
+                )
+                route_counts[1] += 1
+            else:
+                trace_capacity = (
+                    <uint64_t> sq[t].n
+                    + region_count * (<uint64_t> om.M + 6)
+                )
+                domains = <P7_PIPELINE_COMPACT_DOMAIN*> malloc(
+                    region_count * sizeof(P7_PIPELINE_COMPACT_DOMAIN)
+                )
+                null2 = <float*> malloc(
+                    region_count * p7_COMPACT_NULL2_COUNT * sizeof(float)
+                )
+                trace_offsets = <uint64_t*> malloc(
+                    (region_count + 1) * sizeof(uint64_t)
+                )
+                traces = <P7_PIPELINE_COMPACT_TRACE_STEP*> malloc(
+                    trace_capacity * sizeof(P7_PIPELINE_COMPACT_TRACE_STEP)
+                )
+                if (
+                    domains == NULL or null2 == NULL
+                    or trace_offsets == NULL or traces == NULL
+                ):
+                    status = eslEMEM
+                    break
+                status = _build_compact_domains(
+                    pli, om, sq[t], regions, region_count,
+                    <uint32_t> t, 0, <uint32_t> t,
+                    domains, null2, trace_offsets, traces,
+                    trace_capacity, &trace_count,
+                )
+                if status != eslOK:
+                    break
+                generation_tail_fingerprint = (
+                    p7_pipeline_CompactTailFingerprint(pli)
+                )
+                status = p7_PipelineFromFilterForwardAndCompactDomains(
+                    pli, om, bg, sq[t], NULL, th,
+                    usc, filtersc, vfsc, fwdsc,
+                    generation_tail_fingerprint,
+                    <uint32_t> t, 0, <uint32_t> t, nexpected,
+                    domains, region_count,
+                    trace_offsets, region_count + 1,
+                    traces, trace_count,
+                    null2, region_count * p7_COMPACT_NULL2_COUNT,
+                )
+                route_counts[3] += 1
+
+            free(forward_xmx)
+            forward_xmx = NULL
+            free(domains)
+            domains = NULL
+            free(null2)
+            null2 = NULL
+            free(trace_offsets)
+            trace_offsets = NULL
+            free(traces)
+            traces = NULL
+            free(regions)
+            regions = NULL
+            if status != eslOK:
+                break
+            status = p7_pipeline_Reuse(pli)
+            if status != eslOK:
+                break
+
+    free(forward_xmx)
+    free(domains)
+    free(null2)
+    free(trace_offsets)
+    free(traces)
     free(regions)
     return status
 
@@ -868,6 +1243,290 @@ cdef int _invalid_simple_regions(
     return status
 
 
+cdef int _invalid_compact_domains(
+    P7_PIPELINE* pli,
+    P7_OPROFILE* om,
+    P7_BG* bg,
+    const ESL_SQ* sq,
+    P7_TOPHITS* th,
+    int corruption,
+    uint64_t* ret_changed,
+) noexcept nogil:
+    cdef P7_PIPELINE_SIMPLE_REGION region
+    cdef P7_PIPELINE_COMPACT_DOMAIN domain
+    cdef P7_PIPELINE_COMPACT_TRACE_STEP* traces = NULL
+    cdef uint64_t trace_offsets[2]
+    cdef float null2[29]
+    cdef _float_bits bad_float
+    cdef unsigned char* snapshot = NULL
+    cdef size_t offset = 0
+    cdef size_t n2sc_size
+    cdef size_t dcl_size
+    cdef size_t snapshot_size
+    cdef uint64_t generation_tail_fingerprint
+    cdef uint64_t trace_capacity
+    cdef uint64_t trace_count
+    cdef uint64_t trace_offset_count = 2
+    cdef uint64_t supplied_trace_count
+    cdef uint64_t supplied_null2_count = 29
+    cdef float filtersc
+    cdef float fwdsc
+    cdef float usc
+    cdef float vfsc
+    cdef int first_match = -1
+    cdef int original_rounding = -1
+    cdef int status
+    cdef int z
+
+    ret_changed[0] = 1
+    if sq.n <= 0:
+        return eslEINVAL
+    status = p7_pli_NewModel(pli, om, bg)
+    if status != eslOK:
+        return status
+    status = p7_pli_NewSeq(pli, sq)
+    if status != eslOK:
+        return status
+    status = p7_bg_SetLength(bg, sq.n)
+    if status != eslOK:
+        return status
+    status = p7_oprofile_ReconfigLength(om, sq.n)
+    if status != eslOK:
+        return status
+    status = p7_omx_GrowTo(pli.oxf, om.M, 0, sq.n)
+    if status != eslOK:
+        return status
+    status = p7_MSVFilter(sq.dsq, sq.n, om, pli.oxf, &usc)
+    if status != eslOK:
+        return status
+    status = p7_bg_FilterScore(bg, sq.dsq, sq.n, &filtersc)
+    if status != eslOK:
+        return status
+    status = p7_ViterbiFilter(sq.dsq, sq.n, om, pli.oxf, &vfsc)
+    if status != eslOK:
+        return status
+    status = p7_ForwardParser(sq.dsq, sq.n, om, pli.oxf, &fwdsc)
+    if status != eslOK:
+        return status
+
+    region.i = 1
+    region.j = <uint32_t> sq.n
+    trace_capacity = <uint64_t> sq.n + <uint64_t> om.M + 6
+    traces = <P7_PIPELINE_COMPACT_TRACE_STEP*> malloc(
+        trace_capacity * sizeof(P7_PIPELINE_COMPACT_TRACE_STEP)
+    )
+    if traces == NULL:
+        return eslEMEM
+    status = _build_compact_domains(
+        pli, om, sq, &region, 1, 0, 0, 0,
+        &domain, null2, trace_offsets, traces,
+        trace_capacity, &trace_count,
+    )
+    if status != eslOK:
+        free(traces)
+        return status
+    supplied_trace_count = trace_count
+    generation_tail_fingerprint = p7_pipeline_CompactTailFingerprint(pli)
+    for z in range(<int> trace_count):
+        if traces[z].state == p7T_M:
+            first_match = z
+            break
+    if first_match < 0:
+        free(traces)
+        return eslENORESULT
+
+    if corruption == 0:
+        domain.status = 255
+    elif corruption == 1:
+        domain.action = 0
+    elif corruption == 2:
+        domain.has_own_scales = 1
+    elif corruption == 3:
+        domain.reserved = 1
+    elif corruption == 4:
+        domain.reserved2 = 1
+    elif corruption == 5:
+        domain.row_index = 1
+    elif corruption == 6:
+        domain.profile_index = 1
+    elif corruption == 7:
+        domain.sequence_index = 1
+    elif corruption == 8:
+        domain.envelope_begin = 0
+    elif corruption == 9:
+        domain.envelope_begin = domain.envelope_end + 1
+    elif corruption == 10:
+        domain.envelope_end = <uint32_t> sq.n + 1
+    elif corruption == 11:
+        domain.alignment_begin = 0
+    elif corruption == 12:
+        domain.model_begin = 0
+    elif corruption == 13:
+        bad_float.bits = 0x7fc00000
+        domain.forward_score = bad_float.value
+    elif corruption == 14:
+        bad_float.bits = 0x7fc00000
+        domain.backward_score = bad_float.value
+    elif corruption == 15:
+        bad_float.bits = 0x7fc00000
+        domain.oa_score = bad_float.value
+    elif corruption == 16:
+        domain.oa_score = -1.0
+    elif corruption == 17:
+        bad_float.bits = 0x7fc00000
+        domain.domain_correction = bad_float.value
+    elif corruption == 18:
+        domain.score_consistency = 0.003
+    elif corruption == 19:
+        domain.score_consistency += 0.0001
+    elif corruption == 20:
+        trace_offset_count = 1
+    elif corruption == 21:
+        trace_offsets[1] = trace_offsets[0]
+    elif corruption == 22:
+        supplied_trace_count -= 1
+    elif corruption == 23:
+        traces[0].state = <uint8_t> p7T_M
+    elif corruption == 24:
+        traces[first_match].sequence_position += 1
+    elif corruption == 25:
+        bad_float.bits = 0x7fc00000
+        traces[first_match].posterior = bad_float.value
+    elif corruption == 26:
+        traces[first_match].reserved[0] = 1
+    elif corruption == 27:
+        null2[0] = 0.0
+    elif corruption == 28:
+        null2[21] += 0.01
+    elif corruption == 29:
+        generation_tail_fingerprint ^= 1
+    elif corruption == 30:
+        original_rounding = fegetround()
+        if fesetround(FE_DOWNWARD) != 0:
+            free(traces)
+            return eslEINVAL
+    elif corruption == 31:
+        pli.E += 1.0
+    elif corruption == 32:
+        pli.ddef.nregions = 1
+    elif corruption == 33:
+        om.L -= 1
+    elif corruption == 34:
+        status = p7_oprofile_ReconfigUnihit(om, sq.n)
+        if status != eslOK:
+            free(traces)
+            return status
+    elif corruption == 35:
+        status = p7_bg_SetLength(bg, sq.n - 1)
+        if status != eslOK:
+            free(traces)
+            return status
+    elif corruption == 36:
+        domain.domain_correction += 0.01
+    elif corruption == 37:
+        domain.backward_score += 0.01
+    elif corruption == 38:
+        trace_offsets[0] = 1
+    elif corruption == 39:
+        supplied_null2_count -= 1
+    elif corruption == 40:
+        domain.oa_score += 0.01
+    elif corruption != 41:
+        free(traces)
+        return eslEINVAL
+
+    n2sc_size = (<size_t> pli.ddef.Lalloc + 1) * sizeof(float)
+    dcl_size = <size_t> pli.ddef.nalloc * sizeof(P7_DOMAIN)
+    snapshot_size = (
+        sizeof(P7_PIPELINE) + sizeof(P7_OPROFILE) + sizeof(P7_BG)
+        + sizeof(P7_TOPHITS) + sizeof(P7_DOMAINDEF)
+        + sizeof(P7_TRACE) + 4 * sizeof(P7_OMX)
+        + n2sc_size + dcl_size
+    )
+    snapshot = <unsigned char*> malloc(snapshot_size)
+    if snapshot == NULL:
+        if original_rounding != -1:
+            fesetround(original_rounding)
+        free(traces)
+        return eslEMEM
+    memcpy(snapshot + offset, pli, sizeof(P7_PIPELINE))
+    offset += sizeof(P7_PIPELINE)
+    memcpy(snapshot + offset, om, sizeof(P7_OPROFILE))
+    offset += sizeof(P7_OPROFILE)
+    memcpy(snapshot + offset, bg, sizeof(P7_BG))
+    offset += sizeof(P7_BG)
+    memcpy(snapshot + offset, th, sizeof(P7_TOPHITS))
+    offset += sizeof(P7_TOPHITS)
+    memcpy(snapshot + offset, pli.ddef, sizeof(P7_DOMAINDEF))
+    offset += sizeof(P7_DOMAINDEF)
+    memcpy(snapshot + offset, pli.ddef.tr, sizeof(P7_TRACE))
+    offset += sizeof(P7_TRACE)
+    memcpy(snapshot + offset, pli.oxf, sizeof(P7_OMX))
+    offset += sizeof(P7_OMX)
+    memcpy(snapshot + offset, pli.oxb, sizeof(P7_OMX))
+    offset += sizeof(P7_OMX)
+    memcpy(snapshot + offset, pli.fwd, sizeof(P7_OMX))
+    offset += sizeof(P7_OMX)
+    memcpy(snapshot + offset, pli.bck, sizeof(P7_OMX))
+    offset += sizeof(P7_OMX)
+    memcpy(snapshot + offset, pli.ddef.n2sc, n2sc_size)
+    offset += n2sc_size
+    memcpy(snapshot + offset, pli.ddef.dcl, dcl_size)
+
+    status = p7_PipelineFromFilterForwardAndCompactDomains(
+        pli, om, bg, sq, NULL, th,
+        usc, filtersc, vfsc, fwdsc,
+        generation_tail_fingerprint,
+        0, 0, 0, 1.0,
+        &domain, 1,
+        trace_offsets, trace_offset_count,
+        traces, supplied_trace_count,
+        null2, supplied_null2_count,
+    )
+    if original_rounding != -1 and fesetround(original_rounding) != 0:
+        free(snapshot)
+        free(traces)
+        return eslEINVAL
+
+    offset = 0
+    ret_changed[0] = memcmp(snapshot + offset, pli, sizeof(P7_PIPELINE)) != 0
+    offset += sizeof(P7_PIPELINE)
+    ret_changed[0] |= memcmp(snapshot + offset, om, sizeof(P7_OPROFILE)) != 0
+    offset += sizeof(P7_OPROFILE)
+    ret_changed[0] |= memcmp(snapshot + offset, bg, sizeof(P7_BG)) != 0
+    offset += sizeof(P7_BG)
+    ret_changed[0] |= memcmp(snapshot + offset, th, sizeof(P7_TOPHITS)) != 0
+    offset += sizeof(P7_TOPHITS)
+    ret_changed[0] |= memcmp(
+        snapshot + offset, pli.ddef, sizeof(P7_DOMAINDEF),
+    ) != 0
+    offset += sizeof(P7_DOMAINDEF)
+    ret_changed[0] |= memcmp(
+        snapshot + offset, pli.ddef.tr, sizeof(P7_TRACE),
+    ) != 0
+    offset += sizeof(P7_TRACE)
+    ret_changed[0] |= memcmp(snapshot + offset, pli.oxf, sizeof(P7_OMX)) != 0
+    offset += sizeof(P7_OMX)
+    ret_changed[0] |= memcmp(snapshot + offset, pli.oxb, sizeof(P7_OMX)) != 0
+    offset += sizeof(P7_OMX)
+    ret_changed[0] |= memcmp(snapshot + offset, pli.fwd, sizeof(P7_OMX)) != 0
+    offset += sizeof(P7_OMX)
+    ret_changed[0] |= memcmp(snapshot + offset, pli.bck, sizeof(P7_OMX)) != 0
+    offset += sizeof(P7_OMX)
+    if pli.ddef.n2sc != NULL:
+        ret_changed[0] |= memcmp(
+            snapshot + offset, pli.ddef.n2sc, n2sc_size,
+        ) != 0
+    offset += n2sc_size
+    if pli.ddef.dcl != NULL:
+        ret_changed[0] |= memcmp(
+            snapshot + offset, pli.ddef.dcl, dcl_size,
+        ) != 0
+    free(snapshot)
+    free(traces)
+    return status
+
+
 def search_from_msv(
     Pipeline pipeline,
     HMM query,
@@ -999,6 +1658,42 @@ def search_simple_regions(
     )
 
 
+def search_compact_domains(
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+):
+    """Exercise compact-domain continuation with a pristine CPU oracle."""
+    cdef TopHits hits = TopHits(query)
+    cdef uint64_t route_counts[4]
+    cdef int status
+
+    with nogil:
+        pipeline._pli.mode = p7_SEARCH_SEQS
+        pipeline._pli.nseqs = 0
+        status = _loop_compact_domains(
+            pipeline._pli,
+            optimized_profile._om,
+            pipeline.background._bg,
+            <const ESL_SQ**> sequences._refs,
+            sequences._length,
+            hits._th,
+            route_counts,
+        )
+        if status == eslOK:
+            hits._sort_by_key()
+            hits._threshold(pipeline)
+    if status != eslOK:
+        raise RuntimeError(f"HMMER status {status}")
+    hits._query = query
+    hits._empty = False
+    return hits, (
+        route_counts[0], route_counts[1],
+        route_counts[2], route_counts[3],
+    )
+
+
 def invalid_forward_status(
     Pipeline pipeline,
     HMM query,
@@ -1046,6 +1741,35 @@ def invalid_simple_regions_status(
         pipeline._pli.mode = p7_SEARCH_SEQS
         pipeline._pli.nseqs = 0
         status = _invalid_simple_regions(
+            pipeline._pli,
+            optimized_profile._om,
+            pipeline.background._bg,
+            <const ESL_SQ*> sequences._refs[0],
+            hits._th,
+            corruption,
+            &changed,
+        )
+    return status, bool(changed)
+
+
+def invalid_compact_domains_status(
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    DigitalSequenceBlock sequences,
+    int corruption,
+):
+    cdef TopHits hits
+    cdef uint64_t changed
+    cdef int status
+
+    if sequences._length != 1:
+        raise ValueError("invalid compact-domain probe requires one target")
+    hits = TopHits(query)
+    with nogil:
+        pipeline._pli.mode = p7_SEARCH_SEQS
+        pipeline._pli.nseqs = 0
+        status = _invalid_compact_domains(
             pipeline._pli,
             optimized_profile._om,
             pipeline.background._bg,

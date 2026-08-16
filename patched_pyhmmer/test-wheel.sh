@@ -66,7 +66,9 @@ for symbol in \
   p7_PipelineFromMSV \
   p7_PipelineFromFilterScores \
   p7_PipelineFromFilterAndForwardScores \
-  p7_PipelineFromFilterAndForwardSimpleRegions; do
+  p7_PipelineFromFilterAndForwardSimpleRegions \
+  p7_PipelineFromFilterForwardAndCompactDomains \
+  p7_pipeline_CompactTailFingerprint; do
   if ! rg -q "[[:space:]]${symbol}$" <<<"$defined_symbols"; then
     echo "patched HMMER library is missing $symbol" >&2
     exit 1
@@ -86,8 +88,8 @@ print(package.parent / "pyhmmer.libs" / "liblibhmmer.so")
 PY
 )
 if nm -D --defined-only "$stock_library" | \
-    rg -q '[[:space:]]p7_PipelineFromFilterAndForwardSimpleRegions$'; then
-  echo "stock HMMER unexpectedly exports the private simple-region seam" >&2
+    rg -q '[[:space:]]p7_PipelineFromFilter(AndForwardSimpleRegions|ForwardAndCompactDomains)$'; then
+  echo "stock HMMER unexpectedly exports a private domain seam" >&2
   exit 1
 fi
 

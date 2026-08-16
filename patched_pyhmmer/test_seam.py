@@ -12,6 +12,14 @@ import seam_probe
 
 DATA = Path(pyhmmer.__file__).parent / "tests" / "data"
 COUNTERS = ("n_past_msv", "n_past_bias", "n_past_vit", "n_past_fwd")
+PIPELINE_STATE = (
+    "Z",
+    "domZ",
+    "nmodels",
+    "nseqs",
+    "nres",
+    *COUNTERS,
+)
 
 
 def load(hmm_name: str, index: int | None = None):
@@ -45,6 +53,11 @@ def counters(hits) -> tuple[int, ...]:
     return tuple(state[key] for key in COUNTERS)
 
 
+def pipeline_state(hits) -> tuple[int | float, ...]:
+    state = hits.__getstate__()["pipeline"]
+    return tuple(state[key] for key in PIPELINE_STATE)
+
+
 def compare(
     label: str,
     hmm,
@@ -71,7 +84,7 @@ def compare(
         poison_filtersc,
     )
     assert tables(standard) == tables(resumed), label
-    assert counters(standard) == counters(resumed), label
+    assert pipeline_state(standard) == pipeline_state(resumed), label
     if expected_counters is not None:
         assert counters(standard) == expected_counters, label
 
@@ -100,7 +113,7 @@ def compare_forward(
         omit_forward_matrix,
     )
     assert tables(standard) == tables(resumed), label
-    assert counters(standard) == counters(resumed), label
+    assert pipeline_state(standard) == pipeline_state(resumed), label
     if expected_counters is not None:
         assert counters(standard) == expected_counters, label
 
@@ -128,7 +141,41 @@ def compare_simple_regions(
     )
     assert routes == expected_routes, label
     assert tables(standard) == tables(resumed), label
-    assert counters(standard) == counters(resumed), label
+    assert pipeline_state(standard) == pipeline_state(resumed), label
+
+
+def compare_compact_domains(
+    label: str,
+    hmm,
+    sequences,
+    options: dict,
+    expected_routes: tuple[int, int, int, int] | None,
+    repetitions: int = 1,
+) -> None:
+    standard_pipeline = plan7.Pipeline(hmm.alphabet, **options)
+    compact_pipeline = plan7.Pipeline(hmm.alphabet, **options)
+    optimized = hmm.to_profile(
+        plan7.Background(hmm.alphabet),
+        L=400,
+    ).to_optimized()
+    for repetition in range(repetitions):
+        standard = standard_pipeline.search_hmm(hmm, sequences)
+        resumed, routes = seam_probe.search_compact_domains(
+            compact_pipeline,
+            hmm,
+            optimized,
+            sequences,
+        )
+        if expected_routes is None:
+            assert sum(routes) == len(sequences), (label, routes)
+            assert routes[3] > 0, (label, routes)
+        else:
+            assert routes == expected_routes, (label, routes)
+        assert tables(standard) == tables(resumed), (label, repetition)
+        assert pipeline_state(standard) == pipeline_state(resumed), (
+            label,
+            repetition,
+        )
 
 
 def check_one_library() -> None:
@@ -332,6 +379,70 @@ def main() -> None:
         },
         (1, 1, 2),
     )
+    compare_compact_domains(
+        "external compact domains",
+        hmm,
+        route_sequences,
+        all_pass,
+        (1, 1, 0, 2),
+    )
+    compare_compact_domains(
+        "external compact domains current options",
+        hmm,
+        route_sequences,
+        {
+            **all_pass,
+            "bias_filter": False,
+            "null2": False,
+            "T": -100.0,
+            "domT": -100.0,
+            "incT": -100.0,
+            "incdomT": -100.0,
+        },
+        (1, 1, 0, 2),
+    )
+    compare_compact_domains(
+        "external compact domains fixed search spaces",
+        hmm,
+        route_sequences,
+        {**all_pass, "Z": 123.0, "domZ": 17.0},
+        (1, 1, 0, 2),
+    )
+    compact_fixture = easel.DigitalSequenceBlock(
+        hmm.alphabet,
+        [all_sequences[index] for index in range(80)],
+    )
+    compare_compact_domains(
+        "external compact domains broad fixture and state reuse",
+        hmm,
+        compact_fixture,
+        all_pass,
+        None,
+        repetitions=2,
+    )
+    multidomain_fixture = easel.DigitalSequenceBlock(
+        hmm.alphabet,
+        [all_sequences[26]],
+    )
+    multidomain_options = {
+        **all_pass,
+        "T": -100.0,
+        "domT": -100.0,
+        "incT": -100.0,
+        "incdomT": -100.0,
+    }
+    multidomain_standard = plan7.Pipeline(
+        hmm.alphabet,
+        **multidomain_options,
+    ).search_hmm(hmm, multidomain_fixture)
+    assert [len(hit.domains) for hit in multidomain_standard] == [2]
+    compare_compact_domains(
+        "external compact multi-domain target",
+        hmm,
+        multidomain_fixture,
+        multidomain_options,
+        (0, 0, 0, 1),
+    )
     invalid_sequence = easel.DigitalSequenceBlock(
         hmm.alphabet,
         [all_sequences[13]],
@@ -364,8 +475,49 @@ def main() -> None:
     assert status == seam_probe.GPU_VITERBI_OK
     assert changed
 
+    for corruption in range(41):
+        optimized = hmm.to_profile(
+            plan7.Background(hmm.alphabet),
+            L=400,
+        ).to_optimized()
+        status, changed = seam_probe.invalid_compact_domains_status(
+            plan7.Pipeline(hmm.alphabet, **all_pass),
+            hmm,
+            optimized,
+            invalid_sequence,
+            corruption,
+        )
+        assert status == seam_probe.HMMER_EINVAL, corruption
+        assert not changed, corruption
+    optimized = hmm.to_profile(
+        plan7.Background(hmm.alphabet),
+        L=400,
+    ).to_optimized()
+    status, changed = seam_probe.invalid_compact_domains_status(
+        plan7.Pipeline(hmm.alphabet, **all_pass),
+        hmm,
+        optimized,
+        invalid_sequence,
+        41,
+    )
+    assert status == seam_probe.GPU_VITERBI_OK
+    assert changed
+
+    cutoff_hmm, cutoff_sequences = load("LuxC.hmm")
+    cutoff_fixture = easel.DigitalSequenceBlock(
+        cutoff_hmm.alphabet,
+        [cutoff_sequences[index] for index in range(16)],
+    )
+    compare_compact_domains(
+        "external compact domains model cutoffs",
+        cutoff_hmm,
+        cutoff_fixture,
+        {**all_pass, "bit_cutoffs": "gathering"},
+        None,
+    )
+
     check_one_library()
-    print("patched PyHMMER seam parity: 4 full searches + 60 seam cases")
+    print("patched PyHMMER seam parity: full searches and guarded seam cases")
 
 
 if __name__ == "__main__":
