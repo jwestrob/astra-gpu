@@ -795,6 +795,11 @@ cdef extern from "backward_domain_cuda.h" nogil:
         PLAN7_BACKWARD_DOMAIN_ENORESULT
         PLAN7_BACKWARD_DOMAIN_EMPTY
 
+    cdef enum plan7_backward_domain_test_fault:
+        PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_RESULT_HASH
+        PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_THRESHOLD_HASH
+        PLAN7_BACKWARD_DOMAIN_TEST_FORCE_SIMPLE_OWN_SCALE
+
     ctypedef struct plan7_backward_domain_candidate:
         uint32_t profile_index
         uint32_t sequence_index
@@ -939,6 +944,13 @@ cdef extern from "backward_domain_cuda.h" nogil:
         const plan7_backward_domain_output *output,
     )
 
+    int plan7_backward_domain_output_apply_test_fault(
+        plan7_backward_domain_output *output,
+        int fault,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_backward_domain_cpu_oracle(
         uintptr_t source_profile_pointer,
         const uint8_t *residues,
@@ -955,6 +967,169 @@ cdef extern from "backward_domain_cuda.h" nogil:
         plan7_simple_region *regions,
         size_t region_capacity,
         size_t *region_count,
+        char *error,
+        size_t error_size,
+    )
+
+
+cdef extern from "domain_rescore_cuda.h" nogil:
+    cdef enum plan7_domain_rescore_abi:
+        PLAN7_DOMAIN_RESCORE_RECORD_VERSION
+        PLAN7_DOMAIN_RESCORE_RECORD_SIZE
+        PLAN7_DOMAIN_RESCORE_TRACE_STEP_SIZE
+        PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+        PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES
+        PLAN7_DOMAIN_RESCORE_MAX_MATRIX_BYTES
+        PLAN7_DOMAIN_RESCORE_MAX_TRACE_BYTES
+
+    cdef enum plan7_domain_rescore_action:
+        PLAN7_DOMAIN_RESCORE_CPU_REQUIRED
+        PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+
+    cdef enum plan7_domain_rescore_status:
+        PLAN7_DOMAIN_RESCORE_OK
+        PLAN7_DOMAIN_RESCORE_ERANGE
+        PLAN7_DOMAIN_RESCORE_ENORESULT
+        PLAN7_DOMAIN_RESCORE_ECAP
+        PLAN7_DOMAIN_RESCORE_EMPTY
+
+    ctypedef struct plan7_domain_rescore_result:
+        uint32_t row_index
+        uint32_t profile_index
+        uint32_t sequence_index
+        uint32_t envelope_begin
+        uint32_t envelope_end
+        uint32_t alignment_begin
+        uint32_t alignment_end
+        uint32_t model_begin
+        uint32_t model_end
+        float forward_score
+        float backward_score
+        float oa_score
+        float domain_correction
+        float score_consistency
+        uint8_t status
+        uint8_t action
+        uint8_t has_own_scales
+        uint8_t reserved
+        uint32_t reserved2
+
+    ctypedef struct plan7_domain_rescore_trace_step:
+        uint32_t sequence_position
+        uint32_t model_position
+        float posterior
+        uint8_t state
+        uint8_t reserved[3]
+
+    ctypedef struct plan7_domain_rescore_provenance:
+        plan7_backward_domain_provenance backward
+        uint64_t result_hash
+        uint64_t trace_hash
+        uint64_t null2_hash
+        uint64_t result_count
+        uint64_t trace_count
+        uint64_t null2_count
+
+    ctypedef struct plan7_domain_rescore_statistics:
+        uint64_t upstream_row_count
+        uint64_t simple_row_count
+        uint64_t region_count
+        uint64_t device_result_count
+        uint64_t cpu_required_count
+        uint64_t numeric_fallback_count
+        uint64_t cap_fallback_count
+        uint64_t global_cpu_fallback_count
+        uint64_t work_cells
+        uint64_t forward_matrix_bytes
+        uint64_t posterior_matrix_bytes
+        uint64_t special_workspace_bytes
+        uint64_t trace_workspace_bytes
+        uint64_t compact_output_byte_limit
+        uint64_t compact_output_bytes
+        float kernel_milliseconds
+        float upload_milliseconds
+        float download_milliseconds
+        float total_milliseconds
+
+    ctypedef struct plan7_domain_rescore_output:
+        pass
+
+    int plan7_domain_rescore_run(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_output *upstream,
+        uint64_t compact_byte_budget,
+        uint64_t matrix_byte_budget,
+        uint64_t trace_byte_budget,
+        plan7_domain_rescore_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_domain_rescore_output_destroy(
+        plan7_domain_rescore_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    size_t plan7_domain_rescore_output_result_count(
+        const plan7_domain_rescore_output *output,
+    )
+
+    const plan7_domain_rescore_result *plan7_domain_rescore_output_results(
+        const plan7_domain_rescore_output *output,
+    )
+
+    const uint64_t *plan7_domain_rescore_output_trace_offsets(
+        const plan7_domain_rescore_output *output,
+    )
+
+    size_t plan7_domain_rescore_output_trace_count(
+        const plan7_domain_rescore_output *output,
+    )
+
+    const plan7_domain_rescore_trace_step *plan7_domain_rescore_output_traces(
+        const plan7_domain_rescore_output *output,
+    )
+
+    size_t plan7_domain_rescore_output_null2_count(
+        const plan7_domain_rescore_output *output,
+    )
+
+    const float *plan7_domain_rescore_output_null2(
+        const plan7_domain_rescore_output *output,
+    )
+
+    const plan7_domain_rescore_provenance *plan7_domain_rescore_output_provenance(
+        const plan7_domain_rescore_output *output,
+    )
+
+    const plan7_domain_rescore_statistics *plan7_domain_rescore_output_statistics(
+        const plan7_domain_rescore_output *output,
+    )
+
+    int c_plan7_domain_rescore_own_scale_required_for_test \
+            "plan7_domain_rescore_own_scale_required_for_test"(float xB)
+    int c_plan7_domain_rescore_oatrace_j_predecessor_for_test \
+            "plan7_domain_rescore_oatrace_j_predecessor_for_test"(
+        float jpath,
+        float epath,
+        int j_loop_enabled,
+        int e_loop_enabled,
+    )
+
+    int plan7_domain_rescore_cpu_oracle(
+        uintptr_t source_profile_pointer,
+        const uint8_t *residues,
+        size_t residue_count,
+        uint32_t envelope_begin,
+        uint32_t envelope_end,
+        plan7_domain_rescore_result *result,
+        float *null2,
+        size_t null2_count,
+        plan7_domain_rescore_trace_step *trace,
+        size_t trace_capacity,
+        size_t *trace_count,
         char *error,
         size_t error_size,
     )
@@ -1920,6 +2095,170 @@ cdef BackwardDomainProvenance _backward_provenance_from_output(
     return token
 
 
+cdef object _backward_domain_route_payload_from_output(
+    const plan7_backward_domain_output *output,
+):
+    """Copy the compact route/region journal for diagnostic audits only."""
+    cdef size_t result_count
+    cdef size_t result_bytes
+    cdef size_t offset_bytes
+    cdef size_t region_count
+    cdef size_t region_bytes
+    cdef bytes result_storage
+    cdef bytes offset_storage
+    cdef bytes region_storage
+    cdef const plan7_backward_domain_result *results
+    cdef const uint64_t *offsets
+    cdef const plan7_simple_region *regions
+
+    if output == NULL:
+        raise RuntimeError("Backward/domain route output is null")
+    result_count = plan7_backward_domain_output_result_count(output)
+    region_count = plan7_backward_domain_output_region_count(output)
+    if result_count > (
+        <size_t> PY_SSIZE_T_MAX // sizeof(plan7_backward_domain_result)
+    ):
+        raise OverflowError("Backward/domain route results exceed Python limits")
+    if result_count > (<size_t> PY_SSIZE_T_MAX // sizeof(uint64_t)) - 1:
+        raise OverflowError("Backward/domain route offsets exceed Python limits")
+    if region_count > (
+        <size_t> PY_SSIZE_T_MAX // sizeof(plan7_simple_region)
+    ):
+        raise OverflowError("Backward/domain route regions exceed Python limits")
+    result_bytes = result_count * sizeof(plan7_backward_domain_result)
+    offset_bytes = (result_count + 1) * sizeof(uint64_t)
+    region_bytes = region_count * sizeof(plan7_simple_region)
+    results = plan7_backward_domain_output_results(output)
+    offsets = plan7_backward_domain_output_region_offsets(output)
+    regions = plan7_backward_domain_output_regions(output)
+    if (
+        offsets == NULL
+        or (result_count and results == NULL)
+        or (region_count and regions == NULL)
+    ):
+        raise RuntimeError("Backward/domain route storage is incomplete")
+    result_storage = PyBytes_FromStringAndSize(NULL, result_bytes)
+    if result_bytes:
+        memcpy(PyBytes_AS_STRING(result_storage), results, result_bytes)
+    offset_storage = PyBytes_FromStringAndSize(NULL, offset_bytes)
+    memcpy(PyBytes_AS_STRING(offset_storage), offsets, offset_bytes)
+    region_storage = PyBytes_FromStringAndSize(NULL, region_bytes)
+    if region_bytes:
+        memcpy(PyBytes_AS_STRING(region_storage), regions, region_bytes)
+    return (
+        result_storage,
+        memoryview(offset_storage).cast("Q"),
+        memoryview(region_storage).cast("I"),
+    )
+
+
+cdef object _domain_rescore_payload_from_output(
+    const plan7_domain_rescore_output *output,
+):
+    cdef size_t result_count
+    cdef size_t result_bytes
+    cdef size_t offset_bytes
+    cdef size_t trace_count
+    cdef size_t trace_bytes
+    cdef size_t null2_count
+    cdef size_t null2_bytes
+    cdef bytes result_storage
+    cdef bytes offset_storage
+    cdef bytes trace_storage
+    cdef bytes null2_storage
+    cdef const plan7_domain_rescore_result *results
+    cdef const uint64_t *offsets
+    cdef const plan7_domain_rescore_trace_step *traces
+    cdef const float *null2
+    cdef const plan7_domain_rescore_statistics *statistics
+    cdef const plan7_domain_rescore_provenance *provenance
+
+    if output == NULL:
+        raise RuntimeError("isolated-domain output is null")
+    result_count = plan7_domain_rescore_output_result_count(output)
+    trace_count = plan7_domain_rescore_output_trace_count(output)
+    null2_count = plan7_domain_rescore_output_null2_count(output)
+    if result_count > (<size_t> PY_SSIZE_T_MAX // sizeof(plan7_domain_rescore_result)):
+        raise OverflowError("isolated-domain results exceed Python limits")
+    if trace_count > (
+        <size_t> PY_SSIZE_T_MAX // sizeof(plan7_domain_rescore_trace_step)
+    ):
+        raise OverflowError("isolated-domain traces exceed Python limits")
+    if null2_count > (<size_t> PY_SSIZE_T_MAX // sizeof(float)):
+        raise OverflowError("isolated-domain null2 output exceeds Python limits")
+    if result_count > (
+        <size_t> PY_SSIZE_T_MAX // sizeof(uint64_t)
+    ) - 1:
+        raise OverflowError("isolated-domain offsets exceed Python limits")
+    result_bytes = result_count * sizeof(plan7_domain_rescore_result)
+    offset_bytes = (result_count + 1) * sizeof(uint64_t)
+    trace_bytes = trace_count * sizeof(plan7_domain_rescore_trace_step)
+    null2_bytes = null2_count * sizeof(float)
+    results = plan7_domain_rescore_output_results(output)
+    offsets = plan7_domain_rescore_output_trace_offsets(output)
+    traces = plan7_domain_rescore_output_traces(output)
+    null2 = plan7_domain_rescore_output_null2(output)
+    statistics = plan7_domain_rescore_output_statistics(output)
+    provenance = plan7_domain_rescore_output_provenance(output)
+    if (
+        offsets == NULL
+        or statistics == NULL
+        or provenance == NULL
+        or (result_count and results == NULL)
+        or (trace_count and traces == NULL)
+        or (null2_count and null2 == NULL)
+    ):
+        raise RuntimeError("isolated-domain output storage is incomplete")
+    result_storage = PyBytes_FromStringAndSize(NULL, result_bytes)
+    if result_bytes:
+        memcpy(PyBytes_AS_STRING(result_storage), results, result_bytes)
+    offset_storage = PyBytes_FromStringAndSize(NULL, offset_bytes)
+    memcpy(PyBytes_AS_STRING(offset_storage), offsets, offset_bytes)
+    trace_storage = PyBytes_FromStringAndSize(NULL, trace_bytes)
+    if trace_bytes:
+        memcpy(PyBytes_AS_STRING(trace_storage), traces, trace_bytes)
+    null2_storage = PyBytes_FromStringAndSize(NULL, null2_bytes)
+    if null2_bytes:
+        memcpy(PyBytes_AS_STRING(null2_storage), null2, null2_bytes)
+    return (
+        result_storage,
+        memoryview(offset_storage).cast("Q"),
+        trace_storage,
+        memoryview(null2_storage).cast("f"),
+        {
+            "upstream_row_count": statistics.upstream_row_count,
+            "simple_row_count": statistics.simple_row_count,
+            "region_count": statistics.region_count,
+            "device_result_count": statistics.device_result_count,
+            "cpu_required_count": statistics.cpu_required_count,
+            "numeric_fallback_count": statistics.numeric_fallback_count,
+            "cap_fallback_count": statistics.cap_fallback_count,
+            "global_cpu_fallback_count": (
+                statistics.global_cpu_fallback_count
+            ),
+            "work_cells": statistics.work_cells,
+            "forward_matrix_bytes": statistics.forward_matrix_bytes,
+            "posterior_matrix_bytes": statistics.posterior_matrix_bytes,
+            "special_workspace_bytes": statistics.special_workspace_bytes,
+            "trace_workspace_bytes": statistics.trace_workspace_bytes,
+            "compact_output_byte_limit": (
+                statistics.compact_output_byte_limit
+            ),
+            "compact_output_bytes": statistics.compact_output_bytes,
+            "kernel_ms": statistics.kernel_milliseconds,
+            "upload_ms": statistics.upload_milliseconds,
+            "download_ms": statistics.download_milliseconds,
+            "total_ms": statistics.total_milliseconds,
+            "result_hash": provenance.result_hash,
+            "trace_hash": provenance.trace_hash,
+            "null2_hash": provenance.null2_hash,
+            "result_count": provenance.result_count,
+            "trace_count": provenance.trace_count,
+            "null2_count": provenance.null2_count,
+        },
+    )
+
+
 def backward_domain_cpu_oracle_raw(
     OptimizedProfile profile,
     const uint8_t[::1] residues,
@@ -1998,6 +2337,110 @@ def backward_domain_cpu_oracle_raw(
         memoryview(posterior_storage).cast("f"),
         memoryview(region_storage).cast("I"),
     )
+
+
+def domain_rescore_cpu_oracle_raw(
+    OptimizedProfile profile,
+    const uint8_t[::1] residues,
+    uint32_t envelope_begin,
+    uint32_t envelope_end,
+):
+    """Run pristine HMMER's complete isolated-envelope rescore path."""
+    cdef plan7_domain_rescore_result result
+    cdef size_t trace_capacity
+    cdef size_t trace_count = 0
+    cdef size_t trace_bytes
+    cdef bytes result_storage
+    cdef bytes null2_storage
+    cdef bytes trace_storage
+    cdef float *null2_pointer
+    cdef plan7_domain_rescore_trace_step *trace_pointer
+    cdef char error[512]
+    cdef int status
+
+    if residues.shape[0] == 0:
+        raise ValueError("isolated-domain CPU oracle requires a nonempty target")
+    if envelope_begin == 0 or envelope_begin > envelope_end:
+        raise ValueError("isolated-domain envelope is invalid")
+    if envelope_end > <uint32_t> residues.shape[0]:
+        raise ValueError("isolated-domain envelope exceeds the target")
+    if sizeof(plan7_domain_rescore_result) != PLAN7_DOMAIN_RESCORE_RECORD_SIZE:
+        raise RuntimeError("isolated-domain result ABI size mismatch")
+    if sizeof(plan7_domain_rescore_trace_step) != (
+        PLAN7_DOMAIN_RESCORE_TRACE_STEP_SIZE
+    ):
+        raise RuntimeError("isolated-domain trace ABI size mismatch")
+    trace_capacity = (
+        <size_t> (envelope_end - envelope_begin + 1)
+        + <size_t> profile.M
+        + 16
+    )
+    if trace_capacity > (
+        <size_t> PY_SSIZE_T_MAX // sizeof(plan7_domain_rescore_trace_step)
+    ):
+        raise OverflowError("isolated-domain trace exceeds Python limits")
+    trace_bytes = trace_capacity * sizeof(plan7_domain_rescore_trace_step)
+    trace_storage = PyBytes_FromStringAndSize(NULL, trace_bytes)
+    trace_pointer = <plan7_domain_rescore_trace_step *> PyBytes_AS_STRING(
+        trace_storage
+    )
+    null2_storage = PyBytes_FromStringAndSize(
+        NULL, PLAN7_DOMAIN_RESCORE_NULL2_COUNT * sizeof(float)
+    )
+    null2_pointer = <float *> PyBytes_AS_STRING(null2_storage)
+    error[0] = 0
+    with nogil:
+        status = plan7_domain_rescore_cpu_oracle(
+            <uintptr_t> profile._om,
+            &residues[0],
+            <size_t> residues.shape[0],
+            envelope_begin,
+            envelope_end,
+            &result,
+            null2_pointer,
+            PLAN7_DOMAIN_RESCORE_NULL2_COUNT,
+            trace_pointer,
+            trace_capacity,
+            &trace_count,
+            error,
+            sizeof(error),
+        )
+    if status != 0:
+        message = error.decode("utf-8", "replace")
+        raise RuntimeError(message or f"isolated-domain oracle status {status}")
+    if trace_count > trace_capacity:
+        raise RuntimeError("isolated-domain oracle trace count changed")
+    result_storage = PyBytes_FromStringAndSize(
+        <const char *> &result, sizeof(plan7_domain_rescore_result)
+    )
+    trace_storage = trace_storage[
+        : trace_count * sizeof(plan7_domain_rescore_trace_step)
+    ]
+    return (
+        result_storage,
+        memoryview(null2_storage).cast("f"),
+        trace_storage,
+    )
+
+
+def domain_rescore_own_scale_required_for_test(float xB):
+    """Exercise the exact stock binary32/double scaling boundary."""
+    return bool(c_plan7_domain_rescore_own_scale_required_for_test(xB))
+
+
+def domain_rescore_oatrace_j_predecessor_for_test(
+    float jpath,
+    float epath,
+    bint j_loop_enabled,
+    bint e_loop_enabled,
+):
+    """Return whether stock OATrace's strict comparison chooses J."""
+    return bool(c_plan7_domain_rescore_oatrace_j_predecessor_for_test(
+        jpath,
+        epath,
+        j_loop_enabled,
+        e_loop_enabled,
+    ))
 
 
 cdef class ProfileSelection:
@@ -3742,6 +4185,11 @@ cdef class SequenceBatch:
         double f3,
         uint64_t gathered_byte_budget,
         bint sealed_domain_journal,
+        bint rescore_simple_diagnostic,
+        uint64_t rescore_compact_byte_budget,
+        uint64_t rescore_matrix_byte_budget,
+        uint64_t rescore_trace_byte_budget,
+        int rescore_test_fault,
         double generation_f1,
         bint generation_bias_filter,
         float rt1,
@@ -3782,6 +4230,7 @@ cdef class SequenceBatch:
         cdef plan7_forward_database *database = NULL
         cdef plan7_forward_output *output = NULL
         cdef plan7_backward_domain_output *domain_output = NULL
+        cdef plan7_domain_rescore_output *rescore_output = NULL
         cdef const plan7_forward_result *native_results
         cdef const uint64_t *native_offsets
         cdef const float *native_specials
@@ -3808,6 +4257,8 @@ cdef class SequenceBatch:
         cdef dict statistics
         cdef ForwardProvenance provenance
         cdef object journal_capsule = None
+        cdef object rescore_payload = None
+        cdef object upstream_payload = None
         cdef bytes profile_fingerprint_storage = b""
         cdef const uint8_t[::1] profile_fingerprint_view
         cdef const uint8_t[::1] sequence_fingerprint_view
@@ -4058,6 +4509,44 @@ cdef class SequenceBatch:
                     )
                 if status != 0:
                     raise RuntimeError(error.decode("utf-8", "replace"))
+                if rescore_simple_diagnostic:
+                    if rescore_test_fault != 0:
+                        error[0] = 0
+                        with nogil:
+                            status = (
+                                plan7_backward_domain_output_apply_test_fault(
+                                    domain_output,
+                                    rescore_test_fault,
+                                    error,
+                                    sizeof(error),
+                                )
+                            )
+                        if status != 0:
+                            raise RuntimeError(
+                                error.decode("utf-8", "replace")
+                            )
+                    upstream_payload = _backward_domain_route_payload_from_output(
+                        domain_output
+                    )
+                    error[0] = 0
+                    with nogil:
+                        status = plan7_domain_rescore_run(
+                            database,
+                            self._batch,
+                            domain_output,
+                            rescore_compact_byte_budget,
+                            rescore_matrix_byte_budget,
+                            rescore_trace_byte_budget,
+                            &rescore_output,
+                            error,
+                            sizeof(error),
+                        )
+                    if status != 0:
+                        raise RuntimeError(error.decode("utf-8", "replace"))
+                    rescore_payload = _domain_rescore_payload_from_output(
+                        rescore_output
+                    )
+                    rescore_payload = rescore_payload + (upstream_payload,)
                 profile_fingerprint_storage = b"".join(selection._fingerprints)
                 profile_fingerprint_view = profile_fingerprint_storage
                 sequence_fingerprint_view = self._content_fingerprint
@@ -4096,6 +4585,10 @@ cdef class SequenceBatch:
                     guard_band,
                 )
             except:
+                if rescore_output != NULL:
+                    plan7_domain_rescore_output_destroy(
+                        &rescore_output, NULL, 0
+                    )
                 if domain_output != NULL:
                     plan7_backward_domain_output_destroy(
                         &domain_output, NULL, 0
@@ -4113,6 +4606,10 @@ cdef class SequenceBatch:
                     &database, destroy_error, sizeof(destroy_error)
                 )
         if destroy_status != 0:
+            if rescore_output != NULL:
+                plan7_domain_rescore_output_destroy(
+                    &rescore_output, NULL, 0
+                )
             if domain_output != NULL:
                 plan7_backward_domain_output_destroy(&domain_output, NULL, 0)
             if output != NULL:
@@ -4120,12 +4617,18 @@ cdef class SequenceBatch:
             raise RuntimeError(destroy_error.decode("utf-8", "replace"))
 
         if sealed_domain_journal:
+            if rescore_output != NULL:
+                plan7_domain_rescore_output_destroy(
+                    &rescore_output, NULL, 0
+                )
             if domain_output != NULL:
                 plan7_backward_domain_output_destroy(
                     &domain_output, NULL, 0
                 )
             if output != NULL:
                 plan7_forward_output_destroy(&output, NULL, 0)
+            if rescore_simple_diagnostic:
+                return journal_capsule, rescore_payload
             return journal_capsule
 
         try:
@@ -4217,6 +4720,10 @@ cdef class SequenceBatch:
             )
             return result
         finally:
+            if rescore_output != NULL:
+                plan7_domain_rescore_output_destroy(
+                    &rescore_output, NULL, 0
+                )
             if domain_output != NULL:
                 plan7_backward_domain_output_destroy(&domain_output, NULL, 0)
             if output != NULL:
@@ -4242,6 +4749,11 @@ cdef class SequenceBatch:
             f3,
             gathered_byte_budget,
             False,
+            False,
+            0,
+            0,
+            0,
+            0,
             0.02,
             True,
             <float> 0.25,
@@ -4258,6 +4770,11 @@ cdef class SequenceBatch:
         double f3,
         float guard_band=2.0e-4,
         uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
+        bint rescore_simple_diagnostic=False,
+        uint64_t rescore_matrix_byte_budget=0,
+        uint64_t rescore_trace_byte_budget=0,
+        uint64_t rescore_compact_byte_budget=0,
+        int _rescore_test_fault=0,
     ):
         """Run the fused package-internal path and return one opaque seal.
 
@@ -4296,6 +4813,11 @@ cdef class SequenceBatch:
             f3,
             gathered_byte_budget,
             True,
+            rescore_simple_diagnostic,
+            rescore_compact_byte_budget,
+            rescore_matrix_byte_budget,
+            rescore_trace_byte_budget,
+            _rescore_test_fault,
             f1,
             True,
             <float> 0.25,
@@ -4813,3 +5335,26 @@ BACKWARD_DOMAIN_STATUS_OK = PLAN7_BACKWARD_DOMAIN_OK
 BACKWARD_DOMAIN_STATUS_ERANGE = PLAN7_BACKWARD_DOMAIN_ERANGE
 BACKWARD_DOMAIN_STATUS_ENORESULT = PLAN7_BACKWARD_DOMAIN_ENORESULT
 BACKWARD_DOMAIN_STATUS_EMPTY = PLAN7_BACKWARD_DOMAIN_EMPTY
+BACKWARD_DOMAIN_TEST_TAMPER_RESULT_HASH = (
+    PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_RESULT_HASH
+)
+BACKWARD_DOMAIN_TEST_TAMPER_THRESHOLD_HASH = (
+    PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_THRESHOLD_HASH
+)
+BACKWARD_DOMAIN_TEST_FORCE_SIMPLE_OWN_SCALE = (
+    PLAN7_BACKWARD_DOMAIN_TEST_FORCE_SIMPLE_OWN_SCALE
+)
+DOMAIN_RESCORE_RECORD_VERSION = PLAN7_DOMAIN_RESCORE_RECORD_VERSION
+DOMAIN_RESCORE_RESULT_SIZE = sizeof(plan7_domain_rescore_result)
+DOMAIN_RESCORE_TRACE_STEP_SIZE = sizeof(plan7_domain_rescore_trace_step)
+DOMAIN_RESCORE_NULL2_COUNT = PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+DOMAIN_RESCORE_MAX_COMPACT_BYTES = PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES
+DOMAIN_RESCORE_MAX_MATRIX_BYTES = PLAN7_DOMAIN_RESCORE_MAX_MATRIX_BYTES
+DOMAIN_RESCORE_MAX_TRACE_BYTES = PLAN7_DOMAIN_RESCORE_MAX_TRACE_BYTES
+DOMAIN_RESCORE_CPU_REQUIRED = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED
+DOMAIN_RESCORE_DEVICE_RESULT = PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+DOMAIN_RESCORE_STATUS_OK = PLAN7_DOMAIN_RESCORE_OK
+DOMAIN_RESCORE_STATUS_ERANGE = PLAN7_DOMAIN_RESCORE_ERANGE
+DOMAIN_RESCORE_STATUS_ENORESULT = PLAN7_DOMAIN_RESCORE_ENORESULT
+DOMAIN_RESCORE_STATUS_ECAP = PLAN7_DOMAIN_RESCORE_ECAP
+DOMAIN_RESCORE_STATUS_EMPTY = PLAN7_DOMAIN_RESCORE_EMPTY

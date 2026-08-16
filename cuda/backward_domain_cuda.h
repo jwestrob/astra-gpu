@@ -34,6 +34,15 @@ enum plan7_backward_domain_status {
   PLAN7_BACKWARD_DOMAIN_EMPTY = 255
 };
 
+/* Deliberately inaccessible from production wrappers. These mutations let
+ * tests prove that the next opaque stage rejects corrupt seals and retains a
+ * valid, sealed own-scale row on CPU. */
+enum plan7_backward_domain_test_fault {
+  PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_RESULT_HASH = 1,
+  PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_THRESHOLD_HASH = 2,
+  PLAN7_BACKWARD_DOMAIN_TEST_FORCE_SIMPLE_OWN_SCALE = 3
+};
+
 /* The row record is pointer-free: profiles and sequences are identified by
  * index, and Forward parser state is an ordinary packed array. */
 typedef struct plan7_backward_domain_candidate {
@@ -176,6 +185,20 @@ plan7_backward_domain_output_provenance(
 const plan7_backward_domain_statistics *
 plan7_backward_domain_output_statistics(
   const plan7_backward_domain_output *output);
+
+/* Returns 1 only for a sealed production output generated with canonical
+ * domain thresholds and the calibrated >=2e-4 ambiguity guard. */
+int plan7_backward_domain_output_is_production_calibrated(
+  const plan7_backward_domain_output *output);
+
+/* Test-only opaque-output mutation seam. FORCE_SIMPLE_OWN_SCALE reseals the
+ * journal after changing the first SIMPLE row; the tamper operations do not,
+ * so a production consumer must reject them. */
+int plan7_backward_domain_output_apply_test_fault(
+  plan7_backward_domain_output *output,
+  int fault,
+  char *error,
+  size_t error_size);
 
 /* Pristine HMMER 3.4 SSE oracle for focused tests. The only pointer-valued
  * argument is deliberately confined to this test seam; production work uses

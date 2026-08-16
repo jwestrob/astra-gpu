@@ -690,6 +690,11 @@ struct plan7_backward_domain_output {
   std::vector<plan7_simple_region> regions;
   plan7_backward_domain_statistics statistics;
   plan7_backward_domain_provenance provenance;
+  float rt1 = NAN;
+  float rt2 = NAN;
+  float rt3 = NAN;
+  float guard_band = NAN;
+  bool sealed = false;
 };
 
 namespace {
@@ -871,6 +876,10 @@ int backward_domain_run_impl(
     set_error(error, error_size, "Backward/domain output allocation failed");
     return -1;
   }
+  created->rt1 = rt1;
+  created->rt2 = rt2;
+  created->rt3 = rt3;
+  created->guard_band = guard_band;
   try {
     created->results.resize(candidate_count);
     created->posterior_offsets.assign(candidate_count + 1, 0);
@@ -1340,6 +1349,7 @@ int backward_domain_run_impl(
                 "Backward/domain output provenance sealing failed");
       return -1;
     }
+    created->sealed = true;
   }
   *output = created.release();
   return 0;
@@ -1471,6 +1481,66 @@ extern "C" const plan7_backward_domain_statistics *
 plan7_backward_domain_output_statistics(
     const plan7_backward_domain_output *output) {
   return output == nullptr ? nullptr : &output->statistics;
+}
+
+extern "C" int plan7_backward_domain_output_is_production_calibrated(
+    const plan7_backward_domain_output *output) {
+  if (output == nullptr || !output->sealed || output->rt1 != 0.25f ||
+      output->rt2 != 0.10f || output->rt3 != 0.20f ||
+      !std::isfinite(output->guard_band) || output->guard_band < 2.0e-4f)
+    return 0;
+  uint64_t threshold_hash =
+      hash_u64(kHashOffset, UINT64_C(0x54485245));
+  for (const float value : {
+           output->rt1, output->rt2, output->rt3, output->guard_band}) {
+    FloatBits bits{};
+    bits.value = value;
+    threshold_hash = hash_u32(threshold_hash, bits.bits);
+  }
+  return output->provenance.threshold_hash == hash_u64(
+      threshold_hash, PLAN7_BACKWARD_DOMAIN_RECORD_VERSION);
+}
+
+extern "C" int plan7_backward_domain_output_apply_test_fault(
+    plan7_backward_domain_output *output, int fault,
+    char *error, size_t error_size) {
+  if (output == nullptr || !output->sealed) {
+    set_error(error, error_size,
+              "Backward/domain test fault requires a sealed output");
+    return -1;
+  }
+  switch (fault) {
+    case PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_RESULT_HASH:
+      output->provenance.result_hash ^= UINT64_C(1);
+      return 0;
+    case PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_THRESHOLD_HASH:
+      output->provenance.threshold_hash ^= UINT64_C(1);
+      return 0;
+    case PLAN7_BACKWARD_DOMAIN_TEST_FORCE_SIMPLE_OWN_SCALE:
+      for (auto &result : output->results) {
+        if (result.route != PLAN7_BACKWARD_DOMAIN_SIMPLE) continue;
+        if (!result.has_own_scales) {
+          result.has_own_scales = 1;
+          ++output->statistics.own_scale_count;
+        }
+        if (!seal_backward_domain_provenance(
+                output, output->provenance.forward,
+                output->rt1, output->rt2, output->rt3,
+                output->guard_band)) {
+          set_error(error, error_size,
+                    "Backward/domain own-scale test reseal failed");
+          return -1;
+        }
+        return 0;
+      }
+      set_error(error, error_size,
+                "Backward/domain test output has no SIMPLE row");
+      return -1;
+    default:
+      set_error(error, error_size,
+                "unknown Backward/domain test fault");
+      return -1;
+  }
 }
 
 namespace {

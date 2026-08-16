@@ -1,0 +1,224 @@
+{
+  "absolute_error": {
+    "backward": {
+      "count": 21,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "consistency": {
+      "count": 21,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "correction": {
+      "count": 21,
+      "max": 4.76837158203125e-07,
+      "p50": 0.0,
+      "p99": 4.76837158203125e-07
+    },
+    "forward": {
+      "count": 21,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "null2": {
+      "count": 609,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "oa": {
+      "count": 21,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "trace_posterior": {
+      "count": 1701,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    }
+  },
+  "coordinates": {
+    "alignment_mismatches": 0,
+    "alignment_residue_mismatches": 0,
+    "envelope_count_mismatches": 0,
+    "envelope_residue_mismatches": 0,
+    "model_mismatches": 0,
+    "non_simple_result_mismatches": 0,
+    "trace_length_mismatches": 0,
+    "trace_state_coordinate_mismatches": 0,
+    "unexpected_result_keys": 0,
+    "upstream_region_journal_mismatches": 0
+  },
+  "coverage": {
+    "accounted_final_domains": 39,
+    "census_guarded_simple_rows": 23,
+    "census_guarded_stage_regions": 32,
+    "device_final_domain_fraction": 0.5384615384615384,
+    "device_final_domains": 21,
+    "device_owned_upstream_rows": 16,
+    "device_rescore_envelopes": 21,
+    "emitted_rescore_records": 21,
+    "expected_device_owned_simple_rows": 13,
+    "expected_device_owned_stage_regions": 21,
+    "expected_final_domains": 39,
+    "front_half_cpu_retained_domains": 12,
+    "front_half_cpu_retained_rows": 11,
+    "missed_final_domains": 0,
+    "observed_simple_rows": 13,
+    "observed_stage_regions": 21,
+    "stage_cpu_fallback_envelopes": 0,
+    "stage_cpu_fallback_rows": 0,
+    "stage_cpu_retained_domains": 0,
+    "stock_upstream_rows": 27,
+    "total_cpu_retained_domains": 18,
+    "upstream_route_cpu_retained_domains": 6
+  },
+  "inputs": {
+    "census": {
+      "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/build/cuda-domain-rescore/build/post-forward-census/pfam-selected16-first1000.tsv",
+      "sha256": "9f7b0e6e274d5da5dc63923c01da6e71eccd2d897c90c02a2498d66902ab931e"
+    },
+    "fasta": {
+      "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/results/datasets/PLM2_5.first1000.faa",
+      "sha256": "b835fa20310971a507f5067f7136291cf2a4f5671e7ad64cf503c258cf24db2b"
+    },
+    "hmm": {
+      "path": "/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/build/cuda-domain-rescore/build/post-forward-census/pfam-selected16.hmm",
+      "sha256": "34d2341aea72889f24058ae9c4751c450823df3ddb0cdc3c71ca4820fa7adc62"
+    },
+    "reference_options": {
+      "bit_cutoffs": "gathering",
+      "cpus": 0,
+      "engine": "PyHMMER 0.12.0 / HMMER 3.4",
+      "f1": 0.02,
+      "f2": 0.001,
+      "f3": 1e-05
+    }
+  },
+  "memory": {
+    "compact_output_bytes": 31172,
+    "dense_workspace_bytes": 6982736
+  },
+  "nonfinite_values": 0,
+  "routes": {
+    "device_domain_count_mismatches": 0,
+    "device_result_statistic_mismatches": false,
+    "stage_mixed_action_rows": 0,
+    "upstream_duplicate_keys": 0,
+    "upstream_payload_count_mismatches": false,
+    "upstream_route_mismatches": 0,
+    "upstream_unexpected_keys": 0
+  },
+  "scope": {
+    "f1": 0.02,
+    "f2": 0.001,
+    "f3": 1e-05,
+    "guard": 0.0002,
+    "profile_names": [
+      "1-cysPrx_C",
+      "1TM_TonB_rel",
+      "2-Hacid_dh_C",
+      "2-oxoacid_dh",
+      "2-oxogl_dehyd_N",
+      "2-ph_phosp",
+      "23S_rRNA_IVP",
+      "2Fe-2S_thioredx",
+      "2OG-FeII_Oxy_3",
+      "2TM",
+      "3-HAO",
+      "3Beta_HSD",
+      "3HB_CusB",
+      "3HCDH_N",
+      "3keto-disac_hyd",
+      "4HBT"
+    ],
+    "profile_sequence_pairs": 16000,
+    "profiles": 16,
+    "sequences": 1000
+  },
+  "statistics": {
+    "cap_fallback_count": 0,
+    "compact_output_byte_limit": 134217728,
+    "compact_output_bytes": 31172,
+    "cpu_required_count": 0,
+    "device_result_count": 21,
+    "download_ms": 0.06481999903917313,
+    "forward_matrix_bytes": 3415200,
+    "global_cpu_fallback_count": 0,
+    "kernel_ms": 32.93113708496094,
+    "null2_count": 609,
+    "null2_hash": 5306653713819763079,
+    "numeric_fallback_count": 0,
+    "posterior_matrix_bytes": 3415200,
+    "region_count": 21,
+    "result_count": 21,
+    "result_hash": 13182035619274811841,
+    "simple_row_count": 13,
+    "special_workspace_bytes": 74640,
+    "total_ms": 33.888694763183594,
+    "trace_count": 1701,
+    "trace_hash": 1622192854957746692,
+    "trace_workspace_bytes": 77696,
+    "upload_ms": 0.33317700028419495,
+    "upstream_row_count": 16,
+    "work_cells": 280295
+  },
+  "timing": {
+    "audit_wall_seconds": 0.728995943441987,
+    "cpu_oracle_validation_seconds": 0.022228848189115524,
+    "end_to_end_stage_wall_seconds": 0.09024295210838318,
+    "preparation_seconds": 0.16286733001470566,
+    "rescore_kernel_ms": 32.93113708496094,
+    "rescore_wrapper_total_ms": 33.888694763183594
+  },
+  "ulp_error": {
+    "backward": {
+      "count": 21,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "consistency": {
+      "count": 21,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "correction": {
+      "count": 21,
+      "max": 2.0,
+      "p50": 0.0,
+      "p99": 2.0
+    },
+    "forward": {
+      "count": 21,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "null2": {
+      "count": 609,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "oa": {
+      "count": 21,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    },
+    "trace_posterior": {
+      "count": 1701,
+      "max": 0.0,
+      "p50": 0.0,
+      "p99": 0.0
+    }
+  }
+}
