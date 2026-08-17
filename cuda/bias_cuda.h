@@ -21,6 +21,55 @@ enum plan7_bias_cutoff_mode {
   PLAN7_BIAS_CUTOFF_ALWAYS_PASS = 3
 };
 
+/* A CUDA math target admitted by the bias-filter correctness attestation.
+ * Keep these values stable: they are also exposed in the private Python test
+ * and provenance API. */
+enum plan7_bias_cuda_target {
+  PLAN7_BIAS_CUDA_UNATTESTED = 0,
+  PLAN7_BIAS_CUDA_SM75_RTX2080_TI = 1,
+  PLAN7_BIAS_CUDA_SM90_H200 = 2
+};
+
+/* Runtime identity captured before any exact bias-filter kernel is launched.
+ * UUID and PCI address are provenance, rather than allow-list keys: all full
+ * H200 devices of the admitted product/architecture may be used. */
+typedef struct {
+  int32_t device_ordinal;
+  int32_t runtime_version;
+  int32_t driver_version;
+  int32_t cudart_version;
+  int32_t nvcc_major;
+  int32_t nvcc_minor;
+  int32_t nvcc_build;
+  int32_t compute_major;
+  int32_t compute_minor;
+  int32_t multiprocessor_count;
+  int32_t pci_domain_id;
+  int32_t pci_bus_id;
+  int32_t pci_device_id;
+  uint64_t total_global_memory;
+  uint8_t uuid[16];
+  char pci_bus_address[32];
+  char name[256];
+} plan7_bias_cuda_identity;
+
+/* Host CPUID state that affects the attested scalar reference calculations.
+ * This separate value object keeps the target allow-list host-unit-testable
+ * without requiring either admitted GPU. */
+typedef struct {
+  uint32_t vendor_ebx;
+  uint32_t vendor_edx;
+  uint32_t vendor_ecx;
+  uint32_t family;
+  uint32_t model;
+  uint32_t stepping;
+  uint32_t leaf1_ecx;
+  uint32_t leaf1_edx;
+  uint32_t leaf7_ebx;
+  uint32_t xcr0_low;
+  uint32_t xcr0_high;
+} plan7_bias_host_identity;
+
 typedef struct {
   float t10;
   float t11;
@@ -85,7 +134,28 @@ int plan7_bias_rebias_decision(uint8_t ssv_status,
  * rounding and denormal modes. */
 int plan7_bias_host_environment_attested(void);
 
-/* Returns 1 only for the exhaustively attested host/device math target. */
+/* Capture current identities. These do not attest them and never launch a
+ * kernel. They are exposed for immutable benchmark provenance. */
+int plan7_bias_current_cuda_identity(plan7_bias_cuda_identity *identity,
+                                     char *reason,
+                                     size_t reason_size);
+int plan7_bias_current_host_identity(plan7_bias_host_identity *identity,
+                                     char *reason,
+                                     size_t reason_size);
+
+/* Pure host-side allow-list boundaries used by the runtime gate and unit
+ * tests. CUDA identity returns a plan7_bias_cuda_target value. */
+int plan7_bias_cuda_identity_target(
+  const plan7_bias_cuda_identity *identity,
+  char *reason,
+  size_t reason_size);
+int plan7_bias_host_identity_attested(
+  const plan7_bias_host_identity *identity,
+  int cuda_target,
+  char *reason,
+  size_t reason_size);
+
+/* Returns 1 only for an explicitly admitted host/device math target. */
 int plan7_bias_environment_attested(char *reason, size_t reason_size);
 
 /* Internal device-buffer entry point used by the resident SSV batch. */

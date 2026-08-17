@@ -116,6 +116,120 @@ def pack_bias_profiles(background, profiles, f1):
     _native is not None and _pipeline is not None, "native modules unavailable"
 )
 class BiasHostTests(unittest.TestCase):
+    def test_cuda_target_allowlist_has_host_unit_boundaries(self):
+        common = {
+            "multiprocessor_count": 132,
+            "total_global_memory": 141 * 1024**3,
+            "uuid": bytes(range(1, 17)),
+            "pci_bus_address": "0000:01:00.0",
+        }
+        for name in ("NVIDIA H200", "NVIDIA H200 NVL"):
+            target, reason = _native._bias_cuda_identity_target_raw(
+                name, 9, 0, **common
+            )
+            self.assertEqual(target, _native.BIAS_CUDA_SM90_H200)
+            self.assertEqual(reason, "")
+
+        target, reason = _native._bias_cuda_identity_target_raw(
+            "NVIDIA GeForce RTX 2080 Ti",
+            7,
+            5,
+            68,
+            11 * 1024**3,
+            bytes(range(1, 17)),
+            "0000:01:00.0",
+        )
+        self.assertEqual(target, _native.BIAS_CUDA_SM75_RTX2080_TI)
+        self.assertEqual(reason, "")
+
+        rejected = (
+            {"name": "NVIDIA H100", "compute_major": 9, "compute_minor": 0},
+            {"name": "NVIDIA H200", "compute_major": 8, "compute_minor": 9},
+            {
+                "name": "NVIDIA H200",
+                "compute_major": 9,
+                "compute_minor": 0,
+                "runtime_version": 12040,
+            },
+            {
+                "name": "NVIDIA H200",
+                "compute_major": 9,
+                "compute_minor": 0,
+                "driver_version": 12040,
+            },
+            {
+                "name": "NVIDIA H200",
+                "compute_major": 9,
+                "compute_minor": 0,
+                "nvcc_build": 81,
+            },
+            {
+                "name": "NVIDIA H200",
+                "compute_major": 9,
+                "compute_minor": 0,
+                "uuid": bytes(16),
+            },
+        )
+        for changes in rejected:
+            arguments = {**common, **changes}
+            with self.subTest(changes=changes):
+                target, reason = _native._bias_cuda_identity_target_raw(
+                    arguments.pop("name"),
+                    arguments.pop("compute_major"),
+                    arguments.pop("compute_minor"),
+                    **arguments,
+                )
+                self.assertEqual(target, _native.BIAS_CUDA_UNATTESTED)
+                self.assertTrue(reason)
+
+    def test_cpu_allowlist_is_bound_to_accelerator_target(self):
+        leaf1_ecx = (1 << 12) | (1 << 19) | (1 << 27) | (1 << 28)
+        leaf1_edx = 1 << 26
+        leaf7_ebx = (
+            (1 << 5)
+            | (1 << 16)
+            | (1 << 17)
+            | (1 << 28)
+            | (1 << 30)
+            | (1 << 31)
+        )
+        common = (leaf1_ecx, leaf1_edx, leaf7_ebx, 0xE6)
+        accepted, reason = _native._bias_host_identity_attested_raw(
+            _native.BIAS_CUDA_SM75_RTX2080_TI, 6, 85, 4, *common
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+        accepted, reason = _native._bias_host_identity_attested_raw(
+            _native.BIAS_CUDA_SM90_H200, 6, 143, 8, *common
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+
+        for target, family, model, stepping in (
+            (_native.BIAS_CUDA_SM90_H200, 6, 85, 4),
+            (_native.BIAS_CUDA_SM75_RTX2080_TI, 6, 143, 8),
+            (_native.BIAS_CUDA_SM90_H200, 6, 143, 7),
+        ):
+            with self.subTest(target=target, model=model, stepping=stepping):
+                accepted, reason = _native._bias_host_identity_attested_raw(
+                    target, family, model, stepping, *common
+                )
+                self.assertFalse(accepted)
+                self.assertTrue(reason)
+
+        accepted, reason = _native._bias_host_identity_attested_raw(
+            _native.BIAS_CUDA_SM90_H200,
+            6,
+            143,
+            8,
+            leaf1_ecx,
+            leaf1_edx,
+            leaf7_ebx & ~(1 << 16),
+            0xE6,
+        )
+        self.assertFalse(accepted)
+        self.assertRegex(reason, "feature set")
+
     def test_nondefault_float_modes_fail_closed(self):
         libc = ctypes.CDLL(None)
         libc.fegetround.restype = ctypes.c_int
@@ -264,6 +378,33 @@ class BiasHostTests(unittest.TestCase):
 
 @unittest.skipUnless(bias_attested(), "exact bias CUDA environment not attested")
 class CudaBiasTests(unittest.TestCase):
+    def test_runtime_provenance_matches_the_attested_target(self):
+        provenance = _native.bias_environment_provenance()
+        self.assertTrue(provenance["attested"], provenance["reason"])
+        cuda = provenance["cuda"]
+        expected = {
+            "sm75_rtx2080ti": (
+                _native.BIAS_CUDA_SM75_RTX2080_TI,
+                [7, 5],
+                {"NVIDIA GeForce RTX 2080 Ti"},
+            ),
+            "sm90_h200": (
+                _native.BIAS_CUDA_SM90_H200,
+                [9, 0],
+                {"NVIDIA H200", "NVIDIA H200 NVL"},
+            ),
+        }
+        self.assertIn(provenance["target"], expected)
+        target_code, capability, names = expected[provenance["target"]]
+        self.assertEqual(provenance["target_code"], target_code)
+        self.assertEqual(cuda["compute_capability"], capability)
+        self.assertIn(cuda["name"], names)
+        self.assertEqual(cuda["runtime_version"], 12050)
+        self.assertGreaterEqual(cuda["driver_version"], 12050)
+        self.assertEqual(cuda["nvcc"], {"major": 12, "minor": 5, "build": 82})
+        self.assertRegex(cuda["uuid"], r"^GPU-[0-9a-f-]{36}$")
+        self.assertRegex(cuda["pci_bus_address"], r"^[0-9A-Fa-f:.]+$")
+
     def test_bad_batch_creation_environment_routes_every_target_to_cpu(self):
         background, profiles = load_optimized(HMM_GLOBINS)
         profile = profiles[0]

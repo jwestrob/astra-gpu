@@ -28,6 +28,10 @@ static_assert(sizeof(plan7_bias_ssv_input) == 4,
               "plan7_bias_ssv_input ABI size changed");
 static_assert(sizeof(plan7_bias_result) == 12,
               "plan7_bias_result ABI size changed");
+static_assert(sizeof(plan7_bias_cuda_identity) == 368,
+              "plan7_bias_cuda_identity ABI size changed");
+static_assert(sizeof(plan7_bias_host_identity) == 44,
+              "plan7_bias_host_identity ABI size changed");
 
 namespace {
 
@@ -48,6 +52,14 @@ set_cuda_error(char *error, size_t error_size, const char *operation,
 {
   if (error != nullptr && error_size != 0)
     snprintf(error, error_size, "%s: %s", operation, cudaGetErrorString(status));
+}
+
+bool
+uuid_is_zero(const uint8_t uuid[16])
+{
+  uint8_t combined = 0;
+  for (size_t index = 0; index < 16; ++index) combined |= uuid[index];
+  return combined == 0;
 }
 
 float
@@ -526,13 +538,238 @@ plan7_bias_host_environment_attested(void)
 }
 
 extern "C" int
+plan7_bias_current_cuda_identity(plan7_bias_cuda_identity *identity,
+                                 char *reason,
+                                 size_t reason_size)
+{
+  if (identity == nullptr) {
+    set_error(reason, reason_size, "bias CUDA identity output is null");
+    return -1;
+  }
+  memset(identity, 0, sizeof(*identity));
+  identity->device_ordinal = -1;
+  identity->pci_domain_id = -1;
+  identity->pci_bus_id = -1;
+  identity->pci_device_id = -1;
+  identity->cudart_version = CUDART_VERSION;
+  identity->nvcc_major = __CUDACC_VER_MAJOR__;
+  identity->nvcc_minor = __CUDACC_VER_MINOR__;
+  identity->nvcc_build = __CUDACC_VER_BUILD__;
+
+  cudaError_t status = cudaRuntimeGetVersion(&identity->runtime_version);
+  if (status != cudaSuccess) {
+    set_cuda_error(reason, reason_size, "cudaRuntimeGetVersion", status);
+    return -1;
+  }
+  status = cudaDriverGetVersion(&identity->driver_version);
+  if (status != cudaSuccess) {
+    set_cuda_error(reason, reason_size, "cudaDriverGetVersion", status);
+    return -1;
+  }
+  status = cudaGetDevice(&identity->device_ordinal);
+  if (status != cudaSuccess) {
+    set_cuda_error(reason, reason_size, "cudaGetDevice", status);
+    return -1;
+  }
+
+  cudaDeviceProp properties;
+  status = cudaGetDeviceProperties(&properties, identity->device_ordinal);
+  if (status != cudaSuccess) {
+    set_cuda_error(reason, reason_size, "cudaGetDeviceProperties", status);
+    return -1;
+  }
+  identity->compute_major = properties.major;
+  identity->compute_minor = properties.minor;
+  identity->multiprocessor_count = properties.multiProcessorCount;
+  identity->pci_domain_id = properties.pciDomainID;
+  identity->pci_bus_id = properties.pciBusID;
+  identity->pci_device_id = properties.pciDeviceID;
+  identity->total_global_memory =
+    static_cast<uint64_t>(properties.totalGlobalMem);
+  memcpy(identity->uuid, properties.uuid.bytes, sizeof(identity->uuid));
+  snprintf(identity->name, sizeof(identity->name), "%s", properties.name);
+  status = cudaDeviceGetPCIBusId(
+    identity->pci_bus_address, static_cast<int>(sizeof(identity->pci_bus_address)),
+    identity->device_ordinal);
+  if (status != cudaSuccess) {
+    set_cuda_error(reason, reason_size, "cudaDeviceGetPCIBusId", status);
+    return -1;
+  }
+  if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+  return 0;
+}
+
+extern "C" int
+plan7_bias_current_host_identity(plan7_bias_host_identity *identity,
+                                 char *reason,
+                                 size_t reason_size)
+{
+  if (identity == nullptr) {
+    set_error(reason, reason_size, "bias host identity output is null");
+    return -1;
+  }
+  memset(identity, 0, sizeof(*identity));
+#if !defined(__x86_64__) || !defined(__GLIBC__)
+  set_error(reason, reason_size,
+            "bias math is not attested for this host architecture");
+  return -1;
+#else
+  const unsigned vendor_max = __get_cpuid_max(0, nullptr);
+  unsigned vendor_eax;
+  unsigned leaf1_eax;
+  unsigned leaf1_ebx;
+  unsigned leaf7_eax;
+  unsigned leaf7_ecx;
+  unsigned leaf7_edx;
+  if (vendor_max < 7 ||
+      !__get_cpuid(0, &vendor_eax, &identity->vendor_ebx,
+                   &identity->vendor_ecx, &identity->vendor_edx) ||
+      !__get_cpuid(1, &leaf1_eax, &leaf1_ebx,
+                   &identity->leaf1_ecx, &identity->leaf1_edx) ||
+      !__get_cpuid_count(7, 0, &leaf7_eax, &identity->leaf7_ebx,
+                         &leaf7_ecx, &leaf7_edx)) {
+    set_error(reason, reason_size, "bias CPUID identity is unavailable");
+    return -1;
+  }
+  const unsigned base_model = (leaf1_eax >> 4) & UINT32_C(0x0f);
+  const unsigned base_family = (leaf1_eax >> 8) & UINT32_C(0x0f);
+  const unsigned extended_model = (leaf1_eax >> 16) & UINT32_C(0x0f);
+  const unsigned extended_family = (leaf1_eax >> 20) & UINT32_C(0xff);
+  identity->stepping = leaf1_eax & UINT32_C(0x0f);
+  identity->family = base_family == UINT32_C(0x0f)
+                       ? base_family + extended_family
+                       : base_family;
+  identity->model =
+    (base_family == UINT32_C(0x06) || base_family == UINT32_C(0x0f))
+      ? base_model | (extended_model << 4)
+      : base_model;
+  if ((identity->leaf1_ecx & bit_OSXSAVE) != 0) {
+    __asm__ volatile("xgetbv" : "=a"(identity->xcr0_low),
+                                  "=d"(identity->xcr0_high) : "c"(0));
+  }
+  if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+  return 0;
+#endif
+}
+
+extern "C" int
+plan7_bias_cuda_identity_target(const plan7_bias_cuda_identity *identity,
+                                char *reason,
+                                size_t reason_size)
+{
+  if (identity == nullptr) {
+    set_error(reason, reason_size, "bias CUDA identity is null");
+    return PLAN7_BIAS_CUDA_UNATTESTED;
+  }
+  if (identity->cudart_version != 12050 ||
+      identity->nvcc_major != 12 || identity->nvcc_minor != 5 ||
+      identity->nvcc_build != 82) {
+    set_error(reason, reason_size,
+              "bias math is not attested for this CUDA toolkit build");
+    return PLAN7_BIAS_CUDA_UNATTESTED;
+  }
+  if (identity->runtime_version != 12050) {
+    set_error(reason, reason_size,
+              "bias math is not attested for this CUDA runtime version");
+    return PLAN7_BIAS_CUDA_UNATTESTED;
+  }
+  if (identity->driver_version < identity->runtime_version) {
+    set_error(reason, reason_size,
+              "bias math requires a driver supporting CUDA runtime 12.5");
+    return PLAN7_BIAS_CUDA_UNATTESTED;
+  }
+  if (identity->device_ordinal < 0 || identity->multiprocessor_count <= 0 ||
+      identity->total_global_memory == 0 || uuid_is_zero(identity->uuid) ||
+      identity->pci_domain_id < 0 || identity->pci_bus_id < 0 ||
+      identity->pci_bus_id > 255 || identity->pci_device_id < 0 ||
+      identity->pci_device_id > 31 || identity->pci_bus_address[0] == '\0' ||
+      memchr(identity->pci_bus_address, '\0',
+             sizeof(identity->pci_bus_address)) == nullptr ||
+      memchr(identity->name, '\0', sizeof(identity->name)) == nullptr) {
+    set_error(reason, reason_size,
+              "bias CUDA device identity or provenance is incomplete");
+    return PLAN7_BIAS_CUDA_UNATTESTED;
+  }
+  if (identity->compute_major == 7 && identity->compute_minor == 5 &&
+      strcmp(identity->name, "NVIDIA GeForce RTX 2080 Ti") == 0 &&
+      identity->multiprocessor_count == 68 &&
+      identity->total_global_memory >= UINT64_C(10) * 1024 * 1024 * 1024) {
+    if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+    return PLAN7_BIAS_CUDA_SM75_RTX2080_TI;
+  }
+  const bool named_h200 = strcmp(identity->name, "NVIDIA H200") == 0 ||
+                          strcmp(identity->name, "NVIDIA H200 NVL") == 0;
+  if (identity->compute_major == 9 && identity->compute_minor == 0 &&
+      named_h200 && identity->multiprocessor_count >= 100 &&
+      identity->total_global_memory >=
+        UINT64_C(100) * 1024 * 1024 * 1024) {
+    if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+    return PLAN7_BIAS_CUDA_SM90_H200;
+  }
+  set_error(reason, reason_size,
+            "bias math is not attested for this CUDA product/architecture");
+  return PLAN7_BIAS_CUDA_UNATTESTED;
+}
+
+extern "C" int
+plan7_bias_host_identity_attested(const plan7_bias_host_identity *identity,
+                                  int cuda_target,
+                                  char *reason,
+                                  size_t reason_size)
+{
+#if !defined(__x86_64__) || !defined(__GLIBC__)
+  (void) identity;
+  (void) cuda_target;
+  set_error(reason, reason_size,
+            "bias math is not attested for this host architecture");
+  return 0;
+#else
+  if (identity == nullptr) {
+    set_error(reason, reason_size, "bias host identity is null");
+    return 0;
+  }
+  const uint32_t required_leaf1_ecx =
+    bit_FMA | bit_SSE4_1 | bit_OSXSAVE | bit_AVX;
+  const uint32_t required_leaf7_ebx =
+    bit_AVX2 | bit_AVX512F | bit_AVX512DQ | bit_AVX512CD |
+    bit_AVX512BW | bit_AVX512VL;
+  if (identity->vendor_ebx != UINT32_C(0x756e6547) ||
+      identity->vendor_edx != UINT32_C(0x49656e69) ||
+      identity->vendor_ecx != UINT32_C(0x6c65746e) ||
+      (identity->leaf1_edx & bit_SSE2) == 0 ||
+      (identity->leaf1_ecx & required_leaf1_ecx) != required_leaf1_ecx ||
+      (identity->leaf7_ebx & required_leaf7_ebx) != required_leaf7_ebx ||
+      (identity->xcr0_low & UINT32_C(0x000000e6)) !=
+        UINT32_C(0x000000e6) ||
+      identity->xcr0_high != 0) {
+    set_error(reason, reason_size,
+              "bias math is not attested for this CPU vendor or feature set");
+    return 0;
+  }
+  if (cuda_target == PLAN7_BIAS_CUDA_SM75_RTX2080_TI &&
+      identity->family == 6 && identity->model == 85 &&
+      identity->stepping == 4) {
+    if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+    return 1;
+  }
+  if (cuda_target == PLAN7_BIAS_CUDA_SM90_H200 &&
+      identity->family == 6 && identity->model == 143 &&
+      identity->stepping == 8) {
+    if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+    return 1;
+  }
+  set_error(reason, reason_size,
+            "bias math is not attested for this CPU/accelerator pairing");
+  return 0;
+#endif
+}
+
+extern "C" int
 plan7_bias_environment_attested(char *reason, size_t reason_size)
 {
-#if !defined(__x86_64__) || !defined(__GLIBC__) || CUDART_VERSION != 12050 || \
-    __CUDACC_VER_MAJOR__ != 12 || __CUDACC_VER_MINOR__ != 5 ||             \
-    __CUDACC_VER_BUILD__ != 82
+#if !defined(__x86_64__) || !defined(__GLIBC__)
   set_error(reason, reason_size,
-            "bias math is not attested for this host or CUDA toolkit");
+            "bias math is not attested for this host architecture");
   return 0;
 #else
   if (plan7_bias_host_environment_attested() != 1) {
@@ -550,73 +787,23 @@ plan7_bias_environment_attested(char *reason, size_t reason_size)
               "bias math is not attested for this loaded libm build");
     return 0;
   }
-  unsigned vendor_max;
-  unsigned vendor_ebx;
-  unsigned vendor_ecx;
-  unsigned vendor_edx;
-  unsigned leaf1_eax;
-  unsigned leaf1_ebx;
-  unsigned leaf1_ecx;
-  unsigned leaf1_edx;
-  unsigned leaf7_eax;
-  unsigned leaf7_ebx;
-  unsigned leaf7_ecx;
-  unsigned leaf7_edx;
-  vendor_max = __get_cpuid_max(0, nullptr);
-  if (vendor_max < 7 ||
-      !__get_cpuid(0, &vendor_max, &vendor_ebx, &vendor_ecx, &vendor_edx) ||
-      vendor_ebx != UINT32_C(0x756e6547) ||
-      vendor_edx != UINT32_C(0x49656e69) ||
-      vendor_ecx != UINT32_C(0x6c65746e) ||
-      !__get_cpuid(1, &leaf1_eax, &leaf1_ebx, &leaf1_ecx, &leaf1_edx) ||
-      !__get_cpuid_count(7, 0, &leaf7_eax, &leaf7_ebx,
-                         &leaf7_ecx, &leaf7_edx)) {
-    set_error(reason, reason_size,
-              "bias math is not attested for this CPU vendor");
+
+  plan7_bias_cuda_identity cuda_identity;
+  if (plan7_bias_current_cuda_identity(
+        &cuda_identity, reason, reason_size) != 0)
     return 0;
-  }
-  const unsigned stepping = leaf1_eax & UINT32_C(0x0f);
-  const unsigned base_model = (leaf1_eax >> 4) & UINT32_C(0x0f);
-  const unsigned base_family = (leaf1_eax >> 8) & UINT32_C(0x0f);
-  const unsigned extended_model = (leaf1_eax >> 16) & UINT32_C(0x0f);
-  const unsigned family = base_family;
-  const unsigned model = base_model | (extended_model << 4);
-  const uint32_t required_leaf1_ecx =
-    bit_FMA | bit_SSE4_1 | bit_OSXSAVE | bit_AVX;
-  const uint32_t required_leaf7_ebx =
-    bit_AVX2 | bit_AVX512F | bit_AVX512DQ | bit_AVX512CD |
-    bit_AVX512BW | bit_AVX512VL;
-  uint32_t xcr0_low;
-  uint32_t xcr0_high;
-  __asm__ volatile("xgetbv" : "=a"(xcr0_low), "=d"(xcr0_high) : "c"(0));
-  if (family != 6 || model != 85 || stepping != 4 ||
-      (leaf1_edx & bit_SSE2) == 0 ||
-      (leaf1_ecx & required_leaf1_ecx) != required_leaf1_ecx ||
-      (leaf7_ebx & required_leaf7_ebx) != required_leaf7_ebx ||
-      (xcr0_low & UINT32_C(0x000000e6)) != UINT32_C(0x000000e6) ||
-      xcr0_high != 0) {
-    set_error(reason, reason_size,
-              "bias math is not attested for this CPU model or feature set");
+  const int target = plan7_bias_cuda_identity_target(
+    &cuda_identity, reason, reason_size);
+  if (target == PLAN7_BIAS_CUDA_UNATTESTED) return 0;
+
+  plan7_bias_host_identity host_identity;
+  if (plan7_bias_current_host_identity(
+        &host_identity, reason, reason_size) != 0)
     return 0;
-  }
-  int device;
-  cudaDeviceProp properties;
-  cudaError_t status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    set_cuda_error(reason, reason_size, "cudaGetDevice", status);
+  if (plan7_bias_host_identity_attested(
+        &host_identity, target, reason, reason_size) != 1)
     return 0;
-  }
-  status = cudaGetDeviceProperties(&properties, device);
-  if (status != cudaSuccess) {
-    set_cuda_error(reason, reason_size, "cudaGetDeviceProperties", status);
-    return 0;
-  }
-  if (properties.major != 7 || properties.minor != 5 ||
-      strcmp(properties.name, "NVIDIA GeForce RTX 2080 Ti") != 0) {
-    set_error(reason, reason_size,
-              "bias math is not attested for this CUDA architecture");
-    return 0;
-  }
+
   if (reason != nullptr && reason_size != 0) reason[0] = '\0';
   return 1;
 #endif

@@ -4,6 +4,10 @@ CC         ?= gcc
 CXX        ?= g++
 NVCC       ?= nvcc
 PYTHON     ?= python3
+H200_FIRST1000_FASTA ?=
+H200_PFAM_BASE ?=
+H200_PFAM_MANIFEST ?=
+H200_FIRST1000_OUTPUT ?=
 
 CPPFLAGS += -I$(HMMER_ROOT)/src -I$(HMMER_ROOT)/easel -I$(HMMER_ROOT)/libdivsufsort
 CFLAGS   += -O2 -g -std=c11 -Wall -Wextra -Wshadow -Wconversion
@@ -51,7 +55,8 @@ HMMER_HEADERS := $(HMMER_ROOT)/src/hmmer.h \
 	$(HMMER_ROOT)/src/p7_config.h \
 	$(HMMER_ROOT)/src/impl_sse/impl_sse.h
 
-.PHONY: all oracle bias-attestation cuda cuda-test pipeline pipeline-test test clean
+.PHONY: all oracle bias-attestation cuda cuda-test h200-first1000-audit \
+	pipeline pipeline-test test clean
 
 all: oracle
 
@@ -71,6 +76,17 @@ pipeline-test: pipeline
 cuda-test: cuda
 	PYTHONPATH=python $(PYTHON) -c 'import sys; from plan7_gpu import _native; sys.exit("no CUDA device") if _native.device_count() <= 0 else None'
 	PYTHONPATH=python $(PYTHON) -m unittest discover -s tests -p 'test_cuda_*.py' -v
+
+h200-first1000-audit: cuda
+	test -n "$(H200_FIRST1000_FASTA)" || { echo "H200_FIRST1000_FASTA is required" >&2; exit 2; }
+	test -n "$(H200_PFAM_BASE)" || { echo "H200_PFAM_BASE is required" >&2; exit 2; }
+	test -n "$(H200_PFAM_MANIFEST)" || { echo "H200_PFAM_MANIFEST is required" >&2; exit 2; }
+	test -n "$(H200_FIRST1000_OUTPUT)" || { echo "H200_FIRST1000_OUTPUT is required" >&2; exit 2; }
+	PYTHONPATH=python $(PYTHON) tests/audit_h200_pfam_first1000.py \
+		--fasta "$(H200_FIRST1000_FASTA)" \
+		--pressed-base "$(H200_PFAM_BASE)" \
+		--manifest "$(H200_PFAM_MANIFEST)" \
+		--output "$(H200_FIRST1000_OUTPUT)"
 
 $(ORACLE_BIN): $(ORACLE_OBJ) $(HMMER_LIBS)
 	$(CC) $(LDFLAGS) -o $@ $(ORACLE_OBJ) $(LDLIBS)

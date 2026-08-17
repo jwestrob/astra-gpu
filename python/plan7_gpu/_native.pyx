@@ -4,7 +4,7 @@ from libc.stddef cimport size_t
 from libc.stdint cimport int16_t, int32_t, uintptr_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.math cimport isfinite
 from libc.stdlib cimport calloc, free
-from libc.string cimport memcmp, memcpy
+from libc.string cimport memcmp, memcpy, memset
 from cpython.array cimport array as carray, clone
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
 from cpython.pycapsule cimport (
@@ -118,6 +118,43 @@ cdef extern from "bias_cuda.h" nogil:
         PLAN7_BIAS_CUTOFF_ALWAYS_REJECT
         PLAN7_BIAS_CUTOFF_ALWAYS_PASS
 
+    cdef enum plan7_bias_cuda_target:
+        PLAN7_BIAS_CUDA_UNATTESTED
+        PLAN7_BIAS_CUDA_SM75_RTX2080_TI
+        PLAN7_BIAS_CUDA_SM90_H200
+
+    ctypedef struct plan7_bias_cuda_identity:
+        int32_t device_ordinal
+        int32_t runtime_version
+        int32_t driver_version
+        int32_t cudart_version
+        int32_t nvcc_major
+        int32_t nvcc_minor
+        int32_t nvcc_build
+        int32_t compute_major
+        int32_t compute_minor
+        int32_t multiprocessor_count
+        int32_t pci_domain_id
+        int32_t pci_bus_id
+        int32_t pci_device_id
+        uint64_t total_global_memory
+        uint8_t uuid[16]
+        char pci_bus_address[32]
+        char name[256]
+
+    ctypedef struct plan7_bias_host_identity:
+        uint32_t vendor_ebx
+        uint32_t vendor_edx
+        uint32_t vendor_ecx
+        uint32_t family
+        uint32_t model
+        uint32_t stepping
+        uint32_t leaf1_ecx
+        uint32_t leaf1_edx
+        uint32_t leaf7_ebx
+        uint32_t xcr0_low
+        uint32_t xcr0_high
+
     ctypedef struct plan7_bias_profile:
         float t10
         float t11
@@ -168,6 +205,27 @@ cdef extern from "bias_cuda.h" nogil:
     )
 
     int plan7_bias_host_environment_attested()
+    int plan7_bias_current_cuda_identity(
+        plan7_bias_cuda_identity *identity,
+        char *reason,
+        size_t reason_size,
+    )
+    int plan7_bias_current_host_identity(
+        plan7_bias_host_identity *identity,
+        char *reason,
+        size_t reason_size,
+    )
+    int plan7_bias_cuda_identity_target(
+        const plan7_bias_cuda_identity *identity,
+        char *reason,
+        size_t reason_size,
+    )
+    int plan7_bias_host_identity_attested(
+        const plan7_bias_host_identity *identity,
+        int cuda_target,
+        char *reason,
+        size_t reason_size,
+    )
     int plan7_bias_environment_attested(char *reason, size_t reason_size)
 
 
@@ -1911,6 +1969,215 @@ def bias_environment_attested():
     reason[0] = 0
     with nogil:
         attested = plan7_bias_environment_attested(reason, sizeof(reason))
+    return bool(attested), reason.decode("utf-8", "replace")
+
+
+cdef object _bias_cuda_identity_dict(plan7_bias_cuda_identity *identity):
+    cdef bytes uuid = PyBytes_FromStringAndSize(
+        <char *> &identity.uuid[0], sizeof(identity.uuid)
+    )
+    return {
+        "device_ordinal": identity.device_ordinal,
+        "runtime_version": identity.runtime_version,
+        "driver_version": identity.driver_version,
+        "cudart_version": identity.cudart_version,
+        "nvcc": {
+            "major": identity.nvcc_major,
+            "minor": identity.nvcc_minor,
+            "build": identity.nvcc_build,
+        },
+        "compute_capability": [
+            identity.compute_major, identity.compute_minor
+        ],
+        "multiprocessor_count": identity.multiprocessor_count,
+        "pci_domain_id": identity.pci_domain_id,
+        "pci_bus_id": identity.pci_bus_id,
+        "pci_device_id": identity.pci_device_id,
+        "total_global_memory": identity.total_global_memory,
+        "uuid": (
+            "GPU-"
+            + uuid.hex()[0:8]
+            + "-"
+            + uuid.hex()[8:12]
+            + "-"
+            + uuid.hex()[12:16]
+            + "-"
+            + uuid.hex()[16:20]
+            + "-"
+            + uuid.hex()[20:32]
+        ),
+        "pci_bus_address": identity.pci_bus_address.decode(
+            "ascii", "strict"
+        ),
+        "name": identity.name.decode("utf-8", "replace"),
+    }
+
+
+cdef object _bias_host_identity_dict(plan7_bias_host_identity *identity):
+    return {
+        "vendor_words": [
+            identity.vendor_ebx,
+            identity.vendor_edx,
+            identity.vendor_ecx,
+        ],
+        "family": identity.family,
+        "model": identity.model,
+        "stepping": identity.stepping,
+        "leaf1_ecx": identity.leaf1_ecx,
+        "leaf1_edx": identity.leaf1_edx,
+        "leaf7_ebx": identity.leaf7_ebx,
+        "xcr0_low": identity.xcr0_low,
+        "xcr0_high": identity.xcr0_high,
+    }
+
+
+def bias_environment_provenance():
+    """Return the exact host, toolkit, driver-API, and device gate inputs."""
+    cdef plan7_bias_cuda_identity cuda_identity
+    cdef plan7_bias_host_identity host_identity
+    cdef char cuda_reason[512]
+    cdef char host_reason[512]
+    cdef char attestation_reason[512]
+    cdef int cuda_status
+    cdef int host_status
+    cdef int target = PLAN7_BIAS_CUDA_UNATTESTED
+    cdef int attested
+    cuda_reason[0] = 0
+    host_reason[0] = 0
+    attestation_reason[0] = 0
+    with nogil:
+        cuda_status = plan7_bias_current_cuda_identity(
+            &cuda_identity, cuda_reason, sizeof(cuda_reason)
+        )
+        host_status = plan7_bias_current_host_identity(
+            &host_identity, host_reason, sizeof(host_reason)
+        )
+        if cuda_status == 0:
+            target = plan7_bias_cuda_identity_target(
+                &cuda_identity, cuda_reason, sizeof(cuda_reason)
+            )
+        attested = plan7_bias_environment_attested(
+            attestation_reason, sizeof(attestation_reason)
+        )
+    target_name = {
+        PLAN7_BIAS_CUDA_SM75_RTX2080_TI: "sm75_rtx2080ti",
+        PLAN7_BIAS_CUDA_SM90_H200: "sm90_h200",
+    }.get(target, "unattested")
+    return {
+        "attested": bool(attested),
+        "reason": attestation_reason.decode("utf-8", "replace"),
+        "target": target_name,
+        "target_code": target,
+        "cuda": (
+            _bias_cuda_identity_dict(&cuda_identity)
+            if cuda_status == 0 else None
+        ),
+        "cuda_identity_reason": cuda_reason.decode("utf-8", "replace"),
+        "host": (
+            _bias_host_identity_dict(&host_identity)
+            if host_status == 0 else None
+        ),
+        "host_identity_reason": host_reason.decode("utf-8", "replace"),
+    }
+
+
+def _bias_cuda_identity_target_raw(
+    str name,
+    int compute_major,
+    int compute_minor,
+    int multiprocessor_count,
+    uint64_t total_global_memory,
+    bytes uuid,
+    str pci_bus_address,
+    int device_ordinal=0,
+    int runtime_version=12050,
+    int driver_version=12050,
+    int cudart_version=12050,
+    int nvcc_major=12,
+    int nvcc_minor=5,
+    int nvcc_build=82,
+    int pci_domain_id=0,
+    int pci_bus_id=1,
+    int pci_device_id=0,
+):
+    """Classify a synthetic CUDA identity at the pure host unit boundary."""
+    cdef plan7_bias_cuda_identity identity
+    cdef char reason[512]
+    cdef bytes encoded_name = name.encode("utf-8")
+    cdef bytes encoded_pci = pci_bus_address.encode("ascii")
+    cdef int target
+    if len(uuid) != sizeof(identity.uuid):
+        raise ValueError("CUDA UUID must contain exactly 16 bytes")
+    if b"\0" in encoded_name or len(encoded_name) >= sizeof(identity.name):
+        raise ValueError("CUDA device name does not fit the identity record")
+    if b"\0" in encoded_pci or len(encoded_pci) >= sizeof(identity.pci_bus_address):
+        raise ValueError("CUDA PCI address does not fit the identity record")
+    memset(&identity, 0, sizeof(identity))
+    identity.device_ordinal = device_ordinal
+    identity.runtime_version = runtime_version
+    identity.driver_version = driver_version
+    identity.cudart_version = cudart_version
+    identity.nvcc_major = nvcc_major
+    identity.nvcc_minor = nvcc_minor
+    identity.nvcc_build = nvcc_build
+    identity.compute_major = compute_major
+    identity.compute_minor = compute_minor
+    identity.multiprocessor_count = multiprocessor_count
+    identity.pci_domain_id = pci_domain_id
+    identity.pci_bus_id = pci_bus_id
+    identity.pci_device_id = pci_device_id
+    identity.total_global_memory = total_global_memory
+    memcpy(&identity.uuid[0], PyBytes_AS_STRING(uuid), sizeof(identity.uuid))
+    memcpy(
+        &identity.name[0], PyBytes_AS_STRING(encoded_name), len(encoded_name)
+    )
+    memcpy(
+        &identity.pci_bus_address[0],
+        PyBytes_AS_STRING(encoded_pci),
+        len(encoded_pci),
+    )
+    reason[0] = 0
+    with nogil:
+        target = plan7_bias_cuda_identity_target(
+            &identity, reason, sizeof(reason)
+        )
+    return target, reason.decode("utf-8", "replace")
+
+
+def _bias_host_identity_attested_raw(
+    int cuda_target,
+    uint32_t family,
+    uint32_t model,
+    uint32_t stepping,
+    uint32_t leaf1_ecx,
+    uint32_t leaf1_edx,
+    uint32_t leaf7_ebx,
+    uint32_t xcr0_low,
+    uint32_t xcr0_high=0,
+    uint32_t vendor_ebx=0x756e6547,
+    uint32_t vendor_edx=0x49656e69,
+    uint32_t vendor_ecx=0x6c65746e,
+):
+    """Evaluate a synthetic CPU/accelerator pairing without a GPU."""
+    cdef plan7_bias_host_identity identity
+    cdef char reason[512]
+    cdef int attested
+    identity.vendor_ebx = vendor_ebx
+    identity.vendor_edx = vendor_edx
+    identity.vendor_ecx = vendor_ecx
+    identity.family = family
+    identity.model = model
+    identity.stepping = stepping
+    identity.leaf1_ecx = leaf1_ecx
+    identity.leaf1_edx = leaf1_edx
+    identity.leaf7_ebx = leaf7_ebx
+    identity.xcr0_low = xcr0_low
+    identity.xcr0_high = xcr0_high
+    reason[0] = 0
+    with nogil:
+        attested = plan7_bias_host_identity_attested(
+            &identity, cuda_target, reason, sizeof(reason)
+        )
     return bool(attested), reason.decode("utf-8", "replace")
 
 
@@ -5635,6 +5902,9 @@ BIAS_CUTOFF_INVALID = PLAN7_BIAS_CUTOFF_INVALID
 BIAS_CUTOFF_SCORE = PLAN7_BIAS_CUTOFF_SCORE
 BIAS_CUTOFF_ALWAYS_REJECT = PLAN7_BIAS_CUTOFF_ALWAYS_REJECT
 BIAS_CUTOFF_ALWAYS_PASS = PLAN7_BIAS_CUTOFF_ALWAYS_PASS
+BIAS_CUDA_UNATTESTED = PLAN7_BIAS_CUDA_UNATTESTED
+BIAS_CUDA_SM75_RTX2080_TI = PLAN7_BIAS_CUDA_SM75_RTX2080_TI
+BIAS_CUDA_SM90_H200 = PLAN7_BIAS_CUDA_SM90_H200
 BIAS_PROFILE_SIZE = sizeof(plan7_bias_profile)
 BIAS_RESULT_SIZE = sizeof(plan7_bias_result)
 POSTFILTER_RECORD_VERSION = PLAN7_POSTFILTER_RECORD_VERSION
