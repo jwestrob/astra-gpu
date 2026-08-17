@@ -110,16 +110,13 @@ valid_profile_inputs(const float *background,
 struct build_id_search {
   uintptr_t symbol;
   bool module_found;
-  bool build_id_matches;
+  bool build_id_found;
+  uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE];
 };
 
 int
 find_attested_build_id(struct dl_phdr_info *info, size_t, void *opaque)
 {
-  constexpr unsigned char kExpectedBuildId[20] = {
-    0xe6, 0xf0, 0x50, 0x69, 0x61, 0x20, 0xae, 0xb5, 0x13, 0x4a,
-    0x14, 0xe3, 0x8b, 0xc5, 0x4e, 0x8c, 0xe1, 0xbd, 0xc0, 0xb5
-  };
   build_id_search *search = static_cast<build_id_search *>(opaque);
   bool contains_symbol = false;
   for (ElfW(Half) index = 0; index < info->dlpi_phnum; ++index) {
@@ -155,9 +152,10 @@ find_attested_build_id(struct dl_phdr_info *info, size_t, void *opaque)
       cursor += descriptor_size;
       if (note->n_type == NT_GNU_BUILD_ID && note->n_namesz == 4 &&
           memcmp(name, "GNU", 4) == 0 &&
-          note->n_descsz == sizeof(kExpectedBuildId) &&
-          memcmp(descriptor, kExpectedBuildId, sizeof(kExpectedBuildId)) == 0) {
-        search->build_id_matches = true;
+          note->n_descsz == PLAN7_BIAS_LIBM_BUILD_ID_SIZE) {
+        memcpy(search->build_id, descriptor,
+               PLAN7_BIAS_LIBM_BUILD_ID_SIZE);
+        search->build_id_found = true;
         return 1;
       }
     }
@@ -166,15 +164,26 @@ find_attested_build_id(struct dl_phdr_info *info, size_t, void *opaque)
 }
 
 bool
-loaded_libm_is_attested()
+loaded_libm_build_id(uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE])
 {
   void *symbol = dlsym(RTLD_DEFAULT, "log");
   if (symbol == nullptr) return false;
   build_id_search search = {
-    reinterpret_cast<uintptr_t>(symbol), false, false
+    reinterpret_cast<uintptr_t>(symbol), false, false, {}
   };
   dl_iterate_phdr(find_attested_build_id, &search);
-  return search.module_found && search.build_id_matches;
+  if (!search.module_found || !search.build_id_found) return false;
+  memcpy(build_id, search.build_id, PLAN7_BIAS_LIBM_BUILD_ID_SIZE);
+  return true;
+}
+
+bool
+loaded_libm_is_attested(int cuda_target)
+{
+  uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE];
+  return loaded_libm_build_id(build_id) &&
+         plan7_bias_libm_build_id_attested(
+           build_id, sizeof(build_id), cuda_target) == 1;
 }
 
 void
@@ -765,6 +774,39 @@ plan7_bias_host_identity_attested(const plan7_bias_host_identity *identity,
 }
 
 extern "C" int
+plan7_bias_current_libm_build_id(
+  uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE])
+{
+  if (build_id == nullptr) return -1;
+  memset(build_id, 0, PLAN7_BIAS_LIBM_BUILD_ID_SIZE);
+  return loaded_libm_build_id(build_id) ? 0 : -1;
+}
+
+extern "C" int
+plan7_bias_libm_build_id_attested(const uint8_t *build_id,
+                                  size_t build_id_size,
+                                  int cuda_target)
+{
+  constexpr uint8_t kSm75LibmBuildId[PLAN7_BIAS_LIBM_BUILD_ID_SIZE] = {
+    0xe6, 0xf0, 0x50, 0x69, 0x61, 0x20, 0xae, 0xb5, 0x13, 0x4a,
+    0x14, 0xe3, 0x8b, 0xc5, 0x4e, 0x8c, 0xe1, 0xbd, 0xc0, 0xb5
+  };
+  constexpr uint8_t kSm90H200LibmBuildId[PLAN7_BIAS_LIBM_BUILD_ID_SIZE] = {
+    0xb2, 0xb4, 0xcd, 0x0f, 0x73, 0xa7, 0xc7, 0xa6, 0xda, 0x5b,
+    0xa4, 0x12, 0x6b, 0xce, 0xb3, 0x3c, 0xe6, 0x88, 0x53, 0xd5
+  };
+  if (build_id == nullptr ||
+      build_id_size != PLAN7_BIAS_LIBM_BUILD_ID_SIZE)
+    return 0;
+  if (cuda_target == PLAN7_BIAS_CUDA_SM75_RTX2080_TI)
+    return memcmp(build_id, kSm75LibmBuildId, sizeof(kSm75LibmBuildId)) == 0;
+  if (cuda_target == PLAN7_BIAS_CUDA_SM90_H200)
+    return memcmp(build_id, kSm90H200LibmBuildId,
+                  sizeof(kSm90H200LibmBuildId)) == 0;
+  return 0;
+}
+
+extern "C" int
 plan7_bias_environment_attested(char *reason, size_t reason_size)
 {
 #if !defined(__x86_64__) || !defined(__GLIBC__)
@@ -782,11 +824,6 @@ plan7_bias_environment_attested(char *reason, size_t reason_size)
               "bias math is not attested for this glibc version");
     return 0;
   }
-  if (!loaded_libm_is_attested()) {
-    set_error(reason, reason_size,
-              "bias math is not attested for this loaded libm build");
-    return 0;
-  }
 
   plan7_bias_cuda_identity cuda_identity;
   if (plan7_bias_current_cuda_identity(
@@ -795,6 +832,11 @@ plan7_bias_environment_attested(char *reason, size_t reason_size)
   const int target = plan7_bias_cuda_identity_target(
     &cuda_identity, reason, reason_size);
   if (target == PLAN7_BIAS_CUDA_UNATTESTED) return 0;
+  if (!loaded_libm_is_attested(target)) {
+    set_error(reason, reason_size,
+              "bias math is not attested for this loaded libm build");
+    return 0;
+  }
 
   plan7_bias_host_identity host_identity;
   if (plan7_bias_current_host_identity(

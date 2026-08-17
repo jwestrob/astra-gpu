@@ -230,6 +230,39 @@ class BiasHostTests(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertRegex(reason, "feature set")
 
+    def test_libm_build_ids_are_bound_to_accelerator_target(self):
+        sm75 = bytes.fromhex("e6f050696120aeb5134a14e38bc54e8ce1bdc0b5")
+        h200 = bytes.fromhex("b2b4cd0f73a7c7a6da5ba4126bceb33ce68853d5")
+        self.assertEqual(len(sm75), _native.BIAS_LIBM_BUILD_ID_SIZE)
+        self.assertEqual(len(h200), _native.BIAS_LIBM_BUILD_ID_SIZE)
+        self.assertTrue(
+            _native._bias_libm_build_id_attested_raw(
+                sm75, _native.BIAS_CUDA_SM75_RTX2080_TI
+            )
+        )
+        self.assertTrue(
+            _native._bias_libm_build_id_attested_raw(
+                h200, _native.BIAS_CUDA_SM90_H200
+            )
+        )
+        for build_id, target in (
+            (sm75, _native.BIAS_CUDA_SM90_H200),
+            (h200, _native.BIAS_CUDA_SM75_RTX2080_TI),
+            (bytes(len(sm75)), _native.BIAS_CUDA_SM75_RTX2080_TI),
+            (bytes(len(h200)), _native.BIAS_CUDA_SM90_H200),
+            (sm75[:-1], _native.BIAS_CUDA_SM75_RTX2080_TI),
+            (b"", _native.BIAS_CUDA_SM90_H200),
+            (None, _native.BIAS_CUDA_SM90_H200),
+            (sm75, _native.BIAS_CUDA_UNATTESTED),
+        ):
+            with self.subTest(
+                build_id=None if build_id is None else build_id.hex(),
+                target=target,
+            ):
+                self.assertFalse(
+                    _native._bias_libm_build_id_attested_raw(build_id, target)
+                )
+
     def test_nondefault_float_modes_fail_closed(self):
         libc = ctypes.CDLL(None)
         libc.fegetround.restype = ctypes.c_int
@@ -387,16 +420,22 @@ class CudaBiasTests(unittest.TestCase):
                 _native.BIAS_CUDA_SM75_RTX2080_TI,
                 [7, 5],
                 {"NVIDIA GeForce RTX 2080 Ti"},
+                "e6f050696120aeb5134a14e38bc54e8ce1bdc0b5",
             ),
             "sm90_h200": (
                 _native.BIAS_CUDA_SM90_H200,
                 [9, 0],
                 {"NVIDIA H200", "NVIDIA H200 NVL"},
+                "b2b4cd0f73a7c7a6da5ba4126bceb33ce68853d5",
             ),
         }
         self.assertIn(provenance["target"], expected)
-        target_code, capability, names = expected[provenance["target"]]
+        target_code, capability, names, libm_build_id = expected[
+            provenance["target"]
+        ]
         self.assertEqual(provenance["target_code"], target_code)
+        self.assertEqual(provenance["libm"]["gnu_build_id"], libm_build_id)
+        self.assertTrue(provenance["libm"]["attested_for_target"])
         self.assertEqual(cuda["compute_capability"], capability)
         self.assertIn(cuda["name"], names)
         self.assertEqual(cuda["runtime_version"], 12050)

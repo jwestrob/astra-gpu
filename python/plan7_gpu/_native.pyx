@@ -123,6 +123,9 @@ cdef extern from "bias_cuda.h" nogil:
         PLAN7_BIAS_CUDA_SM75_RTX2080_TI
         PLAN7_BIAS_CUDA_SM90_H200
 
+    enum:
+        PLAN7_BIAS_LIBM_BUILD_ID_SIZE
+
     ctypedef struct plan7_bias_cuda_identity:
         int32_t device_ordinal
         int32_t runtime_version
@@ -225,6 +228,12 @@ cdef extern from "bias_cuda.h" nogil:
         int cuda_target,
         char *reason,
         size_t reason_size,
+    )
+    int plan7_bias_current_libm_build_id(uint8_t *build_id)
+    int plan7_bias_libm_build_id_attested(
+        const uint8_t *build_id,
+        size_t build_id_size,
+        int cuda_target,
     )
     int plan7_bias_environment_attested(char *reason, size_t reason_size)
 
@@ -2035,11 +2044,14 @@ def bias_environment_provenance():
     """Return the exact host, toolkit, driver-API, and device gate inputs."""
     cdef plan7_bias_cuda_identity cuda_identity
     cdef plan7_bias_host_identity host_identity
+    cdef uint8_t libm_build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE]
     cdef char cuda_reason[512]
     cdef char host_reason[512]
     cdef char attestation_reason[512]
     cdef int cuda_status
     cdef int host_status
+    cdef int libm_status
+    cdef int libm_attested = 0
     cdef int target = PLAN7_BIAS_CUDA_UNATTESTED
     cdef int attested
     cuda_reason[0] = 0
@@ -2055,6 +2067,11 @@ def bias_environment_provenance():
         if cuda_status == 0:
             target = plan7_bias_cuda_identity_target(
                 &cuda_identity, cuda_reason, sizeof(cuda_reason)
+            )
+        libm_status = plan7_bias_current_libm_build_id(&libm_build_id[0])
+        if libm_status == 0:
+            libm_attested = plan7_bias_libm_build_id_attested(
+                &libm_build_id[0], sizeof(libm_build_id), target
             )
         attested = plan7_bias_environment_attested(
             attestation_reason, sizeof(attestation_reason)
@@ -2078,6 +2095,15 @@ def bias_environment_provenance():
             if host_status == 0 else None
         ),
         "host_identity_reason": host_reason.decode("utf-8", "replace"),
+        "libm": {
+            "gnu_build_id": (
+                PyBytes_FromStringAndSize(
+                    <char *> &libm_build_id[0], sizeof(libm_build_id)
+                ).hex()
+                if libm_status == 0 else None
+            ),
+            "attested_for_target": bool(libm_attested),
+        },
     }
 
 
@@ -2179,6 +2205,25 @@ def _bias_host_identity_attested_raw(
             &identity, cuda_target, reason, sizeof(reason)
         )
     return bool(attested), reason.decode("utf-8", "replace")
+
+
+def _bias_libm_build_id_attested_raw(build_id, int cuda_target):
+    """Evaluate a synthetic libm build ID at the pure host unit boundary."""
+    cdef bytes encoded
+    cdef const uint8_t *raw = NULL
+    cdef size_t raw_size = 0
+    cdef int attested
+    if build_id is not None:
+        if type(build_id) is not bytes:
+            raise TypeError("libm build ID must be exactly bytes or None")
+        encoded = build_id
+        raw = <const uint8_t *> PyBytes_AS_STRING(encoded)
+        raw_size = len(encoded)
+    with nogil:
+        attested = plan7_bias_libm_build_id_attested(
+            raw, raw_size, cuda_target
+        )
+    return bool(attested)
 
 
 def _sealed_journal_transport_statistics():
@@ -5905,6 +5950,7 @@ BIAS_CUTOFF_ALWAYS_PASS = PLAN7_BIAS_CUTOFF_ALWAYS_PASS
 BIAS_CUDA_UNATTESTED = PLAN7_BIAS_CUDA_UNATTESTED
 BIAS_CUDA_SM75_RTX2080_TI = PLAN7_BIAS_CUDA_SM75_RTX2080_TI
 BIAS_CUDA_SM90_H200 = PLAN7_BIAS_CUDA_SM90_H200
+BIAS_LIBM_BUILD_ID_SIZE = PLAN7_BIAS_LIBM_BUILD_ID_SIZE
 BIAS_PROFILE_SIZE = sizeof(plan7_bias_profile)
 BIAS_RESULT_SIZE = sizeof(plan7_bias_result)
 POSTFILTER_RECORD_VERSION = PLAN7_POSTFILTER_RECORD_VERSION

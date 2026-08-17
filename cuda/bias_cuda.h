@@ -30,6 +30,8 @@ enum plan7_bias_cuda_target {
   PLAN7_BIAS_CUDA_SM90_H200 = 2
 };
 
+enum { PLAN7_BIAS_LIBM_BUILD_ID_SIZE = 20 };
+
 /* Runtime identity captured before any exact bias-filter kernel is launched.
  * UUID and PCI address are provenance, rather than allow-list keys: all full
  * H200 devices of the admitted product/architecture may be used. */
@@ -154,6 +156,15 @@ int plan7_bias_host_identity_attested(
   int cuda_target,
   char *reason,
   size_t reason_size);
+
+/* Capture the loaded libm GNU build ID and apply the target-specific exact
+ * allow-list. The pure predicate keeps this boundary independently testable. */
+int plan7_bias_current_libm_build_id(
+  uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE]);
+int plan7_bias_libm_build_id_attested(
+  const uint8_t *build_id,
+  size_t build_id_size,
+  int cuda_target);
 
 /* Returns 1 only for an explicitly admitted host/device math target. */
 int plan7_bias_environment_attested(char *reason, size_t reason_size);
