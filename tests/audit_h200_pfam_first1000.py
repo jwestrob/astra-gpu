@@ -24,13 +24,43 @@ from pathlib import Path
 import pyhmmer
 
 from plan7_gpu import SequenceBatch, load_pressed_profiles
-from plan7_gpu import _native
-from plan7_gpu.astra_search import hmmsearch
+from plan7_gpu import _native, _pipeline
+from plan7_gpu.adapter import _candidate_state, _sequence_native
+from plan7_gpu.astra_search import _prepare_candidates, hmmsearch
 
 
 SEQUENCE_COUNT = 1000
 EXPECTED_TARGET = "sm90_h200"
 _MISSING = object()
+_POSITIVE_WORKSPACE_FIELDS = (
+    "postfilter_device_bytes",
+    "postfilter_dp_capacity_bytes",
+    "postfilter_run_count",
+    "forward_device_bytes",
+    "forward_dp_capacity_bytes",
+    "forward_xmx_capacity_bytes",
+    "forward_gather_capacity_bytes",
+    "forward_event_create_count",
+    "forward_run_count",
+)
+_SEAM_PROBES = {
+    "filter": "_filter_scores_seam_available",
+    "forward": "_filter_and_forward_scores_seam_available",
+    "simple_regions": "_simple_regions_seam_available",
+    "compact_domains": "_compact_domains_seam_available",
+}
+_NATIVE_CAPABILITIES = {
+    "ViterbiProfiles": (_native, "ViterbiProfiles"),
+    "ForwardProfiles": (_native, "ForwardProfiles"),
+    "SequenceBatch.postfilter_candidates_many_csr_raw": (
+        _native.SequenceBatch,
+        "postfilter_candidates_many_csr_raw",
+    ),
+    "SequenceBatch.forward_candidates_many_raw": (
+        _native.SequenceBatch,
+        "forward_candidates_many_raw",
+    ),
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -128,9 +158,18 @@ def table_bytes(hits: object, table_format: str) -> bytes:
     return output.getvalue()
 
 
+def identifier_bytes(value: object | None) -> bytes | None:
+    """Normalize PyHMMER identifier storage without changing its text."""
+    if value is None or type(value) is bytes:
+        return value
+    if type(value) is str:
+        return value.encode("utf-8")
+    raise TypeError(f"unexpected PyHMMER identifier type: {type(value).__name__}")
+
+
 def exact_payload(hits: object) -> tuple[bytes, bytes, bytes, bytes]:
-    query_name = hits.query.name or b""
-    query_accession = hits.query.accession
+    query_name = identifier_bytes(hits.query.name) or b""
+    query_accession = identifier_bytes(hits.query.accession)
     query_identity = (
         struct.pack(
             "=Iii",
@@ -164,6 +203,111 @@ def update_digest(digest: object, payload: tuple[bytes, ...]) -> None:
         digest.update(item)
 
 
+def gpu_capability_record() -> dict[str, object]:
+    """Resolve and attest every native seam required by the V2 GPU route."""
+    seams = {
+        name: bool(getattr(_pipeline, attribute)())
+        for name, attribute in _SEAM_PROBES.items()
+    }
+    cache = _pipeline._continuation_seam_cache_info()
+    native = {
+        name: callable(getattr(owner, attribute, None))
+        for name, (owner, attribute) in _NATIVE_CAPABILITIES.items()
+    }
+    failures = [name for name, available in seams.items() if not available]
+    failures.extend(name for name, available in native.items() if not available)
+    for name in _SEAM_PROBES:
+        state = cache.get(name)
+        if not isinstance(state, dict):
+            failures.append(f"{name}.cache_missing")
+            continue
+        for field in ("resolved", "available", "same_dso"):
+            if state.get(field) is not True:
+                failures.append(f"{name}.{field}")
+        for field in ("resolutions", "dlopen_calls", "dlclose_calls"):
+            if state.get(field) != 1:
+                failures.append(f"{name}.{field}")
+    return {
+        "seams": seams,
+        "native_capabilities": native,
+        "continuation_seam_cache": cache,
+        "attested": not failures,
+        "failures": failures,
+    }
+
+
+def candidate_census(candidates: object) -> dict[str, object]:
+    """Summarize every authentic post-filter row without exposing payloads."""
+    counts = [candidates.candidate_count(row) for row in range(len(candidates))]
+    digest = hashlib.sha256()
+    for count in counts:
+        digest.update(struct.pack("=q", count))
+    out_of_range = [
+        row for row, count in enumerate(counts) if not 0 <= count <= SEQUENCE_COUNT
+    ]
+    state = _candidate_state(candidates)
+    routes = None
+    routes_unavailable_reason = None
+    if state.sealed_postfilter is not None:
+        try:
+            routes = _pipeline._sealed_continuation_statistics_bound(
+                state.sealed_postfilter
+            )
+        except TypeError as error:
+            # The direct first-1000 bridge seals filter/Forward provenance but
+            # does not build the optional persistent-session domain journal.
+            routes_unavailable_reason = str(error)
+    return {
+        "model_rows": len(counts),
+        "total_retained_candidates": sum(counts),
+        "nonempty_model_rows": sum(count > 0 for count in counts),
+        "all_target_model_rows": sum(count == SEQUENCE_COUNT for count in counts),
+        "minimum_row_candidates": min(counts, default=0),
+        "maximum_row_candidates": max(counts, default=0),
+        "out_of_range_model_rows": len(out_of_range),
+        "out_of_range_model_row_examples": out_of_range[:20],
+        "row_counts_sha256": digest.hexdigest(),
+        "sealed_postfilter": state.sealed_postfilter is not None,
+        "continuation_routes": routes,
+        "continuation_routes_unavailable_reason": routes_unavailable_reason,
+    }
+
+
+def nonvacuous_gpu_work_failures(
+    workspace: dict[str, object], candidates: dict[str, object]
+) -> list[str]:
+    """Return every reason the observed CUDA work is not demonstrably live."""
+    failures = [
+        f"workspace.{field} is not positive"
+        for field in _POSITIVE_WORKSPACE_FIELDS
+        if not isinstance(workspace.get(field), int) or workspace[field] <= 0
+    ]
+    for field in ("model_rows", "total_retained_candidates", "nonempty_model_rows"):
+        if not isinstance(candidates.get(field), int) or candidates[field] <= 0:
+            failures.append(f"candidates.{field} is not positive")
+    if candidates.get("sealed_postfilter") is not True:
+        failures.append("candidates.sealed_postfilter is not true")
+    if candidates.get("out_of_range_model_rows") != 0:
+        failures.append("candidate row counts fall outside [0, 1000]")
+    routes = candidates.get("continuation_routes")
+    if routes is not None:
+        route_total = sum(
+            int(routes[field])
+            for field in (
+                "cpu_required_count",
+                "no_region_count",
+                "simple_count",
+            )
+        )
+        if int(routes["row_count"]) != route_total:
+            failures.append("continuation route counts do not sum to row_count")
+        if int(routes["row_count"]) != candidates.get(
+            "total_retained_candidates"
+        ):
+            failures.append("continuation rows differ from retained candidates")
+    return failures
+
+
 def compare_searches(pairs: tuple[object, ...], targets: object) -> dict[str, object]:
     options = {"bit_cutoffs": "gathering"}
     cpu_started = time.monotonic()
@@ -175,7 +319,12 @@ def compare_searches(pairs: tuple[object, ...], targets: object) -> dict[str, ob
     gpu_setup_started = time.monotonic()
     batch = SequenceBatch(targets)
     try:
-        gpu_results = hmmsearch(pairs, batch, cpus=1, postfilter=True, **options)
+        gpu_options = dict(options)
+        candidates = _prepare_candidates(pairs, batch, gpu_options, True)
+        candidates_record = candidate_census(candidates)
+        gpu_results = hmmsearch(
+            pairs, candidates, cpus=1, postfilter=True, **gpu_options
+        )
         gpu_setup_seconds = time.monotonic() - gpu_setup_started
         comparison_started = time.monotonic()
         cpu_digest = hashlib.sha256()
@@ -214,6 +363,14 @@ def compare_searches(pairs: tuple[object, ...], targets: object) -> dict[str, ob
                         }
                     )
         comparison_seconds = time.monotonic() - comparison_started
+        # The iterator is now exhausted and all queued native work is complete;
+        # capture these counters while the underlying native batch is live.
+        native_batch = _sequence_native(batch)
+        workspace = dict(native_batch.workspace_statistics)
+        memory_snapshot = dict(native_batch.memory_snapshot)
+        gpu_work_failures = nonvacuous_gpu_work_failures(
+            workspace, candidates_record
+        )
     finally:
         batch.close()
 
@@ -227,6 +384,11 @@ def compare_searches(pairs: tuple[object, ...], targets: object) -> dict[str, ob
         "cpu_iterator_setup_seconds": cpu_setup_seconds,
         "gpu_filter_setup_seconds": gpu_setup_seconds,
         "comparison_seconds": comparison_seconds,
+        "candidate_census": candidates_record,
+        "workspace_statistics_after_consumption": workspace,
+        "memory_snapshot_after_consumption": memory_snapshot,
+        "nonvacuous_gpu_work": not gpu_work_failures,
+        "nonvacuous_gpu_work_failures": gpu_work_failures,
     }
 
 
@@ -269,6 +431,12 @@ def main() -> int:
     source = git_revision(root)
     if source["dirty"]:
         raise RuntimeError("first-1000 acceptance requires a clean source revision")
+    capabilities = gpu_capability_record()
+    if capabilities["attested"] is not True:
+        raise RuntimeError(
+            "first-1000 acceptance requires every V2 same-DSO GPU seam: "
+            + ", ".join(capabilities["failures"])
+        )
 
     started = time.monotonic()
     fasta_sha256 = sha256_file(args.fasta)
@@ -281,6 +449,9 @@ def main() -> int:
         comparison["models_compared"] == comparison["expected_models"]
         and comparison["mismatch_count"] == 0
         and comparison["cpu_payload_sha256"] == comparison["gpu_payload_sha256"]
+        and comparison["candidate_census"]["model_rows"]
+        == comparison["expected_models"]
+        and comparison["nonvacuous_gpu_work"] is True
     )
     record = {
         "schema_version": 1,
@@ -305,7 +476,12 @@ def main() -> int:
                 "path": str(Path(_native.__file__).resolve()),
                 "sha256": sha256_file(Path(_native.__file__).resolve()),
             },
+            "pipeline_extension": {
+                "path": str(Path(_pipeline.__file__).resolve()),
+                "sha256": sha256_file(Path(_pipeline.__file__).resolve()),
+            },
         },
+        "gpu_capabilities": capabilities,
         "cuda_attestation": provenance,
         "nvidia_smi_selected_gpu": nvidia_smi,
         "workload": {
