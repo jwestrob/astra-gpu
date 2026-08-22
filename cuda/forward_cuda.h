@@ -268,6 +268,12 @@ const float *plan7_forward_output_specials(
   const plan7_forward_output *output);
 const plan7_forward_statistics *plan7_forward_output_statistics(
   const plan7_forward_output *output);
+/* Additive instrumentation accessors on the opaque output. They do not alter
+ * plan7_forward_statistics, the continuation journal, or provenance hashes. */
+float plan7_forward_output_upload_milliseconds(
+  const plan7_forward_output *output);
+float plan7_forward_output_total_milliseconds(
+  const plan7_forward_output *output);
 const plan7_forward_provenance *plan7_forward_output_provenance(
   const plan7_forward_output *output);
 

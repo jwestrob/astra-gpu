@@ -547,6 +547,8 @@ struct plan7_forward_output {
   std::vector<float> specials;
   plan7_forward_statistics statistics;
   plan7_forward_provenance provenance;
+  float upload_milliseconds;
+  float total_milliseconds;
 };
 
 namespace {
@@ -1409,6 +1411,7 @@ extern "C" int plan7_forward_run_with_workspace(
     const float *filter_scores, size_t candidate_count, double f3,
     uint64_t gathered_byte_budget,
     plan7_forward_output **output, char *error, size_t error_size) {
+  const auto call_begin = std::chrono::steady_clock::now();
   if (output == nullptr || *output != nullptr || workspace == nullptr ||
       database == nullptr || batch == nullptr ||
       (profile_count != 0 &&
@@ -1563,6 +1566,9 @@ extern "C" int plan7_forward_run_with_workspace(
       set_error(error, error_size, "Forward provenance sealing failed");
       return -1;
     }
+    created->total_milliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - call_begin).count();
     *output = created.release();
     return 0;
   }
@@ -1574,6 +1580,9 @@ extern "C" int plan7_forward_run_with_workspace(
       set_error(error, error_size, "Forward provenance sealing failed");
       return -1;
     }
+    created->total_milliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - call_begin).count();
     *output = created.release();
     return 0;
   }
@@ -1771,6 +1780,7 @@ extern "C" int plan7_forward_run_with_workspace(
           &workspace->growth_count, "cudaMalloc(Forward gather workspace)",
           error, error_size) != 0)
     return -1;
+  const auto input_upload_begin = std::chrono::steady_clock::now();
   CUDA_RUN(cudaMemcpy(buffers.candidate_profiles,
                       host_candidate_profiles.data(),
                       candidate_bytes, cudaMemcpyHostToDevice));
@@ -1784,6 +1794,9 @@ extern "C" int plan7_forward_run_with_workspace(
                       offset_bytes, cudaMemcpyHostToDevice));
   CUDA_RUN(cudaMemcpy(buffers.x_offsets, host_x_offsets.data(),
                       offset_bytes, cudaMemcpyHostToDevice));
+  created->upload_milliseconds +=
+      std::chrono::duration<float, std::milli>(
+          std::chrono::steady_clock::now() - input_upload_begin).count();
   if (buffers.begin_event == nullptr) {
     CUDA_RUN(cudaEventCreate(&buffers.begin_event));
     ++workspace->event_create_count;
@@ -1933,6 +1946,7 @@ extern "C" int plan7_forward_run_with_workspace(
                 "Forward special matrix allocation failed");
       return -1;
     }
+    const auto survivor_upload_begin = std::chrono::steady_clock::now();
     CUDA_RUN(cudaMemcpy(buffers.survivor_candidates,
                         host_survivor_candidates.data(),
                         survivor_count * sizeof(uint32_t),
@@ -1941,6 +1955,9 @@ extern "C" int plan7_forward_run_with_workspace(
                         host_survivor_offsets.data(),
                         (survivor_count + 1) * sizeof(uint64_t),
                         cudaMemcpyHostToDevice));
+    created->upload_milliseconds +=
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - survivor_upload_begin).count();
     CUDA_RUN(cudaEventRecord(buffers.begin_event));
     gather_specials_kernel<<<static_cast<unsigned>(survivor_count),
                              kGatherThreads>>>(
@@ -1976,6 +1993,9 @@ extern "C" int plan7_forward_run_with_workspace(
     set_error(error, error_size, "Forward provenance sealing failed");
     return -1;
   }
+  created->total_milliseconds =
+      std::chrono::duration<float, std::milli>(
+          std::chrono::steady_clock::now() - call_begin).count();
   *output = created.release();
   return 0;
 }
@@ -2066,6 +2086,16 @@ extern "C" const float *plan7_forward_output_specials(
 extern "C" const plan7_forward_statistics *
 plan7_forward_output_statistics(const plan7_forward_output *output) {
   return output == nullptr ? nullptr : &output->statistics;
+}
+
+extern "C" float plan7_forward_output_upload_milliseconds(
+    const plan7_forward_output *output) {
+  return output == nullptr ? 0.0f : output->upload_milliseconds;
+}
+
+extern "C" float plan7_forward_output_total_milliseconds(
+    const plan7_forward_output *output) {
+  return output == nullptr ? 0.0f : output->total_milliseconds;
 }
 
 extern "C" const plan7_forward_provenance *

@@ -758,14 +758,16 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
             compact_budget,
             test_fault,
             tail_fingerprint,
+            _return_stage_timings=True,
         )
 
     @staticmethod
     def seal_continuation_capsule(
-        capsule, selection, batch, pipeline, options, guard=2.0e-4
+        transport, selection, batch, pipeline, options, guard=2.0e-4
     ):
         selection_state = _profile_selection_state(selection)
         sequence_state = _sequence_state(batch)
+        capsule, native_stage_timings = transport
         return _pipeline._seal_profile_selection_continuation_bound(
             selection_state.queries,
             selection_state.profiles,
@@ -783,6 +785,7 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
             memoryview(sequence_state.content_fingerprint),
             pipeline,
             guard,
+            native_stage_timings,
         )
 
     def test_sequence_batch_owns_an_independent_exact_target_copy(self):
@@ -935,6 +938,80 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
         )
         route_statistics = _pipeline._sealed_continuation_statistics_bound(
             _candidate_state(fused).sealed_postfilter
+        )
+        native_timings = route_statistics["native_stage_timings"]
+        self.assertEqual(native_timings["schema_version"], 1)
+        self.assertEqual(native_timings["units"], "milliseconds")
+        self.assertEqual(
+            native_timings["forward"]["profile_staging_scope"],
+            "per-selection database",
+        )
+        self.assertIn(
+            "provenance sealing",
+            native_timings["forward"]["call_total_scope"],
+        )
+        self.assertIn(
+            "download_milliseconds",
+            native_timings["backward_domain"][
+                "post_primary_materialization_native_field"
+            ],
+        )
+        for stage in ("forward", "backward_domain", "domain_rescore"):
+            values = native_timings[stage]
+            if stage == "domain_rescore" and not route_statistics["compact_enabled"]:
+                self.assertIsNone(values)
+                continue
+            self.assertIsNotNone(values)
+            for name, value in values.items():
+                if name.endswith("_ms"):
+                    self.assertIs(type(value), float)
+                    self.assertTrue(math.isfinite(value))
+                    self.assertGreaterEqual(value, 0.0)
+        forward = native_timings["forward"]
+        for name in (
+            "run_upload_ms",
+            "kernel_ms",
+            "classification_ms",
+            "gather_ms",
+            "download_ms",
+            "timed_loop_ms",
+        ):
+            self.assertGreaterEqual(forward["call_total_ms"] + 0.1, forward[name])
+        backward = native_timings["backward_domain"]
+        for name in (
+            "upload_ms",
+            "kernel_ms",
+            "post_primary_materialization_ms",
+        ):
+            self.assertGreaterEqual(backward["total_ms"] + 0.1, backward[name])
+        rescore = native_timings["domain_rescore"]
+        if rescore is not None:
+            for name in ("upload_ms", "kernel_ms", "download_ms"):
+                self.assertGreaterEqual(rescore["total_ms"] + 0.1, rescore[name])
+        resident_memory = fused.resident_memory
+        self.assertIs(type(fused.resident_bytes), int)
+        self.assertEqual(
+            fused.resident_bytes, resident_memory["resident_bytes"]
+        )
+        self.assertEqual(resident_memory["owned_device_bytes"], 0)
+        self.assertEqual(
+            resident_memory["sealed"]["journal_allocation_bytes"],
+            route_statistics["journal_bytes"],
+        )
+        self.assertEqual(
+            resident_memory["sealed"]["owned_host_bytes"],
+            resident_memory["sealed"]["journal_allocation_bytes"]
+            + resident_memory["sealed"]["row_markers_bytes"],
+        )
+        # Returned records are defensive snapshots, not mutable accounting.
+        resident_memory["state_buffers"]["offsets_bytes"] = -1
+        native_timings["forward"]["kernel_ms"] = -1.0
+        self.assertGreaterEqual(fused.resident_bytes, 0)
+        self.assertGreaterEqual(
+            _pipeline._sealed_continuation_statistics_bound(
+                _candidate_state(fused).sealed_postfilter
+            )["native_stage_timings"]["forward"]["kernel_ms"],
+            0.0,
         )
         after = _native._sealed_journal_transport_statistics()
         self.assertEqual(after["build_count"], before["build_count"] + 1)
@@ -1102,7 +1179,7 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                         capsule = self.mint_continuation_capsule(
                             selection, original_batch, options
                         )
-                        tamper_first_journal_sequence_index(capsule)
+                        tamper_first_journal_sequence_index(capsule[0])
                         with self.assertRaisesRegex(
                             ValueError, "Forward identity differs"
                         ):
@@ -1850,7 +1927,7 @@ class CompactDomainProfileSessionTests(ProfileSessionFixture, unittest.TestCase)
                             self.options,
                             pipeline=generation_pipeline,
                         )
-                        tamper_first_compact_forward_score(capsule)
+                        tamper_first_compact_forward_score(capsule[0])
                         with self.assertRaisesRegex(
                             ValueError, "compact hashes differ"
                         ):

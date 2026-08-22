@@ -310,6 +310,7 @@ if _runtime_abi_sha256 != PYHMMER_PRIVATE_ABI_SHA256:
 
 
 cdef size_t HMMER_TARGET_LIMIT = 100000
+SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 
 cdef enum:
     BIAS_CPU_REQUIRED = 0
@@ -531,6 +532,11 @@ cdef class _SealedPostfilterBatch:
     cdef uint64_t _rescore_numeric_fallback_count
     cdef uint64_t _rescore_cap_fallback_count
     cdef uint64_t _rescore_global_cpu_fallback_count
+    cdef object _owned_residue_offsets_bytes
+    cdef object _owned_background_fingerprint_bytes
+    cdef object _excluded_residue_offsets_bytes
+    cdef object _excluded_background_fingerprint_bytes
+    cdef object _native_stage_timings
     cdef _pipeline_tail_snapshot _pipeline_options
     cdef _pipeline_from_filter_scores_f _filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam
@@ -540,6 +546,11 @@ cdef class _SealedPostfilterBatch:
 
     def __cinit__(self):
         self._ready = False
+        self._owned_residue_offsets_bytes = 0
+        self._owned_background_fingerprint_bytes = 0
+        self._excluded_residue_offsets_bytes = 0
+        self._excluded_background_fingerprint_bytes = 0
+        self._native_stage_timings = None
 
     def __repr__(self):
         return "<opaque sealed post-filter batch>"
@@ -2811,10 +2822,11 @@ cdef void _validate_sealed_residue_offsets(
             raise ValueError("target residue prefix differs from target length")
 
 
-cdef object _immutable_owned_view(object value, str expected_format):
-    """Return a one-dimensional native view whose ultimate owner is bytes."""
+cdef tuple _immutable_owned_view_with_copy(object value, str expected_format):
+    """Return a full bytes-backed native view and whether it was copied."""
     cdef object view = memoryview(value)
     cdef object owner
+    cdef object frozen
 
     if view.ndim != 1 or not view.c_contiguous:
         raise ValueError("sealed buffers must be one-dimensional and contiguous")
@@ -2825,9 +2837,195 @@ cdef object _immutable_owned_view(object value, str expected_format):
     owner = view.obj
     while type(owner) is memoryview:
         owner = owner.obj
-    if type(owner) is bytes and view.readonly:
-        return view
-    return memoryview(view.cast("B").tobytes()).cast(expected_format)
+    # A readonly slice still pins the owner's entire allocation. Copy slices
+    # so the charged retained payload is exactly the backing allocation size.
+    if type(owner) is bytes and view.readonly and view.nbytes == len(owner):
+        return view, False
+    frozen = memoryview(view.cast("B").tobytes()).cast(expected_format)
+    return frozen, True
+
+
+cdef object _immutable_owned_view(object value, str expected_format):
+    """Return a one-dimensional full-owner immutable native view."""
+    return _immutable_owned_view_with_copy(value, expected_format)[0]
+
+
+cdef tuple _validate_native_timing_stage(
+    object values,
+    size_t expected_count,
+    str stage,
+):
+    """Freeze one exact native timing tuple after a strict scalar check."""
+    cdef tuple frozen
+    cdef object value
+    cdef size_t index
+
+    if type(values) is not tuple:
+        raise TypeError(f"{stage} native timings must be exactly tuple")
+    frozen = <tuple> values
+    if len(frozen) != expected_count:
+        raise ValueError(
+            f"{stage} native timing field count differs from schema"
+        )
+    for index in range(expected_count):
+        value = frozen[index]
+        if type(value) is not float:
+            raise TypeError(
+                f"{stage} native timing field {index} must be exactly float"
+            )
+        if not isfinite(<double> value) or <double> value < 0.0:
+            raise ValueError(
+                f"{stage} native timing field {index} is not finite nonnegative"
+            )
+    return frozen
+
+
+cdef tuple _validate_native_stage_timings(
+    object values,
+    bint rescore_expected,
+):
+    """Validate the sidecar paired with one consumed continuation journal."""
+    cdef tuple frozen
+    cdef tuple forward
+    cdef tuple backward_domain
+    cdef object domain_rescore
+
+    if type(values) is not tuple:
+        raise TypeError("native stage timings must be exactly tuple")
+    frozen = <tuple> values
+    if len(frozen) != 4:
+        raise ValueError("native stage timing tuple differs from schema")
+    if (
+        type(frozen[0]) is not int
+        or frozen[0] != SEALED_STAGE_TIMING_SCHEMA_VERSION
+    ):
+        raise ValueError("native stage timing schema version differs")
+    forward = _validate_native_timing_stage(frozen[1], 9, "Forward")
+    backward_domain = _validate_native_timing_stage(
+        frozen[2], 4, "Backward/domain"
+    )
+    domain_rescore = frozen[3]
+    if rescore_expected:
+        domain_rescore = _validate_native_timing_stage(
+            domain_rescore, 4, "domain rescore"
+        )
+    elif domain_rescore is not None:
+        raise ValueError("domain-rescore timings exist without compact output")
+    return (
+        SEALED_STAGE_TIMING_SCHEMA_VERSION,
+        forward,
+        backward_domain,
+        domain_rescore,
+    )
+
+
+cdef dict _native_stage_timing_evidence(tuple values):
+    """Copy a validated immutable timing tuple into JSON-safe evidence."""
+    cdef tuple forward = <tuple> values[1]
+    cdef tuple backward_domain = <tuple> values[2]
+    cdef object domain_rescore = values[3]
+    cdef object rescore_evidence = None
+
+    if domain_rescore is not None:
+        rescore_evidence = {
+            "kernel_ms": domain_rescore[0],
+            "upload_ms": domain_rescore[1],
+            "download_ms": domain_rescore[2],
+            "total_ms": domain_rescore[3],
+            "upload_scope": (
+                "device allocations plus host-to-device work, offset, result, "
+                "and null2 buffers; queued trace and trace-count memset "
+                "completion is not "
+                "isolated by this host timer"
+            ),
+            "kernel_scope": "three isolated-domain CUDA kernels",
+            "download_scope": (
+                "four synchronous device-to-host result, null2, trace-count, "
+                "and trace copies"
+            ),
+            "total_scope": (
+                "successful domain_rescore_run_impl entry through host "
+                "validation, trace compaction, and statistics; excludes the "
+                "later provenance seal"
+            ),
+        }
+    return {
+        "schema_version": values[0],
+        "units": "milliseconds",
+        "source": "native CUDA/steady-clock statistics",
+        "forward": {
+            "profile_staging_scope": "per-selection database",
+            "profile_pack_scope": (
+                "host descriptor and identity snapshot allocation and "
+                "validation; ProfileSelection emissions and transitions were "
+                "already packed"
+            ),
+            "profile_upload_scope": (
+                "database device allocations, descriptor/emission/transition "
+                "host-to-device copies, and device synchronization"
+            ),
+            "run_upload_scope": (
+                "synchronous initial candidate, length-transition, and offset "
+                "host-to-device copies plus survivor index/offset copies"
+            ),
+            "kernel_scope": "main Forward CUDA kernels only",
+            "classification_scope": "per-tile CPU result classification",
+            "gather_scope": "surviving special-row gather CUDA kernels only",
+            "download_scope": (
+                "synchronous Forward result and gathered-special "
+                "device-to-host copies"
+            ),
+            "timed_loop_scope": (
+                "tile loop after host candidate preparation, workspace growth, "
+                "initial upload, event setup, and host result allocation; "
+                "includes main kernels, result download, CPU classification, "
+                "survivor upload, gather kernels, and gathered download; ends "
+                "before provenance sealing"
+            ),
+            "call_total_scope": (
+                "successful plan7_forward_run_with_workspace entry through "
+                "provenance sealing; excludes per-selection database staging"
+            ),
+            "profile_pack_ms": forward[0],
+            "profile_upload_ms": forward[1],
+            "run_upload_ms": forward[2],
+            "kernel_ms": forward[3],
+            "classification_ms": forward[4],
+            "gather_ms": forward[5],
+            "download_ms": forward[6],
+            "timed_loop_ms": forward[7],
+            "call_total_ms": forward[8],
+        },
+        "backward_domain": {
+            "kernel_ms": backward_domain[0],
+            "upload_ms": backward_domain[1],
+            "post_primary_materialization_ms": backward_domain[2],
+            "total_ms": backward_domain[3],
+            "upload_scope": "device allocations plus initial host-to-device copies",
+            "kernel_scope": "primary backward_domain_kernel only",
+            "post_primary_materialization_scope": (
+                "native download_milliseconds field: initial result "
+                "device-to-host copy, CPU routing/output sizing and allocation, "
+                "region-offset device allocation/upload, simple-region gather "
+                "kernel, region/posterior downloads, and output CSR remap"
+            ),
+            "post_primary_materialization_native_field": (
+                "plan7_backward_domain_statistics.download_milliseconds"
+            ),
+            "total_scope": (
+                "successful backward_domain_run_impl entry through route "
+                "statistics aggregation; excludes the later provenance seal"
+            ),
+        },
+        "domain_rescore": rescore_evidence,
+    }
+
+
+def _validate_native_stage_timings_bound(values, bint rescore_expected):
+    """Host-test boundary for the exact sealed timing sidecar schema."""
+    return _native_stage_timing_evidence(
+        _validate_native_stage_timings(values, rescore_expected)
+    )
 
 
 cdef bint _journal_expected_segment(
@@ -3787,6 +3985,8 @@ def _seal_postfilter_batch_bound(
     selection_identity=None,
     selection_identity_tokens=None,
     domain_pipeline=None,
+    _residue_offsets_shared=False,
+    _background_fingerprint_shared=False,
 ):
     """Seal one already-owned post-filter batch after one complete validation.
 
@@ -3805,12 +4005,16 @@ def _seal_postfilter_batch_bound(
     cdef object postfilter_offset_owner = _immutable_owned_view(
         postfilter_offsets, "Q"
     )
-    cdef object residue_offset_owner = _immutable_owned_view(
+    cdef tuple residue_owner_record = _immutable_owned_view_with_copy(
         residue_offsets, "Q"
     )
-    cdef object background_owner = _immutable_owned_view(
+    cdef tuple background_owner_record = _immutable_owned_view_with_copy(
         background_fingerprint, "B"
     )
+    cdef object residue_offset_owner = residue_owner_record[0]
+    cdef object background_owner = background_owner_record[0]
+    cdef bint residue_offsets_copied = residue_owner_record[1]
+    cdef bint background_fingerprint_copied = background_owner_record[1]
     cdef const uint8_t[::1] postfilter_view = postfilter_owner
     cdef const uint64_t[::1] postfilter_offset_view = postfilter_offset_owner
     cdef const uint64_t[::1] residue_offset_view = residue_offset_owner
@@ -3887,6 +4091,11 @@ def _seal_postfilter_batch_bound(
     cdef Pipeline journal_pipeline
     cdef object expected_identity_owner
     cdef const uint64_t[::1] expected_identity_view
+
+    if type(_residue_offsets_shared) is not bool:
+        raise TypeError("residue-offset ownership provenance must be bool")
+    if type(_background_fingerprint_shared) is not bool:
+        raise TypeError("background ownership provenance must be bool")
 
     if postfilter_offset_view.shape[0] == 0:
         raise ValueError("post-filter row offsets need an initial zero")
@@ -4084,6 +4293,22 @@ def _seal_postfilter_batch_bound(
     sealed._rescore_numeric_fallback_count = 0
     sealed._rescore_cap_fallback_count = 0
     sealed._rescore_global_cpu_fallback_count = 0
+    if residue_offsets_copied or not _residue_offsets_shared:
+        sealed._owned_residue_offsets_bytes = (
+            int(residue_offset_view.shape[0]) * sizeof(uint64_t)
+        )
+    else:
+        sealed._excluded_residue_offsets_bytes = (
+            int(residue_offset_view.shape[0]) * sizeof(uint64_t)
+        )
+    if background_fingerprint_copied or not _background_fingerprint_shared:
+        sealed._owned_background_fingerprint_bytes = int(
+            background_view.shape[0]
+        )
+    else:
+        sealed._excluded_background_fingerprint_bytes = int(
+            background_view.shape[0]
+        )
     if continuation_journal is not None:
         sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
@@ -4110,6 +4335,7 @@ def _seal_profile_selection_continuation_bound(
     sequence_content_fingerprint,
     Pipeline pipeline,
     double guard_band,
+    native_stage_timings=None,
 ):
     """Consume one package-internal journal into an opaque continuation batch.
 
@@ -4120,12 +4346,16 @@ def _seal_profile_selection_continuation_bound(
     cdef tuple query_tuple = tuple(queries)
     cdef tuple profile_tuple = tuple(optimized_profiles)
     cdef size_t profile_count = len(profile_tuple)
-    cdef object residue_offset_owner = _immutable_owned_view(
+    cdef tuple residue_owner_record = _immutable_owned_view_with_copy(
         residue_offsets, "Q"
     )
-    cdef object background_owner = _immutable_owned_view(
+    cdef tuple background_owner_record = _immutable_owned_view_with_copy(
         background_fingerprint, "B"
     )
+    cdef object residue_offset_owner = residue_owner_record[0]
+    cdef object background_owner = background_owner_record[0]
+    cdef bint residue_offsets_copied = residue_owner_record[1]
+    cdef bint background_fingerprint_copied = background_owner_record[1]
     cdef object identity_owner = _immutable_owned_view(
         selection_identity_tokens, "Q"
     )
@@ -4192,6 +4422,7 @@ def _seal_profile_selection_continuation_bound(
     cdef uint64_t rescore_numeric_fallback_count = 0
     cdef uint64_t rescore_cap_fallback_count = 0
     cdef uint64_t rescore_global_cpu_fallback_count = 0
+    cdef object validated_stage_timings = None
 
     if type(pipeline) is not _pyhmmer.plan7.Pipeline:
         raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
@@ -4326,6 +4557,11 @@ def _seal_profile_selection_continuation_bound(
     rescore_numeric_fallback_count = journal_values[22]
     rescore_cap_fallback_count = journal_values[23]
     rescore_global_cpu_fallback_count = journal_values[24]
+    if native_stage_timings is not None:
+        validated_stage_timings = _validate_native_stage_timings(
+            native_stage_timings,
+            generation_compact_domains,
+        )
     expected_guard.value = <float> guard_band
     if journal_guard_bits != expected_guard.bits:
         raise ValueError("continuation journal guard band differs")
@@ -4425,6 +4661,23 @@ def _seal_profile_selection_continuation_bound(
     sealed._rescore_global_cpu_fallback_count = (
         rescore_global_cpu_fallback_count
     )
+    if residue_offsets_copied:
+        sealed._owned_residue_offsets_bytes = (
+            int(residue_offset_view.shape[0]) * sizeof(uint64_t)
+        )
+    else:
+        sealed._excluded_residue_offsets_bytes = (
+            int(residue_offset_view.shape[0]) * sizeof(uint64_t)
+        )
+    if background_fingerprint_copied:
+        sealed._owned_background_fingerprint_bytes = int(
+            background_view.shape[0]
+        )
+    else:
+        sealed._excluded_background_fingerprint_bytes = int(
+            background_view.shape[0]
+        )
+    sealed._native_stage_timings = validated_stage_timings
     sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
     sealed._forward_scores_seam = forward_scores_seam
@@ -4671,7 +4924,7 @@ def _sealed_postfilter_candidate_count_bound(sealed_object, Py_ssize_t row):
 
 
 def _sealed_continuation_statistics_bound(sealed_object):
-    """Return immutable route counts without exposing journal rows."""
+    """Return immutable route counts and native timing evidence."""
     cdef _SealedPostfilterBatch sealed
     cdef plan7_continuation_journal_row journal_row
     cdef size_t row
@@ -4732,6 +4985,149 @@ def _sealed_continuation_statistics_bound(sealed_object):
         "compact_global_cpu_fallback_count": (
             sealed._rescore_global_cpu_fallback_count
         ),
+        "native_stage_timings": (
+            _native_stage_timing_evidence(<tuple> sealed._native_stage_timings)
+            if sealed._native_stage_timings is not None
+            else None
+        ),
+    }
+
+
+def _sealed_resident_memory_bound(sealed_object):
+    """Return exact owned buffer payload bytes for one opaque sealed batch.
+
+    Journal subviews are reported but charged only through their single native
+    allocation. Proven-shared source identity buffers and generation workspaces
+    are excluded; any defensive identity-buffer copy is charged to the seal.
+    """
+    cdef _SealedPostfilterBatch sealed
+    cdef object journal_bytes
+    cdef object journal_subview_bytes
+    cdef object postfilter_bytes = 0
+    cdef object postfilter_offset_bytes = 0
+    cdef object forward_bytes = 0
+    cdef object forward_offset_bytes = 0
+    cdef object special_offset_bytes = 0
+    cdef object special_bytes = 0
+    cdef object row_marker_bytes
+    cdef object journal_sentinel_bytes = 0
+    cdef object owned_host_bytes
+    cdef object owned_residue_offsets_bytes
+    cdef object owned_background_fingerprint_bytes
+    cdef object excluded_residue_offsets_bytes
+    cdef object excluded_background_fingerprint_bytes
+    cdef object shared_identity_bytes
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+
+    # Convert every shape to Python int before arithmetic so even a corrupt or
+    # future expanded layout cannot silently wrap a native aggregate counter.
+    journal_bytes = int(sealed._journal_storage.shape[0])
+    journal_subview_bytes = (
+        int(sealed._postfilter_records.shape[0])
+        + int(sealed._postfilter_offsets.shape[0]) * sizeof(uint64_t)
+        + int(sealed._forward_records.shape[0])
+        + int(sealed._forward_offsets.shape[0]) * sizeof(uint64_t)
+        + int(sealed._special_offsets.shape[0]) * sizeof(uint64_t)
+        + int(sealed._specials.shape[0]) * sizeof(float)
+        + int(sealed._journal_profile_offsets.shape[0]) * sizeof(uint64_t)
+        + int(sealed._journal_rows.shape[0])
+        + int(sealed._journal_region_offsets.shape[0]) * sizeof(uint64_t)
+        + int(sealed._journal_regions.shape[0])
+        + int(sealed._journal_compact_row_offsets.shape[0])
+            * sizeof(uint64_t)
+        + int(sealed._journal_compact_results.shape[0])
+        + int(sealed._journal_compact_trace_offsets.shape[0])
+            * sizeof(uint64_t)
+        + int(sealed._journal_compact_traces.shape[0])
+        + int(sealed._journal_compact_null2.shape[0]) * sizeof(float)
+    )
+    if journal_bytes == 0:
+        postfilter_bytes = int(sealed._postfilter_records.shape[0])
+        postfilter_offset_bytes = (
+            int(sealed._postfilter_offsets.shape[0]) * sizeof(uint64_t)
+        )
+        forward_bytes = int(sealed._forward_records.shape[0])
+        forward_offset_bytes = (
+            int(sealed._forward_offsets.shape[0]) * sizeof(uint64_t)
+        )
+        special_offset_bytes = (
+            int(sealed._special_offsets.shape[0]) * sizeof(uint64_t)
+        )
+        special_bytes = (
+            int(sealed._specials.shape[0]) * sizeof(float)
+        )
+        journal_sentinel_bytes = (
+            int(sealed._journal_profile_offsets.shape[0])
+                * sizeof(uint64_t)
+            + int(sealed._journal_region_offsets.shape[0])
+                * sizeof(uint64_t)
+            + int(sealed._journal_compact_row_offsets.shape[0])
+                * sizeof(uint64_t)
+            + int(sealed._journal_compact_trace_offsets.shape[0])
+                * sizeof(uint64_t)
+        )
+    row_marker_bytes = int(sealed._row_has_external.shape[0])
+    owned_residue_offsets_bytes = sealed._owned_residue_offsets_bytes
+    owned_background_fingerprint_bytes = (
+        sealed._owned_background_fingerprint_bytes
+    )
+    excluded_residue_offsets_bytes = sealed._excluded_residue_offsets_bytes
+    excluded_background_fingerprint_bytes = (
+        sealed._excluded_background_fingerprint_bytes
+    )
+    for value in (
+        owned_residue_offsets_bytes,
+        owned_background_fingerprint_bytes,
+        excluded_residue_offsets_bytes,
+        excluded_background_fingerprint_bytes,
+    ):
+        if type(value) is not int or value < 0:
+            raise RuntimeError("sealed identity-buffer accounting is invalid")
+    owned_host_bytes = (
+        journal_bytes
+        + postfilter_bytes
+        + postfilter_offset_bytes
+        + forward_bytes
+        + forward_offset_bytes
+        + special_offset_bytes
+        + special_bytes
+        + row_marker_bytes
+        + journal_sentinel_bytes
+        + owned_residue_offsets_bytes
+        + owned_background_fingerprint_bytes
+    )
+    shared_identity_bytes = (
+        excluded_residue_offsets_bytes
+        + excluded_background_fingerprint_bytes
+    )
+    return {
+        "schema_version": 1,
+        "owned_host_bytes": owned_host_bytes,
+        "owned_device_bytes": 0,
+        "journal_allocation_bytes": journal_bytes,
+        "journal_subview_bytes": journal_subview_bytes,
+        "postfilter_records_bytes": postfilter_bytes,
+        "postfilter_offsets_bytes": postfilter_offset_bytes,
+        "forward_records_bytes": forward_bytes,
+        "forward_offsets_bytes": forward_offset_bytes,
+        "special_offsets_bytes": special_offset_bytes,
+        "specials_bytes": special_bytes,
+        "row_markers_bytes": row_marker_bytes,
+        "journal_sentinel_bytes": journal_sentinel_bytes,
+        "owned_residue_offsets_bytes": owned_residue_offsets_bytes,
+        "owned_background_fingerprint_bytes": (
+            owned_background_fingerprint_bytes
+        ),
+        "excluded_residue_offsets_bytes": excluded_residue_offsets_bytes,
+        "excluded_background_fingerprint_bytes": (
+            excluded_background_fingerprint_bytes
+        ),
+        "excluded_shared_identity_bytes": shared_identity_bytes,
     }
 
 

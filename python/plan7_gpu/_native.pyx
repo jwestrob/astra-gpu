@@ -49,6 +49,7 @@ cdef carray _FLOAT_ARRAY_TEMPLATE = _array.array("f")
 cdef uint64_t _sealed_journal_build_count = 0
 cdef uint64_t _sealed_journal_payload_bytes = 0
 cdef uint64_t _sealed_journal_duplicate_python_bytes = 0
+SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 
 _DEVICE_CAPACITY_NAMES = (
     "input_residues",
@@ -833,6 +834,14 @@ cdef extern from "forward_cuda.h" nogil:
     )
 
     const plan7_forward_statistics *plan7_forward_output_statistics(
+        const plan7_forward_output *output,
+    )
+
+    float plan7_forward_output_upload_milliseconds(
+        const plan7_forward_output *output,
+    )
+
+    float plan7_forward_output_total_milliseconds(
         const plan7_forward_output *output,
     )
 
@@ -4867,6 +4876,8 @@ cdef class SequenceBatch:
         cdef const float *native_specials
         cdef const plan7_forward_provenance *native_provenance
         cdef const plan7_forward_statistics *native_statistics
+        cdef const plan7_backward_domain_statistics *native_domain_statistics
+        cdef const plan7_domain_rescore_statistics *native_rescore_statistics
         cdef char error[512]
         cdef char destroy_error[512]
         cdef int status = 0
@@ -4888,6 +4899,7 @@ cdef class SequenceBatch:
         cdef dict statistics
         cdef ForwardProvenance provenance
         cdef object journal_capsule = None
+        cdef object sealed_stage_timings = None
         cdef object rescore_payload = None
         cdef object upstream_payload = None
         cdef bytes profile_fingerprint_storage = b""
@@ -5227,6 +5239,56 @@ cdef class SequenceBatch:
                     rt3,
                     guard_band,
                 )
+                native_statistics = plan7_forward_output_statistics(output)
+                native_domain_statistics = (
+                    plan7_backward_domain_output_statistics(domain_output)
+                )
+                native_rescore_statistics = (
+                    plan7_domain_rescore_output_statistics(rescore_output)
+                    if rescore_output != NULL
+                    else NULL
+                )
+                if (
+                    native_statistics == NULL
+                    or native_domain_statistics == NULL
+                    or (
+                        rescore_output != NULL
+                        and native_rescore_statistics == NULL
+                    )
+                ):
+                    raise RuntimeError(
+                        "sealed native stage timing storage is incomplete"
+                    )
+                sealed_stage_timings = (
+                    SEALED_STAGE_TIMING_SCHEMA_VERSION,
+                    (
+                        plan7_forward_database_pack_milliseconds(database),
+                        plan7_forward_database_upload_milliseconds(database),
+                        plan7_forward_output_upload_milliseconds(output),
+                        native_statistics.kernel_milliseconds,
+                        native_statistics.classification_milliseconds,
+                        native_statistics.gather_milliseconds,
+                        native_statistics.download_milliseconds,
+                        native_statistics.total_milliseconds,
+                        plan7_forward_output_total_milliseconds(output),
+                    ),
+                    (
+                        native_domain_statistics.kernel_milliseconds,
+                        native_domain_statistics.upload_milliseconds,
+                        native_domain_statistics.download_milliseconds,
+                        native_domain_statistics.total_milliseconds,
+                    ),
+                    (
+                        (
+                            native_rescore_statistics.kernel_milliseconds,
+                            native_rescore_statistics.upload_milliseconds,
+                            native_rescore_statistics.download_milliseconds,
+                            native_rescore_statistics.total_milliseconds,
+                        )
+                        if native_rescore_statistics != NULL
+                        else None
+                    ),
+                )
             except:
                 if rescore_output != NULL:
                     plan7_domain_rescore_output_destroy(
@@ -5272,7 +5334,7 @@ cdef class SequenceBatch:
                 plan7_forward_output_destroy(&output, NULL, 0)
             if rescore_simple_diagnostic:
                 return journal_capsule, rescore_payload
-            return journal_capsule
+            return journal_capsule, sealed_stage_timings
 
         try:
             result_count = plan7_forward_output_result_count(output)
@@ -5420,6 +5482,7 @@ cdef class SequenceBatch:
         uint64_t rescore_compact_byte_budget=0,
         int _rescore_test_fault=0,
         uint64_t generation_tail_fingerprint=0,
+        bint _return_stage_timings=False,
     ):
         """Run the fused package-internal path and return one opaque seal.
 
@@ -5431,6 +5494,11 @@ cdef class SequenceBatch:
         cdef object result
         cdef carray residue_offsets
         cdef size_t index
+
+        if rescore_simple_diagnostic and _return_stage_timings:
+            raise ValueError(
+                "stage-timing transport cannot be combined with rescore diagnostics"
+            )
 
         postfilter_records, postfilter_offsets = (
             self.postfilter_profile_selection_csr_raw(selection, f1)
@@ -5471,7 +5539,9 @@ cdef class SequenceBatch:
             <float> 0.20,
             guard_band,
         )
-        return result
+        if rescore_simple_diagnostic or _return_stage_timings:
+            return result
+        return result[0]
 
     cdef size_t _run_profile_selection_candidates(
         self,

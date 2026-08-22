@@ -76,6 +76,9 @@ class SealedCandidateTests(unittest.TestCase):
         defaults.update(options)
         return pyhmmer.plan7.Pipeline(SealedCandidateTests.alphabet, **defaults)
 
+    def setUp(self):
+        self.identity_sources = []
+
     @staticmethod
     def table_bytes(hits, format):
         output = io.BytesIO()
@@ -112,7 +115,7 @@ class SealedCandidateTests(unittest.TestCase):
             ),
         )
 
-    def candidates(self, pairs=None):
+    def candidates(self, pairs=None, *, identity_mode="owned"):
         if pairs is None:
             pairs = self.pairs
         pairs = tuple(pairs)
@@ -128,20 +131,49 @@ class SealedCandidateTests(unittest.TestCase):
         for target in self.targets:
             residue_offsets.append(residue_offsets[-1] + len(target))
         background = pyhmmer.plan7.Background(self.alphabet)
+        residue_payload = residue_offsets.tobytes()
+        background_payload = _background_fingerprint(background)
+        ownership_options = {}
+        if identity_mode == "owned":
+            residue_input = memoryview(residue_payload).cast("Q")
+            background_input = background_payload
+        elif identity_mode == "shared":
+            residue_input = memoryview(residue_payload).cast("Q")
+            background_input = memoryview(background_payload)
+            self.identity_sources.extend((residue_payload, background_payload))
+            ownership_options = {
+                "_residue_offsets_shared": True,
+                "_background_fingerprint_shared": True,
+            }
+        elif identity_mode == "shared_slices":
+            residue_owner = bytes(8) + residue_payload + bytes(8)
+            background_owner = b"x" + background_payload + b"y"
+            residue_input = memoryview(residue_owner)[8:-8].cast("Q")
+            background_input = memoryview(background_owner)[1:-1]
+            self.identity_sources.extend(
+                (residue_payload, residue_owner, background_owner)
+            )
+            ownership_options = {
+                "_residue_offsets_shared": True,
+                "_background_fingerprint_shared": True,
+            }
+        else:
+            raise ValueError("unknown identity ownership test mode")
         sealed = _pipeline._seal_postfilter_batch_bound(
             tuple(state.hmm for state in states),
             tuple(state.optimized_profile for state in states),
             self.targets,
             records,
             row_offsets,
-            residue_offsets,
+            residue_input,
             0.02,
-            _background_fingerprint(background),
+            background_input,
+            **ownership_options,
         )
         return _new_candidate_batch(
             pairs,
             self.targets,
-            residue_offsets.tobytes(),
+            residue_payload,
             array("I"),
             row_offsets,
             bytes(len(pairs)),
@@ -163,6 +195,64 @@ class SealedCandidateTests(unittest.TestCase):
         self.assertFalse(hasattr(candidates, "_sealed_postfilter"))
         with self.assertRaises((AttributeError, TypeError)):
             candidates.records = b""
+
+    def test_sealed_resident_memory_counts_backings_not_subviews(self):
+        candidates = self.candidates()
+        memory = candidates.resident_memory
+        sealed = memory["sealed"]
+        self.assertIs(type(candidates.resident_bytes), int)
+        self.assertGreater(candidates.resident_bytes, 0)
+        self.assertEqual(memory["owned_device_bytes"], 0)
+        self.assertEqual(memory["state_buffers"]["postfilter_records_bytes"], 0)
+        self.assertEqual(sealed["journal_allocation_bytes"], 0)
+        charged_sealed_fields = (
+            "journal_allocation_bytes",
+            "postfilter_records_bytes",
+            "postfilter_offsets_bytes",
+            "forward_records_bytes",
+            "forward_offsets_bytes",
+            "special_offsets_bytes",
+            "specials_bytes",
+            "row_markers_bytes",
+            "journal_sentinel_bytes",
+            "owned_residue_offsets_bytes",
+            "owned_background_fingerprint_bytes",
+        )
+        self.assertEqual(
+            sealed["owned_host_bytes"],
+            sum(sealed[field] for field in charged_sealed_fields),
+        )
+        self.assertEqual(
+            memory["resident_bytes"],
+            memory["state_owned_host_bytes"] + sealed["owned_host_bytes"],
+        )
+        self.assertGreater(sealed["journal_subview_bytes"], 0)
+        self.assertGreater(sealed["owned_residue_offsets_bytes"], 0)
+        self.assertGreater(sealed["owned_background_fingerprint_bytes"], 0)
+        self.assertEqual(sealed["excluded_shared_identity_bytes"], 0)
+        original = candidates.resident_bytes
+        sealed["postfilter_records_bytes"] = -1
+        memory["state_buffers"]["offsets_bytes"] = -1
+        self.assertEqual(candidates.resident_bytes, original)
+
+    def test_identity_ownership_distinguishes_full_shared_views_and_slices(self):
+        shared = self.candidates(identity_mode="shared").resident_memory["sealed"]
+        copied = self.candidates(
+            identity_mode="shared_slices"
+        ).resident_memory["sealed"]
+
+        self.assertEqual(shared["owned_residue_offsets_bytes"], 0)
+        self.assertEqual(shared["owned_background_fingerprint_bytes"], 0)
+        self.assertGreater(shared["excluded_residue_offsets_bytes"], 0)
+        self.assertGreater(shared["excluded_background_fingerprint_bytes"], 0)
+        self.assertEqual(
+            shared["excluded_shared_identity_bytes"],
+            shared["excluded_residue_offsets_bytes"]
+            + shared["excluded_background_fingerprint_bytes"],
+        )
+        self.assertGreater(copied["owned_residue_offsets_bytes"], 0)
+        self.assertGreater(copied["owned_background_fingerprint_bytes"], 0)
+        self.assertEqual(copied["excluded_shared_identity_bytes"], 0)
 
     def test_pipeline_lease_and_duplicate_pair_lock_remain_exclusive(self):
         cases = (

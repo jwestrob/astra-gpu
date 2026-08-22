@@ -820,10 +820,16 @@ class _ForwardAugmentation:
         f3_bits: int,
         bias_filter: bool,
     ) -> None:
-        self.records = records
-        self.row_offsets = memoryview(row_offsets).toreadonly()
-        self.special_offsets = memoryview(special_offsets).toreadonly()
-        self.specials = memoryview(specials).toreadonly()
+        self.records = memoryview(records).cast("B").tobytes()
+        self.row_offsets = memoryview(
+            memoryview(row_offsets).cast("B").tobytes()
+        ).cast("Q")
+        self.special_offsets = memoryview(
+            memoryview(special_offsets).cast("B").tobytes()
+        ).cast("Q")
+        self.specials = memoryview(
+            memoryview(specials).cast("B").tobytes()
+        ).cast("f")
         self.f2_bits = f2_bits
         self.f3_bits = f3_bits
         self.bias_filter = bias_filter
@@ -896,6 +902,104 @@ class CandidateBatch:
 
     def __repr__(self) -> str:
         return f"CandidateBatch(rows={len(self)}, F1={self.F1!r})"
+
+    @property
+    def resident_memory(self) -> dict[str, Any]:
+        """Return exact incremental buffer payload bytes owned by this batch.
+
+        This is retained backing-buffer payload accounting, not Python object
+        overhead or process RSS. Each immutable backing allocation is charged
+        once even when several sealed views address it.
+
+        Shared targets, source residue storage, pressed profiles,
+        selection/session storage, and persistent CUDA workspaces are excluded;
+        defensive identity-buffer copies are charged. Native Forward,
+        Backward/domain, and rescore outputs are downloaded and destroyed before
+        construction, so a CandidateBatch owns no device allocation.
+        """
+        state = _candidate_state(self)
+        state_buffers = {
+            "indices_bytes": len(state.indices),
+            "offsets_bytes": len(state.offsets),
+            "all_rows_bytes": len(state.all_rows),
+            "all_targets_bytes": len(state.all_targets),
+            "postfilter_records_bytes": (
+                len(state.postfilter_records)
+                if state.sealed_postfilter is None
+                and state.postfilter_records is not None
+                else 0
+            ),
+            "forward_records_bytes": (
+                len(state.forward.records) if state.forward is not None else 0
+            ),
+            "forward_offsets_bytes": (
+                state.forward.row_offsets.nbytes
+                if state.forward is not None
+                else 0
+            ),
+            "forward_special_offsets_bytes": (
+                state.forward.special_offsets.nbytes
+                if state.forward is not None
+                else 0
+            ),
+            "forward_specials_bytes": (
+                state.forward.specials.nbytes
+                if state.forward is not None
+                else 0
+            ),
+        }
+        state_owned_host_bytes = sum(state_buffers.values())
+        sealed_memory = None
+        sealed_owned_host_bytes = 0
+        sealed_owned_device_bytes = 0
+        if state.sealed_postfilter is not None:
+            from . import _pipeline  # type: ignore[attr-defined]
+
+            sealed_memory = _pipeline._sealed_resident_memory_bound(
+                state.sealed_postfilter
+            )
+            if type(sealed_memory) is not dict:
+                raise RuntimeError("sealed resident-memory record is not a dict")
+            sealed_owned_host_bytes = sealed_memory.get("owned_host_bytes")
+            sealed_owned_device_bytes = sealed_memory.get("owned_device_bytes")
+            for name, value in (
+                ("owned_host_bytes", sealed_owned_host_bytes),
+                ("owned_device_bytes", sealed_owned_device_bytes),
+            ):
+                if type(value) is not int or value < 0:
+                    raise RuntimeError(
+                        f"sealed resident-memory {name} is not exact nonnegative int"
+                    )
+        owned_host_bytes = state_owned_host_bytes + sealed_owned_host_bytes
+        owned_device_bytes = sealed_owned_device_bytes
+        resident_bytes = owned_host_bytes + owned_device_bytes
+        return {
+            "schema_version": 1,
+            "accounting_scope": "owned immutable backing-buffer payload",
+            "resident_bytes": resident_bytes,
+            "owned_host_bytes": owned_host_bytes,
+            "owned_device_bytes": owned_device_bytes,
+            "state_owned_host_bytes": state_owned_host_bytes,
+            "state_buffers": state_buffers,
+            "sealed": sealed_memory,
+            "excluded_shared": (
+                "pressed_profile_pairs",
+                "query_profile_reference_tuples_and_wrappers",
+                "targets",
+                "residue_offsets",
+                "profile_selection_session",
+                "sequence_batch_device_storage",
+                "generation_workspaces",
+            ),
+        }
+
+    @property
+    def resident_bytes(self) -> int:
+        """Exact incremental host plus device buffer bytes owned by this batch."""
+        value = self.resident_memory["resident_bytes"]
+        if type(value) is not int or value < 0:
+            raise RuntimeError("candidate resident bytes are not exact nonnegative int")
+        return value
 
     def _row_index(self, row: int) -> int:
         if isinstance(row, bool):
@@ -1069,16 +1173,22 @@ def _new_candidate_batch(
     sealed_postfilter: Any | None = None,
 ) -> CandidateBatch:
     candidates = object.__new__(CandidateBatch)
+    frozen_all_rows = memoryview(all_rows).cast("B").tobytes()
+    frozen_postfilter_records = (
+        memoryview(postfilter_records).cast("B").tobytes()
+        if sealed_postfilter is None and postfilter_records is not None
+        else None
+    )
     _CANDIDATE_STATES[candidates] = _CandidateState(
         pairs,
         targets,
         residue_offsets,
         indices.tobytes(),
         offsets.tobytes(),
-        all_rows,
+        frozen_all_rows,
         all_targets.tobytes(),
-        postfilter_records,
-        forward,
+        frozen_postfilter_records,
+        forward if sealed_postfilter is None else None,
         sealed_postfilter,
         f1,
     )
@@ -1641,6 +1751,7 @@ class SequenceBatch:
         states = [_pair_state(pair) for pair in selection_state.pairs]
         unique_locks = {id(state.lock): state.lock for state in states}
         capsule: Any | None = None
+        native_stage_timings: Any | None = None
         compact_tail_fingerprint = 0
 
         with _lease_pipeline(pipeline):
@@ -1693,7 +1804,7 @@ class SequenceBatch:
                         raise RuntimeError(
                             "native profile selection fingerprint changed"
                         )
-                    capsule = (
+                    capsule, native_stage_timings = (
                         sequence_state.native._postfilter_forward_domain_selection_sealed(
                             selection_state.native,
                             threshold,
@@ -1714,6 +1825,7 @@ class SequenceBatch:
                             generation_tail_fingerprint=(
                                 compact_tail_fingerprint
                             ),
+                            _return_stage_timings=True,
                         )
                     )
 
@@ -1755,9 +1867,11 @@ class SequenceBatch:
                         memoryview(sequence_state.content_fingerprint),
                         pipeline,
                         guard,
+                        native_stage_timings,
                     )
                 )
                 capsule = None
+                native_stage_timings = None
 
         offsets = array("Q", [0]) * (len(selection_state.pairs) + 1)
         return _new_candidate_batch(
@@ -1921,6 +2035,8 @@ class SequenceBatch:
                     memoryview(sequence_state.residue_offsets).cast("Q"),
                     threshold,
                     memoryview(canonical_background),
+                    _residue_offsets_shared=True,
+                    _background_fingerprint_shared=False,
                     **seal_options,
                 )
 
@@ -2132,6 +2248,8 @@ class SequenceBatch:
                             memoryview(sequence_state.residue_offsets).cast("Q"),
                             threshold,
                             memoryview(canonical_background),
+                            _residue_offsets_shared=True,
+                            _background_fingerprint_shared=False,
                             **seal_options,
                         )
 
