@@ -1892,6 +1892,7 @@ class SequenceBatch:
                             ),
                             _return_stage_timings=True,
                             _return_generation_statistics=telemetry,
+                            _direct_sparse_v3=sparse_journal_v3,
                         )
                     )
                     if telemetry:

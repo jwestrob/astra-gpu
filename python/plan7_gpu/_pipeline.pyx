@@ -114,6 +114,8 @@ from threading import Lock as _Lock
 # importlib loads this DSO under its bare ``_pipeline`` initialization name.
 from plan7_gpu import _telemetry as _telemetry_module
 
+DIRECT_V3_STAGING_SCHEMA_VERSION = 1
+
 cdef extern from "dlfcn.h" nogil:
     ctypedef struct Dl_info:
         const char* dli_fname
@@ -191,6 +193,7 @@ cdef extern from "continuation_journal.h":
     cdef enum plan7_continuation_journal_v3_source_kind:
         PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL
         PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
+        PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT
 
     cdef enum plan7_continuation_journal_v3_source_stage:
         PLAN7_CONTINUATION_V3_BEFORE_F1
@@ -914,6 +917,18 @@ cdef class _SealedPostfilterBatch:
     cdef uint64_t _journal_v3_bytes
     cdef uint64_t _journal_v3_planning_ns
     cdef uint64_t _journal_v3_validation_ns
+    cdef bint _direct_v3_source
+    cdef uint64_t _direct_v3_eliminated_v2_bytes
+    cdef uint64_t _direct_v3_staging_bytes
+    cdef uint64_t _direct_v3_staging_build_ns
+    cdef uint64_t _direct_v3_source_validation_ns
+    cdef uint64_t _source_consumer_validation_ns
+    cdef const uint64_t[::1] _source_identity_tokens
+    cdef const uint8_t[::1] _source_profile_fingerprints
+    cdef const uint8_t[::1] _source_sequence_fingerprint
+    cdef plan7_forward_provenance _source_forward_provenance
+    cdef plan7_backward_domain_provenance _source_backward_provenance
+    cdef plan7_domain_rescore_provenance _source_rescore_provenance
     cdef _pipeline_tail_snapshot _pipeline_options
     cdef _pipeline_from_filter_scores_f _filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam
@@ -936,6 +951,12 @@ cdef class _SealedPostfilterBatch:
         self._journal_v3_bytes = 0
         self._journal_v3_planning_ns = 0
         self._journal_v3_validation_ns = 0
+        self._direct_v3_source = False
+        self._direct_v3_eliminated_v2_bytes = 0
+        self._direct_v3_staging_bytes = 0
+        self._direct_v3_staging_build_ns = 0
+        self._direct_v3_source_validation_ns = 0
+        self._source_consumer_validation_ns = 0
 
     def __dealloc__(self):
         if self._journal_v3 != NULL:
@@ -1001,6 +1022,12 @@ cdef uint64_t _simple_regions_dlclose_calls = 0
 cdef uint64_t _compact_domains_resolutions = 0
 cdef uint64_t _compact_domains_dlopen_calls = 0
 cdef uint64_t _compact_domains_dlclose_calls = 0
+cdef uint64_t _v3_consumer_call_count = 0
+cdef uint64_t _v3_consumer_preflight_ns = 0
+cdef uint64_t _v3_consumer_core_ns = 0
+cdef uint64_t _v3_consumer_statistics_ns = 0
+cdef uint64_t _v3_consumer_certificate_visits = 0
+cdef uint64_t _v3_consumer_exception_visits = 0
 
 _continuation_seam_resolve_lock = _Lock()
 cdef uint8_t _consumed_journal_sentinel = 0
@@ -3936,6 +3963,8 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
     cdef bint has_forward
     cdef bint has_domain
     cdef bint has_source_v2
+    cdef bint has_direct_source
+    cdef bint has_authenticated_source
     cdef bint domain_safe
     cdef bint compact_available
     cdef _double_bits f2_bits
@@ -3961,6 +3990,8 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
         // sizeof(plan7_continuation_journal_row)
     )
     has_source_v2 = sealed._journal_storage.shape[0] != 0
+    has_direct_source = sealed._direct_v3_source
+    has_authenticated_source = has_source_v2 or has_direct_source
     if not sealed._generation_bias_filter:
         raise ValueError(
             "journal v3 semantic planning requires bias-enabled generation"
@@ -4000,7 +4031,7 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
             forward_start = <size_t> sealed._forward_offsets[profile]
             forward_stop = <size_t> sealed._forward_offsets[profile + 1]
             forward_cursor = forward_start
-            if has_source_v2:
+            if has_authenticated_source:
                 domain_start = <size_t> sealed._journal_profile_offsets[profile]
                 domain_stop = <size_t> sealed._journal_profile_offsets[profile + 1]
             else:
@@ -4213,9 +4244,13 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
         )
         journal.compact_null2_stride = PLAN7_DOMAIN_RESCORE_NULL2_COUNT
         journal.source_kind = (
-            PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
-            if has_source_v2
-            else PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL
+            PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT
+            if has_direct_source
+            else (
+                PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
+                if has_source_v2
+                else PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL
+            )
         )
         journal.total_bytes = cursor
         journal.source_seal_token = <uint64_t> id(sealed)
@@ -4247,7 +4282,7 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
         journal.background_fingerprint_bytes = (
             sealed._background_fingerprint.shape[0]
         )
-        _v3_fill_options(&journal.options, sealed, has_source_v2)
+        _v3_fill_options(&journal.options, sealed, has_authenticated_source)
         if has_source_v2:
             journal.session_id = source_v2.session_id
             journal.selection_id = source_v2.selection_id
@@ -4272,6 +4307,30 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
             memcpy(
                 &journal.rescore,
                 &source_v2.rescore,
+                sizeof(plan7_domain_rescore_provenance),
+            )
+        elif has_direct_source:
+            journal.session_id = sealed._telemetry_session_id
+            journal.selection_id = sealed._telemetry_selection_id
+            journal.batch_generation = sealed._telemetry_batch_generation
+            memcpy(
+                journal.sequence_content_fingerprint,
+                &sealed._source_sequence_fingerprint[0],
+                PLAN7_CONTINUATION_JOURNAL_V3_SEQUENCE_FINGERPRINT_SIZE,
+            )
+            memcpy(
+                &journal.forward,
+                &sealed._source_forward_provenance,
+                sizeof(plan7_forward_provenance),
+            )
+            memcpy(
+                &journal.backward,
+                &sealed._source_backward_provenance,
+                sizeof(plan7_backward_domain_provenance),
+            )
+            memcpy(
+                &journal.rescore,
+                &sealed._source_rescore_provenance,
                 sizeof(plan7_domain_rescore_provenance),
             )
         destination = <uint8_t *> journal
@@ -4305,7 +4364,7 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
             forward_start = <size_t> sealed._forward_offsets[profile]
             forward_stop = <size_t> sealed._forward_offsets[profile + 1]
             forward_cursor = forward_start
-            if has_source_v2:
+            if has_authenticated_source:
                 domain_start = <size_t> sealed._journal_profile_offsets[profile]
                 domain_stop = <size_t> sealed._journal_profile_offsets[profile + 1]
             else:
@@ -4653,19 +4712,33 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
             profile_record.source_domain_begin = domain_start
             profile_record.source_domain_count = domain_stop - domain_start
             profile_record.profile_index = <uint32_t> profile
-            if has_source_v2:
-                profile_record.identity_token = source_identity_tokens[profile]
+            if has_authenticated_source:
+                profile_record.identity_token = (
+                    source_identity_tokens[profile]
+                    if has_source_v2
+                    else sealed._source_identity_tokens[profile]
+                )
                 profile_record.flags = (
                     PLAN7_CONTINUATION_V3_PROFILE_HAS_V2_IDENTITY
                     | PLAN7_CONTINUATION_V3_PROFILE_HAS_FINGERPRINT
                 )
-                memcpy(
-                    profile_record.profile_fingerprint,
-                    source_profile_fingerprints
-                    + profile
-                    * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
-                    PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
-                )
+                if has_source_v2:
+                    memcpy(
+                        profile_record.profile_fingerprint,
+                        source_profile_fingerprints
+                        + profile
+                        * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+                        PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+                    )
+                else:
+                    memcpy(
+                        profile_record.profile_fingerprint,
+                        &sealed._source_profile_fingerprints[
+                            profile
+                            * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
+                        ],
+                        PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+                    )
             else:
                 profile_record.identity_token = (
                     <uint64_t> <size_t> optimized_profile._om
@@ -4735,6 +4808,8 @@ cdef plan7_continuation_journal_v3 *_v3_validate_packet(
     cdef uint64_t integrity
     cdef uint64_t compact_null2_expected
     cdef uint64_t trace_offset_index
+    cdef uint64_t expected_source_domain_begin
+    cdef uint64_t expected_source_domain_count
     cdef const uint64_t *source_identity_tokens = NULL
     cdef const uint8_t *source_profile_fingerprints = NULL
     cdef const uint64_t *compact_trace_offsets = NULL
@@ -4782,6 +4857,7 @@ cdef plan7_continuation_journal_v3 *_v3_validate_packet(
         or journal.source_kind not in (
             PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL,
             PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL,
+            PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT,
         )
     ):
         raise ValueError("continuation journal v3 ABI header is invalid")
@@ -4848,15 +4924,18 @@ cdef plan7_continuation_journal_v3 *_v3_validate_packet(
         )
     ):
         raise ValueError("continuation journal v3 background identity differs")
-    if bool(sealed._journal_storage.shape[0]) != (
-        journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
+    if (
+        bool(sealed._journal_storage.shape[0])
+        != (journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL)
+        or sealed._direct_v3_source
+        != (journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT)
     ):
         raise ValueError("continuation journal v3 source provenance differs")
     memset(&expected_options, 0, sizeof(expected_options))
     _v3_fill_options(
         &expected_options,
         sealed,
-        journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL,
+        journal.source_kind != PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL,
     )
     if (
         journal.source_postfilter_count
@@ -4916,6 +4995,37 @@ cdef plan7_continuation_journal_v3 *_v3_validate_packet(
             <const uint8_t *> source_v2
             + source_v2.profile_fingerprints_offset
         )
+    elif journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT:
+        if (
+            journal.session_id != sealed._telemetry_session_id
+            or journal.selection_id != sealed._telemetry_selection_id
+            or journal.batch_generation != sealed._telemetry_batch_generation
+            or journal.source_v2_total_bytes != 0
+            or journal.source_v2_integrity_tag != 0
+            or memcmp(
+                journal.sequence_content_fingerprint,
+                &sealed._source_sequence_fingerprint[0],
+                PLAN7_CONTINUATION_JOURNAL_V3_SEQUENCE_FINGERPRINT_SIZE,
+            ) != 0
+            or memcmp(
+                &journal.forward,
+                &sealed._source_forward_provenance,
+                sizeof(plan7_forward_provenance),
+            ) != 0
+            or memcmp(
+                &journal.backward,
+                &sealed._source_backward_provenance,
+                sizeof(plan7_backward_domain_provenance),
+            ) != 0
+            or memcmp(
+                &journal.rescore,
+                &sealed._source_rescore_provenance,
+                sizeof(plan7_domain_rescore_provenance),
+            ) != 0
+        ):
+            raise ValueError("continuation journal v3 direct source identity differs")
+        source_identity_tokens = &sealed._source_identity_tokens[0]
+        source_profile_fingerprints = &sealed._source_profile_fingerprints[0]
     elif (
         journal.session_id != 0
         or journal.selection_id != 0
@@ -4965,6 +5075,15 @@ cdef plan7_continuation_journal_v3 *_v3_validate_packet(
     exception_end = 0
     for profile in range(<size_t> journal.profile_count):
         profile_record = &profiles[profile]
+        if journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL:
+            expected_source_domain_begin = 0
+            expected_source_domain_count = 0
+        else:
+            expected_source_domain_begin = sealed._journal_profile_offsets[profile]
+            expected_source_domain_count = (
+                sealed._journal_profile_offsets[profile + 1]
+                - sealed._journal_profile_offsets[profile]
+            )
         if (
             profile_record.profile_index != profile
             or profile_record.profile_tag == 0
@@ -4993,13 +5112,15 @@ cdef plan7_continuation_journal_v3 *_v3_validate_packet(
             != sealed._forward_offsets[profile + 1]
             - sealed._forward_offsets[profile]
             or profile_record.source_domain_begin
-            != sealed._journal_profile_offsets[profile]
+            != expected_source_domain_begin
             or profile_record.source_domain_count
-            != sealed._journal_profile_offsets[profile + 1]
-            - sealed._journal_profile_offsets[profile]
+            != expected_source_domain_count
         ):
             raise ValueError("continuation journal v3 profile certificate is invalid")
-        if journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL:
+        if journal.source_kind in (
+            PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL,
+            PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT,
+        ):
             if (
                 profile_record.flags
                 != (
@@ -5372,6 +5493,34 @@ cdef plan7_continuation_journal_v3 *_v3_validate_packet(
     return journal
 
 
+cdef void _v3_drop_direct_staging(_SealedPostfilterBatch sealed) except *:
+    """Release every dense planning view after direct v3 is authenticated."""
+    cdef object empty_bytes = b""
+    cdef object zero_q = memoryview(bytes(sizeof(uint64_t))).cast("Q")
+    cdef object empty_f = memoryview(b"").cast("f")
+    if not sealed._direct_v3_source:
+        return
+    if sealed._journal_v3 == NULL:
+        raise RuntimeError("direct v3 staging cannot be dropped before sealing")
+    sealed._postfilter_records = empty_bytes
+    sealed._postfilter_offsets = zero_q
+    sealed._forward_records = empty_bytes
+    sealed._forward_offsets = zero_q
+    sealed._special_offsets = zero_q
+    sealed._specials = empty_f
+    sealed._row_has_external = empty_bytes
+    sealed._journal_storage = empty_bytes
+    sealed._journal_profile_offsets = zero_q
+    sealed._journal_rows = empty_bytes
+    sealed._journal_region_offsets = zero_q
+    sealed._journal_regions = empty_bytes
+    sealed._journal_compact_row_offsets = zero_q
+    sealed._journal_compact_results = empty_bytes
+    sealed._journal_compact_trace_offsets = zero_q
+    sealed._journal_compact_traces = empty_bytes
+    sealed._journal_compact_null2 = empty_f
+
+
 cdef plan7_continuation_journal_v3 *_v3_validate_capsule(
     object capsule,
     _SealedPostfilterBatch sealed,
@@ -5561,9 +5710,14 @@ cdef dict _v3_debug_summary(
     return {
         "schema_version": journal.version,
         "source_kind": (
-            "v2_journal"
-            if journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
-            else "host_seal"
+            "native_direct"
+            if journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT
+            else (
+                "v2_journal"
+                if journal.source_kind
+                == PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
+                else "host_seal"
+            )
         ),
         "profile_count": journal.profile_count,
         "target_count": journal.target_count,
@@ -6651,6 +6805,369 @@ cdef tuple _consume_validate_continuation_journal(
     )
 
 
+cdef tuple _consume_validate_direct_v3_staging(
+    object source_object,
+    size_t profile_count,
+    size_t target_count,
+    uint64_t expected_session_id,
+    uint64_t expected_selection_id,
+    const uint64_t[::1] expected_identity_tokens,
+    const uint8_t[::1] expected_profile_fingerprints,
+    uint64_t expected_batch_generation,
+    const uint8_t[::1] expected_sequence_fingerprint,
+    double expected_f1,
+    uint64_t expected_f2_bits,
+    uint64_t expected_f3_bits,
+    uint64_t expected_tail_fingerprint,
+):
+    """Validate transient native facts without allocating a dense v2 packet."""
+    cdef tuple source
+    cdef object postfilter_owner
+    cdef object postfilter_offset_owner
+    cdef object forward_owner
+    cdef object forward_offset_owner
+    cdef object special_offset_owner
+    cdef object special_owner
+    cdef object profile_offset_owner
+    cdef object row_owner
+    cdef object region_offset_owner
+    cdef object region_owner
+    cdef object compact_row_offset_owner
+    cdef object compact_result_owner
+    cdef object compact_trace_offset_owner
+    cdef object compact_trace_owner
+    cdef object compact_null2_owner
+    cdef const uint8_t[::1] postfilter_view
+    cdef const uint64_t[::1] postfilter_offset_view
+    cdef const uint8_t[::1] forward_view
+    cdef const uint64_t[::1] forward_offset_view
+    cdef const uint64_t[::1] special_offset_view
+    cdef const float[::1] special_view
+    cdef const uint64_t[::1] profile_offset_view
+    cdef const uint8_t[::1] row_view
+    cdef const uint64_t[::1] region_offset_view
+    cdef const uint8_t[::1] region_view
+    cdef const uint64_t[::1] compact_row_offset_view
+    cdef const uint8_t[::1] compact_result_view
+    cdef const uint64_t[::1] compact_trace_offset_view
+    cdef const uint8_t[::1] compact_trace_view
+    cdef const float[::1] compact_null2_view
+    cdef const uint8_t[::1] identity_view
+    cdef const uint8_t[::1] profile_fingerprint_view
+    cdef const uint8_t[::1] sequence_fingerprint_view
+    cdef const uint8_t[::1] forward_provenance_view
+    cdef const uint8_t[::1] backward_provenance_view
+    cdef const uint8_t[::1] rescore_provenance_view
+    cdef plan7_forward_provenance forward_provenance
+    cdef plan7_backward_domain_provenance backward_provenance
+    cdef plan7_domain_rescore_provenance rescore_provenance
+    cdef _double_bits encoded
+    cdef size_t postfilter_count
+    cdef size_t forward_count
+    cdef size_t domain_count
+    cdef size_t region_count
+    cdef size_t compact_result_count
+    cdef size_t compact_trace_count
+    cdef size_t compact_null2_count
+    cdef size_t index
+
+    if type(source_object) is not tuple:
+        raise TypeError("direct v3 staging must be exactly tuple")
+    source = <tuple> source_object
+    if (
+        len(source) != 42
+        or type(source[0]) is not int
+        or source[0] != DIRECT_V3_STAGING_SCHEMA_VERSION
+    ):
+        raise ValueError("direct v3 staging schema differs")
+    for index in range(1, 16):
+        if type(source[index]) is not bytes:
+            raise TypeError("direct v3 staging payload must be bytes")
+    for index in range(16, 31):
+        if type(source[index]) not in (int, bool):
+            raise TypeError("direct v3 staging metadata must be integral")
+    for index in range(31, 35):
+        if type(source[index]) is not bytes:
+            raise TypeError("direct v3 staging identity must be bytes")
+    if type(source[35]) is not float or type(source[36]) is not float:
+        raise TypeError("direct v3 staging thresholds must be float")
+    if type(source[37]) is not bool:
+        raise TypeError("direct v3 staging bias flag must be bool")
+    for index in range(38, 41):
+        if type(source[index]) is not bytes:
+            raise TypeError("direct v3 staging provenance must be bytes")
+    if type(source[41]) is not int or source[41] < 0:
+        raise TypeError("direct v3 source validation time must be nonnegative int")
+
+    postfilter_owner = _immutable_owned_view(source[1], "B")
+    postfilter_offset_owner = _immutable_owned_view(
+        memoryview(source[2]).cast("Q"), "Q"
+    )
+    forward_owner = _immutable_owned_view(source[3], "B")
+    forward_offset_owner = _immutable_owned_view(
+        memoryview(source[4]).cast("Q"), "Q"
+    )
+    special_offset_owner = _immutable_owned_view(
+        memoryview(source[5]).cast("Q"), "Q"
+    )
+    special_owner = _immutable_owned_view(
+        memoryview(source[6]).cast("f"), "f"
+    )
+    profile_offset_owner = _immutable_owned_view(
+        memoryview(source[7]).cast("Q"), "Q"
+    )
+    row_owner = _immutable_owned_view(source[8], "B")
+    region_offset_owner = _immutable_owned_view(
+        memoryview(source[9]).cast("Q"), "Q"
+    )
+    region_owner = _immutable_owned_view(source[10], "B")
+    compact_row_offset_owner = _immutable_owned_view(
+        memoryview(source[11]).cast("Q"), "Q"
+    )
+    compact_result_owner = _immutable_owned_view(source[12], "B")
+    compact_trace_offset_owner = _immutable_owned_view(
+        memoryview(source[13]).cast("Q"), "Q"
+    )
+    compact_trace_owner = _immutable_owned_view(source[14], "B")
+    compact_null2_owner = _immutable_owned_view(
+        memoryview(source[15]).cast("f"), "f"
+    )
+    postfilter_view = postfilter_owner
+    postfilter_offset_view = postfilter_offset_owner
+    forward_view = forward_owner
+    forward_offset_view = forward_offset_owner
+    special_offset_view = special_offset_owner
+    special_view = special_owner
+    profile_offset_view = profile_offset_owner
+    row_view = row_owner
+    region_offset_view = region_offset_owner
+    region_view = region_owner
+    compact_row_offset_view = compact_row_offset_owner
+    compact_result_view = compact_result_owner
+    compact_trace_offset_view = compact_trace_offset_owner
+    compact_trace_view = compact_trace_owner
+    compact_null2_view = compact_null2_owner
+
+    if (
+        postfilter_view.shape[0] % sizeof(_postfilter_result)
+        or forward_view.shape[0] % sizeof(_forward_result)
+        or row_view.shape[0] % sizeof(plan7_continuation_journal_row)
+        or region_view.shape[0] % sizeof(plan7_simple_region)
+        or compact_result_view.shape[0]
+        % sizeof(plan7_domain_rescore_result)
+        or compact_trace_view.shape[0]
+        % sizeof(plan7_domain_rescore_trace_step)
+    ):
+        raise ValueError("direct v3 staging record storage has trailing bytes")
+    postfilter_count = postfilter_view.shape[0] // sizeof(_postfilter_result)
+    forward_count = forward_view.shape[0] // sizeof(_forward_result)
+    domain_count = row_view.shape[0] // sizeof(plan7_continuation_journal_row)
+    region_count = region_view.shape[0] // sizeof(plan7_simple_region)
+    compact_result_count = (
+        compact_result_view.shape[0] // sizeof(plan7_domain_rescore_result)
+    )
+    compact_trace_count = (
+        compact_trace_view.shape[0]
+        // sizeof(plan7_domain_rescore_trace_step)
+    )
+    compact_null2_count = compact_null2_view.shape[0]
+    if (
+        postfilter_offset_view.shape[0] != profile_count + 1
+        or forward_offset_view.shape[0] != profile_count + 1
+        or special_offset_view.shape[0] != forward_count + 1
+        or profile_offset_view.shape[0] != profile_count + 1
+        or region_offset_view.shape[0] != domain_count + 1
+        or compact_row_offset_view.shape[0] != domain_count + 1
+        or compact_trace_offset_view.shape[0] != compact_result_count + 1
+        or postfilter_offset_view[0] != 0
+        or postfilter_offset_view[profile_count] != postfilter_count
+        or forward_offset_view[0] != 0
+        or forward_offset_view[profile_count] != forward_count
+        or special_offset_view[0] != 0
+        or special_offset_view[forward_count] != special_view.shape[0]
+        or profile_offset_view[0] != 0
+        or profile_offset_view[profile_count] != domain_count
+        or region_offset_view[0] != 0
+        or region_offset_view[domain_count] != region_count
+        or compact_row_offset_view[0] != 0
+        or compact_row_offset_view[domain_count] != compact_result_count
+        or compact_trace_offset_view[0] != 0
+        or compact_trace_offset_view[compact_result_count]
+        != compact_trace_count
+        or compact_result_count > (<size_t> -1)
+        // PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+        or compact_null2_count
+        != compact_result_count * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+    ):
+        raise ValueError("direct v3 staging offsets or counts differ")
+    for index in range(profile_count):
+        if (
+            postfilter_offset_view[index] > postfilter_offset_view[index + 1]
+            or forward_offset_view[index] > forward_offset_view[index + 1]
+            or profile_offset_view[index] > profile_offset_view[index + 1]
+        ):
+            raise ValueError("direct v3 profile offsets are not monotone")
+    for index in range(forward_count):
+        if special_offset_view[index] > special_offset_view[index + 1]:
+            raise ValueError("direct v3 special offsets are not monotone")
+    for index in range(domain_count):
+        if (
+            region_offset_view[index] > region_offset_view[index + 1]
+            or compact_row_offset_view[index]
+            > compact_row_offset_view[index + 1]
+        ):
+            raise ValueError("direct v3 domain offsets are not monotone")
+    for index in range(compact_result_count):
+        if (
+            compact_trace_offset_view[index]
+            > compact_trace_offset_view[index + 1]
+        ):
+            raise ValueError("direct v3 trace offsets are not monotone")
+
+    identity_view = source[31]
+    profile_fingerprint_view = source[32]
+    sequence_fingerprint_view = source[33]
+    if (
+        source[28] != expected_session_id
+        or source[29] != expected_selection_id
+        or source[30] != expected_batch_generation
+        or identity_view.shape[0] != profile_count * sizeof(uint64_t)
+        or (
+            identity_view.shape[0] != 0
+            and memcmp(
+                &identity_view[0],
+                &expected_identity_tokens[0],
+                identity_view.shape[0],
+            ) != 0
+        )
+        or profile_fingerprint_view.shape[0]
+        != expected_profile_fingerprints.shape[0]
+        or (
+            profile_fingerprint_view.shape[0] != 0
+            and memcmp(
+                &profile_fingerprint_view[0],
+                &expected_profile_fingerprints[0],
+                profile_fingerprint_view.shape[0],
+            ) != 0
+        )
+        or sequence_fingerprint_view.shape[0]
+        != expected_sequence_fingerprint.shape[0]
+        or memcmp(
+            &sequence_fingerprint_view[0],
+            &expected_sequence_fingerprint[0],
+            sequence_fingerprint_view.shape[0],
+        ) != 0
+    ):
+        raise ValueError("direct v3 staging identity differs")
+    encoded.value = expected_f1
+    if source[34] != encoded.bits or not source[37]:
+        raise ValueError("direct v3 F1 or bias provenance differs")
+    encoded.value = source[35]
+    if encoded.bits != expected_f2_bits:
+        raise ValueError("direct v3 F2 provenance differs")
+    encoded.value = source[36]
+    if encoded.bits != expected_f3_bits:
+        raise ValueError("direct v3 F3 provenance differs")
+    if (
+        source[17] != expected_tail_fingerprint
+        or bool(source[18]) != bool(expected_tail_fingerprint)
+        or source[25] <= 0
+        or source[26] < 0
+        or source[27] < 0
+    ):
+        raise ValueError("direct v3 staging generation metadata differs")
+
+    forward_provenance_view = source[38]
+    backward_provenance_view = source[39]
+    rescore_provenance_view = source[40]
+    if (
+        forward_provenance_view.shape[0] != sizeof(plan7_forward_provenance)
+        or backward_provenance_view.shape[0]
+        != sizeof(plan7_backward_domain_provenance)
+        or rescore_provenance_view.shape[0]
+        != sizeof(plan7_domain_rescore_provenance)
+    ):
+        raise ValueError("direct v3 staging provenance size differs")
+    memcpy(
+        &forward_provenance,
+        &forward_provenance_view[0],
+        sizeof(plan7_forward_provenance),
+    )
+    memcpy(
+        &backward_provenance,
+        &backward_provenance_view[0],
+        sizeof(plan7_backward_domain_provenance),
+    )
+    memcpy(
+        &rescore_provenance,
+        &rescore_provenance_view[0],
+        sizeof(plan7_domain_rescore_provenance),
+    )
+    if (
+        forward_provenance.batch_generation != expected_batch_generation
+        or forward_provenance.pass_count != domain_count
+        or forward_provenance.special_count != special_view.shape[0]
+        or memcmp(
+            &forward_provenance,
+            &backward_provenance.forward,
+            sizeof(plan7_forward_provenance),
+        ) != 0
+        or backward_provenance.candidate_count != domain_count
+        or backward_provenance.region_count != region_count
+    ):
+        raise ValueError("direct v3 Forward/domain provenance differs")
+    if source[18]:
+        if (
+            memcmp(
+                &rescore_provenance.backward,
+                &backward_provenance,
+                sizeof(plan7_backward_domain_provenance),
+            ) != 0
+            or rescore_provenance.result_count != compact_result_count
+            or rescore_provenance.trace_count != compact_trace_count
+            or rescore_provenance.null2_count != compact_null2_count
+            or source[20] + source[21] != region_count
+        ):
+            raise ValueError("direct v3 rescore provenance differs")
+    elif (
+        compact_result_count != 0
+        or compact_trace_count != 0
+        or compact_null2_count != 0
+        or rescore_provenance.result_count != 0
+        or rescore_provenance.trace_count != 0
+        or rescore_provenance.null2_count != 0
+    ):
+        raise ValueError("disabled direct v3 rescore carries output")
+
+    return (
+        b"",
+        postfilter_owner,
+        postfilter_offset_owner,
+        forward_owner,
+        forward_offset_owner,
+        special_offset_owner,
+        special_owner,
+        profile_offset_owner,
+        row_owner,
+        region_offset_owner,
+        region_owner,
+        compact_row_offset_owner,
+        compact_result_owner,
+        compact_trace_offset_owner,
+        compact_trace_owner,
+        compact_null2_owner,
+        source[16],
+        source[17],
+        source[18],
+        source[19],
+        source[20],
+        source[21],
+        source[22],
+        source[23],
+        source[24],
+    )
+
+
 def _seal_postfilter_batch_bound(
     queries,
     optimized_profiles,
@@ -7064,6 +7581,8 @@ def _seal_profile_selection_continuation_bound(
         sequence_fingerprint_owner
     )
     cdef object journal_values
+    cdef tuple direct_source
+    cdef bint direct_v3_source = False
     cdef const uint8_t[::1] journal_storage_view
     cdef const uint8_t[::1] postfilter_view
     cdef const uint64_t[::1] postfilter_offset_view
@@ -7117,7 +7636,12 @@ def _seal_profile_selection_continuation_bound(
     cdef object profile_statistics
     cdef object planning_start_ns
     cdef object validation_start_ns
+    cdef object source_validation_start_ns
+    cdef object source_validation_elapsed_ns
     cdef plan7_continuation_journal_v3 *journal_v3 = NULL
+    cdef const uint8_t[::1] direct_forward_provenance_view
+    cdef const uint8_t[::1] direct_backward_provenance_view
+    cdef const uint8_t[::1] direct_rescore_provenance_view
 
     if type(pipeline) is not _pyhmmer.plan7.Pipeline:
         raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
@@ -7211,21 +7735,49 @@ def _seal_profile_selection_continuation_bound(
             sequences,
         )
 
-    journal_values = _consume_validate_continuation_journal(
-        continuation_journal,
-        profile_tuple,
-        sequences,
-        expected_session_id,
-        expected_selection_id,
-        identity_view,
-        profile_fingerprint_view,
-        batch_generation,
-        sequence_fingerprint_view,
-        f1,
-        pipeline_options.f2_bits,
-        pipeline_options.f3_bits,
-        True,
-        expected_tail_fingerprint,
+    direct_v3_source = (
+        sparse_journal_v3
+        and type(continuation_journal) is tuple
+        and len(continuation_journal) != 0
+        and continuation_journal[0] == DIRECT_V3_STAGING_SCHEMA_VERSION
+    )
+    source_validation_start_ns = _time.perf_counter_ns()
+    if direct_v3_source:
+        direct_source = <tuple> continuation_journal
+        journal_values = _consume_validate_direct_v3_staging(
+            direct_source,
+            profile_count,
+            len(sequences),
+            expected_session_id,
+            expected_selection_id,
+            identity_view,
+            profile_fingerprint_view,
+            batch_generation,
+            sequence_fingerprint_view,
+            f1,
+            pipeline_options.f2_bits,
+            pipeline_options.f3_bits,
+            expected_tail_fingerprint,
+        )
+    else:
+        journal_values = _consume_validate_continuation_journal(
+            continuation_journal,
+            profile_tuple,
+            sequences,
+            expected_session_id,
+            expected_selection_id,
+            identity_view,
+            profile_fingerprint_view,
+            batch_generation,
+            sequence_fingerprint_view,
+            f1,
+            pipeline_options.f2_bits,
+            pipeline_options.f3_bits,
+            True,
+            expected_tail_fingerprint,
+        )
+    source_validation_elapsed_ns = (
+        _time.perf_counter_ns() - source_validation_start_ns
     )
     journal_storage_view = journal_values[0]
     postfilter_view = journal_values[1]
@@ -7264,7 +7816,9 @@ def _seal_profile_selection_continuation_bound(
             )
         )
         if generation_statistics["journal"]["allocation_bytes"] != (
-            journal_storage_view.shape[0]
+            direct_source[25]
+            if direct_v3_source
+            else journal_storage_view.shape[0]
         ):
             raise ValueError(
                 "generation telemetry journal allocation differs"
@@ -7397,6 +7951,34 @@ def _seal_profile_selection_continuation_bound(
     )
     sealed._journal_compact_traces = journal_compact_trace_view
     sealed._journal_compact_null2 = journal_compact_null2_view
+    sealed._source_identity_tokens = identity_view
+    sealed._source_profile_fingerprints = profile_fingerprint_view
+    sealed._source_sequence_fingerprint = sequence_fingerprint_view
+    sealed._direct_v3_source = direct_v3_source
+    sealed._source_consumer_validation_ns = source_validation_elapsed_ns
+    if direct_v3_source:
+        sealed._direct_v3_eliminated_v2_bytes = direct_source[25]
+        sealed._direct_v3_staging_build_ns = direct_source[26]
+        sealed._direct_v3_staging_bytes = direct_source[27]
+        sealed._direct_v3_source_validation_ns = direct_source[41]
+        direct_forward_provenance_view = direct_source[38]
+        direct_backward_provenance_view = direct_source[39]
+        direct_rescore_provenance_view = direct_source[40]
+        memcpy(
+            &sealed._source_forward_provenance,
+            &direct_forward_provenance_view[0],
+            sizeof(plan7_forward_provenance),
+        )
+        memcpy(
+            &sealed._source_backward_provenance,
+            &direct_backward_provenance_view[0],
+            sizeof(plan7_backward_domain_provenance),
+        )
+        memcpy(
+            &sealed._source_rescore_provenance,
+            &direct_rescore_provenance_view[0],
+            sizeof(plan7_domain_rescore_provenance),
+        )
     sealed._f1 = f1
     sealed._generation_f2_bits = pipeline_options.f2_bits
     sealed._generation_f3_bits = pipeline_options.f3_bits
@@ -7429,7 +8011,7 @@ def _seal_profile_selection_continuation_bound(
         )
     sealed._native_stage_timings = validated_stage_timings
     sealed._generation_statistics = generation_statistics
-    if generation_statistics is not None:
+    if generation_statistics is not None or direct_v3_source:
         sealed._telemetry_session_id = expected_session_id
         sealed._telemetry_selection_id = expected_selection_id
         sealed._telemetry_batch_generation = batch_generation
@@ -7467,6 +8049,8 @@ def _seal_profile_selection_continuation_bound(
             journal_v3 = NULL
         finally:
             free(journal_v3)
+    if direct_v3_source:
+        _v3_drop_direct_staging(sealed)
     return sealed
 
 
@@ -8222,6 +8806,10 @@ def _search_hmm_sealed_postfilter_bound(
     sealed = <_SealedPostfilterBatch> sealed_object
     if not sealed._ready:
         raise TypeError("sealed batch was not created by the provenance adapter")
+    if sealed._direct_v3_source:
+        raise TypeError(
+            "direct sparse-v3 batches cannot enter the dense replay consumer"
+        )
     if type(pipeline) is not _pyhmmer.plan7.Pipeline:
         raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
     if row < 0 or row >= len(sealed._queries):
@@ -8433,6 +9021,8 @@ def _search_hmm_sealed_postfilter_bound(
 def _sealed_postfilter_candidate_count_bound(sealed_object, Py_ssize_t row):
     """Return one opaque batch's authentic post-filter row count."""
     cdef _SealedPostfilterBatch sealed
+    cdef const uint8_t *base
+    cdef const plan7_continuation_journal_v3_profile *profiles
     if type(sealed_object) is not _SealedPostfilterBatch:
         raise TypeError("sealed batch has the wrong extension type")
     sealed = <_SealedPostfilterBatch> sealed_object
@@ -8440,6 +9030,14 @@ def _sealed_postfilter_candidate_count_bound(sealed_object, Py_ssize_t row):
         raise TypeError("sealed batch was not created by the provenance adapter")
     if row < 0 or row >= len(sealed._queries):
         raise IndexError("sealed post-filter row out of range")
+    if sealed._direct_v3_source:
+        if sealed._journal_v3 == NULL:
+            raise RuntimeError("direct v3 packet is unavailable")
+        base = <const uint8_t *> sealed._journal_v3
+        profiles = <const plan7_continuation_journal_v3_profile *> (
+            base + sealed._journal_v3.profiles_offset
+        )
+        return profiles[row].source_postfilter_count
     return sealed._postfilter_offsets[row + 1] - sealed._postfilter_offsets[row]
 
 
@@ -8454,6 +9052,18 @@ def _sealed_sparse_journal_v3_enabled_bound(sealed_object):
     return sealed._journal_v3 != NULL
 
 
+def _sparse_journal_v3_consumer_statistics_bound():
+    """Return cumulative successful sparse-consumer timing and visit counts."""
+    return {
+        "call_count": _v3_consumer_call_count,
+        "preflight_ns": _v3_consumer_preflight_ns,
+        "core_ns": _v3_consumer_core_ns,
+        "statistics_ns": _v3_consumer_statistics_ns,
+        "certificate_visits": _v3_consumer_certificate_visits,
+        "exception_visits": _v3_consumer_exception_visits,
+    }
+
+
 def _sealed_continuation_statistics_bound(sealed_object):
     """Return immutable route counts and native timing evidence."""
     cdef _SealedPostfilterBatch sealed
@@ -8463,43 +9073,101 @@ def _sealed_continuation_statistics_bound(sealed_object):
     cdef size_t cpu_required = 0
     cdef size_t no_regions = 0
     cdef size_t simple = 0
+    cdef const uint8_t *base
+    cdef const plan7_continuation_journal_v3_certificate *certificates
+    cdef const plan7_continuation_journal_v3_exception *exceptions
+    cdef const plan7_continuation_journal_v3_certificate *certificate
+    cdef const plan7_continuation_journal_v3_exception *exception
+    cdef size_t certificate_index
+    cdef size_t exception_index
     if type(sealed_object) is not _SealedPostfilterBatch:
         raise TypeError("sealed batch has the wrong extension type")
     sealed = <_SealedPostfilterBatch> sealed_object
-    if not sealed._ready or sealed._journal_storage.shape[0] == 0:
+    if not sealed._ready or (
+        sealed._journal_storage.shape[0] == 0
+        and not sealed._direct_v3_source
+    ):
         raise TypeError("sealed batch has no continuation journal")
-    row_count = (
-        <size_t> sealed._journal_rows.shape[0]
-        // sizeof(plan7_continuation_journal_row)
-    )
-    for row in range(row_count):
-        memcpy(
-            &journal_row,
-            &sealed._journal_rows[
-                row * sizeof(plan7_continuation_journal_row)
-            ],
-            sizeof(plan7_continuation_journal_row),
+    if sealed._direct_v3_source:
+        if sealed._journal_v3 == NULL:
+            raise RuntimeError("direct v3 packet is unavailable")
+        base = <const uint8_t *> sealed._journal_v3
+        certificates = <const plan7_continuation_journal_v3_certificate *> (
+            base + sealed._journal_v3.certificates_offset
         )
-        if (
-            journal_row.domain_status != DOMAIN_OK
-            or journal_row.domain_route == DOMAIN_CPU_REQUIRED
-            or journal_row.has_own_scales
-            or journal_row.uncertain_count != 0
-            or journal_row.multidomain_count != 0
+        exceptions = <const plan7_continuation_journal_v3_exception *> (
+            base + sealed._journal_v3.exceptions_offset
+        )
+        row_count = <size_t> sealed._journal_v3.source_domain_count
+        for certificate_index in range(
+            <size_t> sealed._journal_v3.certificate_count
         ):
-            cpu_required += 1
-        elif journal_row.domain_route == DOMAIN_NO_REGIONS:
-            no_regions += 1
-        elif journal_row.domain_route == DOMAIN_SIMPLE:
-            simple += 1
-        else:
-            cpu_required += 1
+            certificate = &certificates[certificate_index]
+            no_regions += <size_t> certificate.no_region_count
+        for exception_index in range(
+            <size_t> sealed._journal_v3.exception_count
+        ):
+            exception = &exceptions[exception_index]
+            if not (
+                exception.payload_flags & PLAN7_CONTINUATION_V3_HAS_DOMAIN
+            ):
+                continue
+            memcpy(
+                &journal_row,
+                exception.domain_record,
+                sizeof(plan7_continuation_journal_row),
+            )
+            if (
+                journal_row.domain_status != DOMAIN_OK
+                or journal_row.domain_route == DOMAIN_CPU_REQUIRED
+                or journal_row.has_own_scales
+                or journal_row.uncertain_count != 0
+                or journal_row.multidomain_count != 0
+            ):
+                cpu_required += 1
+            elif journal_row.domain_route == DOMAIN_NO_REGIONS:
+                no_regions += 1
+            elif journal_row.domain_route == DOMAIN_SIMPLE:
+                simple += 1
+            else:
+                cpu_required += 1
+        if cpu_required + no_regions + simple != row_count:
+            raise RuntimeError("direct v3 domain census is incomplete")
+    else:
+        row_count = (
+            <size_t> sealed._journal_rows.shape[0]
+            // sizeof(plan7_continuation_journal_row)
+        )
+        for row in range(row_count):
+            memcpy(
+                &journal_row,
+                &sealed._journal_rows[
+                    row * sizeof(plan7_continuation_journal_row)
+                ],
+                sizeof(plan7_continuation_journal_row),
+            )
+            if (
+                journal_row.domain_status != DOMAIN_OK
+                or journal_row.domain_route == DOMAIN_CPU_REQUIRED
+                or journal_row.has_own_scales
+                or journal_row.uncertain_count != 0
+                or journal_row.multidomain_count != 0
+            ):
+                cpu_required += 1
+            elif journal_row.domain_route == DOMAIN_NO_REGIONS:
+                no_regions += 1
+            elif journal_row.domain_route == DOMAIN_SIMPLE:
+                simple += 1
+            else:
+                cpu_required += 1
     return {
         "row_count": row_count,
         "cpu_required_count": cpu_required,
         "no_region_count": no_regions,
         "simple_count": simple,
         "journal_bytes": sealed._journal_storage.shape[0],
+        "dense_v2_retained_bytes": sealed._journal_storage.shape[0],
+        "eliminated_v2_bytes": sealed._direct_v3_eliminated_v2_bytes,
         "guard_band_bits": sealed._journal_guard_bits,
         "compact_enabled": sealed._compact_domains_seam != NULL,
         "compact_simple_row_count": sealed._rescore_simple_row_count,
@@ -8526,6 +9194,28 @@ def _sealed_continuation_statistics_bound(sealed_object):
             "packet_bytes": sealed._journal_v3_bytes,
             "planning_ns": sealed._journal_v3_planning_ns,
             "validation_ns": sealed._journal_v3_validation_ns,
+            "source_kind": (
+                "native_direct" if sealed._direct_v3_source else "dense_v2"
+            ),
+            "direct_staging_build_ns": sealed._direct_v3_staging_build_ns,
+            "direct_source_validation_ns": (
+                sealed._direct_v3_source_validation_ns
+            ),
+            "source_consumer_validation_ns": (
+                sealed._source_consumer_validation_ns
+            ),
+            "direct_staging_bytes": sealed._direct_v3_staging_bytes,
+            "eliminated_v2_bytes": (
+                sealed._direct_v3_eliminated_v2_bytes
+            ),
+            "certificate_count": (
+                sealed._journal_v3.certificate_count
+                if sealed._journal_v3 != NULL else 0
+            ),
+            "exception_count": (
+                sealed._journal_v3.exception_count
+                if sealed._journal_v3 != NULL else 0
+            ),
             "planning_scope": "once per sealed batch",
             "validation_scope": "once per sealed batch",
             "consumer_timing": (
@@ -8575,6 +9265,7 @@ def _sealed_resident_memory_bound(sealed_object):
     cdef object excluded_background_fingerprint_bytes
     cdef object shared_identity_bytes
     cdef object sparse_journal_v3_bytes
+    cdef object dense_replay_retained_bytes
     cdef dict evidence
 
     if type(sealed_object) is not _SealedPostfilterBatch:
@@ -8666,6 +9357,17 @@ def _sealed_resident_memory_bound(sealed_object):
         + excluded_background_fingerprint_bytes
     )
     sparse_journal_v3_bytes = int(sealed._journal_v3_bytes)
+    dense_replay_retained_bytes = (
+        int(sealed._journal_storage.shape[0])
+        + int(sealed._postfilter_records.shape[0])
+        + int(sealed._forward_records.shape[0])
+        + int(sealed._specials.shape[0]) * sizeof(float)
+        + int(sealed._journal_rows.shape[0])
+        + int(sealed._journal_regions.shape[0])
+        + int(sealed._journal_compact_results.shape[0])
+        + int(sealed._journal_compact_traces.shape[0])
+        + int(sealed._journal_compact_null2.shape[0]) * sizeof(float)
+    )
     evidence = {
         "schema_version": 1,
         "owned_host_bytes": owned_host_bytes,
@@ -8689,6 +9391,10 @@ def _sealed_resident_memory_bound(sealed_object):
             excluded_background_fingerprint_bytes
         ),
         "excluded_shared_identity_bytes": shared_identity_bytes,
+        "direct_v3_source": bool(sealed._direct_v3_source),
+        "dense_replay_retained_bytes": dense_replay_retained_bytes,
+        "direct_v3_staging_retained_bytes": 0,
+        "eliminated_v2_bytes": sealed._direct_v3_eliminated_v2_bytes,
     }
     if sparse_journal_v3_bytes:
         evidence["sparse_journal_v3_bytes"] = sparse_journal_v3_bytes
@@ -10575,8 +11281,13 @@ cdef void _v3_preflight_live_pipeline_range(
         raise AlphabetMismatch(pipeline.alphabet, sealed._sequences.alphabet)
     if not journal.options.complete:
         raise ValueError("journal v3 execution requires complete options")
-    if journal.source_kind != PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL:
-        raise ValueError("journal v3 execution requires a validated v2 source")
+    if journal.source_kind not in (
+        PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL,
+        PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT,
+    ):
+        raise ValueError(
+            "journal v3 execution requires an authenticated native source"
+        )
     if not _pipeline_tail_options_match(&sealed._pipeline_options, pipeline):
         raise ValueError("journal v3 pipeline options differ from generation")
     if not _sealed_background_matches(sealed, pipeline):
@@ -10779,6 +11490,11 @@ cdef void _v3_complete_row_route_statistics(
             certificate.bias_reject_count + certificate.f2_reject_count
         )
         statistics.source_forward_count += certificate.f3_reject_count
+        statistics.journal_match_count += certificate.no_region_count
+        statistics.journal_no_region_count += certificate.no_region_count
+        statistics.source_journal_eligible_count += (
+            certificate.no_region_count
+        )
 
     for exception_index in range(profile.exception_count):
         exception = &exceptions[profile.exception_begin + exception_index]
@@ -10788,16 +11504,13 @@ cdef void _v3_complete_row_route_statistics(
             statistics.source_filter_count += 1
         elif exception.route == PLAN7_CONTINUATION_V3_FORWARD_SCORES:
             statistics.source_forward_count += 1
-
-    for domain_index in range(
-        profile.source_domain_begin,
-        profile.source_domain_begin + profile.source_domain_count,
-    ):
+        if not (
+            exception.payload_flags & PLAN7_CONTINUATION_V3_HAS_DOMAIN
+        ):
+            continue
         memcpy(
             &domain,
-            &sealed._journal_rows[
-                domain_index * sizeof(plan7_continuation_journal_row)
-            ],
+            exception.domain_record,
             sizeof(plan7_continuation_journal_row),
         )
         statistics.journal_match_count += 1
@@ -10818,12 +11531,10 @@ cdef void _v3_complete_row_route_statistics(
             statistics.journal_cpu_required_count += 1
             continue
         statistics.source_journal_eligible_count += 1
-        compact_begin = sealed._journal_compact_row_offsets[domain_index]
-        compact_end = sealed._journal_compact_row_offsets[domain_index + 1]
         if (
             domain.domain_route == DOMAIN_SIMPLE
             and domain.compact_route == PLAN7_CONTINUATION_COMPACT_DEVICE
-            and compact_begin < compact_end
+            and domain.compact_result_count != 0
             and compact_generation_matches
         ):
             continue
@@ -10833,10 +11544,12 @@ cdef void _v3_complete_row_route_statistics(
             or domain.compact_route != PLAN7_CONTINUATION_COMPACT_DEVICE
         ):
             statistics.decision_compact_route_not_device += 1
-        if compact_begin == compact_end:
+        if domain.compact_result_count == 0:
             statistics.decision_compact_empty += 1
         if not compact_generation_matches:
             statistics.decision_compact_tail_changed += 1
+    if statistics.journal_match_count != profile.source_domain_count:
+        raise RuntimeError("journal v3 packet domain census is incomplete")
 
 
 def _search_hmm_sealed_sparse_journal_v3_bound(
@@ -10860,6 +11573,18 @@ def _search_hmm_sealed_sparse_journal_v3_bound(
     cdef uint64_t local_index
     cdef _compact_consumption_statistics statistics
     cdef object start_ns = None
+    cdef object preflight_start_ns
+    cdef object preflight_elapsed_ns
+    cdef object core_start_ns
+    cdef object core_elapsed_ns
+    cdef object statistics_start_ns
+    cdef object statistics_elapsed_ns = 0
+    global _v3_consumer_call_count
+    global _v3_consumer_preflight_ns
+    global _v3_consumer_core_ns
+    global _v3_consumer_statistics_ns
+    global _v3_consumer_certificate_visits
+    global _v3_consumer_exception_visits
 
     if _return_route_statistics:
         start_ns = _time.perf_counter_ns()
@@ -10873,9 +11598,12 @@ def _search_hmm_sealed_sparse_journal_v3_bound(
     if row < 0 or row >= len(sealed._queries):
         raise IndexError("sealed post-filter row out of range")
 
+    preflight_start_ns = _time.perf_counter_ns()
     _v3_preflight_live_pipeline_row(
         sealed._journal_v3, sealed, pipeline, <size_t> row
     )
+    preflight_elapsed_ns = _time.perf_counter_ns() - preflight_start_ns
+    core_start_ns = _time.perf_counter_ns()
     query = (<HMM> sealed._queries[row]).copy()
     optimized_profile = <OptimizedProfile> sealed._optimized_profiles[row]
     hits = TopHits(query)
@@ -10913,7 +11641,9 @@ def _search_hmm_sealed_sparse_journal_v3_bound(
             compact_rebased_offsets,
             &statistics,
         )
+        core_elapsed_ns = _time.perf_counter_ns() - core_start_ns
         if _return_route_statistics:
+            statistics_start_ns = _time.perf_counter_ns()
             _v3_complete_row_route_statistics(
                 sealed._journal_v3,
                 sealed,
@@ -10921,6 +11651,15 @@ def _search_hmm_sealed_sparse_journal_v3_bound(
                 pipeline,
                 &statistics,
             )
+            statistics_elapsed_ns = (
+                _time.perf_counter_ns() - statistics_start_ns
+            )
+        _v3_consumer_call_count += 1
+        _v3_consumer_preflight_ns += <uint64_t> preflight_elapsed_ns
+        _v3_consumer_core_ns += <uint64_t> core_elapsed_ns
+        _v3_consumer_statistics_ns += <uint64_t> statistics_elapsed_ns
+        _v3_consumer_certificate_visits += profile.certificate_count
+        _v3_consumer_exception_visits += profile.exception_count
         return _sealed_search_result(
             hits,
             &statistics,
@@ -10946,12 +11685,12 @@ cdef TopHits _v3_dense_reference_profile_preallocated(
     uint64_t *compact_rebased_offsets,
     _compact_consumption_statistics *statistics,
 ):
-    cdef size_t postfilter_start = <size_t> sealed._postfilter_offsets[row]
-    cdef size_t postfilter_stop = <size_t> sealed._postfilter_offsets[row + 1]
-    cdef size_t forward_start = <size_t> sealed._forward_offsets[row]
-    cdef size_t forward_stop = <size_t> sealed._forward_offsets[row + 1]
-    cdef size_t journal_start = <size_t> sealed._journal_profile_offsets[row]
-    cdef size_t journal_stop = <size_t> sealed._journal_profile_offsets[row + 1]
+    cdef size_t postfilter_start
+    cdef size_t postfilter_stop
+    cdef size_t forward_start
+    cdef size_t forward_stop
+    cdef size_t journal_start
+    cdef size_t journal_stop
     cdef const uint8_t *postfilter_ptr = NULL
     cdef const uint8_t *forward_ptr = NULL
     cdef const float *special_ptr = NULL
@@ -10961,6 +11700,17 @@ cdef TopHits _v3_dense_reference_profile_preallocated(
     cdef const uint8_t *compact_trace_ptr = NULL
     cdef const float *compact_null2_ptr = NULL
     cdef _double_bits generation_f1
+
+    if sealed._direct_v3_source:
+        raise TypeError(
+            "direct sparse-v3 batches have no dense audit source"
+        )
+    postfilter_start = <size_t> sealed._postfilter_offsets[row]
+    postfilter_stop = <size_t> sealed._postfilter_offsets[row + 1]
+    forward_start = <size_t> sealed._forward_offsets[row]
+    forward_stop = <size_t> sealed._forward_offsets[row + 1]
+    journal_start = <size_t> sealed._journal_profile_offsets[row]
+    journal_stop = <size_t> sealed._journal_profile_offsets[row + 1]
 
     if postfilter_stop != postfilter_start:
         postfilter_ptr = &sealed._postfilter_records[

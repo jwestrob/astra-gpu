@@ -19,6 +19,7 @@ from pyhmmer.plan7 cimport OptimizedProfile
 
 import array as _array
 import pyhmmer as _pyhmmer
+import time as _time
 
 from . import _abi as _abi_module
 from . import _telemetry as _telemetry_module
@@ -51,8 +52,16 @@ cdef carray _FLOAT_ARRAY_TEMPLATE = _array.array("f")
 cdef uint64_t _sealed_journal_build_count = 0
 cdef uint64_t _sealed_journal_payload_bytes = 0
 cdef uint64_t _sealed_journal_duplicate_python_bytes = 0
+cdef uint64_t _sealed_journal_validation_ns = 0
+cdef uint64_t _sealed_journal_emit_ns = 0
+cdef uint64_t _direct_v3_staging_build_count = 0
+cdef uint64_t _direct_v3_eliminated_v2_bytes = 0
+cdef uint64_t _direct_v3_staging_payload_bytes = 0
+cdef uint64_t _direct_v3_staging_build_ns = 0
+cdef uint64_t _direct_v3_source_validation_ns = 0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 GENERATION_TELEMETRY_SCHEMA_VERSION = 2
+DIRECT_V3_STAGING_SCHEMA_VERSION = 1
 
 # Host F2 decisions are made in this Cython translation unit, so their exact
 # version-1 facts intentionally live beside that source predicate.
@@ -1590,6 +1599,27 @@ cdef bint _journal_append_storage(
     return True
 
 
+cdef bytes _copy_native_bytes(
+    const void *source,
+    size_t count,
+    size_t item_size,
+    const char *label,
+):
+    cdef size_t byte_count
+    cdef bytes storage
+    if count != 0 and item_size > (<size_t> -1) // count:
+        raise OverflowError((<bytes> label).decode() + " size overflows size_t")
+    byte_count = count * item_size
+    if byte_count > <size_t> PY_SSIZE_T_MAX:
+        raise OverflowError((<bytes> label).decode() + " exceeds Python limits")
+    storage = PyBytes_FromStringAndSize(NULL, byte_count)
+    if byte_count:
+        if source == NULL:
+            raise RuntimeError((<bytes> label).decode() + " source is null")
+        memcpy(PyBytes_AS_STRING(storage), source, byte_count)
+    return storage
+
+
 cdef object _build_continuation_journal_capsule(
     const plan7_profile_selection_view *view,
     const uint8_t *profile_fingerprints,
@@ -1618,6 +1648,8 @@ cdef object _build_continuation_journal_capsule(
     float rt3,
     float guard_band,
     uint64_t *journal_total_bytes,
+    object postfilter_owner=None,
+    bint direct_sparse_v3=False,
 ):
     cdef const plan7_forward_result *forward_results
     cdef const float *forward_specials
@@ -1675,8 +1707,41 @@ cdef object _build_continuation_journal_capsule(
     cdef double_bits double_encoded
     cdef float_bits float_encoded
     cdef object capsule
+    cdef object validation_start_ns = _time.perf_counter_ns()
+    cdef object validation_elapsed_ns
+    cdef object dense_emit_start_ns
+    cdef object direct_start_ns
+    cdef bytes direct_postfilter_storage
+    cdef bytes direct_postfilter_offsets
+    cdef bytes direct_forward_records
+    cdef bytes direct_forward_offsets
+    cdef bytes direct_forward_special_offsets
+    cdef bytes direct_profile_offsets
+    cdef bytes direct_rows
+    cdef bytes direct_specials
+    cdef bytes direct_region_offsets
+    cdef bytes direct_regions
+    cdef bytes direct_compact_row_offsets
+    cdef bytes direct_compact_results
+    cdef bytes direct_compact_trace_offsets
+    cdef bytes direct_compact_traces
+    cdef bytes direct_compact_null2
+    cdef bytes direct_identity_tokens
+    cdef bytes direct_profile_fingerprints
+    cdef bytes direct_sequence_fingerprint
+    cdef bytes direct_forward_provenance
+    cdef bytes direct_domain_provenance
+    cdef bytes direct_rescore_provenance
+    cdef uint64_t direct_staging_bytes = 0
     global _sealed_journal_build_count
     global _sealed_journal_payload_bytes
+    global _sealed_journal_validation_ns
+    global _sealed_journal_emit_ns
+    global _direct_v3_staging_build_count
+    global _direct_v3_eliminated_v2_bytes
+    global _direct_v3_staging_payload_bytes
+    global _direct_v3_staging_build_ns
+    global _direct_v3_source_validation_ns
 
     forward_count = plan7_forward_output_result_count(forward_output)
     special_count = plan7_forward_output_special_count(forward_output)
@@ -1789,6 +1854,7 @@ cdef object _build_continuation_journal_capsule(
             &cursor, compact_null2_count, sizeof(float),
             &compact_null2_offset,
         )
+        and cursor <= <size_t> PY_SSIZE_T_MAX
     ):
         raise OverflowError("continuation journal size overflows size_t")
 
@@ -1934,6 +2000,316 @@ cdef object _build_continuation_journal_capsule(
             ):
                 raise RuntimeError("compact-domain action counts differ")
 
+    validation_elapsed_ns = _time.perf_counter_ns() - validation_start_ns
+    if direct_sparse_v3:
+        _direct_v3_source_validation_ns += <uint64_t> validation_elapsed_ns
+        # Phase 1B deliberately avoids the dense v2 allocation.  The native
+        # outputs are still live here, so copy only the segmented generation
+        # facts needed by the already-oracled v3 planner.  The large
+        # post-filter byte string is reused without a second copy.
+        direct_start_ns = _time.perf_counter_ns()
+        if type(postfilter_owner) is not bytes:
+            raise TypeError("direct v3 post-filter storage must be bytes")
+        if len(postfilter_owner) != postfilter_count * sizeof(
+            plan7_postfilter_result
+        ):
+            raise ValueError("direct v3 post-filter storage size changed")
+        direct_postfilter_storage = postfilter_owner
+        direct_postfilter_offsets = _copy_native_bytes(
+            postfilter_offsets,
+            view.profile_count + 1,
+            sizeof(uint64_t),
+            b"direct v3 post-filter offsets",
+        )
+        direct_forward_records = _copy_native_bytes(
+            forward_results,
+            forward_count,
+            sizeof(plan7_forward_result),
+            b"direct v3 Forward records",
+        )
+        direct_forward_offsets = _copy_native_bytes(
+            forward_profile_offsets,
+            view.profile_count + 1,
+            sizeof(uint64_t),
+            b"direct v3 Forward profile offsets",
+        )
+        direct_forward_special_offsets = _copy_native_bytes(
+            plan7_forward_output_special_offsets(forward_output),
+            forward_count + 1,
+            sizeof(uint64_t),
+            b"direct v3 Forward special offsets",
+        )
+        direct_profile_offsets = _copy_native_bytes(
+            profile_offsets,
+            view.profile_count + 1,
+            sizeof(uint64_t),
+            b"direct v3 domain profile offsets",
+        )
+        direct_specials = _copy_native_bytes(
+            forward_specials,
+            special_count,
+            sizeof(float),
+            b"direct v3 Forward specials",
+        )
+        direct_region_offsets = _copy_native_bytes(
+            domain_region_offsets,
+            pass_count + 1,
+            sizeof(uint64_t),
+            b"direct v3 region offsets",
+        )
+        direct_regions = _copy_native_bytes(
+            domain_regions,
+            region_count,
+            sizeof(plan7_simple_region),
+            b"direct v3 regions",
+        )
+        if compact_result_count:
+            direct_compact_row_offsets = _copy_native_bytes(
+                domain_region_offsets,
+                pass_count + 1,
+                sizeof(uint64_t),
+                b"direct v3 compact row offsets",
+            )
+        else:
+            direct_compact_row_offsets = bytes(
+                (pass_count + 1) * sizeof(uint64_t)
+            )
+        direct_compact_results = _copy_native_bytes(
+            rescore_results,
+            compact_result_count,
+            sizeof(plan7_domain_rescore_result),
+            b"direct v3 compact results",
+        )
+        if rescore_output != NULL:
+            direct_compact_trace_offsets = _copy_native_bytes(
+                rescore_trace_offsets,
+                compact_result_count + 1,
+                sizeof(uint64_t),
+                b"direct v3 compact trace offsets",
+            )
+        else:
+            direct_compact_trace_offsets = bytes(sizeof(uint64_t))
+        direct_compact_traces = _copy_native_bytes(
+            rescore_traces,
+            compact_trace_count,
+            sizeof(plan7_domain_rescore_trace_step),
+            b"direct v3 compact traces",
+        )
+        direct_compact_null2 = _copy_native_bytes(
+            rescore_null2,
+            compact_null2_count,
+            sizeof(float),
+            b"direct v3 compact null2",
+        )
+        direct_rows = PyBytes_FromStringAndSize(
+            NULL, pass_count * sizeof(plan7_continuation_journal_row)
+        )
+        if pass_count:
+            memset(
+                PyBytes_AS_STRING(direct_rows),
+                0,
+                pass_count * sizeof(plan7_continuation_journal_row),
+            )
+        rows = <plan7_continuation_journal_row *> PyBytes_AS_STRING(
+            direct_rows
+        )
+        for row in range(pass_count):
+            source = pass_sources[row]
+            if source >= forward_count:
+                raise RuntimeError("direct v3 source index changed")
+            if (
+                forward_results[source].action
+                != PLAN7_FORWARD_DEFINITE_PASS
+                or domain_results[row].profile_index
+                != candidate_profiles[source]
+                or domain_results[row].sequence_index
+                != forward_results[source].sequence_index
+            ):
+                raise RuntimeError("direct v3 row identity changed")
+            rows[row].profile_index = domain_results[row].profile_index
+            rows[row].sequence_index = domain_results[row].sequence_index
+            rows[row].usc = uncorrected_scores[source]
+            rows[row].filtersc = candidate_records[source].filtersc
+            rows[row].vfsc = candidate_records[source].vfsc
+            rows[row].fwdsc = forward_results[source].fwdsc
+            rows[row].backward_score = domain_results[row].backward_score
+            rows[row].nexpected = domain_results[row].nexpected
+            rows[row].uncertain_count = domain_results[row].uncertain_count
+            rows[row].region_count = domain_results[row].region_count
+            rows[row].multidomain_count = domain_results[row].multidomain_count
+            rows[row].postfilter_status = candidate_records[source].msv_status
+            rows[row].postfilter_action = candidate_records[source].action
+            rows[row].forward_status = forward_results[source].status
+            rows[row].forward_action = forward_results[source].action
+            rows[row].domain_status = domain_results[row].status
+            rows[row].domain_route = domain_results[row].route
+            rows[row].has_own_scales = domain_results[row].has_own_scales
+            rows[row].reserved = domain_results[row].reserved
+            region_begin = domain_region_offsets[row]
+            region_end = domain_region_offsets[row + 1]
+            if region_end - region_begin > <size_t> 0xffffffff:
+                raise RuntimeError("direct v3 compact row count exceeds uint32")
+            if compact_result_count:
+                rows[row].compact_result_count = <uint32_t> (
+                    region_end - region_begin
+                )
+                if region_begin != region_end:
+                    if rescore_results[region_begin].action == (
+                        PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+                    ):
+                        rows[row].compact_route = (
+                            PLAN7_CONTINUATION_COMPACT_DEVICE
+                        )
+                    else:
+                        rows[row].compact_route = (
+                            PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                        )
+            elif (
+                rescore_output != NULL
+                and rescore_statistics.global_cpu_fallback_count != 0
+                and region_begin != region_end
+            ):
+                rows[row].compact_route = (
+                    PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                )
+
+        direct_identity_tokens = PyBytes_FromStringAndSize(
+            NULL, view.profile_count * sizeof(uint64_t)
+        )
+        target_u64 = <uint64_t *> PyBytes_AS_STRING(direct_identity_tokens)
+        for profile in range(view.profile_count):
+            target_u64[profile] = <uint64_t> view.identity_tokens[profile]
+        direct_profile_fingerprints = _copy_native_bytes(
+            profile_fingerprints,
+            view.profile_count,
+            PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+            b"direct v3 profile fingerprints",
+        )
+        direct_sequence_fingerprint = _copy_native_bytes(
+            sequence_content_fingerprint,
+            32,
+            1,
+            b"direct v3 sequence fingerprint",
+        )
+        direct_forward_provenance = _copy_native_bytes(
+            forward_provenance,
+            1,
+            sizeof(plan7_forward_provenance),
+            b"direct v3 Forward provenance",
+        )
+        direct_domain_provenance = _copy_native_bytes(
+            domain_provenance,
+            1,
+            sizeof(plan7_backward_domain_provenance),
+            b"direct v3 domain provenance",
+        )
+        if rescore_provenance != NULL:
+            direct_rescore_provenance = _copy_native_bytes(
+                rescore_provenance,
+                1,
+                sizeof(plan7_domain_rescore_provenance),
+                b"direct v3 rescore provenance",
+            )
+        else:
+            direct_rescore_provenance = bytes(
+                sizeof(plan7_domain_rescore_provenance)
+            )
+
+        direct_staging_bytes = (
+            len(direct_postfilter_offsets)
+            + len(direct_forward_records)
+            + len(direct_forward_offsets)
+            + len(direct_forward_special_offsets)
+            + len(direct_profile_offsets)
+            + len(direct_rows)
+            + len(direct_specials)
+            + len(direct_region_offsets)
+            + len(direct_regions)
+            + len(direct_compact_row_offsets)
+            + len(direct_compact_results)
+            + len(direct_compact_trace_offsets)
+            + len(direct_compact_traces)
+            + len(direct_compact_null2)
+            + len(direct_identity_tokens)
+            + len(direct_profile_fingerprints)
+            + len(direct_sequence_fingerprint)
+            + len(direct_forward_provenance)
+            + len(direct_domain_provenance)
+            + len(direct_rescore_provenance)
+        )
+        if journal_total_bytes != NULL:
+            # Counterfactual exact v2 allocation size, calculated by the same
+            # checked layout code but never allocated on this path.
+            journal_total_bytes[0] = <uint64_t> cursor
+        float_encoded.value = guard_band
+        double_encoded.value = f1
+        direct_start_ns = _time.perf_counter_ns() - direct_start_ns
+        _direct_v3_staging_build_count += 1
+        _direct_v3_eliminated_v2_bytes += <uint64_t> cursor
+        _direct_v3_staging_payload_bytes += direct_staging_bytes
+        _direct_v3_staging_build_ns += <uint64_t> direct_start_ns
+        return (
+            DIRECT_V3_STAGING_SCHEMA_VERSION,
+            direct_postfilter_storage,
+            direct_postfilter_offsets,
+            direct_forward_records,
+            direct_forward_offsets,
+            direct_forward_special_offsets,
+            direct_specials,
+            direct_profile_offsets,
+            direct_rows,
+            direct_region_offsets,
+            direct_regions,
+            direct_compact_row_offsets,
+            direct_compact_results,
+            direct_compact_trace_offsets,
+            direct_compact_traces,
+            direct_compact_null2,
+            float_encoded.bits,
+            generation_tail_fingerprint,
+            bool(rescore_output != NULL),
+            simple_row_count,
+            (
+                rescore_statistics.device_result_count
+                if rescore_statistics != NULL else 0
+            ),
+            (
+                rescore_statistics.cpu_required_count
+                if rescore_statistics != NULL else 0
+            ),
+            (
+                rescore_statistics.numeric_fallback_count
+                if rescore_statistics != NULL else 0
+            ),
+            (
+                rescore_statistics.cap_fallback_count
+                if rescore_statistics != NULL else 0
+            ),
+            (
+                rescore_statistics.global_cpu_fallback_count
+                if rescore_statistics != NULL else 0
+            ),
+            <uint64_t> cursor,
+            direct_start_ns,
+            direct_staging_bytes,
+            view.session_id,
+            view.selection_id,
+            forward_provenance.batch_generation,
+            direct_identity_tokens,
+            direct_profile_fingerprints,
+            direct_sequence_fingerprint,
+            double_encoded.bits,
+            f2,
+            f3,
+            bool(bias_filter),
+            direct_forward_provenance,
+            direct_domain_provenance,
+            direct_rescore_provenance,
+            validation_elapsed_ns,
+        )
+
+    _sealed_journal_validation_ns += <uint64_t> validation_elapsed_ns
+    dense_emit_start_ns = _time.perf_counter_ns()
     journal = <plan7_continuation_journal *> calloc(1, cursor)
     if journal == NULL:
         raise MemoryError("continuation journal allocation failed")
@@ -2207,6 +2583,9 @@ cdef object _build_continuation_journal_capsule(
         )
         _sealed_journal_build_count += 1
         _sealed_journal_payload_bytes += <uint64_t> cursor
+        _sealed_journal_emit_ns += <uint64_t> (
+            _time.perf_counter_ns() - dense_emit_start_ns
+        )
         journal = NULL
         return capsule
     finally:
@@ -2682,6 +3061,17 @@ def _sealed_journal_transport_statistics():
         "build_count": _sealed_journal_build_count,
         "payload_bytes": _sealed_journal_payload_bytes,
         "duplicate_python_bytes": _sealed_journal_duplicate_python_bytes,
+        "dense_v2_source_validation_ns": _sealed_journal_validation_ns,
+        "dense_v2_emit_ns": _sealed_journal_emit_ns,
+        "direct_v3_staging_build_count": _direct_v3_staging_build_count,
+        "direct_v3_eliminated_v2_bytes": _direct_v3_eliminated_v2_bytes,
+        "direct_v3_staging_payload_bytes": (
+            _direct_v3_staging_payload_bytes
+        ),
+        "direct_v3_staging_build_ns": _direct_v3_staging_build_ns,
+        "direct_v3_source_validation_ns": (
+            _direct_v3_source_validation_ns
+        ),
     }
 
 
@@ -5337,6 +5727,8 @@ cdef class SequenceBatch:
         float rt3,
         float guard_band,
         object generation_telemetry_seed,
+        object postfilter_owner,
+        bint direct_sparse_v3,
     ):
         """Run selection-aware F2/F3 without reading a live optimized profile."""
         cdef plan7_profile_selection_view view = selection._view()
@@ -6465,6 +6857,8 @@ cdef class SequenceBatch:
                     rt3,
                     guard_band,
                     &journal_total_bytes,
+                    postfilter_owner,
+                    direct_sparse_v3,
                 )
                 native_statistics = plan7_forward_output_statistics(output)
                 native_domain_statistics = (
@@ -6875,6 +7269,8 @@ cdef class SequenceBatch:
             <float> 0.20,
             <float> 2.0e-4,
             None,
+            None,
+            False,
         )
 
     def _postfilter_forward_domain_selection_sealed(
@@ -6893,6 +7289,7 @@ cdef class SequenceBatch:
         uint64_t generation_tail_fingerprint=0,
         bint _return_stage_timings=False,
         bint _return_generation_statistics=False,
+        bint _direct_sparse_v3=False,
     ):
         """Run the fused package-internal path and return one opaque seal.
 
@@ -6922,7 +7319,10 @@ cdef class SequenceBatch:
                 postfilter_reason_facts,
                 postfilter_reason_statistics,
             ) = self.postfilter_profile_selection_csr_raw(
-                selection, f1, _return_reason_facts=True
+                selection,
+                f1,
+                _return_reason_facts=True,
+                _immutable_records=_direct_sparse_v3,
             )
             generation_telemetry_seed = (
                 GENERATION_TELEMETRY_SCHEMA_VERSION,
@@ -6931,7 +7331,11 @@ cdef class SequenceBatch:
             )
         else:
             postfilter_records, postfilter_offsets = (
-                self.postfilter_profile_selection_csr_raw(selection, f1)
+                self.postfilter_profile_selection_csr_raw(
+                    selection,
+                    f1,
+                    _immutable_records=_direct_sparse_v3,
+                )
             )
         residue_offsets = clone(
             _UINT64_ARRAY_TEMPLATE, self._sequence_count + 1, False
@@ -6969,6 +7373,8 @@ cdef class SequenceBatch:
             <float> 0.20,
             guard_band,
             generation_telemetry_seed,
+            postfilter_records,
+            _direct_sparse_v3,
         )
         if (
             rescore_simple_diagnostic
@@ -7080,6 +7486,7 @@ cdef class SequenceBatch:
         ProfileSelection selection,
         double f1,
         bint _return_reason_facts=False,
+        bint _immutable_records=False,
     ):
         """Run a sealed selection without reading any live optimized profile."""
         cdef plan7_profile_selection_view view = selection._view()
@@ -7094,7 +7501,7 @@ cdef class SequenceBatch:
         cdef size_t profile_index
         cdef size_t candidate_count
         cdef size_t result_bytes
-        cdef bytearray records
+        cdef object records
         cdef uint8_t[::1] record_view
         cdef carray offsets
         cdef vector[uint16_t] reason_facts
@@ -7196,12 +7603,21 @@ cdef class SequenceBatch:
         if candidate_count > (<size_t> -1) // sizeof(plan7_postfilter_result):
             raise OverflowError("post-filter result size overflows size_t")
         result_bytes = candidate_count * sizeof(plan7_postfilter_result)
-        records = bytearray(result_bytes)
-        if result_bytes:
-            record_view = records
-            memcpy(
-                &record_view[0], self._postfilter_results.data(), result_bytes
-            )
+        if _immutable_records:
+            records = PyBytes_FromStringAndSize(NULL, result_bytes)
+            if result_bytes:
+                memcpy(
+                    PyBytes_AS_STRING(records),
+                    self._postfilter_results.data(),
+                    result_bytes,
+                )
+        else:
+            records = bytearray(result_bytes)
+            if result_bytes:
+                record_view = records
+                memcpy(
+                    &record_view[0], self._postfilter_results.data(), result_bytes
+                )
         offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
         for profile_index in range(profile_count + 1):
             offsets.data.as_ulonglongs[profile_index] = <uint64_t> (

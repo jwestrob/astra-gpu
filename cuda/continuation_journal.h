@@ -60,10 +60,10 @@ typedef struct plan7_continuation_journal_row {
   uint32_t reserved3;
 } plan7_continuation_journal_row;
 
-/* Version 3 is an additive host-side sparse-accounting ABI.  Version 2 above
- * remains the native producer/audit transport and is intentionally unchanged.
- * Phase 1A constructs v3 only after a v2 batch has already survived the full
- * existing seal, or from the older host-only sealed fixture path. */
+/* Version 3 is an additive sparse-accounting ABI.  Version 2 above remains
+ * the audit/default transport and is intentionally unchanged.  A production
+ * sparse request may construct v3 from a transient native staging bundle;
+ * that path never allocates or retains a dense v2 packet. */
 enum plan7_continuation_journal_v3_abi {
   PLAN7_CONTINUATION_JOURNAL_V3_VERSION = 3,
   PLAN7_CONTINUATION_JOURNAL_V3_MAGIC = 0x504a4e33,
@@ -79,7 +79,8 @@ enum plan7_continuation_journal_v3_abi {
 
 enum plan7_continuation_journal_v3_source_kind {
   PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL = 1,
-  PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL = 2
+  PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL = 2,
+  PLAN7_CONTINUATION_V3_SOURCE_NATIVE_DIRECT = 3
 };
 
 /* These are semantic source stages, not planner policy guesses.  Terminal
