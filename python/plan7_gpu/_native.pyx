@@ -538,7 +538,7 @@ cdef extern from "postfilter_cuda.h" nogil:
 
     cdef enum plan7_postfilter_reason_fact:
         PLAN7_POSTFILTER_REASON_RAW_F1_REJECT
-        PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE
+        PLAN7_POSTFILTER_REASON_MSV_RANGE_STATE
         PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU
         PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO
         PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED
@@ -551,6 +551,16 @@ cdef extern from "postfilter_cuda.h" nogil:
         PLAN7_POSTFILTER_REASON_FINAL_PASS
         PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED
         PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK
+        PLAN7_POSTFILTER_REASON_FULL_MSV_EXECUTED
+        PLAN7_POSTFILTER_REASON_VITERBI_EXECUTED
+
+    ctypedef struct plan7_postfilter_reason_statistics:
+        uint64_t candidate_count
+        uint64_t full_msv_execution_count
+        uint64_t viterbi_execution_count
+        uint64_t full_msv_work_cells
+        uint64_t viterbi_work_cells
+        uint64_t work_cells
 
     ctypedef struct plan7_viterbi_database:
         pass
@@ -707,6 +717,7 @@ cdef extern from "postfilter_cuda.h" nogil:
         size_t result_count,
         uint16_t *reason_facts,
         size_t reason_count,
+        plan7_postfilter_reason_statistics *reason_statistics,
         char *error,
         size_t error_size,
     )
@@ -886,6 +897,22 @@ cdef extern from "forward_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_forward_run_batch_workspace_reason_facts(
+        const plan7_forward_database *database,
+        plan7_ssv_sequence_batch *batch,
+        const uintptr_t *source_profile_pointers,
+        size_t profile_count,
+        const uint64_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        const float *filter_scores,
+        size_t candidate_count,
+        double f3,
+        uint64_t gathered_byte_budget,
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_forward_output_destroy(
         plan7_forward_output **output,
         char *error,
@@ -897,6 +924,14 @@ cdef extern from "forward_cuda.h" nogil:
     )
 
     const plan7_forward_result *plan7_forward_output_results(
+        const plan7_forward_output *output,
+    )
+
+    size_t plan7_forward_output_reason_count(
+        const plan7_forward_output *output,
+    )
+
+    const uint16_t *plan7_forward_output_reason_facts(
         const plan7_forward_output *output,
     )
 
@@ -971,6 +1006,8 @@ cdef extern from "backward_domain_cuda.h" nogil:
         PLAN7_BACKWARD_DOMAIN_REASON_NO_REGIONS
         PLAN7_BACKWARD_DOMAIN_REASON_SIMPLE
         PLAN7_BACKWARD_DOMAIN_REASON_REGION_OUTPUT_CAP
+        PLAN7_BACKWARD_DOMAIN_REASON_OTHER_CPU_REQUIRED
+        PLAN7_BACKWARD_DOMAIN_REASON_FINAL_CPU_REQUIRED
 
     cdef enum plan7_backward_domain_test_fault:
         PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_RESULT_HASH
@@ -1144,16 +1181,16 @@ cdef extern from "backward_domain_cuda.h" nogil:
         const plan7_backward_domain_output *output,
     )
 
-    const uint16_t *plan7_backward_domain_output_reason_facts(
+    const uint32_t *plan7_backward_domain_output_reason_facts(
         const plan7_backward_domain_output *output,
     )
 
     int c_plan7_backward_domain_merge_reason_facts_for_test \
             "plan7_backward_domain_merge_reason_facts_for_test"(
         const uint64_t *active_sources,
-        const uint16_t *active_facts,
+        const uint32_t *active_facts,
         size_t active_count,
-        uint16_t *source_facts,
+        uint32_t *source_facts,
         size_t source_count,
     )
 
@@ -1231,6 +1268,7 @@ cdef extern from "domain_rescore_cuda.h" nogil:
         PLAN7_DOMAIN_RESCORE_REASON_DEVICE_RESULT
         PLAN7_DOMAIN_RESCORE_REASON_OTHER_CPU_REQUIRED
         PLAN7_DOMAIN_RESCORE_REASON_UPSTREAM_OWN_SCALES
+        PLAN7_DOMAIN_RESCORE_REASON_FINAL_CPU_REQUIRED
 
     ctypedef struct plan7_domain_rescore_result:
         uint32_t row_index
@@ -2203,17 +2241,17 @@ cdef enum generation_metric_index:
 
 
 cdef enum generation_reason_width:
-    GENERATION_POSTFILTER_REASON_COUNT = 14
+    GENERATION_POSTFILTER_REASON_COUNT = 16
     GENERATION_F2_REASON_COUNT = 5
     GENERATION_FORWARD_REASON_COUNT = 10
-    GENERATION_BACKWARD_REASON_COUNT = 16
-    GENERATION_RESCORE_REASON_COUNT = 24
+    GENERATION_BACKWARD_REASON_COUNT = 18
+    GENERATION_RESCORE_REASON_COUNT = 25
 
 
 GENERATION_REASON_FACT_LAYOUT = (
     (
         PLAN7_POSTFILTER_REASON_RAW_F1_REJECT,
-        PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE,
+        PLAN7_POSTFILTER_REASON_MSV_RANGE_STATE,
         PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU,
         PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO,
         PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED,
@@ -2226,6 +2264,8 @@ GENERATION_REASON_FACT_LAYOUT = (
         PLAN7_POSTFILTER_REASON_FINAL_PASS,
         PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED,
         PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK,
+        PLAN7_POSTFILTER_REASON_FULL_MSV_EXECUTED,
+        PLAN7_POSTFILTER_REASON_VITERBI_EXECUTED,
     ),
     (
         F2_REASON_POSTFILTER_NOT_PASS_OR_HOST_ENVIRONMENT_UNATTESTED,
@@ -2260,7 +2300,7 @@ cdef inline void _count_postfilter_reason(
     vector[uint64_t]& counts, size_t base, uint16_t facts,
 ) noexcept nogil:
     if facts & PLAN7_POSTFILTER_REASON_RAW_F1_REJECT: counts[base] += 1
-    if facts & PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE: counts[base + 1] += 1
+    if facts & PLAN7_POSTFILTER_REASON_MSV_RANGE_STATE: counts[base + 1] += 1
     if facts & PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU: counts[base + 2] += 1
     if facts & PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO: counts[base + 3] += 1
     if facts & PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED: counts[base + 4] += 1
@@ -2273,6 +2313,29 @@ cdef inline void _count_postfilter_reason(
     if facts & PLAN7_POSTFILTER_REASON_FINAL_PASS: counts[base + 11] += 1
     if facts & PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED: counts[base + 12] += 1
     if facts & PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK: counts[base + 13] += 1
+    if facts & PLAN7_POSTFILTER_REASON_FULL_MSV_EXECUTED: counts[base + 14] += 1
+    if facts & PLAN7_POSTFILTER_REASON_VITERBI_EXECUTED: counts[base + 15] += 1
+
+
+cdef inline uint64_t _postfilter_execution_count(uint16_t facts) noexcept nogil:
+    return (
+        (1 if facts & PLAN7_POSTFILTER_REASON_FULL_MSV_EXECUTED else 0)
+        + (1 if facts & PLAN7_POSTFILTER_REASON_VITERBI_EXECUTED else 0)
+    )
+
+
+def postfilter_execution_cells_for_test(
+    uint64_t sequence_length, uint64_t model_length, uint16_t facts,
+):
+    """Exercise the exact opt-in 0/1/2-times-L*M work attribution."""
+    cdef uint64_t execution_count = _postfilter_execution_count(facts)
+    cdef uint64_t base_cells
+    if model_length != 0 and sequence_length > (<uint64_t> -1) // model_length:
+        raise OverflowError("post-filter test cell product overflows uint64")
+    base_cells = sequence_length * model_length
+    if execution_count != 0 and base_cells > (<uint64_t> -1) // execution_count:
+        raise OverflowError("post-filter test execution cells overflow uint64")
+    return base_cells * execution_count
 
 
 cdef inline void _count_forward_reason(
@@ -2291,9 +2354,9 @@ cdef inline void _count_forward_reason(
 
 
 cdef inline void _count_backward_reason(
-    vector[uint64_t]& counts, size_t base, uint16_t facts,
+    vector[uint64_t]& counts, size_t base, uint32_t facts,
 ) noexcept nogil:
-    cdef uint16_t bit = 1
+    cdef uint32_t bit = 1
     cdef size_t index
     for index in range(GENERATION_BACKWARD_REASON_COUNT):
         if facts & bit: counts[base + index] += 1
@@ -2326,7 +2389,7 @@ cdef inline bint _rescore_reason_admitted_work(uint32_t facts) noexcept nogil:
 
 def domain_rescore_reason_admitted_work_for_test(uint32_t facts):
     """Host boundary for exact rescore preflight-versus-active facts."""
-    if facts & <uint32_t> 0xff000000:
+    if facts & <uint32_t> 0xfe000000:
         raise ValueError("rescore reason facts contain unknown bits")
     return bool(_rescore_reason_admitted_work(facts))
 
@@ -3462,26 +3525,26 @@ def domain_rescore_oatrace_j_predecessor_for_test(
 
 def backward_domain_merge_reason_facts_for_test(
     const uint64_t[::1] active_sources,
-    const uint16_t[::1] active_facts,
-    const uint16_t[::1] source_facts,
+    const uint32_t[::1] active_facts,
+    const uint32_t[::1] source_facts,
 ):
     """Exercise production's compact Backward-row reason remapping."""
     cdef carray output
     cdef int status
     if active_sources.shape[0] != active_facts.shape[0]:
         raise ValueError("Backward active reason rows differ")
-    output = clone(_UINT16_ARRAY_TEMPLATE, source_facts.shape[0], False)
+    output = clone(_UINT32_ARRAY_TEMPLATE, source_facts.shape[0], False)
     if source_facts.shape[0]:
         memcpy(
-            output.data.as_ushorts,
+            output.data.as_uints,
             &source_facts[0],
-            source_facts.shape[0] * sizeof(uint16_t),
+            source_facts.shape[0] * sizeof(uint32_t),
         )
     status = c_plan7_backward_domain_merge_reason_facts_for_test(
         &active_sources[0] if active_sources.shape[0] else NULL,
         &active_facts[0] if active_facts.shape[0] else NULL,
         active_sources.shape[0],
-        output.data.as_ushorts if source_facts.shape[0] else NULL,
+        output.data.as_uints if source_facts.shape[0] else NULL,
         source_facts.shape[0],
     )
     if status != 0:
@@ -4821,6 +4884,7 @@ cdef class SequenceBatch:
         cdef object value
         cdef plan7_forward_output *output = NULL
         cdef const plan7_forward_result *native_results
+        cdef const uint16_t *native_forward_reasons
         cdef const uint64_t *native_offsets
         cdef const float *native_specials
         cdef const plan7_forward_statistics *native_statistics
@@ -5309,7 +5373,7 @@ cdef class SequenceBatch:
         cdef uint32_t reason32
         cdef uint16_t forward_facts
         cdef uint8_t forward_call_facts = 0
-        cdef uint16_t backward_preflight_mask
+        cdef uint32_t backward_preflight_mask
         cdef uint32_t previous
         cdef bint have_previous
         cdef bint host_attested
@@ -5332,7 +5396,7 @@ cdef class SequenceBatch:
         cdef const plan7_forward_statistics *native_statistics
         cdef const plan7_backward_domain_statistics *native_domain_statistics
         cdef const plan7_domain_rescore_statistics *native_rescore_statistics
-        cdef const uint16_t *native_domain_reasons
+        cdef const uint32_t *native_domain_reasons
         cdef const uint32_t *native_rescore_reasons
         cdef const plan7_backward_domain_result *native_domain_results = NULL
         cdef const uint64_t *native_domain_region_offsets = NULL
@@ -5356,6 +5420,8 @@ cdef class SequenceBatch:
         cdef uint64_t total_target_residues = 0
         cdef uint64_t journal_total_bytes = 0
         cdef uint64_t logical_cells
+        cdef uint64_t postfilter_base_cells
+        cdef uint64_t postfilter_execution_count
         cdef bint collect_generation_telemetry = (
             generation_telemetry_seed is not None
         )
@@ -5453,10 +5519,12 @@ cdef class SequenceBatch:
         if collect_generation_telemetry:
             if (
                 not isinstance(generation_telemetry_seed, tuple)
-                or len(generation_telemetry_seed) != 2
+                or len(generation_telemetry_seed) != 3
                 or generation_telemetry_seed[0]
                     != GENERATION_TELEMETRY_SCHEMA_VERSION
                 or not isinstance(generation_telemetry_seed[1], bytes)
+                or not isinstance(generation_telemetry_seed[2], tuple)
+                or len(generation_telemetry_seed[2]) != 6
             ):
                 raise ValueError("invalid generation telemetry seed")
             postfilter_reason_storage = generation_telemetry_seed[1]
@@ -5561,10 +5629,6 @@ cdef class SequenceBatch:
                 have_previous = True
                 if collect_generation_telemetry:
                     reason16 = postfilter_reason_view[cursor]
-                    if reason16 & <uint16_t> 0xc000:
-                        raise RuntimeError(
-                            "post-filter reason facts contain unknown bits"
-                        )
                     _count_postfilter_reason(
                         postfilter_reason_counts,
                         profile_index * GENERATION_POSTFILTER_REASON_COUNT,
@@ -5580,11 +5644,24 @@ cdef class SequenceBatch:
                         raise OverflowError(
                             "post-filter logical cell count overflows uint64"
                         )
-                    logical_cells = sequence_length * (
+                    postfilter_base_cells = sequence_length * (
                         <uint64_t> view.profiles[profile_index].model_length
                     )
-                    if reason16 & PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK:
-                        logical_cells = 0
+                    postfilter_execution_count = _postfilter_execution_count(
+                        reason16
+                    )
+                    if (
+                        postfilter_execution_count != 0
+                        and postfilter_base_cells > (<uint64_t> -1) // (
+                            postfilter_execution_count
+                        )
+                    ):
+                        raise OverflowError(
+                            "post-filter execution cell product overflows uint64"
+                        )
+                    logical_cells = (
+                        postfilter_base_cells * postfilter_execution_count
+                    )
                     if logical_cells > (<uint64_t> -1) - generation_metrics[
                         reason_base + GENERATION_POSTFILTER_LOGICAL_CELLS
                     ]:
@@ -5598,9 +5675,17 @@ cdef class SequenceBatch:
                         postfilter_reason_cells,
                         profile_index * GENERATION_POSTFILTER_REASON_COUNT,
                         GENERATION_POSTFILTER_REASON_COUNT,
-                        reason16,
+                        reason16 & <uint16_t> 0x3fff,
                         logical_cells,
                     )
+                    if reason16 & PLAN7_POSTFILTER_REASON_FULL_MSV_EXECUTED:
+                        postfilter_reason_cells[
+                            profile_index * GENERATION_POSTFILTER_REASON_COUNT + 14
+                        ] += postfilter_base_cells
+                    if reason16 & PLAN7_POSTFILTER_REASON_VITERBI_EXECUTED:
+                        postfilter_reason_cells[
+                            profile_index * GENERATION_POSTFILTER_REASON_COUNT + 15
+                        ] += postfilter_base_cells
                 if not host_attested or record.action != PLAN7_BIAS_DEFINITE_PASS:
                     if collect_generation_telemetry:
                         f2_reason_counts[
@@ -5702,7 +5787,24 @@ cdef class SequenceBatch:
                     )
                 if status != 0:
                     break
-        if status == 0:
+        if status == 0 and collect_generation_telemetry:
+            with nogil:
+                status = plan7_forward_run_batch_workspace_reason_facts(
+                    database,
+                    self._batch,
+                    view.identity_tokens,
+                    profile_count,
+                    candidate_offsets.data(),
+                    candidate_indices.data(),
+                    filter_scores.data(),
+                    candidate_count,
+                    f3,
+                    gathered_byte_budget,
+                    &output,
+                    error,
+                    sizeof(error),
+                )
+        elif status == 0:
             with nogil:
                 status = plan7_forward_run_batch_workspace(
                     database,
@@ -5730,6 +5832,9 @@ cdef class SequenceBatch:
             try:
                 result_count = plan7_forward_output_result_count(output)
                 native_results = plan7_forward_output_results(output)
+                native_forward_reasons = (
+                    plan7_forward_output_reason_facts(output)
+                )
                 native_offsets = plan7_forward_output_special_offsets(output)
                 native_specials = plan7_forward_output_specials(output)
                 native_provenance = plan7_forward_output_provenance(output)
@@ -5741,6 +5846,14 @@ cdef class SequenceBatch:
                     or native_provenance == NULL
                     or (result_count and native_results == NULL)
                     or (special_count and native_specials == NULL)
+                    or (
+                        collect_generation_telemetry
+                        and (
+                            plan7_forward_output_reason_count(output)
+                            != result_count
+                            or (result_count and native_forward_reasons == NULL)
+                        )
+                    )
                 ):
                     raise RuntimeError("Forward journal storage is incomplete")
 
@@ -5778,6 +5891,8 @@ cdef class SequenceBatch:
                                     + GENERATION_FORWARD_LOGICAL_CELLS
                                 ] += logical_cells
                             forward_facts = 0
+                            if collect_generation_telemetry:
+                                forward_facts = native_forward_reasons[source]
                             # A call-wide contract fallback preinitializes
                             # conservative rows without launching Forward.
                             # Its exact source transition is the call fact;
@@ -5838,8 +5953,8 @@ cdef class SequenceBatch:
                                     reason_base + GENERATION_FORWARD_CPU_COUNT
                                 ] += 1
                                 if forward_call_facts == 0 and forward_facts == 0:
-                                    forward_facts |= (
-                                        PLAN7_FORWARD_REASON_OUTPUT_CAP
+                                    raise RuntimeError(
+                                        "Forward CPU route lacks a native source fact"
                                     )
                             else:
                                 raise RuntimeError(
@@ -5975,7 +6090,11 @@ cdef class SequenceBatch:
                     for row in range(pass_count):
                         profile_index = domain_candidates[row].profile_index
                         reason_base = profile_index * GENERATION_METRIC_COUNT
-                        reason16 = native_domain_reasons[row]
+                        reason32 = native_domain_reasons[row]
+                        if reason32 & <uint32_t> 0xfffc0000:
+                            raise RuntimeError(
+                                "Backward/domain reason facts contain unknown bits"
+                            )
                         logical_cells = 0
                         generation_metrics[
                             reason_base + GENERATION_JOURNAL_ROW_COUNT
@@ -5990,12 +6109,29 @@ cdef class SequenceBatch:
                         if native_domain_results[row].route == (
                             PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED
                         ):
+                            if (
+                                not (
+                                    reason32
+                                    & PLAN7_BACKWARD_DOMAIN_REASON_FINAL_CPU_REQUIRED
+                                )
+                                or not (reason32 & <uint32_t> 0x0001ffff)
+                            ):
+                                raise RuntimeError(
+                                    "Backward/domain CPU route lacks source facts"
+                                )
                             generation_metrics[
                                 reason_base + GENERATION_BACKWARD_CPU_COUNT
                             ] += 1
                         elif native_domain_results[row].route == (
                             PLAN7_BACKWARD_DOMAIN_NO_REGIONS
                         ):
+                            if not (
+                                reason32
+                                & PLAN7_BACKWARD_DOMAIN_REASON_NO_REGIONS
+                            ):
+                                raise RuntimeError(
+                                    "Backward/domain no-region route lacks source fact"
+                                )
                             generation_metrics[
                                 reason_base
                                 + GENERATION_BACKWARD_NO_REGION_COUNT
@@ -6003,10 +6139,16 @@ cdef class SequenceBatch:
                         elif native_domain_results[row].route == (
                             PLAN7_BACKWARD_DOMAIN_SIMPLE
                         ):
+                            if not (
+                                reason32 & PLAN7_BACKWARD_DOMAIN_REASON_SIMPLE
+                            ):
+                                raise RuntimeError(
+                                    "Backward/domain SIMPLE route lacks source fact"
+                                )
                             generation_metrics[
                                 reason_base + GENERATION_BACKWARD_SIMPLE_COUNT
                             ] += 1
-                        if not (reason16 & backward_preflight_mask):
+                        if not (reason32 & backward_preflight_mask):
                             sequence_length = self._lengths[
                                 domain_candidates[row].sequence_index
                             ]
@@ -6032,14 +6174,14 @@ cdef class SequenceBatch:
                             backward_reason_counts,
                             profile_index
                             * GENERATION_BACKWARD_REASON_COUNT,
-                            reason16,
+                            reason32,
                         )
-                        _count_reason_cells16(
+                        _count_reason_cells32(
                             backward_reason_cells,
                             profile_index
                             * GENERATION_BACKWARD_REASON_COUNT,
                             GENERATION_BACKWARD_REASON_COUNT,
-                            reason16,
+                            reason32,
                             logical_cells,
                         )
                 if (
@@ -6137,7 +6279,7 @@ cdef class SequenceBatch:
                                     profile_index * GENERATION_METRIC_COUNT
                                 )
                                 reason32 = native_rescore_reasons[region]
-                                if reason32 & <uint32_t> 0xff000000:
+                                if reason32 & <uint32_t> 0xfe000000:
                                     raise RuntimeError(
                                         "rescore reason facts contain unknown bits"
                                     )
@@ -6155,6 +6297,13 @@ cdef class SequenceBatch:
                                 if native_rescore_results[region].action == (
                                     PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
                                 ):
+                                    if not (
+                                        reason32
+                                        & PLAN7_DOMAIN_RESCORE_REASON_DEVICE_RESULT
+                                    ):
+                                        raise RuntimeError(
+                                            "rescore device route lacks source fact"
+                                        )
                                     generation_metrics[
                                         reason_base
                                         + GENERATION_RESCORE_DEVICE_COUNT
@@ -6162,6 +6311,16 @@ cdef class SequenceBatch:
                                 elif native_rescore_results[region].action == (
                                     PLAN7_DOMAIN_RESCORE_CPU_REQUIRED
                                 ):
+                                    if (
+                                        not (
+                                            reason32
+                                            & PLAN7_DOMAIN_RESCORE_REASON_FINAL_CPU_REQUIRED
+                                        )
+                                        or not (reason32 & <uint32_t> 0x00ffffff)
+                                    ):
+                                        raise RuntimeError(
+                                            "rescore CPU route lacks source facts"
+                                        )
                                     generation_metrics[
                                         reason_base
                                         + GENERATION_RESCORE_CPU_COUNT
@@ -6218,7 +6377,7 @@ cdef class SequenceBatch:
                                 ]
                                 while region < stop:
                                     reason32 = native_rescore_reasons[region]
-                                    if reason32 & <uint32_t> 0xff000000:
+                                    if reason32 & <uint32_t> 0xfe000000:
                                         raise RuntimeError(
                                             "rescore reason facts contain unknown bits"
                                         )
@@ -6465,6 +6624,22 @@ cdef class SequenceBatch:
                             )
                         )
                     native_totals = {
+                        "postfilter": {
+                            "candidate_count": generation_telemetry_seed[2][0],
+                            "full_msv_execution_count": (
+                                generation_telemetry_seed[2][1]
+                            ),
+                            "viterbi_execution_count": (
+                                generation_telemetry_seed[2][2]
+                            ),
+                            "full_msv_work_cells": (
+                                generation_telemetry_seed[2][3]
+                            ),
+                            "viterbi_work_cells": (
+                                generation_telemetry_seed[2][4]
+                            ),
+                            "work_cells": generation_telemetry_seed[2][5],
+                        },
                         "forward": {
                             "candidate_count": native_statistics.candidate_count,
                             "survivor_count": native_statistics.survivor_count,
@@ -6729,6 +6904,7 @@ cdef class SequenceBatch:
         cdef object result
         cdef object generation_telemetry_seed = None
         cdef object postfilter_reason_facts = None
+        cdef object postfilter_reason_statistics = None
         cdef carray residue_offsets
         cdef size_t index
 
@@ -6744,12 +6920,14 @@ cdef class SequenceBatch:
                 postfilter_records,
                 postfilter_offsets,
                 postfilter_reason_facts,
+                postfilter_reason_statistics,
             ) = self.postfilter_profile_selection_csr_raw(
                 selection, f1, _return_reason_facts=True
             )
             generation_telemetry_seed = (
                 GENERATION_TELEMETRY_SCHEMA_VERSION,
                 postfilter_reason_facts,
+                postfilter_reason_statistics,
             )
         else:
             postfilter_records, postfilter_offsets = (
@@ -6920,6 +7098,7 @@ cdef class SequenceBatch:
         cdef uint8_t[::1] record_view
         cdef carray offsets
         cdef vector[uint16_t] reason_facts
+        cdef plan7_postfilter_reason_statistics reason_statistics
         cdef bytes reason_storage
 
         if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
@@ -6953,6 +7132,12 @@ cdef class SequenceBatch:
         self._postfilter_results.resize(candidate_count)
         if _return_reason_facts:
             reason_facts.resize(candidate_count)
+            reason_statistics.candidate_count = 0
+            reason_statistics.full_msv_execution_count = 0
+            reason_statistics.viterbi_execution_count = 0
+            reason_statistics.full_msv_work_cells = 0
+            reason_statistics.viterbi_work_cells = 0
+            reason_statistics.work_cells = 0
 
         if candidate_count:
             error[0] = 0
@@ -6977,6 +7162,7 @@ cdef class SequenceBatch:
                                 candidate_count,
                                 reason_facts.data(),
                                 candidate_count,
+                                &reason_statistics,
                                 error,
                                 sizeof(error),
                             )
@@ -7033,7 +7219,14 @@ cdef class SequenceBatch:
                     reason_facts.data(),
                     candidate_count * sizeof(uint16_t),
                 )
-            return records, offsets, reason_storage
+            return records, offsets, reason_storage, (
+                reason_statistics.candidate_count,
+                reason_statistics.full_msv_execution_count,
+                reason_statistics.viterbi_execution_count,
+                reason_statistics.full_msv_work_cells,
+                reason_statistics.viterbi_work_cells,
+                reason_statistics.work_cells,
+            )
         return records, offsets
 
     cdef size_t _run_postfilter_candidates_many(

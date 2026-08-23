@@ -543,6 +543,7 @@ struct plan7_forward_workspace {
 
 struct plan7_forward_output {
   std::vector<plan7_forward_result> results;
+  std::vector<uint16_t> reason_facts;
   std::vector<uint64_t> special_offsets;
   std::vector<float> specials;
   plan7_forward_statistics statistics;
@@ -1403,7 +1404,7 @@ extern "C" int plan7_forward_workspace_get_statistics(
   return 0;
 }
 
-extern "C" int plan7_forward_run_with_workspace(
+static int forward_run_with_workspace_impl(
     plan7_forward_workspace *workspace,
     const plan7_forward_database *database,
     const plan7_ssv_sequence_batch *batch,
@@ -1411,7 +1412,8 @@ extern "C" int plan7_forward_run_with_workspace(
     const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
     const float *filter_scores, size_t candidate_count, double f3,
     uint64_t gathered_byte_budget,
-    plan7_forward_output **output, char *error, size_t error_size) {
+    plan7_forward_output **output, bool collect_reason_facts,
+    char *error, size_t error_size) {
   const auto call_begin = std::chrono::steady_clock::now();
   if (output == nullptr || *output != nullptr || workspace == nullptr ||
       database == nullptr || batch == nullptr ||
@@ -1531,6 +1533,8 @@ extern "C" int plan7_forward_run_with_workspace(
   try {
     created->results.resize(candidate_count);
     created->special_offsets.assign(candidate_count + 1, 0);
+    if (collect_reason_facts)
+      created->reason_facts.assign(candidate_count, 0);
   } catch (...) {
     set_error(error, error_size, "Forward output allocation failed");
     return -1;
@@ -1899,6 +1903,9 @@ extern "C" int plan7_forward_run_with_workspace(
           if (output_cap_exhausted ||
               x_cells > output_cell_limit - gathered_cells) {
             result.action = PLAN7_FORWARD_CPU_REQUIRED;
+            if (collect_reason_facts)
+              created->reason_facts[candidate] |=
+                  PLAN7_FORWARD_REASON_OUTPUT_CAP;
             output_cap_exhausted = true;
             ++created->statistics.output_cap_fallback_count;
           } else if (!checked_add(tile_gathered_cells, x_cells,
@@ -2002,6 +2009,21 @@ extern "C" int plan7_forward_run_with_workspace(
   return 0;
 }
 
+extern "C" int plan7_forward_run_with_workspace(
+    plan7_forward_workspace *workspace,
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  return forward_run_with_workspace_impl(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, false, error, error_size);
+}
+
 extern "C" int plan7_forward_run(
     const plan7_forward_database *database,
     const plan7_ssv_sequence_batch *batch,
@@ -2046,6 +2068,24 @@ extern "C" int plan7_forward_run_batch_workspace(
       f3, gathered_byte_budget, output, error, error_size);
 }
 
+extern "C" int plan7_forward_run_batch_workspace_reason_facts(
+    const plan7_forward_database *database,
+    plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  plan7_forward_workspace *workspace = nullptr;
+  if (plan7_ssv_sequence_batch_get_forward_workspace(
+          batch, &workspace, error, error_size) != 0)
+    return -1;
+  return forward_run_with_workspace_impl(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, true, error, error_size);
+}
+
 extern "C" int plan7_forward_output_destroy(
     plan7_forward_output **output, char *error, size_t error_size) {
   if (output == nullptr) {
@@ -2066,6 +2106,17 @@ extern "C" const plan7_forward_result *plan7_forward_output_results(
     const plan7_forward_output *output) {
   return output == nullptr || output->results.empty()
       ? nullptr : output->results.data();
+}
+
+extern "C" size_t plan7_forward_output_reason_count(
+    const plan7_forward_output *output) {
+  return output == nullptr ? 0 : output->reason_facts.size();
+}
+
+extern "C" const uint16_t *plan7_forward_output_reason_facts(
+    const plan7_forward_output *output) {
+  return output == nullptr || output->reason_facts.empty()
+      ? nullptr : output->reason_facts.data();
 }
 
 extern "C" const uint64_t *plan7_forward_output_special_offsets(

@@ -273,12 +273,32 @@ int plan7_forward_run_batch_workspace(
   char *error,
   size_t error_size);
 
+/* Opt-in diagnostic twin. The ordinary result/statistics/provenance ABIs and
+ * the default entry point above are unchanged. */
+int plan7_forward_run_batch_workspace_reason_facts(
+  const plan7_forward_database *database,
+  plan7_ssv_sequence_batch *batch,
+  const uintptr_t *source_profile_pointers,
+  size_t profile_count,
+  const uint64_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  const float *filter_scores,
+  size_t candidate_count,
+  double f3,
+  uint64_t gathered_byte_budget,
+  plan7_forward_output **output,
+  char *error,
+  size_t error_size);
+
 int plan7_forward_output_destroy(plan7_forward_output **output,
                                  char *error,
                                  size_t error_size);
 
 size_t plan7_forward_output_result_count(const plan7_forward_output *output);
 const plan7_forward_result *plan7_forward_output_results(
+  const plan7_forward_output *output);
+size_t plan7_forward_output_reason_count(const plan7_forward_output *output);
+const uint16_t *plan7_forward_output_reason_facts(
   const plan7_forward_output *output);
 const uint64_t *plan7_forward_output_special_offsets(
   const plan7_forward_output *output);

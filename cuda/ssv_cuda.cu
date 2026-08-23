@@ -2369,6 +2369,7 @@ sequence_batch_postfilter_candidates_many_impl(
   size_t result_count,
   uint16_t *reason_facts,
   size_t reason_count,
+  plan7_postfilter_reason_statistics *reason_statistics,
   char *error,
   size_t error_size)
 {
@@ -2379,6 +2380,8 @@ sequence_batch_postfilter_candidates_many_impl(
   size_t length_term_bytes;
   int current_device;
   int maximum_grid_x;
+
+  if (reason_statistics != nullptr) *reason_statistics = {};
 
   if (batch == nullptr) {
     set_error(error, error_size, "sequence batch is null");
@@ -2405,6 +2408,7 @@ sequence_batch_postfilter_candidates_many_impl(
       (candidate_count != 0 &&
        (candidate_indices == nullptr || results == nullptr ||
         (reason_facts != nullptr && reason_count < candidate_count))) ||
+      ((reason_facts == nullptr) != (reason_statistics == nullptr)) ||
       result_count < candidate_count || viterbi_database == nullptr ||
       (profile_count != 0 && source_profile_pointers == nullptr)) {
     set_error(error, error_size, "invalid post-filter candidate buffers");
@@ -2441,6 +2445,10 @@ sequence_batch_postfilter_candidates_many_impl(
   if (batch->alphabet_size != 29 ||
       !batch->host_float_environment_valid ||
       plan7_bias_environment_attested(nullptr, 0) != 1) {
+    if (reason_statistics != nullptr) {
+      *reason_statistics = {};
+      reason_statistics->candidate_count = candidate_count;
+    }
     for (size_t profile = 0; profile < profile_count; ++profile) {
       for (size_t candidate = candidate_offsets[profile];
            candidate < candidate_offsets[profile + 1]; ++candidate) {
@@ -2610,7 +2618,8 @@ sequence_batch_postfilter_candidates_many_impl(
           batch->device_bias_logp, batch->device_bias_log1mp,
           batch->device_bias_profiles, batch->device_bias_candidates,
           batch->host_bias_candidates, batch->device_bias_ssv_inputs,
-          candidate_count, results, reason_facts, error, error_size);
+          candidate_count, results, reason_facts, reason_statistics,
+          error, error_size);
   if (postfilter_status != 0)
     return -1;
 #undef CUDA_TRY_POSTFILTER
@@ -2635,7 +2644,7 @@ plan7_ssv_sequence_batch_postfilter_candidates_many(
   return sequence_batch_postfilter_candidates_many_impl(
       batch, bias_profiles, profile_count, candidate_offsets,
       candidate_indices, candidate_count, source_profile_pointers,
-      viterbi_database, results, result_count, nullptr, 0,
+      viterbi_database, results, result_count, nullptr, 0, nullptr,
       error, error_size);
 }
 
@@ -2653,11 +2662,13 @@ plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
   size_t result_count,
   uint16_t *reason_facts,
   size_t reason_count,
+  plan7_postfilter_reason_statistics *reason_statistics,
   char *error,
   size_t error_size)
 {
   if (candidate_count != 0 &&
-      (reason_facts == nullptr || reason_count < candidate_count)) {
+      (reason_facts == nullptr || reason_count < candidate_count ||
+       reason_statistics == nullptr)) {
     set_error(error, error_size, "post-filter reason output is too small");
     return -1;
   }
@@ -2665,6 +2676,7 @@ plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
       batch, bias_profiles, profile_count, candidate_offsets,
       candidate_indices, candidate_count, source_profile_pointers,
       viterbi_database, results, result_count, reason_facts, reason_count,
+      reason_statistics,
       error, error_size);
 }
 

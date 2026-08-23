@@ -2604,9 +2604,13 @@ int domain_rescore_run_impl(
         ++created->statistics.cap_fallback_count;
       else
         ++created->statistics.numeric_fallback_count;
-      if (collect_reason_facts && created->reason_facts[result_index] == 0)
+      if (collect_reason_facts) {
+        if (created->reason_facts[result_index] == 0)
+          created->reason_facts[result_index] |=
+              PLAN7_DOMAIN_RESCORE_REASON_OTHER_CPU_REQUIRED;
         created->reason_facts[result_index] |=
-            PLAN7_DOMAIN_RESCORE_REASON_OTHER_CPU_REQUIRED;
+            PLAN7_DOMAIN_RESCORE_REASON_FINAL_CPU_REQUIRED;
+      }
     }
   }
   created->statistics.work_cells = work_cells;

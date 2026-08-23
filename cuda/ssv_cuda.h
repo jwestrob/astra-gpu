@@ -60,6 +60,7 @@ struct plan7_viterbi_database;
 struct plan7_postfilter_result;
 
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
+struct plan7_postfilter_reason_statistics;
 struct plan7_forward_workspace;
 
 typedef struct plan7_ssv_workspace_statistics {
@@ -355,6 +356,7 @@ int plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
   size_t result_count,
   uint16_t *reason_facts,
   size_t reason_count,
+  struct plan7_postfilter_reason_statistics *reason_statistics,
   char *error,
   size_t error_size);
 

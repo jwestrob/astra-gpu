@@ -21,7 +21,7 @@ from libc.stdint cimport (
     uintptr_t,
 )
 from libc.stdlib cimport calloc, free, malloc
-from libc.string cimport memcmp, memcpy, strlen
+from libc.string cimport memcmp, memcpy, memset, strlen
 from cpython.bytes cimport (
     PyBytes_AS_STRING,
     PyBytes_FromStringAndSize,
@@ -700,6 +700,27 @@ cdef struct _compact_consumption_statistics:
     uint32_t first_profile_index
     uint32_t first_sequence_index
     uint64_t first_domain_count
+    uint64_t requested_profile_index
+    uint64_t journal_row_start
+    uint64_t journal_row_stop
+    uint64_t source_postfilter_cpu_count
+    uint64_t source_definite_reject_count
+    uint64_t source_filter_count
+    uint64_t source_forward_count
+    uint64_t source_journal_eligible_count
+    uint64_t source_simple_bypass_count
+    uint64_t decision_forward_row_external_unavailable
+    uint64_t decision_forward_seam_unavailable
+    uint64_t decision_forward_f2_changed
+    uint64_t decision_forward_f3_changed
+    uint64_t decision_forward_bias_changed
+    uint64_t decision_journal_storage_unavailable
+    uint64_t decision_journal_simple_seam_unavailable
+    uint64_t decision_journal_tail_changed
+    uint64_t decision_compact_route_not_device
+    uint64_t decision_compact_empty
+    uint64_t decision_compact_tail_changed
+    uint64_t decision_compact_rebase_unavailable
 
 
 ctypedef int (*_pipeline_from_filter_scores_f)(
@@ -2056,7 +2077,13 @@ cdef int _search_loop_postfilter_forward(
             has_journal = journal.sequence_index == postfilter.sequence_index
         if has_journal and compact_statistics != NULL:
             compact_statistics.journal_match_count += 1
-            if journal.domain_route == DOMAIN_CPU_REQUIRED:
+            if (
+                journal.domain_status != DOMAIN_OK
+                or journal.domain_route == DOMAIN_CPU_REQUIRED
+                or journal.has_own_scales
+                or journal.uncertain_count != 0
+                or journal.multidomain_count != 0
+            ):
                 compact_statistics.journal_cpu_required_count += 1
             elif journal.domain_route == DOMAIN_NO_REGIONS:
                 compact_statistics.journal_no_region_count += 1
@@ -2069,10 +2096,12 @@ cdef int _search_loop_postfilter_forward(
         if postfilter.action == BIAS_CPU_REQUIRED:
             if compact_statistics != NULL:
                 compact_statistics.cpu_pipeline_count += 1
+                compact_statistics.source_postfilter_cpu_count += 1
             status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
         elif isnan(postfilter.filtersc):
             if compact_statistics != NULL:
                 compact_statistics.definite_reject_count += 1
+                compact_statistics.source_definite_reject_count += 1
             status = eslOK
         else:
             usc = <float> postfilter.msv_numerator
@@ -2092,6 +2121,8 @@ cdef int _search_loop_postfilter_forward(
                 and journal.uncertain_count == 0
                 and journal.multidomain_count == 0
             ):
+                if compact_statistics != NULL:
+                    compact_statistics.source_journal_eligible_count += 1
                 region_start = journal_region_offsets[journal_cursor]
                 region_stop = journal_region_offsets[journal_cursor + 1]
                 if region_start == region_stop:
@@ -2223,6 +2254,18 @@ cdef int _search_loop_postfilter_forward(
                 else:
                     if compact_statistics != NULL:
                         compact_statistics.simple_continuation_count += 1
+                        compact_statistics.source_simple_bypass_count += 1
+                        if journal.domain_route != DOMAIN_SIMPLE or (
+                            journal.compact_route
+                            != PLAN7_CONTINUATION_COMPACT_DEVICE
+                        ):
+                            compact_statistics.decision_compact_route_not_device += 1
+                        if compact_count == 0:
+                            compact_statistics.decision_compact_empty += 1
+                        if not compact_generation_matches:
+                            compact_statistics.decision_compact_tail_changed += 1
+                        if compact_rebased_offsets == NULL:
+                            compact_statistics.decision_compact_rebase_unavailable += 1
                     status = simple_regions_seam(
                         pli,
                         om,
@@ -2247,6 +2290,7 @@ cdef int _search_loop_postfilter_forward(
             elif has_forward and forward.action != FORWARD_CPU_REQUIRED:
                 if compact_statistics != NULL:
                     compact_statistics.forward_continuation_count += 1
+                    compact_statistics.source_forward_count += 1
                 xmx_count = (
                     special_offsets[forward_cursor + 1]
                     - special_offsets[forward_cursor]
@@ -2273,6 +2317,7 @@ cdef int _search_loop_postfilter_forward(
             else:
                 if compact_statistics != NULL:
                     compact_statistics.filter_continuation_count += 1
+                    compact_statistics.source_filter_count += 1
                 status = filter_scores_seam(
                     pli,
                     om,
@@ -7642,6 +7687,33 @@ cdef object _sealed_search_result(
                 statistics.first_sequence_index,
                 statistics.first_domain_count,
             ),
+            (
+                statistics.source_postfilter_cpu_count,
+                statistics.source_definite_reject_count,
+                statistics.source_filter_count,
+                statistics.source_forward_count,
+                statistics.source_journal_eligible_count,
+                statistics.source_simple_bypass_count,
+            ),
+            (
+                statistics.decision_forward_row_external_unavailable,
+                statistics.decision_forward_seam_unavailable,
+                statistics.decision_forward_f2_changed,
+                statistics.decision_forward_f3_changed,
+                statistics.decision_forward_bias_changed,
+                statistics.decision_journal_storage_unavailable,
+                statistics.decision_journal_simple_seam_unavailable,
+                statistics.decision_journal_tail_changed,
+                statistics.decision_compact_route_not_device,
+                statistics.decision_compact_empty,
+                statistics.decision_compact_tail_changed,
+                statistics.decision_compact_rebase_unavailable,
+            ),
+            (
+                statistics.requested_profile_index,
+                statistics.journal_row_start,
+                statistics.journal_row_stop,
+            ),
         )
     return hits, {
         "attempt_count": statistics.attempt_count,
@@ -7701,12 +7773,16 @@ cdef void _count_nonjournal_routes(
             has_forward = forward.sequence_index == postfilter.sequence_index
         if postfilter.action == BIAS_CPU_REQUIRED:
             statistics.cpu_pipeline_count += 1
+            statistics.source_postfilter_cpu_count += 1
         elif isnan(postfilter.filtersc):
             statistics.definite_reject_count += 1
+            statistics.source_definite_reject_count += 1
         elif has_forward and forward.action != FORWARD_CPU_REQUIRED:
             statistics.forward_continuation_count += 1
+            statistics.source_forward_count += 1
         else:
             statistics.filter_continuation_count += 1
+            statistics.source_filter_count += 1
         if has_forward:
             forward_cursor += 1
     if forward_cursor != forward_count:
@@ -7740,26 +7816,7 @@ def _search_hmm_sealed_postfilter_bound(
     cdef object start_ns = None
 
     if _return_compact_statistics or _return_route_statistics:
-        statistics.target_count = 0
-        statistics.postfilter_record_count = 0
-        statistics.f1_reject_count = 0
-        statistics.cpu_pipeline_count = 0
-        statistics.definite_reject_count = 0
-        statistics.filter_continuation_count = 0
-        statistics.forward_continuation_count = 0
-        statistics.simple_continuation_count = 0
-        statistics.journal_match_count = 0
-        statistics.journal_cpu_required_count = 0
-        statistics.journal_no_region_count = 0
-        statistics.journal_simple_count = 0
-        statistics.attempt_count = 0
-        statistics.accepted_count = 0
-        statistics.invalid_retry_count = 0
-        statistics.threshold_retry_count = 0
-        statistics.first_row_index = 0
-        statistics.first_profile_index = 0
-        statistics.first_sequence_index = 0
-        statistics.first_domain_count = 0
+        memset(&statistics, 0, sizeof(_compact_consumption_statistics))
         compact_statistics = &statistics
     if _return_route_statistics:
         start_ns = _time.perf_counter_ns()
@@ -7793,6 +7850,8 @@ def _search_hmm_sealed_postfilter_bound(
     postfilter_stop = <size_t> sealed._postfilter_offsets[row + 1]
     forward_start = <size_t> sealed._forward_offsets[row]
     forward_stop = <size_t> sealed._forward_offsets[row + 1]
+    if compact_statistics != NULL:
+        statistics.requested_profile_index = row
 
     live_f2.value = pipeline._pli.F2
     live_f3.value = pipeline._pli.F3
@@ -7805,6 +7864,24 @@ def _search_hmm_sealed_postfilter_bound(
     )
     if not use_forward:
         if _return_route_statistics:
+            statistics.decision_forward_row_external_unavailable = (
+                0 if sealed._row_has_external[row] else 1
+            )
+            statistics.decision_forward_seam_unavailable = (
+                0 if sealed._forward_scores_seam != NULL else 1
+            )
+            statistics.decision_forward_f2_changed = (
+                0 if live_f2.bits == sealed._generation_f2_bits else 1
+            )
+            statistics.decision_forward_f3_changed = (
+                0 if live_f3.bits == sealed._generation_f3_bits else 1
+            )
+            statistics.decision_forward_bias_changed = (
+                0
+                if pipeline._pli.do_biasfilter
+                == sealed._generation_bias_filter
+                else 1
+            )
             _count_nonjournal_routes(
                 sealed._postfilter_records[
                     postfilter_start * sizeof(_postfilter_result):
@@ -7841,6 +7918,9 @@ def _search_hmm_sealed_postfilter_bound(
     if use_journal:
         journal_start = <size_t> sealed._journal_profile_offsets[row]
         journal_stop = <size_t> sealed._journal_profile_offsets[row + 1]
+        if compact_statistics != NULL:
+            statistics.journal_row_start = journal_start
+            statistics.journal_row_stop = journal_stop
         generation_f1.value = sealed._f1
         return _sealed_search_result(
             _search_postfilter_forward_journal_validated(
@@ -7892,6 +7972,19 @@ def _search_hmm_sealed_postfilter_bound(
             start_ns,
         )
     if _return_route_statistics:
+        statistics.decision_journal_storage_unavailable = (
+            0 if sealed._journal_storage.shape[0] != 0 else 1
+        )
+        statistics.decision_journal_simple_seam_unavailable = (
+            0 if sealed._simple_regions_seam != NULL else 1
+        )
+        statistics.decision_journal_tail_changed = (
+            0
+            if _pipeline_tail_options_match(
+                &sealed._pipeline_options, pipeline
+            )
+            else 1
+        )
         _count_nonjournal_routes(
             sealed._postfilter_records[
                 postfilter_start * sizeof(_postfilter_result):

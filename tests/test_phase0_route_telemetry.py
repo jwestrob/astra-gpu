@@ -51,30 +51,34 @@ def valid_transport():
         1,  # rescore device
         1,  # rescore regions
     )
-    postfilter = [0] * 14
+    postfilter = [0] * 16
     postfilter[0] = 1
     postfilter[10] = 1
     postfilter[11] = 1
+    postfilter[14] = 1
+    postfilter[15] = 1
     f2 = [0] * 5
     f2[0] = 1
     f2[4] = 1
     forward = [0] * 10
     forward[8] = 1
-    backward = [0] * 16
+    backward = [0] * 18
     backward[14] = 1
-    rescore = [0] * 24
+    rescore = [0] * 25
     rescore[21] = 1
 
-    postfilter_cells = [0] * 14
+    postfilter_cells = [0] * 16
     postfilter_cells[0] = 50
     postfilter_cells[10] = 50
     postfilter_cells[11] = 100
+    postfilter_cells[14] = 50
+    postfilter_cells[15] = 100
     f2_cells = [0] * 5
     forward_cells = [0] * 10
     forward_cells[8] = 50
-    backward_cells = [0] * 16
+    backward_cells = [0] * 18
     backward_cells[14] = 50
-    rescore_cells = [0] * 24
+    rescore_cells = [0] * 25
     rescore_cells[21] = 20
 
     profile_records = (
@@ -97,6 +101,14 @@ def valid_transport():
         ),
     )
     native_totals = {
+        "postfilter": {
+            "candidate_count": 2,
+            "full_msv_execution_count": 1,
+            "viterbi_execution_count": 1,
+            "full_msv_work_cells": 50,
+            "viterbi_work_cells": 100,
+            "work_cells": 150,
+        },
         "forward": {
             "candidate_count": 1,
             "survivor_count": 1,
@@ -185,11 +197,46 @@ class GenerationTelemetryTests(unittest.TestCase):
         }
         cases.append((records[0], bad_native))
 
+        bad_postfilter_native = {
+            **native,
+            "postfilter": {
+                **native["postfilter"],
+                "viterbi_execution_count": 0,
+            },
+        }
+        cases.append((records[0], bad_postfilter_native))
+
         cells = [list(row) for row in records[0][2]]
         cells[2][8] = 51
         cases.append(
             (
                 (records[0][0], records[0][1], tuple(tuple(row) for row in cells)),
+                native,
+            )
+        )
+
+        missing_backward_terminal = [list(row) for row in records[0][1]]
+        missing_backward_terminal[3][14] = 0
+        cases.append(
+            (
+                (
+                    records[0][0],
+                    tuple(tuple(row) for row in missing_backward_terminal),
+                    records[0][2],
+                ),
+                native,
+            )
+        )
+
+        missing_rescore_terminal = [list(row) for row in records[0][1]]
+        missing_rescore_terminal[4][21] = 0
+        cases.append(
+            (
+                (
+                    records[0][0],
+                    tuple(tuple(row) for row in missing_rescore_terminal),
+                    records[0][2],
+                ),
                 native,
             )
         )
@@ -238,13 +285,14 @@ class GenerationTelemetryTests(unittest.TestCase):
         metrics[8:22] = (0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         reasons = list(records[0][1])
         reasons[2] = (0,) * 10
-        reasons[3] = (0,) * 16
-        reasons[4] = (0,) * 24
+        reasons[3] = (0,) * 18
+        reasons[4] = (0,) * 25
         reason_cells = list(records[0][2])
         reason_cells[2] = (0,) * 10
-        reason_cells[3] = (0,) * 16
-        reason_cells[4] = (0,) * 24
+        reason_cells[3] = (0,) * 18
+        reason_cells[4] = (0,) * 25
         native = {
+            "postfilter": native["postfilter"],
             "forward": {
                 "candidate_count": 1,
                 "survivor_count": 0,
@@ -285,9 +333,13 @@ class GenerationTelemetryTests(unittest.TestCase):
         reasons[4][1] = 1  # isolated Backward discovered own scales
         reasons[4][17] = 1  # rejected by exact host result validation
         reasons[4][20] = 1  # row-atomic CPU propagation
+        reasons[4][21] = 0  # no device result on the CPU route
+        reasons[4][24] = 1  # exact final CPU route
         reason_cells[4][1] = 20
         reason_cells[4][17] = 20
         reason_cells[4][20] = 20
+        reason_cells[4][21] = 0
+        reason_cells[4][24] = 20
         native = {
             **native,
             "rescore": {
@@ -328,9 +380,12 @@ class GenerationTelemetryTests(unittest.TestCase):
             123,
             10,
             6,
-            (4, 1, 1, 0, 1, 1, 2),
+            (4, 1, 1, 0, 2, 1, 1),
             (4, 1, 1, 2),
-            (3, 2, 1, 0, 9, 2, 7, 1),
+            (2, 1, 1, 0, 9, 2, 7, 1),
+            (1, 1, 0, 1, 3, 1),
+            (0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0),
+            (2, 8, 12),
         )
         self.assertEqual(value["target_count"], 10)
         self.assertEqual(value["postfilter_record_count"], 6)
@@ -344,29 +399,92 @@ class GenerationTelemetryTests(unittest.TestCase):
             wall_ns=1,
             target_count=4,
             postfilter_record_count=3,
-            route_counts=(1, 0, 0, 0, 0, 1, 2),
+            route_counts=(1, 0, 0, 0, 1, 0, 2),
             journal_counts=(3, 1, 0, 2),
             compact_counts=(2, 2, 0, 0, 1, 0, 1, 1),
+            source_counts=(0, 0, 0, 1, 2, 0),
+            decision_counts=(0,) * 12,
+            identity=(0, 0, 3),
         )
         cases = (
             {**valid, "route_counts": (0, 0, 0, 0, 0, 1, 2)},
             {**valid, "journal_counts": (3, 0, 0, 2)},
             {**valid, "compact_counts": (3, 2, 0, 0, 1, 0, 1, 1)},
             {**valid, "path": "forward"},
+            {**valid, "identity": (1, 0, 3)},
+            {
+                **valid,
+                "compact_counts": (2, 2, 0, 0, 3, 0, 1, 1),
+            },
+            {
+                **valid,
+                "source_counts": (0, 0, 0, 1, 2, 1),
+            },
         )
         for values in cases:
             with self.subTest(values=values):
                 with self.assertRaises(ValueError):
                     _telemetry.build_continuation_statistics(**values)
 
+    def test_continuation_bypass_facts_are_path_specific_and_complete(self):
+        value = _telemetry.build_continuation_statistics(
+            1,
+            "forward",
+            1,
+            2,
+            1,
+            (1, 0, 0, 0, 1, 0, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 1, 0, 0),
+            (0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0),
+            (0, 0, 0),
+        )
+        self.assertEqual(
+            value["decision_facts"]["journal"]["storage_unavailable"], 1
+        )
+        with self.assertRaisesRegex(ValueError, "decision facts"):
+            _telemetry.build_continuation_statistics(
+                1,
+                "forward",
+                1,
+                2,
+                1,
+                (1, 0, 0, 0, 1, 0, 0),
+                (0, 0, 0, 0),
+                (0, 0, 0, 0, 0, 0, 0, 0),
+                (0, 0, 0, 1, 0, 0),
+                (0,) * 12,
+                (0, 0, 0),
+            )
+
 
 @unittest.skipIf(_native is None, "native extension unavailable")
 class ActiveSourceReasonRemapTests(unittest.TestCase):
+    def test_postfilter_work_is_exactly_zero_one_or_two_l_times_m(self):
+        full = 0x4000
+        viterbi = 0x8000
+        self.assertEqual(_native.postfilter_execution_cells_for_test(7, 11, 0), 0)
+        self.assertEqual(
+            _native.postfilter_execution_cells_for_test(7, 11, full), 77
+        )
+        self.assertEqual(
+            _native.postfilter_execution_cells_for_test(7, 11, viterbi), 77
+        )
+        self.assertEqual(
+            _native.postfilter_execution_cells_for_test(
+                7, 11, full | viterbi
+            ),
+            154,
+        )
+        with self.assertRaises(OverflowError):
+            _native.postfilter_execution_cells_for_test(1 << 63, 2, full)
+
     def test_backward_active_rows_restore_original_sparse_ordinals(self):
         result = _native.backward_domain_merge_reason_facts_for_test(
             array("Q", [1, 4]),
-            array("H", [0x0100, 0x4000]),
-            array("H", [1, 2, 3, 4, 5, 6]),
+            array("I", [0x0100, 0x4000]),
+            array("I", [1, 2, 3, 4, 5, 6]),
         )
         self.assertEqual(list(result), [1, 0x0100, 3, 4, 0x4000, 6])
 
@@ -395,7 +513,7 @@ class ActiveSourceReasonRemapTests(unittest.TestCase):
     def test_invalid_or_duplicate_source_ordinals_fail_closed(self):
         with self.assertRaises(ValueError):
             _native.backward_domain_merge_reason_facts_for_test(
-                array("Q", [2, 2]), array("H", [1, 2]), array("H", [0, 0, 0])
+                array("Q", [2, 2]), array("I", [1, 2]), array("I", [0, 0, 0])
             )
         with self.assertRaises(ValueError):
             _native.domain_rescore_merge_reason_facts_for_test(

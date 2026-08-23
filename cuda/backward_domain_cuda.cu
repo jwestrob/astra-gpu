@@ -264,7 +264,7 @@ __device__ __forceinline__ float emission_value(
 
 template <bool CollectReasonFacts>
 __device__ __forceinline__ void add_backward_reason(
-    uint16_t *reason_facts, size_t candidate, uint16_t reason) {
+    uint32_t *reason_facts, size_t candidate, uint32_t reason) {
   if constexpr (CollectReasonFacts) reason_facts[candidate] |= reason;
 }
 
@@ -281,7 +281,7 @@ __global__ void backward_domain_kernel(
     float *dp_storage, float *backward_specials,
     plan7_domain_posterior *posteriors,
     plan7_backward_domain_result *results,
-    uint16_t *reason_facts) {
+    uint32_t *reason_facts) {
   const int lane = threadIdx.x & 31;
   const int warp_in_block = threadIdx.x >> 5;
   if (lane >= kSubwarp) return;
@@ -695,7 +695,7 @@ struct DeviceBuffers {
   plan7_domain_posterior *posteriors = nullptr;
   plan7_simple_region *regions = nullptr;
   plan7_backward_domain_result *results = nullptr;
-  uint16_t *reason_facts = nullptr;
+  uint32_t *reason_facts = nullptr;
 };
 
 void free_device_buffers(DeviceBuffers *buffers) {
@@ -724,7 +724,7 @@ struct plan7_backward_domain_output {
   std::vector<plan7_domain_posterior> posteriors;
   std::vector<uint64_t> region_offsets;
   std::vector<plan7_simple_region> regions;
-  std::vector<uint16_t> reason_facts;
+  std::vector<uint32_t> reason_facts;
   plan7_backward_domain_statistics statistics;
   plan7_backward_domain_provenance provenance;
   float rt1 = NAN;
@@ -738,8 +738,8 @@ namespace {
 
 template <typename SourceIndex>
 bool merge_backward_reason_facts(
-    const SourceIndex *active_sources, const uint16_t *active_facts,
-    size_t active_count, uint16_t *source_facts, size_t source_count) {
+    const SourceIndex *active_sources, const uint32_t *active_facts,
+    size_t active_count, uint32_t *source_facts, size_t source_count) {
   if ((active_count != 0 &&
        (active_sources == nullptr || active_facts == nullptr)) ||
       (source_count != 0 && source_facts == nullptr))
@@ -1173,7 +1173,7 @@ int backward_domain_run_impl(
   const size_t active_count = active_candidates.size();
   std::vector<plan7_backward_domain_result> active_results;
   active_results.resize(active_count);
-  std::vector<uint16_t> active_reason_facts;
+  std::vector<uint32_t> active_reason_facts;
   if (collect_reason_facts) active_reason_facts.resize(active_count);
 
   DeviceBuffers buffers{};
@@ -1194,7 +1194,7 @@ int backward_domain_run_impl(
                        &forward_special_bytes) ||
         requested_posterior_bytes > SIZE_MAX ||
         (collect_reason_facts &&
-         !checked_bytes(active_count, sizeof(uint16_t), &reason_bytes))) {
+         !checked_bytes(active_count, sizeof(uint32_t), &reason_bytes))) {
       set_error(error, error_size, "Backward/domain device size overflow");
       return -1;
     }
@@ -1430,20 +1430,36 @@ int backward_domain_run_impl(
     free_device_buffers(&buffers);
   }
 
-  for (const plan7_backward_domain_result &result : created->results) {
+  for (size_t candidate = 0; candidate < created->results.size(); ++candidate) {
+    const plan7_backward_domain_result &result = created->results[candidate];
     if (result.has_own_scales) ++created->statistics.own_scale_count;
     if (result.uncertain_count != 0)
       ++created->statistics.threshold_uncertain_count;
     if (result.route == PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED) {
       ++created->statistics.cpu_required_count;
+      if (collect_reason_facts) {
+        constexpr uint32_t explained = UINT32_C(0x0000ffff);
+        if ((created->reason_facts[candidate] & explained) == 0)
+          created->reason_facts[candidate] |=
+              PLAN7_BACKWARD_DOMAIN_REASON_OTHER_CPU_REQUIRED;
+        created->reason_facts[candidate] |=
+            PLAN7_BACKWARD_DOMAIN_REASON_FINAL_CPU_REQUIRED;
+      }
       if (result.multidomain_count != 0)
         ++created->statistics.multidomain_fallback_count;
     } else {
       ++created->statistics.device_result_count;
-      if (result.route == PLAN7_BACKWARD_DOMAIN_NO_REGIONS)
+      if (result.route == PLAN7_BACKWARD_DOMAIN_NO_REGIONS) {
         ++created->statistics.no_region_count;
-      else if (result.route == PLAN7_BACKWARD_DOMAIN_SIMPLE)
+        if (collect_reason_facts)
+          created->reason_facts[candidate] |=
+              PLAN7_BACKWARD_DOMAIN_REASON_NO_REGIONS;
+      } else if (result.route == PLAN7_BACKWARD_DOMAIN_SIMPLE) {
         ++created->statistics.simple_count;
+        if (collect_reason_facts)
+          created->reason_facts[candidate] |=
+              PLAN7_BACKWARD_DOMAIN_REASON_SIMPLE;
+      }
     }
   }
   created->statistics.work_cells = work_cells;
@@ -1583,15 +1599,15 @@ extern "C" size_t plan7_backward_domain_output_reason_count(
   return output == nullptr ? 0 : output->reason_facts.size();
 }
 
-extern "C" const uint16_t *plan7_backward_domain_output_reason_facts(
+extern "C" const uint32_t *plan7_backward_domain_output_reason_facts(
     const plan7_backward_domain_output *output) {
   return output == nullptr || output->reason_facts.empty()
              ? nullptr : output->reason_facts.data();
 }
 
 extern "C" int plan7_backward_domain_merge_reason_facts_for_test(
-    const uint64_t *active_sources, const uint16_t *active_facts,
-    size_t active_count, uint16_t *source_facts, size_t source_count) {
+    const uint64_t *active_sources, const uint32_t *active_facts,
+    size_t active_count, uint32_t *source_facts, size_t source_count) {
   return merge_backward_reason_facts(
              active_sources, active_facts, active_count,
              source_facts, source_count)

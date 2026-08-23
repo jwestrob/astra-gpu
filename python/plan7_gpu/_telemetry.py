@@ -66,7 +66,7 @@ _CELL_METRICS = (
 _REASON_FACTS = {
     "postfilter": (
         ("raw_f1_reject", 0x0001),
-        ("full_msv_erange", 0x0002),
+        ("msv_range_state", 0x0002),
         ("candidate_state_cpu", 0x0004),
         ("bias_input_status_nonzero", 0x0008),
         ("bias_filter_score_failed", 0x0010),
@@ -79,6 +79,8 @@ _REASON_FACTS = {
         ("final_pass", 0x0800),
         ("other_cpu_required", 0x1000),
         ("contract_fallback", 0x2000),
+        ("full_msv_executed", 0x4000),
+        ("viterbi_executed", 0x8000),
     ),
     "f2": (
         ("postfilter_not_pass_or_host_environment_unattested", 0x01),
@@ -116,6 +118,8 @@ _REASON_FACTS = {
         ("no_regions", 0x2000),
         ("simple", 0x4000),
         ("region_output_cap", 0x8000),
+        ("other_cpu_required", 0x00010000),
+        ("final_cpu_required", 0x00020000),
     ),
     "rescore": (
         ("global_compact_budget", 0x00000001),
@@ -142,6 +146,7 @@ _REASON_FACTS = {
         ("device_result", 0x00200000),
         ("other_cpu_required", 0x00400000),
         ("upstream_backward_own_scales", 0x00800000),
+        ("final_cpu_required", 0x01000000),
     ),
 }
 
@@ -336,6 +341,14 @@ def build_generation_statistics(
             != metric["f1_candidate_count"]
         ):
             raise ValueError("postfilter final-action facts do not partition rows")
+        full_msv_cells = dict(reason_logical_cells["postfilter"]).get(
+            "full_msv_executed", 0
+        )
+        viterbi_cells = dict(reason_logical_cells["postfilter"]).get(
+            "viterbi_executed", 0
+        )
+        if full_msv_cells + viterbi_cells != metric["postfilter_logical_cells"]:
+            raise ValueError("postfilter execution facts do not partition work")
         f2_reasons = dict(reason_counts["f2"])
         # ``msv_threshold_exceeded`` is a transition fact, not a terminal
         # outcome: a row can fail MSV and subsequently pass Viterbi.  The
@@ -367,6 +380,36 @@ def build_generation_statistics(
             raise ValueError("Forward reject facts changed")
         if forward_reasons.get("survivor_gathered", 0) != metric["forward_pass_count"]:
             raise ValueError("Forward survivor facts changed")
+        backward_reasons = dict(reason_counts["backward_domain"])
+        if (
+            backward_reasons.get("final_cpu_required", 0)
+            != metric["backward_cpu_required_count"]
+            or backward_reasons.get("no_regions", 0)
+            != metric["backward_no_region_count"]
+            or backward_reasons.get("simple", 0)
+            != metric["backward_simple_count"]
+        ):
+            raise ValueError("Backward terminal route facts changed")
+        explained_backward_cpu = sum(
+            count
+            for name, count in backward_reasons.items()
+            if name not in {
+                "final_cpu_required", "no_regions", "simple"
+            }
+        )
+        if (
+            metric["backward_cpu_required_count"] != 0
+            and explained_backward_cpu == 0
+        ):
+            raise ValueError("Backward CPU routes lack source explanations")
+        rescore_reasons = dict(reason_counts["rescore"])
+        if (
+            rescore_reasons.get("device_result", 0)
+            != metric["rescore_device_count"]
+            or rescore_reasons.get("final_cpu_required", 0)
+            != metric["rescore_cpu_required_count"]
+        ):
+            raise ValueError("rescore terminal route facts changed")
         for name, value in metric.items():
             metric_columns[name].append(value)
         profiles.append(
@@ -405,11 +448,21 @@ def build_generation_statistics(
         )
         for stage in _STAGES
     }
+    postfilter_native = native_totals.get("postfilter")
     forward_native = native_totals.get("forward")
     backward_native = native_totals.get("backward_domain")
     rescore_native = native_totals.get("rescore")
     if (
-        type(forward_native) is not dict
+        type(postfilter_native) is not dict
+        or set(postfilter_native) != {
+            "candidate_count",
+            "full_msv_execution_count",
+            "viterbi_execution_count",
+            "full_msv_work_cells",
+            "viterbi_work_cells",
+            "work_cells",
+        }
+        or type(forward_native) is not dict
         or set(forward_native) != {
             "candidate_count",
             "survivor_count",
@@ -423,9 +476,43 @@ def build_generation_statistics(
             "cpu_required_count",
             "work_cells",
         }
-        or set(native_totals) != {"forward", "backward_domain", "rescore"}
+        or set(native_totals) != {
+            "postfilter", "forward", "backward_domain", "rescore"
+        }
     ):
         raise ValueError("native generation totals are incomplete")
+    post_reasons = dict(reason_totals["postfilter"])
+    post_cells = dict(reason_cell_totals["postfilter"])
+    if _uint64(
+        postfilter_native.get("candidate_count"),
+        "native postfilter candidates",
+    ) != totals["f1_candidate_count"]:
+        raise ValueError("native postfilter candidate total changed")
+    if _uint64(
+        postfilter_native.get("full_msv_execution_count"),
+        "native full-MSV executions",
+    ) != post_reasons.get("full_msv_executed", 0):
+        raise ValueError("native full-MSV execution attribution changed")
+    if _uint64(
+        postfilter_native.get("viterbi_execution_count"),
+        "native Viterbi executions",
+    ) != post_reasons.get("viterbi_executed", 0):
+        raise ValueError("native Viterbi execution attribution changed")
+    if _uint64(
+        postfilter_native.get("full_msv_work_cells"),
+        "native full-MSV cells",
+    ) != post_cells.get("full_msv_executed", 0):
+        raise ValueError("native full-MSV work-cell attribution changed")
+    if _uint64(
+        postfilter_native.get("viterbi_work_cells"),
+        "native Viterbi cells",
+    ) != post_cells.get("viterbi_executed", 0):
+        raise ValueError("native Viterbi work-cell attribution changed")
+    if _uint64(
+        postfilter_native.get("work_cells"),
+        "native postfilter cells",
+    ) != totals["postfilter_logical_cells"]:
+        raise ValueError("native postfilter work-cell attribution changed")
     if _uint64(forward_native.get("candidate_count"), "native Forward candidates") != totals["f2_pass_count"]:
         raise ValueError("native Forward candidate total changed")
     if _uint64(forward_native.get("survivor_count"), "native Forward survivors") != totals["forward_pass_count"]:
@@ -676,6 +763,9 @@ def build_continuation_statistics(
     route_counts: tuple[int, ...],
     journal_counts: tuple[int, ...],
     compact_counts: tuple[int, ...],
+    source_counts: tuple[int, ...],
+    decision_counts: tuple[int, ...],
+    identity: tuple[int, ...],
 ) -> dict[str, Any]:
     """Validate one opt-in CPU-consumption record and name every route."""
     if type(schema_version) is not int or schema_version != 1:
@@ -730,6 +820,75 @@ def build_continuation_statistics(
     if compact[0] == 0 and any(compact[4:]):
         raise ValueError("empty compact census has a first-attempt record")
 
+    if type(source_counts) is not tuple or len(source_counts) != 6:
+        raise ValueError("invalid continuation source transport")
+    source = tuple(
+        _uint64(value, f"source_counts[{index}]")
+        for index, value in enumerate(source_counts)
+    )
+    if routes[1] != source[0] + compact[3]:
+        raise ValueError("CPU pipeline source attribution changed")
+    if routes[2] != source[1]:
+        raise ValueError("definite-reject source attribution changed")
+    if routes[3] != source[2]:
+        raise ValueError("filter-continuation source attribution changed")
+    if routes[4] != source[3] + compact[2]:
+        raise ValueError("Forward-continuation source attribution changed")
+    if routes[5] != source[5]:
+        raise ValueError("simple-continuation source attribution changed")
+    if source[4] != source[5] + compact[0]:
+        raise ValueError("journal eligible rows do not partition decisions")
+
+    if type(decision_counts) is not tuple or len(decision_counts) != 12:
+        raise ValueError("invalid continuation decision transport")
+    decisions = tuple(
+        _uint64(value, f"decision_counts[{index}]")
+        for index, value in enumerate(decision_counts)
+    )
+    if any(value > 1 for value in decisions[:8]):
+        raise ValueError("path decision facts must be exact booleans")
+    if path == "postfilter":
+        if not any(decisions[:5]) or any(decisions[5:8]):
+            raise ValueError("postfilter path decision facts changed")
+    elif path == "forward":
+        if any(decisions[:5]) or not any(decisions[5:8]):
+            raise ValueError("Forward path decision facts changed")
+    elif any(decisions[:8]):
+        raise ValueError("journal path contains bypass facts")
+    for value in decisions[8:]:
+        if value > source[5]:
+            raise ValueError("compact bypass fact exceeds bypass rows")
+    if source[5] and sum(decisions[8:]) < source[5]:
+        raise ValueError("compact bypass rows lack source facts")
+
+    if type(identity) is not tuple or len(identity) != 3:
+        raise ValueError("invalid continuation identity transport")
+    identity_values = tuple(
+        _uint64(value, f"identity[{index}]")
+        for index, value in enumerate(identity)
+    )
+    if path == "journal":
+        if identity_values[1] > identity_values[2]:
+            raise ValueError("journal row bounds are not monotone")
+        if journal[0] != identity_values[2] - identity_values[1]:
+            raise ValueError("journal row bounds changed")
+        if source[4] != journal[2] + journal[3]:
+            raise ValueError("journal eligible route attribution changed")
+        if source[3] != journal[1]:
+            raise ValueError("journal CPU route attribution changed")
+        if compact[0] > journal[3]:
+            raise ValueError("compact attempts exceed SIMPLE journal rows")
+    elif any(identity_values[1:]):
+        raise ValueError("non-journal path contains journal row bounds")
+    if compact[0]:
+        if (
+            not identity_values[1] <= compact[4] < identity_values[2]
+            or compact[5] != identity_values[0]
+            or compact[6] >= target_count
+            or compact[7] == 0
+        ):
+            raise ValueError("compact first-attempt identity changed")
+
     return {
         "schema_version": GENERATION_TELEMETRY_SCHEMA_VERSION,
         "scope": "continuation",
@@ -758,5 +917,38 @@ def build_continuation_statistics(
             "invalid_retry_count": compact[2],
             "threshold_retry_count": compact[3],
             "first_attempt": None if compact[0] == 0 else compact[4:],
+        },
+        "source_routes": {
+            "postfilter_cpu_count": source[0],
+            "definite_reject_count": source[1],
+            "filter_count": source[2],
+            "forward_count": source[3],
+            "journal_eligible_count": source[4],
+            "simple_bypass_count": source[5],
+        },
+        "decision_facts": {
+            "forward": {
+                "row_external_unavailable": decisions[0],
+                "seam_unavailable": decisions[1],
+                "f2_changed": decisions[2],
+                "f3_changed": decisions[3],
+                "bias_filter_changed": decisions[4],
+            },
+            "journal": {
+                "storage_unavailable": decisions[5],
+                "simple_regions_seam_unavailable": decisions[6],
+                "tail_options_changed": decisions[7],
+            },
+            "compact": {
+                "route_not_device": decisions[8],
+                "empty": decisions[9],
+                "tail_options_changed": decisions[10],
+                "rebase_unavailable": decisions[11],
+            },
+        },
+        "identity": {
+            "profile_index": identity_values[0],
+            "journal_row_start": identity_values[1],
+            "journal_row_stop": identity_values[2],
         },
     }

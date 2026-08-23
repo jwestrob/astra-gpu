@@ -421,6 +421,16 @@ __global__ void full_msv_kernel(
   }
 }
 
+__global__ void postfilter_full_msv_execution_facts_kernel(
+    const plan7_bias_ssv_input *msv_results, size_t candidate_count,
+    uint16_t *reason_facts) {
+  const size_t candidate =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (candidate >= candidate_count) return;
+  if (msv_results[candidate].status == PLAN7_SSV_ENORESULT)
+    reason_facts[candidate] |= PLAN7_POSTFILTER_REASON_FULL_MSV_EXECUTED;
+}
+
 __global__ void prepare_bias_inputs_kernel(
     const float *null_scores, const plan7_ssv_f1_profile *profiles,
     const plan7_bias_candidate *candidates,
@@ -660,11 +670,11 @@ __global__ void postfilter_reason_facts_kernel(
   const CandidateState state = static_cast<CandidateState>(states[candidate]);
   const plan7_bias_result bias = bias_results[candidate];
   const plan7_postfilter_result output = results[candidate];
-  uint16_t facts = 0;
+  uint16_t facts = reason_facts[candidate];
   if (state == kCandidateRawReject)
     facts |= PLAN7_POSTFILTER_REASON_RAW_F1_REJECT;
   else if (state == kCandidateMsvRange)
-    facts |= PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE;
+    facts |= PLAN7_POSTFILTER_REASON_MSV_RANGE_STATE;
   else if (state == kCandidateCpu)
     facts |= PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU;
 
@@ -691,6 +701,7 @@ __global__ void postfilter_reason_facts_kernel(
     }
 
     if (bias.action != PLAN7_BIAS_CPU_REQUIRED) {
+      facts |= PLAN7_POSTFILTER_REASON_VITERBI_EXECUTED;
       if (vit_results[candidate].status == PLAN7_SSV_ERANGE)
         facts |= PLAN7_POSTFILTER_REASON_VITERBI_ERANGE;
       else if (vit_results[candidate].status != PLAN7_SSV_OK)
@@ -701,7 +712,7 @@ __global__ void postfilter_reason_facts_kernel(
   if (output.action == PLAN7_BIAS_CPU_REQUIRED) {
     facts |= PLAN7_POSTFILTER_REASON_FINAL_CPU_REQUIRED;
     constexpr uint16_t explained =
-        PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE |
+        PLAN7_POSTFILTER_REASON_MSV_RANGE_STATE |
         PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU |
         PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO |
         PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED |
@@ -2297,6 +2308,7 @@ int postfilter_candidates_device_with_workspace_impl(
     const plan7_bias_candidate *host_candidates,
     plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
     plan7_postfilter_result *host_results, uint16_t *host_reason_facts,
+    plan7_postfilter_reason_statistics *reason_statistics,
     char *error, size_t error_size) {
   if (workspace == nullptr || database == nullptr || device_residues == nullptr ||
       device_sequence_offsets == nullptr || host_sequence_lengths == nullptr ||
@@ -2309,6 +2321,8 @@ int postfilter_candidates_device_with_workspace_impl(
     set_error(error, error_size, "invalid post-filter device buffers");
     return -1;
   }
+  if (reason_statistics != nullptr)
+    *reason_statistics = {};
   if (candidate_count == 0) return 0;
   int current_device = -1;
   cudaError_t status = cudaGetDevice(&current_device);
@@ -2491,8 +2505,13 @@ int postfilter_candidates_device_with_workspace_impl(
                             "cudaMalloc(post-filter results)", error,
                             error_size) != 0)
     return -1;
-  if (host_reason_facts != nullptr)
+  if (host_reason_facts != nullptr) {
     CUDA_RUN(cudaMalloc(&reason_storage.device, reason_fact_bytes));
+    CUDA_RUN(cudaMemset(reason_storage.device, 0, reason_fact_bytes));
+    postfilter_full_msv_execution_facts_kernel<<<blocks, kThreads>>>(
+        device_msv_inputs, candidate_count, reason_storage.device);
+    CUDA_RUN(cudaGetLastError());
+  }
   CUDA_RUN(cudaMemcpy(workspace->device_moves, host_moves.data(), move_bytes,
                       cudaMemcpyHostToDevice));
   CUDA_RUN(cudaMemcpy(workspace->device_msv_offsets, host_msv_offsets.data(),
@@ -2559,6 +2578,52 @@ int postfilter_candidates_device_with_workspace_impl(
     CUDA_RUN(cudaGetLastError());
     CUDA_RUN(cudaMemcpy(host_reason_facts, reason_storage.device,
                         reason_fact_bytes, cudaMemcpyDeviceToHost));
+    if (reason_statistics == nullptr) {
+      set_error(error, error_size,
+                "post-filter reason statistics output is null");
+      return -1;
+    }
+    reason_statistics->candidate_count = candidate_count;
+    const auto &profiles = database_host_profiles(database);
+    for (size_t candidate = 0; candidate < candidate_count; ++candidate) {
+      const plan7_bias_candidate mapping = host_candidates[candidate];
+      const uint64_t length = host_sequence_lengths[mapping.sequence_index];
+      const uint64_t model_length =
+          static_cast<uint64_t>(profiles[mapping.profile_index].model_length);
+      uint64_t cells = 0;
+      if (!checked_multiply(length, model_length, &cells)) {
+        set_error(error, error_size,
+                  "post-filter reason work-cell product overflow");
+        return -1;
+      }
+      if (host_reason_facts[candidate] &
+          PLAN7_POSTFILTER_REASON_FULL_MSV_EXECUTED) {
+        ++reason_statistics->full_msv_execution_count;
+        if (!checked_add(reason_statistics->full_msv_work_cells, cells,
+                         &reason_statistics->full_msv_work_cells)) {
+          set_error(error, error_size,
+                    "post-filter full-MSV work-cell total overflow");
+          return -1;
+        }
+      }
+      if (host_reason_facts[candidate] &
+          PLAN7_POSTFILTER_REASON_VITERBI_EXECUTED) {
+        ++reason_statistics->viterbi_execution_count;
+        if (!checked_add(reason_statistics->viterbi_work_cells, cells,
+                         &reason_statistics->viterbi_work_cells)) {
+          set_error(error, error_size,
+                    "post-filter Viterbi work-cell total overflow");
+          return -1;
+        }
+      }
+    }
+    if (!checked_add(reason_statistics->full_msv_work_cells,
+                     reason_statistics->viterbi_work_cells,
+                     &reason_statistics->work_cells)) {
+      set_error(error, error_size,
+                "post-filter work-cell total overflow");
+      return -1;
+    }
   }
   CUDA_RUN(cudaMemcpy(host_results, workspace->device_results, post_result_bytes,
                       cudaMemcpyDeviceToHost));
@@ -2588,7 +2653,7 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
       device_compact_scores, device_f1_profiles, device_tjb,
       device_length_logp, device_length_log1mp, device_bias_profiles,
       device_candidates, host_candidates, device_msv_inputs, candidate_count,
-      host_results, nullptr, error, error_size);
+      host_results, nullptr, nullptr, error, error_size);
 }
 
 extern "C" int plan7_postfilter_candidates_device_with_workspace_reason_facts(
@@ -2605,8 +2670,9 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace_reason_facts(
     const plan7_bias_candidate *host_candidates,
     plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
     plan7_postfilter_result *host_results, uint16_t *reason_facts,
+    plan7_postfilter_reason_statistics *reason_statistics,
     char *error, size_t error_size) {
-  if (candidate_count != 0 && reason_facts == nullptr) {
+  if (reason_facts == nullptr || reason_statistics == nullptr) {
     set_error(error, error_size, "post-filter reason output is null");
     return -1;
   }
@@ -2616,7 +2682,7 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace_reason_facts(
       device_compact_scores, device_f1_profiles, device_tjb,
       device_length_logp, device_length_log1mp, device_bias_profiles,
       device_candidates, host_candidates, device_msv_inputs, candidate_count,
-      host_results, reason_facts, error, error_size);
+      host_results, reason_facts, reason_statistics, error, error_size);
 }
 
 extern "C" int plan7_postfilter_candidates_device(

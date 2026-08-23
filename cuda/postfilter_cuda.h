@@ -20,7 +20,9 @@ enum plan7_postfilter_abi {
  * provenance. Multiple facts may apply to one retained F1 row. */
 enum plan7_postfilter_reason_fact {
   PLAN7_POSTFILTER_REASON_RAW_F1_REJECT = UINT16_C(0x0001),
-  PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE = UINT16_C(0x0002),
+  /* Final candidate state is MSV-range.  This does not imply that the full
+   * MSV kernel ran: an incoming sparse-SSV ERANGE has the same final state. */
+  PLAN7_POSTFILTER_REASON_MSV_RANGE_STATE = UINT16_C(0x0002),
   PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU = UINT16_C(0x0004),
   PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO = UINT16_C(0x0008),
   PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED = UINT16_C(0x0010),
@@ -32,8 +34,21 @@ enum plan7_postfilter_reason_fact {
   PLAN7_POSTFILTER_REASON_FINAL_REJECT = UINT16_C(0x0400),
   PLAN7_POSTFILTER_REASON_FINAL_PASS = UINT16_C(0x0800),
   PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED = UINT16_C(0x1000),
-  PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK = UINT16_C(0x2000)
+  PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK = UINT16_C(0x2000),
+  PLAN7_POSTFILTER_REASON_FULL_MSV_EXECUTED = UINT16_C(0x4000),
+  PLAN7_POSTFILTER_REASON_VITERBI_EXECUTED = UINT16_C(0x8000)
 };
+
+/* Opt-in source-execution census.  This sidecar is not part of any result,
+ * workspace-statistics, provenance, or journal ABI. */
+typedef struct plan7_postfilter_reason_statistics {
+  uint64_t candidate_count;
+  uint64_t full_msv_execution_count;
+  uint64_t viterbi_execution_count;
+  uint64_t full_msv_work_cells;
+  uint64_t viterbi_work_cells;
+  uint64_t work_cells;
+} plan7_postfilter_reason_statistics;
 
 /*
  * Version 1 deliberately preserves plan7_bias_result as its 12-byte prefix.
@@ -297,6 +312,7 @@ int plan7_postfilter_candidates_device_with_workspace_reason_facts(
   size_t candidate_count,
   plan7_postfilter_result *host_results,
   uint16_t *reason_facts,
+  plan7_postfilter_reason_statistics *reason_statistics,
   char *error,
   size_t error_size);
 
