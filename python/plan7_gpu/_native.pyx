@@ -2,7 +2,7 @@
 
 from libc.stddef cimport size_t
 from libc.stdint cimport int16_t, int32_t, uintptr_t, uint8_t, uint16_t, uint32_t, uint64_t
-from libc.math cimport isfinite
+from libc.math cimport isfinite, isnan
 from libc.stdlib cimport calloc, free
 from libc.string cimport memcmp, memcpy, memset
 from cpython.array cimport array as carray, clone
@@ -61,7 +61,7 @@ cdef uint64_t _direct_v3_staging_build_ns = 0
 cdef uint64_t _direct_v3_source_validation_ns = 0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 GENERATION_TELEMETRY_SCHEMA_VERSION = 2
-DIRECT_V3_STAGING_SCHEMA_VERSION = 1
+DIRECT_V3_STAGING_SCHEMA_VERSION = 2
 
 # Host F2 decisions are made in this Cython translation unit, so their exact
 # version-1 facts intentionally live beside that source predicate.
@@ -1463,6 +1463,26 @@ cdef extern from "continuation_journal.h":
         PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
         PLAN7_CONTINUATION_COMPACT_DEVICE
 
+    cdef enum plan7_continuation_journal_v3_source_stage:
+        PLAN7_CONTINUATION_V3_RAW_F1_REJECT
+        PLAN7_CONTINUATION_V3_BIAS_REJECT
+        PLAN7_CONTINUATION_V3_F2_REJECT
+        PLAN7_CONTINUATION_V3_F3_REJECT
+        PLAN7_CONTINUATION_V3_DOMAIN_NO_REGIONS
+        PLAN7_CONTINUATION_V3_CPU_REQUIRED
+        PLAN7_CONTINUATION_V3_F2_SURVIVOR
+        PLAN7_CONTINUATION_V3_F3_SURVIVOR
+        PLAN7_CONTINUATION_V3_DOMAIN_CPU_REQUIRED
+        PLAN7_CONTINUATION_V3_DOMAIN_SIMPLE
+        PLAN7_CONTINUATION_V3_DOMAIN_COMPACT
+
+    cdef enum plan7_continuation_journal_v3_exception_route:
+        PLAN7_CONTINUATION_V3_FULL_PIPELINE
+        PLAN7_CONTINUATION_V3_FILTER_SCORES
+        PLAN7_CONTINUATION_V3_FORWARD_SCORES
+        PLAN7_CONTINUATION_V3_SIMPLE_REGIONS
+        PLAN7_CONTINUATION_V3_COMPACT_DOMAINS
+
     ctypedef struct plan7_continuation_journal_row:
         uint32_t profile_index
         uint32_t sequence_index
@@ -1557,6 +1577,33 @@ cdef extern from "continuation_journal.h":
         const plan7_continuation_journal *journal,
     ) nogil
 
+    uint64_t plan7_continuation_journal_v3_decision_term(
+        uint64_t source_index,
+        uint8_t decision,
+    ) nogil
+
+    uint64_t plan7_continuation_journal_v3_decision_seed(
+        uint64_t postfilter_count,
+        uint64_t profile_count,
+        uint64_t session_id,
+        uint64_t selection_id,
+        uint64_t batch_generation,
+        uint64_t f1_bits,
+        uint64_t f2_bits,
+        uint64_t f3_bits,
+        uint64_t generation_tail_fingerprint,
+    ) nogil
+
+    uint64_t plan7_continuation_journal_v3_decision_finish(
+        uint64_t state,
+        uint64_t exception_count,
+        uint64_t special_count,
+        uint64_t region_count,
+        uint64_t compact_result_count,
+        uint64_t compact_trace_count,
+        uint64_t compact_null2_count,
+    ) nogil
+
 
 cdef union float_bits:
     float value
@@ -1620,6 +1667,43 @@ cdef bytes _copy_native_bytes(
     return storage
 
 
+cdef inline uint8_t _direct_v3_decision(
+    uint8_t stage,
+    uint8_t route,
+) noexcept nogil:
+    return <uint8_t> stage | (<uint8_t> route << 4)
+
+
+cdef inline void _direct_v3_plan_initial(
+    uint8_t *plan,
+    size_t source_index,
+    uint8_t decision,
+    uint64_t *terms,
+    uint64_t *exception_count,
+) noexcept nogil:
+    plan[source_index] = decision
+    terms[0] ^= plan7_continuation_journal_v3_decision_term(
+        <uint64_t> source_index, decision
+    )
+    if decision >> 4:
+        exception_count[0] += 1
+
+
+cdef inline void _direct_v3_plan_replace(
+    uint8_t *plan,
+    size_t source_index,
+    uint8_t decision,
+    uint64_t *terms,
+) noexcept nogil:
+    terms[0] ^= plan7_continuation_journal_v3_decision_term(
+        <uint64_t> source_index, plan[source_index]
+    )
+    plan[source_index] = decision
+    terms[0] ^= plan7_continuation_journal_v3_decision_term(
+        <uint64_t> source_index, decision
+    )
+
+
 cdef object _build_continuation_journal_capsule(
     const plan7_profile_selection_view *view,
     const uint8_t *profile_fingerprints,
@@ -1650,6 +1734,14 @@ cdef object _build_continuation_journal_capsule(
     uint64_t *journal_total_bytes,
     object postfilter_owner=None,
     bint direct_sparse_v3=False,
+    object direct_decision_plan=None,
+    uint64_t direct_decision_terms=0,
+    uint64_t direct_exception_count=0,
+    uint64_t direct_special_count=0,
+    uint64_t direct_region_count=0,
+    uint64_t direct_compact_result_count=0,
+    uint64_t direct_compact_trace_count=0,
+    uint64_t direct_compact_null2_count=0,
 ):
     cdef const plan7_forward_result *forward_results
     cdef const float *forward_specials
@@ -1732,6 +1824,12 @@ cdef object _build_continuation_journal_capsule(
     cdef bytes direct_forward_provenance
     cdef bytes direct_domain_provenance
     cdef bytes direct_rescore_provenance
+    cdef bytes direct_decision_storage
+    cdef tuple direct_decision_counts
+    cdef uint64_t direct_decision_tag = 0
+    cdef double_bits direct_f1_encoded
+    cdef double_bits direct_f2_encoded
+    cdef double_bits direct_f3_encoded
     cdef uint64_t direct_staging_bytes = 0
     global _sealed_journal_build_count
     global _sealed_journal_payload_bytes
@@ -2014,7 +2112,21 @@ cdef object _build_continuation_journal_capsule(
             plan7_postfilter_result
         ):
             raise ValueError("direct v3 post-filter storage size changed")
+        if type(direct_decision_plan) is not bytes:
+            raise TypeError("direct v3 decision plan must be immutable bytes")
+        if len(direct_decision_plan) != postfilter_count:
+            raise ValueError("direct v3 decision plan size changed")
+        if (
+            direct_exception_count > postfilter_count
+            or direct_special_count > special_count
+            or direct_region_count > region_count
+            or direct_compact_result_count > compact_result_count
+            or direct_compact_trace_count > compact_trace_count
+            or direct_compact_null2_count > compact_null2_count
+        ):
+            raise ValueError("direct v3 sparse payload counts exceed sources")
         direct_postfilter_storage = postfilter_owner
+        direct_decision_storage = direct_decision_plan
         direct_postfilter_offsets = _copy_native_bytes(
             postfilter_offsets,
             view.profile_count + 1,
@@ -2236,6 +2348,7 @@ cdef object _build_continuation_journal_capsule(
             + len(direct_forward_provenance)
             + len(direct_domain_provenance)
             + len(direct_rescore_provenance)
+            + len(direct_decision_storage)
         )
         if journal_total_bytes != NULL:
             # Counterfactual exact v2 allocation size, calculated by the same
@@ -2243,6 +2356,38 @@ cdef object _build_continuation_journal_capsule(
             journal_total_bytes[0] = <uint64_t> cursor
         float_encoded.value = guard_band
         double_encoded.value = f1
+        direct_f1_encoded.value = f1
+        direct_f2_encoded.value = f2
+        direct_f3_encoded.value = f3
+        direct_decision_tag = plan7_continuation_journal_v3_decision_seed(
+            postfilter_count,
+            view.profile_count,
+            view.session_id,
+            view.selection_id,
+            forward_provenance.batch_generation,
+            direct_f1_encoded.bits,
+            direct_f2_encoded.bits,
+            direct_f3_encoded.bits,
+            generation_tail_fingerprint,
+        ) ^ direct_decision_terms
+        direct_decision_tag = plan7_continuation_journal_v3_decision_finish(
+            direct_decision_tag,
+            direct_exception_count,
+            direct_special_count,
+            direct_region_count,
+            direct_compact_result_count,
+            direct_compact_trace_count,
+            direct_compact_null2_count,
+        )
+        direct_decision_counts = (
+            direct_exception_count,
+            direct_special_count,
+            direct_region_count,
+            direct_compact_result_count,
+            direct_compact_trace_count,
+            direct_compact_null2_count,
+            direct_decision_tag,
+        )
         direct_start_ns = _time.perf_counter_ns() - direct_start_ns
         _direct_v3_staging_build_count += 1
         _direct_v3_eliminated_v2_bytes += <uint64_t> cursor
@@ -2306,6 +2451,8 @@ cdef object _build_continuation_journal_capsule(
             direct_domain_provenance,
             direct_rescore_provenance,
             validation_elapsed_ns,
+            direct_decision_storage,
+            direct_decision_counts,
         )
 
     _sealed_journal_validation_ns += <uint64_t> validation_elapsed_ns
@@ -5738,6 +5885,7 @@ cdef class SequenceBatch:
         cdef vector[float] uncorrected_scores
         cdef vector[plan7_postfilter_result] candidate_records
         cdef vector[uint32_t] candidate_profiles
+        cdef vector[size_t] candidate_postfilter_sources
         cdef vector[plan7_backward_domain_candidate] domain_candidates
         cdef vector[size_t] pass_sources
         cdef vector[uint64_t] pass_special_offsets
@@ -5765,6 +5913,8 @@ cdef class SequenceBatch:
         cdef uint32_t reason32
         cdef uint16_t forward_facts
         cdef uint8_t forward_call_facts = 0
+        cdef uint8_t direct_decision = 0
+        cdef uint8_t direct_compact_route = PLAN7_CONTINUATION_COMPACT_NONE
         cdef uint32_t backward_preflight_mask
         cdef uint32_t previous
         cdef bint have_previous
@@ -5794,6 +5944,7 @@ cdef class SequenceBatch:
         cdef const uint64_t *native_domain_region_offsets = NULL
         cdef const plan7_simple_region *native_domain_regions = NULL
         cdef const plan7_domain_rescore_result *native_rescore_results = NULL
+        cdef const uint64_t *native_rescore_trace_offsets = NULL
         cdef char error[512]
         cdef char destroy_error[512]
         cdef int status = 0
@@ -5817,7 +5968,25 @@ cdef class SequenceBatch:
         cdef bint collect_generation_telemetry = (
             generation_telemetry_seed is not None
         )
+        cdef bint direct_domain_safe
+        cdef bint direct_no_region
+        cdef size_t direct_postfilter_source
+        cdef size_t direct_region_begin
+        cdef size_t direct_region_end
+        cdef size_t direct_trace_begin
+        cdef size_t direct_trace_end
+        cdef size_t direct_compact_source_count = 0
+        cdef uint64_t direct_payload_delta
+        cdef uint64_t direct_decision_terms = 0
+        cdef uint64_t direct_exception_count = 0
+        cdef uint64_t direct_special_count = 0
+        cdef uint64_t direct_region_count = 0
+        cdef uint64_t direct_compact_result_count = 0
+        cdef uint64_t direct_compact_trace_count = 0
+        cdef uint64_t direct_compact_null2_count = 0
         cdef bytes records
+        cdef bytes direct_decision_plan = b""
+        cdef uint8_t *direct_decisions = NULL
         cdef bytes offset_storage
         cdef bytes special_storage
         cdef object special_offsets
@@ -5894,6 +6063,13 @@ cdef class SequenceBatch:
         )
         if postfilter_offsets[profile_count] != record_count:
             raise ValueError("post-filter row offsets do not span result storage")
+        if direct_sparse_v3:
+            if record_count > <size_t> PY_SSIZE_T_MAX:
+                raise OverflowError("direct v3 decision plan exceeds Python limits")
+            direct_decision_plan = PyBytes_FromStringAndSize(NULL, record_count)
+            direct_decisions = <uint8_t *> PyBytes_AS_STRING(
+                direct_decision_plan
+            )
         if residue_offsets.shape[0] != self._sequence_count + 1:
             raise ValueError("target residue-prefix length differs from targets")
         if residue_offsets[0] != 0:
@@ -6019,6 +6195,22 @@ cdef class SequenceBatch:
                     )
                 previous = record.sequence_index
                 have_previous = True
+                if direct_sparse_v3:
+                    if record.action == PLAN7_BIAS_CPU_REQUIRED:
+                        direct_decision = _direct_v3_decision(
+                            PLAN7_CONTINUATION_V3_CPU_REQUIRED,
+                            PLAN7_CONTINUATION_V3_FULL_PIPELINE,
+                        )
+                    elif isnan(record.filtersc):
+                        direct_decision = _direct_v3_decision(
+                            PLAN7_CONTINUATION_V3_RAW_F1_REJECT, 0
+                        )
+                    elif record.action == PLAN7_BIAS_DEFINITE_REJECT:
+                        direct_decision = _direct_v3_decision(
+                            PLAN7_CONTINUATION_V3_BIAS_REJECT, 0
+                        )
+                    else:
+                        direct_decision = 0xff
                 if collect_generation_telemetry:
                     reason16 = postfilter_reason_view[cursor]
                     _count_postfilter_reason(
@@ -6083,6 +6275,19 @@ cdef class SequenceBatch:
                         f2_reason_counts[
                             profile_index * GENERATION_F2_REASON_COUNT
                         ] += 1
+                    if direct_sparse_v3:
+                        if direct_decision == 0xff:
+                            direct_decision = _direct_v3_decision(
+                                PLAN7_CONTINUATION_V3_F2_SURVIVOR,
+                                PLAN7_CONTINUATION_V3_FILTER_SCORES,
+                            )
+                        _direct_v3_plan_initial(
+                            direct_decisions,
+                            cursor,
+                            direct_decision,
+                            &direct_decision_terms,
+                            &direct_exception_count,
+                        )
                     continue
                 vfsc_bits.value = record.vfsc
                 if (
@@ -6099,6 +6304,19 @@ cdef class SequenceBatch:
                         f2_reason_counts[
                             profile_index * GENERATION_F2_REASON_COUNT + 1
                         ] += 1
+                    if direct_sparse_v3:
+                        if direct_decision == 0xff:
+                            direct_decision = _direct_v3_decision(
+                                PLAN7_CONTINUATION_V3_F2_SURVIVOR,
+                                PLAN7_CONTINUATION_V3_FILTER_SCORES,
+                            )
+                        _direct_v3_plan_initial(
+                            direct_decisions,
+                            cursor,
+                            direct_decision,
+                            &direct_decision_terms,
+                            &direct_exception_count,
+                        )
                     continue
                 usc = <float> record.msv_numerator
                 usc = usc / view.profiles[profile_index].scale
@@ -6127,6 +6345,16 @@ cdef class SequenceBatch:
                             f2_reason_counts[
                                 profile_index * GENERATION_F2_REASON_COUNT + 3
                             ] += 1
+                        if direct_sparse_v3:
+                            _direct_v3_plan_initial(
+                                direct_decisions,
+                                cursor,
+                                _direct_v3_decision(
+                                    PLAN7_CONTINUATION_V3_F2_REJECT, 0
+                                ),
+                                &direct_decision_terms,
+                                &direct_exception_count,
+                            )
                         continue
                 if residue_offsets[record.sequence_index + 1] < (
                     residue_offsets[record.sequence_index]
@@ -6143,6 +6371,18 @@ cdef class SequenceBatch:
                 uncorrected_scores.push_back(usc)
                 candidate_records.push_back(record)
                 candidate_profiles.push_back(<uint32_t> profile_index)
+                if direct_sparse_v3:
+                    _direct_v3_plan_initial(
+                        direct_decisions,
+                        cursor,
+                        _direct_v3_decision(
+                            PLAN7_CONTINUATION_V3_F2_SURVIVOR,
+                            PLAN7_CONTINUATION_V3_FILTER_SCORES,
+                        ),
+                        &direct_decision_terms,
+                        &direct_exception_count,
+                    )
+                    candidate_postfilter_sources.push_back(cursor)
                 if collect_generation_telemetry:
                     f2_reason_counts[
                         profile_index * GENERATION_F2_REASON_COUNT + 4
@@ -6814,6 +7054,304 @@ cdef class SequenceBatch:
                             rescore_output
                         )
                         rescore_payload = rescore_payload + (upstream_payload,)
+                if direct_sparse_v3:
+                    if candidate_postfilter_sources.size() != candidate_count:
+                        raise RuntimeError(
+                            "direct v3 candidate source mapping changed"
+                        )
+                    for source in range(candidate_count):
+                        direct_postfilter_source = (
+                            candidate_postfilter_sources[source]
+                        )
+                        if native_results[source].action == (
+                            PLAN7_FORWARD_DEFINITE_REJECT
+                        ):
+                            if direct_exception_count == 0:
+                                raise RuntimeError(
+                                    "direct v3 exception count underflow"
+                                )
+                            _direct_v3_plan_replace(
+                                direct_decisions,
+                                direct_postfilter_source,
+                                _direct_v3_decision(
+                                    PLAN7_CONTINUATION_V3_F3_REJECT, 0
+                                ),
+                                &direct_decision_terms,
+                            )
+                            direct_exception_count -= 1
+                        elif native_results[source].action not in (
+                            PLAN7_FORWARD_CPU_REQUIRED,
+                            PLAN7_FORWARD_DEFINITE_PASS,
+                        ):
+                            raise RuntimeError(
+                                "direct v3 Forward action is invalid"
+                            )
+
+                    native_domain_results = (
+                        plan7_backward_domain_output_results(domain_output)
+                    )
+                    native_domain_region_offsets = (
+                        plan7_backward_domain_output_region_offsets(
+                            domain_output
+                        )
+                    )
+                    if (
+                        (pass_count and native_domain_results == NULL)
+                        or native_domain_region_offsets == NULL
+                    ):
+                        raise RuntimeError(
+                            "direct v3 domain decision source is incomplete"
+                        )
+                    direct_compact_source_count = 0
+                    native_rescore_results = NULL
+                    native_rescore_trace_offsets = NULL
+                    native_rescore_statistics = NULL
+                    if rescore_output != NULL:
+                        direct_compact_source_count = (
+                            plan7_domain_rescore_output_result_count(
+                                rescore_output
+                            )
+                        )
+                        native_rescore_results = (
+                            plan7_domain_rescore_output_results(rescore_output)
+                        )
+                        native_rescore_trace_offsets = (
+                            plan7_domain_rescore_output_trace_offsets(
+                                rescore_output
+                            )
+                        )
+                        native_rescore_statistics = (
+                            plan7_domain_rescore_output_statistics(
+                                rescore_output
+                            )
+                        )
+                        if (
+                            native_rescore_statistics == NULL
+                            or native_rescore_trace_offsets == NULL
+                            or (
+                                direct_compact_source_count
+                                and native_rescore_results == NULL
+                            )
+                        ):
+                            raise RuntimeError(
+                                "direct v3 rescore decision source is incomplete"
+                            )
+
+                    for row in range(pass_count):
+                        source = pass_sources[row]
+                        if source >= candidate_count:
+                            raise RuntimeError(
+                                "direct v3 pass source index changed"
+                            )
+                        direct_postfilter_source = (
+                            candidate_postfilter_sources[source]
+                        )
+                        if native_results[source].action != (
+                            PLAN7_FORWARD_DEFINITE_PASS
+                        ):
+                            raise RuntimeError(
+                                "direct v3 domain source is not a Forward pass"
+                            )
+                        direct_region_begin = (
+                            <size_t> native_domain_region_offsets[row]
+                        )
+                        direct_region_end = (
+                            <size_t> native_domain_region_offsets[row + 1]
+                        )
+                        if (
+                            direct_region_begin > direct_region_end
+                            or native_domain_results[row].region_count
+                            != direct_region_end - direct_region_begin
+                        ):
+                            raise RuntimeError(
+                                "direct v3 domain region mapping changed"
+                            )
+
+                        direct_compact_route = (
+                            PLAN7_CONTINUATION_COMPACT_NONE
+                        )
+                        if direct_compact_source_count:
+                            if (
+                                direct_region_end
+                                > direct_compact_source_count
+                            ):
+                                raise RuntimeError(
+                                    "direct v3 compact row mapping changed"
+                                )
+                            if direct_region_begin != direct_region_end:
+                                if native_rescore_results[
+                                    direct_region_begin
+                                ].action == PLAN7_DOMAIN_RESCORE_DEVICE_RESULT:
+                                    direct_compact_route = (
+                                        PLAN7_CONTINUATION_COMPACT_DEVICE
+                                    )
+                                elif native_rescore_results[
+                                    direct_region_begin
+                                ].action == PLAN7_DOMAIN_RESCORE_CPU_REQUIRED:
+                                    direct_compact_route = (
+                                        PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                                    )
+                                else:
+                                    raise RuntimeError(
+                                        "direct v3 compact action is invalid"
+                                    )
+                        elif (
+                            rescore_output != NULL
+                            and native_rescore_statistics.global_cpu_fallback_count
+                            != 0
+                            and direct_region_begin != direct_region_end
+                        ):
+                            direct_compact_route = (
+                                PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                            )
+
+                        direct_domain_safe = (
+                            native_domain_results[row].status
+                            == PLAN7_BACKWARD_DOMAIN_OK
+                            and native_domain_results[row].route in (
+                                PLAN7_BACKWARD_DOMAIN_NO_REGIONS,
+                                PLAN7_BACKWARD_DOMAIN_SIMPLE,
+                            )
+                            and not native_domain_results[row].has_own_scales
+                            and native_domain_results[row].uncertain_count == 0
+                            and native_domain_results[row].multidomain_count == 0
+                        )
+                        direct_no_region = (
+                            direct_domain_safe
+                            and native_domain_results[row].route
+                            == PLAN7_BACKWARD_DOMAIN_NO_REGIONS
+                            and direct_region_begin == direct_region_end
+                            and direct_compact_route
+                            == PLAN7_CONTINUATION_COMPACT_NONE
+                        )
+                        if direct_no_region:
+                            if direct_exception_count == 0:
+                                raise RuntimeError(
+                                    "direct v3 exception count underflow"
+                                )
+                            direct_decision = _direct_v3_decision(
+                                PLAN7_CONTINUATION_V3_DOMAIN_NO_REGIONS, 0
+                            )
+                            direct_exception_count -= 1
+                        elif direct_domain_safe:
+                            if (
+                                native_domain_results[row].route
+                                == PLAN7_BACKWARD_DOMAIN_SIMPLE
+                                and direct_compact_route
+                                == PLAN7_CONTINUATION_COMPACT_DEVICE
+                                and direct_region_begin < direct_region_end
+                                and generation_tail_fingerprint != 0
+                            ):
+                                direct_decision = _direct_v3_decision(
+                                    PLAN7_CONTINUATION_V3_DOMAIN_COMPACT,
+                                    PLAN7_CONTINUATION_V3_COMPACT_DOMAINS,
+                                )
+                                direct_payload_delta = (
+                                    direct_region_end - direct_region_begin
+                                )
+                                if direct_payload_delta > (
+                                    (<uint64_t> -1)
+                                    - direct_compact_result_count
+                                ):
+                                    raise OverflowError(
+                                        "direct v3 compact count overflow"
+                                    )
+                                direct_compact_result_count += (
+                                    direct_payload_delta
+                                )
+                                if direct_payload_delta > (
+                                    (<uint64_t> -1)
+                                    // PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+                                ):
+                                    raise OverflowError(
+                                        "direct v3 compact null2 overflow"
+                                    )
+                                direct_payload_delta *= (
+                                    PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+                                )
+                                if direct_payload_delta > (
+                                    (<uint64_t> -1)
+                                    - direct_compact_null2_count
+                                ):
+                                    raise OverflowError(
+                                        "direct v3 compact null2 overflow"
+                                    )
+                                direct_compact_null2_count += (
+                                    direct_payload_delta
+                                )
+                                direct_trace_begin = (
+                                    <size_t> native_rescore_trace_offsets[
+                                        direct_region_begin
+                                    ]
+                                )
+                                direct_trace_end = (
+                                    <size_t> native_rescore_trace_offsets[
+                                        direct_region_end
+                                    ]
+                                )
+                                if direct_trace_begin > direct_trace_end:
+                                    raise RuntimeError(
+                                        "direct v3 compact traces are not monotone"
+                                    )
+                                direct_payload_delta = (
+                                    direct_trace_end - direct_trace_begin
+                                )
+                                if direct_payload_delta > (
+                                    (<uint64_t> -1)
+                                    - direct_compact_trace_count
+                                ):
+                                    raise OverflowError(
+                                        "direct v3 compact trace overflow"
+                                    )
+                                direct_compact_trace_count += (
+                                    direct_payload_delta
+                                )
+                            else:
+                                direct_decision = _direct_v3_decision(
+                                    PLAN7_CONTINUATION_V3_DOMAIN_SIMPLE,
+                                    PLAN7_CONTINUATION_V3_SIMPLE_REGIONS,
+                                )
+                            direct_payload_delta = (
+                                direct_region_end - direct_region_begin
+                            )
+                            if direct_payload_delta > (
+                                (<uint64_t> -1) - direct_region_count
+                            ):
+                                raise OverflowError(
+                                    "direct v3 region count overflow"
+                                )
+                            direct_region_count += direct_payload_delta
+                        else:
+                            direct_decision = _direct_v3_decision(
+                                PLAN7_CONTINUATION_V3_DOMAIN_CPU_REQUIRED,
+                                PLAN7_CONTINUATION_V3_FORWARD_SCORES,
+                            )
+
+                        if direct_decision >> 4 in (
+                            PLAN7_CONTINUATION_V3_FORWARD_SCORES,
+                            PLAN7_CONTINUATION_V3_COMPACT_DOMAINS,
+                        ):
+                            if native_offsets[source] > native_offsets[source + 1]:
+                                raise RuntimeError(
+                                    "direct v3 special offsets are not monotone"
+                                )
+                            direct_payload_delta = (
+                                native_offsets[source + 1]
+                                - native_offsets[source]
+                            )
+                            if direct_payload_delta > (
+                                (<uint64_t> -1) - direct_special_count
+                            ):
+                                raise OverflowError(
+                                    "direct v3 special count overflow"
+                                )
+                            direct_special_count += direct_payload_delta
+                        _direct_v3_plan_replace(
+                            direct_decisions,
+                            direct_postfilter_source,
+                            direct_decision,
+                            &direct_decision_terms,
+                        )
                 profile_fingerprint_storage = b"".join(selection._fingerprints)
                 profile_fingerprint_view = profile_fingerprint_storage
                 sequence_fingerprint_view = self._content_fingerprint
@@ -6859,6 +7397,14 @@ cdef class SequenceBatch:
                     &journal_total_bytes,
                     postfilter_owner,
                     direct_sparse_v3,
+                    direct_decision_plan,
+                    direct_decision_terms,
+                    direct_exception_count,
+                    direct_special_count,
+                    direct_region_count,
+                    direct_compact_result_count,
+                    direct_compact_trace_count,
+                    direct_compact_null2_count,
                 )
                 native_statistics = plan7_forward_output_statistics(output)
                 native_domain_statistics = (

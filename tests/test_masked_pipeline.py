@@ -1505,6 +1505,8 @@ print(json.dumps(after_repeat, sort_keys=True))
         self.assertGreater(preparation["packet_bytes"], 0)
         self.assertGreaterEqual(preparation["planning_ns"], 0)
         self.assertGreaterEqual(preparation["validation_ns"], 0)
+        self.assertEqual(preparation["planner_source_scan_count"], 2)
+        self.assertEqual(preparation["separate_decision_scan_count"], 1)
         self.assertEqual(
             _pipeline._sealed_resident_memory_bound(sparse)[
                 "sparse_journal_v3_bytes"

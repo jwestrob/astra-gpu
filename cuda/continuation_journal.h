@@ -131,6 +131,59 @@ enum plan7_continuation_journal_v3_profile_flag {
   PLAN7_CONTINUATION_V3_PROFILE_HAS_FINGERPRINT = 0x02
 };
 
+/* The native-direct producer builds one final semantic decision byte while it
+ * is already visiting each post-filter row for F2.  Later Forward/domain
+ * results replace only their sparse source positions.  This order-independent
+ * tag lets the v3 emitter authenticate that immutable plan during its single
+ * copy pass, without adding a separate dense validation scan. */
+static inline uint64_t plan7_continuation_journal_v3_decision_mix(
+    uint64_t value) {
+  value += UINT64_C(0x9e3779b97f4a7c15);
+  value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+  value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+  return value ^ (value >> 31);
+}
+
+static inline uint64_t plan7_continuation_journal_v3_decision_term(
+    uint64_t source_index, uint8_t decision) {
+  return plan7_continuation_journal_v3_decision_mix(
+      source_index ^ (UINT64_C(0xd6e8feb86659fd93) *
+                      ((uint64_t)decision + UINT64_C(1))));
+}
+
+static inline uint64_t plan7_continuation_journal_v3_decision_seed(
+    uint64_t postfilter_count, uint64_t profile_count, uint64_t session_id,
+    uint64_t selection_id, uint64_t batch_generation, uint64_t f1_bits,
+    uint64_t f2_bits, uint64_t f3_bits,
+    uint64_t generation_tail_fingerprint) {
+  uint64_t state = UINT64_C(0x563344454349534e);
+  state ^= plan7_continuation_journal_v3_decision_mix(postfilter_count);
+  state ^= plan7_continuation_journal_v3_decision_mix(profile_count);
+  state ^= plan7_continuation_journal_v3_decision_mix(session_id);
+  state ^= plan7_continuation_journal_v3_decision_mix(selection_id);
+  state ^= plan7_continuation_journal_v3_decision_mix(batch_generation);
+  state ^= plan7_continuation_journal_v3_decision_mix(f1_bits);
+  state ^= plan7_continuation_journal_v3_decision_mix(f2_bits);
+  state ^= plan7_continuation_journal_v3_decision_mix(f3_bits);
+  state ^= plan7_continuation_journal_v3_decision_mix(
+      generation_tail_fingerprint);
+  return state;
+}
+
+static inline uint64_t plan7_continuation_journal_v3_decision_finish(
+    uint64_t state, uint64_t exception_count, uint64_t special_count,
+    uint64_t region_count, uint64_t compact_result_count,
+    uint64_t compact_trace_count, uint64_t compact_null2_count) {
+  state ^= plan7_continuation_journal_v3_decision_mix(exception_count);
+  state ^= plan7_continuation_journal_v3_decision_mix(special_count);
+  state ^= plan7_continuation_journal_v3_decision_mix(region_count);
+  state ^= plan7_continuation_journal_v3_decision_mix(compact_result_count);
+  state ^= plan7_continuation_journal_v3_decision_mix(compact_trace_count);
+  state ^= plan7_continuation_journal_v3_decision_mix(compact_null2_count);
+  state = plan7_continuation_journal_v3_decision_mix(state);
+  return state != 0 ? state : UINT64_C(0x5633504c414e5447);
+}
+
 typedef struct plan7_continuation_journal_v3_options {
   uint64_t f1_bits;
   uint64_t f2_bits;

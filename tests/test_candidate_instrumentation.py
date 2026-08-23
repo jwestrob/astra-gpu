@@ -187,6 +187,19 @@ class CandidateResidentMemoryTests(unittest.TestCase):
 
 
 class PrivateTransportSourceCompatibilityTests(unittest.TestCase):
+    def test_direct_v3_uses_fused_plan_and_one_emission_scan(self):
+        native = (ROOT / "python/plan7_gpu/_native.pyx").read_text()
+        pipeline = (ROOT / "python/plan7_gpu/_pipeline.pyx").read_text()
+
+        self.assertIn("candidate_postfilter_sources.push_back(cursor)", native)
+        self.assertIn("_direct_v3_plan_initial(", native)
+        self.assertIn("_direct_v3_plan_replace(", native)
+        self.assertIn("planning_profile_count = 0", pipeline)
+        self.assertIn("sealed._journal_v3_source_scan_count = 1", pipeline)
+        self.assertIn("sealed._journal_v3_decision_scan_count = 0", pipeline)
+        self.assertIn('"planner_source_scan_count": (', pipeline)
+        self.assertIn('"separate_decision_scan_count": (', pipeline)
+
     def test_direct_v3_releases_identity_staging_before_zero_accounting(self):
         source = (ROOT / "python/plan7_gpu/_pipeline.pyx").read_text()
         drop = source[
@@ -202,6 +215,7 @@ class PrivateTransportSourceCompatibilityTests(unittest.TestCase):
             "_source_identity_tokens",
             "_source_profile_fingerprints",
             "_source_sequence_fingerprint",
+            "_direct_v3_decisions",
         ):
             self.assertIn(f"sealed.{field} = ", drop)
         self.assertIn(

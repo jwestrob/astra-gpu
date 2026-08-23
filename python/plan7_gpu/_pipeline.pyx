@@ -114,7 +114,7 @@ from threading import Lock as _Lock
 # importlib loads this DSO under its bare ``_pipeline`` initialization name.
 from plan7_gpu import _telemetry as _telemetry_module
 
-DIRECT_V3_STAGING_SCHEMA_VERSION = 1
+DIRECT_V3_STAGING_SCHEMA_VERSION = 2
 
 cdef extern from "dlfcn.h" nogil:
     ctypedef struct Dl_info:
@@ -600,6 +600,33 @@ cdef extern from "continuation_journal.h":
         uint64_t *product,
     ) nogil
 
+    uint64_t plan7_continuation_journal_v3_decision_term(
+        uint64_t source_index,
+        uint8_t decision,
+    ) nogil
+
+    uint64_t plan7_continuation_journal_v3_decision_seed(
+        uint64_t postfilter_count,
+        uint64_t profile_count,
+        uint64_t session_id,
+        uint64_t selection_id,
+        uint64_t batch_generation,
+        uint64_t f1_bits,
+        uint64_t f2_bits,
+        uint64_t f3_bits,
+        uint64_t generation_tail_fingerprint,
+    ) nogil
+
+    uint64_t plan7_continuation_journal_v3_decision_finish(
+        uint64_t state,
+        uint64_t exception_count,
+        uint64_t special_count,
+        uint64_t region_count,
+        uint64_t compact_result_count,
+        uint64_t compact_trace_count,
+        uint64_t compact_null2_count,
+    ) nogil
+
     int plan7_continuation_journal_rescore_hashes(
         const plan7_domain_rescore_result *results,
         uint64_t result_count,
@@ -922,6 +949,16 @@ cdef class _SealedPostfilterBatch:
     cdef uint64_t _direct_v3_staging_bytes
     cdef uint64_t _direct_v3_staging_build_ns
     cdef uint64_t _direct_v3_source_validation_ns
+    cdef const uint8_t[::1] _direct_v3_decisions
+    cdef uint64_t _direct_v3_expected_exception_count
+    cdef uint64_t _direct_v3_expected_special_count
+    cdef uint64_t _direct_v3_expected_region_count
+    cdef uint64_t _direct_v3_expected_compact_result_count
+    cdef uint64_t _direct_v3_expected_compact_trace_count
+    cdef uint64_t _direct_v3_expected_compact_null2_count
+    cdef uint64_t _direct_v3_expected_decision_tag
+    cdef uint64_t _journal_v3_source_scan_count
+    cdef uint64_t _journal_v3_decision_scan_count
     cdef uint64_t _source_consumer_validation_ns
     cdef const uint64_t[::1] _source_identity_tokens
     cdef const uint8_t[::1] _source_profile_fingerprints
@@ -956,6 +993,15 @@ cdef class _SealedPostfilterBatch:
         self._direct_v3_staging_bytes = 0
         self._direct_v3_staging_build_ns = 0
         self._direct_v3_source_validation_ns = 0
+        self._direct_v3_expected_exception_count = 0
+        self._direct_v3_expected_special_count = 0
+        self._direct_v3_expected_region_count = 0
+        self._direct_v3_expected_compact_result_count = 0
+        self._direct_v3_expected_compact_trace_count = 0
+        self._direct_v3_expected_compact_null2_count = 0
+        self._direct_v3_expected_decision_tag = 0
+        self._journal_v3_source_scan_count = 0
+        self._journal_v3_decision_scan_count = 0
         self._source_consumer_validation_ns = 0
 
     def __dealloc__(self):
@@ -3897,6 +3943,7 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
     cdef size_t decision_bytes
     cdef size_t cursor
     cdef size_t profile_count = len(sealed._optimized_profiles)
+    cdef size_t planning_profile_count
     cdef size_t target_count = sealed._sequences._length
     cdef size_t postfilter_count
     cdef size_t forward_count
@@ -3965,6 +4012,7 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
     cdef bint has_source_v2
     cdef bint has_direct_source
     cdef bint has_authenticated_source
+    cdef bint owns_decisions = False
     cdef bint domain_safe
     cdef bint compact_available
     cdef _double_bits f2_bits
@@ -3973,6 +4021,9 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
     cdef const uint8_t *source_profile_fingerprints = NULL
     cdef uint64_t *compact_trace_offsets
     cdef uint8_t *destination
+    cdef uint64_t direct_decision_state = 0
+    cdef uint64_t direct_decision_tag = 0
+    cdef _double_bits f1_bits
 
     if not sealed._ready:
         raise TypeError("sealed batch was not created by the provenance adapter")
@@ -3997,10 +4048,23 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
             "journal v3 semantic planning requires bias-enabled generation"
         )
     decision_bytes = postfilter_count
-    if decision_bytes:
+    planning_profile_count = profile_count
+    if has_direct_source:
+        planning_profile_count = 0
+        sealed._journal_v3_source_scan_count = 1
+        sealed._journal_v3_decision_scan_count = 0
+        if sealed._direct_v3_decisions.shape[0] != postfilter_count:
+            raise ValueError("direct v3 decision plan size differs from source")
+        if decision_bytes:
+            decisions = <uint8_t *> &sealed._direct_v3_decisions[0]
+    elif decision_bytes:
         decisions = <uint8_t *> malloc(decision_bytes)
         if decisions == NULL:
             raise MemoryError("journal v3 decision workspace allocation failed")
+        owns_decisions = True
+    if not has_direct_source:
+        sealed._journal_v3_source_scan_count = 2
+        sealed._journal_v3_decision_scan_count = 1
 
     f2_bits.bits = sealed._generation_f2_bits
     f3_bits.bits = sealed._generation_f3_bits
@@ -4010,7 +4074,8 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
     )
     if has_source_v2:
         if sealed._journal_storage.shape[0] < sizeof(plan7_continuation_journal):
-            free(decisions)
+            if owns_decisions:
+                free(decisions)
             raise ValueError("sealed v2 journal storage is truncated")
         source_v2 = <plan7_continuation_journal *> &sealed._journal_storage[0]
         source_identity_tokens = <const uint64_t *> (
@@ -4024,7 +4089,7 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
     try:
         # First pass derives one semantic decision per dense post-filter row and
         # exact sparse payload sizes.  No Python object is created per row.
-        for profile in range(profile_count):
+        for profile in range(planning_profile_count):
             optimized_profile = <OptimizedProfile> sealed._optimized_profiles[profile]
             postfilter_start = <size_t> sealed._postfilter_offsets[profile]
             postfilter_stop = <size_t> sealed._postfilter_offsets[profile + 1]
@@ -4166,6 +4231,16 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                     domain_cursor += 1
             if forward_cursor != forward_stop or domain_cursor != domain_stop:
                 raise ValueError("journal v3 source row mapping is incomplete")
+
+        if has_direct_source:
+            exception_count = sealed._direct_v3_expected_exception_count
+            special_count = sealed._direct_v3_expected_special_count
+            region_count = sealed._direct_v3_expected_region_count
+            compact_result_count = (
+                sealed._direct_v3_expected_compact_result_count
+            )
+            compact_trace_count = sealed._direct_v3_expected_compact_trace_count
+            compact_null2_count = sealed._direct_v3_expected_compact_null2_count
 
         if not plan7_continuation_journal_v3_checked_add(
             exception_count, profile_count, &certificate_count
@@ -4354,9 +4429,26 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
             destination + compact_trace_offsets_offset
         )
         compact_trace_offsets[0] = 0
+        if has_direct_source:
+            f1_bits.value = sealed._f1
+            direct_decision_state = (
+                plan7_continuation_journal_v3_decision_seed(
+                    postfilter_count,
+                    profile_count,
+                    journal.session_id,
+                    journal.selection_id,
+                    journal.batch_generation,
+                    f1_bits.bits,
+                    sealed._generation_f2_bits,
+                    sealed._generation_f3_bits,
+                    sealed._generation_tail_fingerprint,
+                )
+            )
 
-        # Second pass emits ordered certificates and copies only exception
-        # payloads.  Certificate targets never include the following exception.
+        # Emit ordered certificates and copy only exception payloads.  This is
+        # the second dense-source pass for v2/audit, but the only planner scan
+        # for native-direct.  Certificate targets never include the following
+        # exception.
         for profile in range(profile_count):
             optimized_profile = <OptimizedProfile> sealed._optimized_profiles[profile]
             postfilter_start = <size_t> sealed._postfilter_offsets[profile]
@@ -4423,6 +4515,12 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                             sealed._journal_compact_row_offsets[domain_cursor + 1]
                         )
                 decision = decisions[postfilter_cursor]
+                if has_direct_source:
+                    direct_decision_state ^= (
+                        plan7_continuation_journal_v3_decision_term(
+                            postfilter_cursor, decision
+                        )
+                    )
                 stage = <uint8_t> (decision & 0x0f)
                 route = <uint8_t> (decision >> 4)
                 if route == 0:
@@ -4444,6 +4542,13 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                     else:
                         raise ValueError("journal v3 terminal source stage is invalid")
                 else:
+                    if (
+                        certificate_cursor >= certificate_count
+                        or exception_cursor >= exception_count
+                    ):
+                        raise ValueError(
+                            "journal v3 decision counts understate exceptions"
+                        )
                     certificate = &certificates[certificate_cursor]
                     if not _v3_fill_certificate(
                         certificate,
@@ -4562,6 +4667,10 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                         special_end = sealed._special_offsets[forward_cursor + 1]
                         exception.special_begin = special_cursor
                         exception.special_count = special_end - special_begin
+                        if exception.special_count > special_count - special_cursor:
+                            raise ValueError(
+                                "journal v3 decision counts understate specials"
+                            )
                         if exception.special_count:
                             exception.payload_flags |= (
                                 PLAN7_CONTINUATION_V3_HAS_SPECIALS
@@ -4579,6 +4688,10 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                     ):
                         exception.region_begin = region_cursor
                         exception.region_count = region_end - region_begin
+                        if exception.region_count > region_count - region_cursor:
+                            raise ValueError(
+                                "journal v3 decision counts understate regions"
+                            )
                         if exception.region_count:
                             exception.payload_flags |= (
                                 PLAN7_CONTINUATION_V3_HAS_REGIONS
@@ -4597,6 +4710,12 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                         exception.payload_flags |= PLAN7_CONTINUATION_V3_HAS_COMPACT
                         exception.compact_result_begin = compact_cursor
                         exception.compact_result_count = compact_end - compact_begin
+                        if exception.compact_result_count > (
+                            compact_result_count - compact_cursor
+                        ):
+                            raise ValueError(
+                                "journal v3 decision counts understate compact rows"
+                            )
                         exception.compact_trace_begin = trace_cursor
                         exception.compact_null2_begin = null2_cursor
                         if exception.compact_result_count:
@@ -4625,6 +4744,14 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                                     compact_source + 1
                                 ]
                             )
+                            if (
+                                source_trace_begin > source_trace_end
+                                or source_trace_end - source_trace_begin
+                                > compact_trace_count - trace_cursor
+                            ):
+                                raise ValueError(
+                                    "journal v3 decision counts understate traces"
+                                )
                             compact_trace_offsets[
                                 compact_cursor + compact_index
                             ] = trace_cursor
@@ -4653,6 +4780,12 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                             exception.compact_result_count
                             * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
                         )
+                        if exception.compact_null2_count > (
+                            compact_null2_count - null2_cursor
+                        ):
+                            raise ValueError(
+                                "journal v3 decision counts understate compact null2"
+                            )
                         if exception.compact_null2_count:
                             memcpy(
                                 destination + compact_null2_offset
@@ -4677,6 +4810,10 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                 if has_domain:
                     domain_cursor += 1
 
+            if certificate_cursor >= certificate_count:
+                raise ValueError(
+                    "journal v3 decision counts understate certificates"
+                )
             certificate = &certificates[certificate_cursor]
             if not _v3_fill_certificate(
                 certificate,
@@ -4761,6 +4898,22 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
             != compact_trace_count
         ):
             raise ValueError("journal v3 emitted payload counts differ")
+        if has_direct_source:
+            direct_decision_tag = (
+                plan7_continuation_journal_v3_decision_finish(
+                    direct_decision_state,
+                    exception_count,
+                    special_count,
+                    region_count,
+                    compact_result_count,
+                    compact_trace_count,
+                    compact_null2_count,
+                )
+            )
+            if direct_decision_tag != sealed._direct_v3_expected_decision_tag:
+                raise ValueError(
+                    "direct v3 decision plan authentication differs"
+                )
         journal.integrity_tag = plan7_continuation_journal_v3_integrity(journal)
         if journal.integrity_tag == 0:
             raise ValueError("journal v3 integrity tag is zero")
@@ -4770,7 +4923,7 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
             free(journal)
         raise
     finally:
-        if decisions != NULL:
+        if owns_decisions and decisions != NULL:
             free(decisions)
 
 
@@ -5523,6 +5676,7 @@ cdef void _v3_drop_direct_staging(_SealedPostfilterBatch sealed) except *:
     sealed._source_identity_tokens = empty_q
     sealed._source_profile_fingerprints = empty_bytes
     sealed._source_sequence_fingerprint = empty_bytes
+    sealed._direct_v3_decisions = empty_bytes
 
 
 cdef plan7_continuation_journal_v3 *_v3_validate_capsule(
@@ -6841,6 +6995,8 @@ cdef tuple _consume_validate_direct_v3_staging(
     cdef object compact_trace_offset_owner
     cdef object compact_trace_owner
     cdef object compact_null2_owner
+    cdef object decision_owner
+    cdef tuple decision_counts
     cdef const uint8_t[::1] postfilter_view
     cdef const uint64_t[::1] postfilter_offset_view
     cdef const uint8_t[::1] forward_view
@@ -6856,6 +7012,7 @@ cdef tuple _consume_validate_direct_v3_staging(
     cdef const uint64_t[::1] compact_trace_offset_view
     cdef const uint8_t[::1] compact_trace_view
     cdef const float[::1] compact_null2_view
+    cdef const uint8_t[::1] decision_view
     cdef const uint8_t[::1] identity_view
     cdef const uint8_t[::1] profile_fingerprint_view
     cdef const uint8_t[::1] sequence_fingerprint_view
@@ -6879,7 +7036,7 @@ cdef tuple _consume_validate_direct_v3_staging(
         raise TypeError("direct v3 staging must be exactly tuple")
     source = <tuple> source_object
     if (
-        len(source) != 42
+        len(source) != 44
         or type(source[0]) is not int
         or source[0] != DIRECT_V3_STAGING_SCHEMA_VERSION
     ):
@@ -6904,6 +7061,18 @@ cdef tuple _consume_validate_direct_v3_staging(
             raise TypeError("direct v3 staging provenance must be bytes")
     if type(source[41]) is not int or source[41] < 0:
         raise TypeError("direct v3 source validation time must be nonnegative int")
+    if type(source[42]) is not bytes:
+        raise TypeError("direct v3 decision plan must be immutable bytes")
+    if type(source[43]) is not tuple or len(source[43]) != 7:
+        raise TypeError("direct v3 decision counts must be a seven-item tuple")
+    decision_counts = <tuple> source[43]
+    for index in range(7):
+        if (
+            type(decision_counts[index]) is not int
+            or decision_counts[index] < 0
+            or decision_counts[index] > <uint64_t> -1
+        ):
+            raise TypeError("direct v3 decision metadata must be uint64")
 
     postfilter_owner = _immutable_owned_view(source[1], "B")
     postfilter_offset_owner = _immutable_owned_view(
@@ -6938,6 +7107,7 @@ cdef tuple _consume_validate_direct_v3_staging(
     compact_null2_owner = _immutable_owned_view(
         memoryview(source[15]).cast("f"), "f"
     )
+    decision_owner = _immutable_owned_view(source[42], "B")
     postfilter_view = postfilter_owner
     postfilter_offset_view = postfilter_offset_owner
     forward_view = forward_owner
@@ -6953,6 +7123,7 @@ cdef tuple _consume_validate_direct_v3_staging(
     compact_trace_offset_view = compact_trace_offset_owner
     compact_trace_view = compact_trace_owner
     compact_null2_view = compact_null2_owner
+    decision_view = decision_owner
 
     if (
         postfilter_view.shape[0] % sizeof(_postfilter_result)
@@ -6978,6 +7149,15 @@ cdef tuple _consume_validate_direct_v3_staging(
     )
     compact_null2_count = compact_null2_view.shape[0]
     if (
+        decision_view.shape[0] != postfilter_count
+        or decision_counts[0] > postfilter_count
+        or decision_counts[1] > special_view.shape[0]
+        or decision_counts[2] > region_count
+        or decision_counts[3] > compact_result_count
+        or decision_counts[4] > compact_trace_count
+        or decision_counts[5] > compact_null2_count
+        or decision_counts[6] == 0
+        or
         postfilter_offset_view.shape[0] != profile_count + 1
         or forward_offset_view.shape[0] != profile_count + 1
         or special_offset_view.shape[0] != forward_count + 1
@@ -7171,6 +7351,8 @@ cdef tuple _consume_validate_direct_v3_staging(
         source[22],
         source[23],
         source[24],
+        decision_owner,
+        decision_counts,
     )
 
 
@@ -7648,6 +7830,8 @@ def _seal_profile_selection_continuation_bound(
     cdef const uint8_t[::1] direct_forward_provenance_view
     cdef const uint8_t[::1] direct_backward_provenance_view
     cdef const uint8_t[::1] direct_rescore_provenance_view
+    cdef const uint8_t[::1] direct_decision_view
+    cdef tuple direct_decision_counts
 
     if type(pipeline) is not _pyhmmer.plan7.Pipeline:
         raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
@@ -7967,6 +8151,22 @@ def _seal_profile_selection_continuation_bound(
         sealed._direct_v3_staging_build_ns = direct_source[26]
         sealed._direct_v3_staging_bytes = direct_source[27]
         sealed._direct_v3_source_validation_ns = direct_source[41]
+        direct_decision_view = journal_values[25]
+        direct_decision_counts = <tuple> journal_values[26]
+        sealed._direct_v3_decisions = direct_decision_view
+        sealed._direct_v3_expected_exception_count = direct_decision_counts[0]
+        sealed._direct_v3_expected_special_count = direct_decision_counts[1]
+        sealed._direct_v3_expected_region_count = direct_decision_counts[2]
+        sealed._direct_v3_expected_compact_result_count = (
+            direct_decision_counts[3]
+        )
+        sealed._direct_v3_expected_compact_trace_count = (
+            direct_decision_counts[4]
+        )
+        sealed._direct_v3_expected_compact_null2_count = (
+            direct_decision_counts[5]
+        )
+        sealed._direct_v3_expected_decision_tag = direct_decision_counts[6]
         direct_forward_provenance_view = direct_source[38]
         direct_backward_provenance_view = direct_source[39]
         direct_rescore_provenance_view = direct_source[40]
@@ -9222,6 +9422,12 @@ def _sealed_continuation_statistics_bound(sealed_object):
                 sealed._journal_v3.exception_count
                 if sealed._journal_v3 != NULL else 0
             ),
+            "planner_source_scan_count": (
+                sealed._journal_v3_source_scan_count
+            ),
+            "separate_decision_scan_count": (
+                sealed._journal_v3_decision_scan_count
+            ),
             "planning_scope": "once per sealed batch",
             "validation_scope": "once per sealed batch",
             "consumer_timing": (
@@ -9380,6 +9586,7 @@ def _sealed_resident_memory_bound(sealed_object):
             int(sealed._source_identity_tokens.shape[0]) * sizeof(uint64_t)
             + int(sealed._source_profile_fingerprints.shape[0])
             + int(sealed._source_sequence_fingerprint.shape[0])
+            + int(sealed._direct_v3_decisions.shape[0])
         )
         if direct_v3_staging_retained_bytes:
             raise RuntimeError("direct v3 staging identity remains retained")
