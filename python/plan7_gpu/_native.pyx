@@ -1,6 +1,7 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
 
 from libc.stddef cimport size_t
+from libc.limits cimport INT_MAX
 from libc.stdint cimport int16_t, int32_t, uintptr_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.math cimport isfinite, isnan
 from libc.stdlib cimport calloc, free
@@ -107,6 +108,10 @@ _DEVICE_CAPACITY_NAMES = (
     "forward_survivor_candidates",
     "forward_survivor_offsets",
     "forward_gathered",
+    "candidate_word_counts",
+    "candidate_word_offsets",
+    "candidate_profile_offsets",
+    "candidate_scan_workspace",
 )
 
 
@@ -191,6 +196,10 @@ cdef extern from "bias_cuda.h" nogil:
         float t02
         float t12
         float eo[29][2]
+
+    ctypedef struct plan7_bias_candidate:
+        uint32_t profile_index
+        uint32_t sequence_index
 
     ctypedef struct plan7_bias_result:
         uint32_t sequence_index
@@ -309,6 +318,10 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t input_device_bytes
 
     ctypedef struct plan7_ssv_workspace_statistics:
+        uint64_t f1_device_compaction_run_count
+        uint64_t f1_host_expansion_run_count
+        uint64_t f1_candidate_upload_count
+        uint64_t f1_candidate_upload_avoided_count
         uint64_t postfilter_device_bytes
         uint64_t postfilter_dp_capacity_bytes
         uint64_t postfilter_growth_count
@@ -349,7 +362,13 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t cuda_free_bytes
         uint64_t cuda_total_bytes
         uint64_t persistent_device_bytes
-        uint64_t device_capacity_bytes[35]
+        uint64_t device_capacity_bytes[39]
+
+    ctypedef struct plan7_ssv_f1_candidate_view:
+        size_t profile_count
+        size_t candidate_count
+        const size_t *candidate_offsets
+        const plan7_bias_candidate *candidates
 
     int plan7_cuda_device_count(char *error, size_t error_size)
     int plan7_cuda_memory_info(
@@ -514,6 +533,26 @@ cdef extern from "ssv_cuda.h" nogil:
         double f1,
         uint32_t *profile_major_candidate_words,
         size_t candidate_word_count,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_f1_compact_many(
+        plan7_ssv_sequence_batch *batch,
+        const uint8_t *packed_scores,
+        size_t packed_score_count,
+        const plan7_ssv_profile *profiles,
+        size_t profile_count,
+        const float *m_mu,
+        const float *m_lambda,
+        double f1,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_get_f1_candidate_view(
+        const plan7_ssv_sequence_batch *batch,
+        plan7_ssv_f1_candidate_view *view,
         char *error,
         size_t error_size,
     )
@@ -4705,6 +4744,14 @@ cdef class SequenceBatch:
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
         return {
+            "f1_device_compaction_run_count": (
+                statistics.f1_device_compaction_run_count
+            ),
+            "f1_host_expansion_run_count": statistics.f1_host_expansion_run_count,
+            "f1_candidate_upload_count": statistics.f1_candidate_upload_count,
+            "f1_candidate_upload_avoided_count": (
+                statistics.f1_candidate_upload_avoided_count
+            ),
             "postfilter_device_bytes": statistics.postfilter_device_bytes,
             "postfilter_dp_capacity_bytes": (
                 statistics.postfilter_dp_capacity_bytes
@@ -5012,6 +5059,7 @@ cdef class SequenceBatch:
         const float[::1] m_mu,
         const float[::1] m_lambda,
         double f1,
+        bint host_candidate_expansion,
     ) except? 0:
         cdef size_t profile_count
         cdef size_t profile_index
@@ -5025,6 +5073,8 @@ cdef class SequenceBatch:
         cdef unsigned bit
         cdef int status
         cdef char error[512]
+        cdef plan7_ssv_f1_candidate_view compact_view
+        cdef plan7_bias_candidate mapping
 
         profile_count = <size_t> score_offsets.shape[0]
         if (
@@ -5046,8 +5096,70 @@ cdef class SequenceBatch:
         if words_per_profile and profile_count > (<size_t> -1) // words_per_profile:
             raise OverflowError("candidate mask size overflows size_t")
         candidate_word_count = profile_count * words_per_profile
-        self._candidate_words.resize(candidate_word_count)
         self._candidate_counts.resize(profile_count)
+        if not host_candidate_expansion and candidate_word_count <= INT_MAX:
+            self._candidate_words.clear()
+            error[0] = 0
+            with nogil:
+                status = plan7_ssv_sequence_batch_f1_compact_many(
+                    self._batch,
+                    &packed_scores[0] if packed_scores.shape[0] else NULL,
+                    <size_t> packed_scores.shape[0],
+                    self._profiles.data() if profile_count else NULL,
+                    profile_count,
+                    &m_mu[0] if profile_count else NULL,
+                    &m_lambda[0] if profile_count else NULL,
+                    f1,
+                    error,
+                    sizeof(error),
+                )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
+            error[0] = 0
+            status = plan7_ssv_sequence_batch_get_f1_candidate_view(
+                self._batch, &compact_view, error, sizeof(error)
+            )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
+            if compact_view.profile_count != profile_count:
+                raise RuntimeError("device candidate profile count changed")
+            candidate_count = compact_view.candidate_count
+            self._candidate_offsets.resize(profile_count)
+            self._candidate_indices.resize(candidate_count)
+            for profile_index in range(profile_count):
+                if (
+                    compact_view.candidate_offsets[profile_index]
+                    > compact_view.candidate_offsets[profile_index + 1]
+                    or compact_view.candidate_offsets[profile_index + 1]
+                    > candidate_count
+                ):
+                    raise RuntimeError("device candidate offsets are invalid")
+                self._candidate_offsets[profile_index] = (
+                    compact_view.candidate_offsets[profile_index]
+                )
+                self._candidate_counts[profile_index] = (
+                    compact_view.candidate_offsets[profile_index + 1]
+                    - compact_view.candidate_offsets[profile_index]
+                )
+                for output_index in range(
+                    compact_view.candidate_offsets[profile_index],
+                    compact_view.candidate_offsets[profile_index + 1],
+                ):
+                    mapping = compact_view.candidates[output_index]
+                    if (
+                        mapping.profile_index != profile_index
+                        or mapping.sequence_index >= self._sequence_count
+                    ):
+                        raise RuntimeError("device candidate mapping is invalid")
+                    self._candidate_indices[output_index] = mapping.sequence_index
+            if (
+                profile_count
+                and compact_view.candidate_offsets[profile_count] != candidate_count
+            ):
+                raise RuntimeError("device candidate count changed")
+            return profile_count
+
+        self._candidate_words.resize(candidate_word_count)
         error[0] = 0
         with nogil:
             status = plan7_ssv_sequence_batch_f1_mask_many(
@@ -5115,6 +5227,7 @@ cdef class SequenceBatch:
         const float[::1] m_mu,
         const float[::1] m_lambda,
         double f1,
+        bint _host_candidate_expansion=False,
     ):
         cdef size_t profile_count
         cdef size_t profile_index
@@ -5133,6 +5246,7 @@ cdef class SequenceBatch:
             m_mu,
             m_lambda,
             f1,
+            _host_candidate_expansion,
         )
         for profile_index in range(profile_count):
             candidates = []
@@ -5157,6 +5271,7 @@ cdef class SequenceBatch:
         const float[::1] m_mu,
         const float[::1] m_lambda,
         double f1,
+        bint _host_candidate_expansion=False,
     ):
         """Return compact candidate rows as native uint32 data and uint64 offsets."""
         cdef size_t profile_count
@@ -5181,6 +5296,7 @@ cdef class SequenceBatch:
             m_mu,
             m_lambda,
             f1,
+            _host_candidate_expansion,
         )
         candidate_count = self._candidate_indices.size()
         indices = clone(_UINT32_ARRAY_TEMPLATE, candidate_count, False)
@@ -5230,6 +5346,7 @@ cdef class SequenceBatch:
             m_mu,
             m_lambda,
             f1,
+            False,
         )
         if profile_count == 0:
             if packed_bias_profiles.shape[0] != 0:
@@ -7944,6 +8061,7 @@ cdef class SequenceBatch:
         self,
         const plan7_profile_selection_view *view,
         double f1,
+        bint host_candidate_expansion,
     ) except? 0:
         cdef size_t profile_count
         cdef size_t profile_index
@@ -7957,6 +8075,8 @@ cdef class SequenceBatch:
         cdef unsigned bit
         cdef int status
         cdef char error[512]
+        cdef plan7_ssv_f1_candidate_view compact_view
+        cdef plan7_bias_candidate mapping
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
@@ -7978,8 +8098,70 @@ cdef class SequenceBatch:
         if words_per_profile and profile_count > (<size_t> -1) // words_per_profile:
             raise OverflowError("candidate mask size overflows size_t")
         candidate_word_count = profile_count * words_per_profile
-        self._candidate_words.resize(candidate_word_count)
         self._candidate_counts.resize(profile_count)
+        if not host_candidate_expansion and candidate_word_count <= INT_MAX:
+            self._candidate_words.clear()
+            error[0] = 0
+            with nogil:
+                status = plan7_ssv_sequence_batch_f1_compact_many(
+                    self._batch,
+                    view.packed_scores,
+                    view.packed_score_count,
+                    view.profiles,
+                    profile_count,
+                    view.m_mu,
+                    view.m_lambda,
+                    f1,
+                    error,
+                    sizeof(error),
+                )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
+            error[0] = 0
+            status = plan7_ssv_sequence_batch_get_f1_candidate_view(
+                self._batch, &compact_view, error, sizeof(error)
+            )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
+            if compact_view.profile_count != profile_count:
+                raise RuntimeError("device candidate profile count changed")
+            candidate_count = compact_view.candidate_count
+            self._candidate_offsets.resize(profile_count)
+            self._candidate_indices.resize(candidate_count)
+            for profile_index in range(profile_count):
+                if (
+                    compact_view.candidate_offsets[profile_index]
+                    > compact_view.candidate_offsets[profile_index + 1]
+                    or compact_view.candidate_offsets[profile_index + 1]
+                    > candidate_count
+                ):
+                    raise RuntimeError("device candidate offsets are invalid")
+                self._candidate_offsets[profile_index] = (
+                    compact_view.candidate_offsets[profile_index]
+                )
+                self._candidate_counts[profile_index] = (
+                    compact_view.candidate_offsets[profile_index + 1]
+                    - compact_view.candidate_offsets[profile_index]
+                )
+                for output_index in range(
+                    compact_view.candidate_offsets[profile_index],
+                    compact_view.candidate_offsets[profile_index + 1],
+                ):
+                    mapping = compact_view.candidates[output_index]
+                    if (
+                        mapping.profile_index != profile_index
+                        or mapping.sequence_index >= self._sequence_count
+                    ):
+                        raise RuntimeError("device candidate mapping is invalid")
+                    self._candidate_indices[output_index] = mapping.sequence_index
+            if (
+                profile_count
+                and compact_view.candidate_offsets[profile_count] != candidate_count
+            ):
+                raise RuntimeError("device candidate count changed")
+            return profile_count
+
+        self._candidate_words.resize(candidate_word_count)
         error[0] = 0
         with nogil:
             status = plan7_ssv_sequence_batch_f1_mask_many(
@@ -8043,6 +8225,7 @@ cdef class SequenceBatch:
         double f1,
         bint _return_reason_facts=False,
         bint _immutable_records=False,
+        bint _host_candidate_expansion=False,
     ):
         """Run a sealed selection without reading any live optimized profile."""
         cdef plan7_profile_selection_view view = selection._view()
@@ -8068,7 +8251,9 @@ cdef class SequenceBatch:
             raise RuntimeError("array('Q') is not native uint64")
         if sizeof(plan7_postfilter_result) != PLAN7_POSTFILTER_RECORD_SIZE:
             raise RuntimeError("post-filter result ABI size mismatch")
-        profile_count = self._run_profile_selection_candidates(&view, f1)
+        profile_count = self._run_profile_selection_candidates(
+            &view, f1, _host_candidate_expansion
+        )
         self._bias_profiles.resize(profile_count)
         self._bias_candidate_offsets.resize(profile_count + 1)
         if profile_count:
@@ -8241,6 +8426,7 @@ cdef class SequenceBatch:
             m_mu,
             m_lambda,
             f1,
+            False,
         )
         if plan7_viterbi_database_profile_count(
             viterbi_profiles._database

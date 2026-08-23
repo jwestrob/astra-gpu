@@ -499,6 +499,10 @@ class CudaBiasTests(unittest.TestCase):
             rows = batch.bias_candidates_many_raw(
                 *packed_ssv, m_mu, m_lambda, 1.0, packed_bias
             )
+            workspace = batch.workspace_statistics
+        self.assertEqual(workspace["f1_device_compaction_run_count"], 1)
+        self.assertEqual(workspace["f1_candidate_upload_avoided_count"], 1)
+        self.assertEqual(workspace["f1_candidate_upload_count"], 0)
         with native_batch(sequences) as reference_batch:
             ssv_rows = reference_batch.filter_many_raw(*packed_ssv)
         self.assertEqual(len(rows), 1)

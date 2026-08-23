@@ -2,6 +2,7 @@
 #include "forward_cuda.h"
 #include "postfilter_cuda.h"
 
+#include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -37,6 +38,8 @@ struct plan7_ssv_sequence_batch {
   size_t host_f1_score_count;
   plan7_bias_candidate *host_bias_candidates;
   size_t host_bias_candidate_capacity;
+  size_t *host_candidate_offsets;
+  size_t host_candidate_offset_capacity;
   uint8_t *device_residues;
   size_t device_residue_capacity;
   uint64_t *device_offsets;
@@ -59,6 +62,14 @@ struct plan7_ssv_sequence_batch {
   size_t device_f1_profile_capacity;
   uint32_t *device_candidate_words;
   size_t device_candidate_word_capacity;
+  uint64_t *device_candidate_word_counts;
+  size_t device_candidate_word_count_capacity;
+  uint64_t *device_candidate_word_offsets;
+  size_t device_candidate_word_offset_capacity;
+  size_t *device_candidate_profile_offsets;
+  size_t device_candidate_profile_offset_capacity;
+  uint8_t *device_candidate_scan_workspace;
+  size_t device_candidate_scan_workspace_capacity;
   plan7_bias_profile *device_bias_profiles;
   size_t device_bias_profile_capacity;
   plan7_bias_candidate *device_bias_candidates;
@@ -70,12 +81,18 @@ struct plan7_ssv_sequence_batch {
   float cached_tjb_scale;
   int tjb_cache_valid;
   size_t cached_f1_profile_count;
+  size_t cached_f1_candidate_count;
   int f1_cache_valid;
+  int f1_device_candidates_valid;
   int bias_length_terms_device_valid;
   int host_float_environment_valid;
   uint64_t input_device_bytes;
   plan7_postfilter_workspace *postfilter_workspace;
   plan7_forward_workspace *forward_workspace;
+  uint64_t f1_device_compaction_run_count;
+  uint64_t f1_host_expansion_run_count;
+  uint64_t f1_candidate_upload_count;
+  uint64_t f1_candidate_upload_avoided_count;
 };
 
 namespace {
@@ -392,6 +409,60 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
       atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
     }
     __syncthreads();
+  }
+}
+
+__global__ void
+candidate_word_counts_kernel(const uint32_t *candidate_words,
+                             size_t word_count,
+                             uint64_t *word_counts)
+{
+  const size_t word = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+  if (word < word_count)
+    word_counts[word] = static_cast<uint64_t>(__popc(candidate_words[word]));
+}
+
+__global__ void
+candidate_profile_offsets_kernel(const uint64_t *word_counts,
+                                 const uint64_t *word_offsets,
+                                 size_t words_per_profile,
+                                 size_t profile_count,
+                                 size_t *profile_offsets)
+{
+  const size_t profile = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                         threadIdx.x;
+  if (profile < profile_count) {
+    profile_offsets[profile] = static_cast<size_t>(
+      word_offsets[profile * words_per_profile]);
+  } else if (profile == profile_count) {
+    const size_t word_count = profile_count * words_per_profile;
+    profile_offsets[profile] = static_cast<size_t>(
+      word_offsets[word_count - 1] + word_counts[word_count - 1]);
+  }
+}
+
+__global__ void
+candidate_scatter_kernel(const uint32_t *candidate_words,
+                         const uint64_t *word_offsets,
+                         size_t word_count,
+                         size_t words_per_profile,
+                         plan7_bias_candidate *candidates)
+{
+  const size_t word_index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                            threadIdx.x;
+  if (word_index >= word_count) return;
+
+  uint32_t word = candidate_words[word_index];
+  size_t output = static_cast<size_t>(word_offsets[word_index]);
+  const uint32_t profile = static_cast<uint32_t>(
+    word_index / words_per_profile);
+  const uint32_t sequence_base = static_cast<uint32_t>(
+    (word_index % words_per_profile) * 32);
+  while (word != 0) {
+    const unsigned bit = static_cast<unsigned>(__ffs(word) - 1);
+    candidates[output++] = {profile, sequence_base + bit};
+    word &= word - 1;
   }
 }
 
@@ -869,6 +940,10 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   CUDA_FREE(batch->device_profiles);
   CUDA_FREE(batch->device_f1_profiles);
   CUDA_FREE(batch->device_candidate_words);
+  CUDA_FREE(batch->device_candidate_word_counts);
+  CUDA_FREE(batch->device_candidate_word_offsets);
+  CUDA_FREE(batch->device_candidate_profile_offsets);
+  CUDA_FREE(batch->device_candidate_scan_workspace);
   CUDA_FREE(batch->device_bias_profiles);
   CUDA_FREE(batch->device_bias_candidates);
   CUDA_FREE(batch->device_bias_ssv_inputs);
@@ -890,6 +965,7 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   free(batch->host_f1_profiles);
   free(batch->host_f1_scores);
   free(batch->host_bias_candidates);
+  free(batch->host_candidate_offsets);
   free(batch->host_tjb_log_terms);
   free(batch->host_bias_log1mp);
   free(batch->host_bias_logp);
@@ -1416,6 +1492,12 @@ plan7_ssv_sequence_batch_get_workspace_statistics(
     return -1;
   }
   memset(statistics, 0, sizeof(*statistics));
+  statistics->f1_device_compaction_run_count =
+    batch->f1_device_compaction_run_count;
+  statistics->f1_host_expansion_run_count = batch->f1_host_expansion_run_count;
+  statistics->f1_candidate_upload_count = batch->f1_candidate_upload_count;
+  statistics->f1_candidate_upload_avoided_count =
+    batch->f1_candidate_upload_avoided_count;
   if (batch->postfilter_workspace != nullptr) {
     plan7_postfilter_workspace_statistics postfilter{};
     if (plan7_postfilter_workspace_get_statistics(
@@ -1494,6 +1576,15 @@ plan7_ssv_sequence_batch_get_memory_snapshot(
       static_cast<uint64_t>(batch->device_f1_profile_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_CANDIDATE_WORDS] =
       static_cast<uint64_t>(batch->device_candidate_word_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_CANDIDATE_WORD_COUNTS] =
+      static_cast<uint64_t>(batch->device_candidate_word_count_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_CANDIDATE_WORD_OFFSETS] =
+      static_cast<uint64_t>(batch->device_candidate_word_offset_capacity);
+  snapshot->device_capacity_bytes[
+      PLAN7_SSV_CAPACITY_CANDIDATE_PROFILE_OFFSETS] =
+      static_cast<uint64_t>(batch->device_candidate_profile_offset_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_CANDIDATE_SCAN_WORKSPACE] =
+      static_cast<uint64_t>(batch->device_candidate_scan_workspace_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_PROFILES] =
       static_cast<uint64_t>(batch->device_bias_profile_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_CANDIDATES] =
@@ -1832,8 +1923,8 @@ plan7_ssv_sequence_batch_filter_many(
   return 0;
 }
 
-extern "C" int
-plan7_ssv_sequence_batch_f1_mask_many(
+static int
+sequence_batch_f1_mask_many_impl(
   plan7_ssv_sequence_batch *batch,
   const uint8_t *packed_scores,
   size_t packed_score_count,
@@ -1844,6 +1935,7 @@ plan7_ssv_sequence_batch_f1_mask_many(
   double f1,
   uint32_t *profile_major_candidate_words,
   size_t candidate_word_count,
+  bool copy_candidate_words,
   char *error,
   size_t error_size)
 {
@@ -1864,6 +1956,8 @@ plan7_ssv_sequence_batch_f1_mask_many(
     return -1;
   }
   batch->f1_cache_valid = 0;
+  batch->f1_device_candidates_valid = 0;
+  batch->cached_f1_candidate_count = 0;
   status = cudaGetDevice(&current_device);
   if (status != cudaSuccess) {
     set_cuda_error(error, error_size, "cudaGetDevice", status);
@@ -1927,7 +2021,7 @@ plan7_ssv_sequence_batch_f1_mask_many(
     set_error(error, error_size, "fused F1 mask size overflow");
     return -1;
   }
-  if (required_word_count != 0 &&
+  if (copy_candidate_words && required_word_count != 0 &&
       (profile_major_candidate_words == nullptr ||
        candidate_word_count < required_word_count)) {
     set_error(error, error_size, "fused F1 mask buffer is too short");
@@ -2090,13 +2184,254 @@ plan7_ssv_sequence_batch_f1_mask_many(
     words_per_profile,
     batch->device_candidate_words);
   CUDA_TRY_FUSED(cudaGetLastError());
-  CUDA_TRY_FUSED(cudaMemcpy(profile_major_candidate_words,
-                            batch->device_candidate_words,
-                            candidate_word_bytes,
-                            cudaMemcpyDeviceToHost));
+  if (copy_candidate_words)
+    CUDA_TRY_FUSED(cudaMemcpy(profile_major_candidate_words,
+                              batch->device_candidate_words,
+                              candidate_word_bytes,
+                              cudaMemcpyDeviceToHost));
   batch->cached_f1_profile_count = profile_count;
   batch->f1_cache_valid = 1;
 #undef CUDA_TRY_FUSED
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_f1_mask_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  const float *m_mu,
+  const float *m_lambda,
+  double f1,
+  uint32_t *profile_major_candidate_words,
+  size_t candidate_word_count,
+  char *error,
+  size_t error_size)
+{
+  const int status = sequence_batch_f1_mask_many_impl(
+    batch, packed_scores, packed_score_count, profiles, profile_count,
+    m_mu, m_lambda, f1, profile_major_candidate_words, candidate_word_count,
+    true, error, error_size);
+  if (status == 0 && batch != nullptr)
+    ++batch->f1_host_expansion_run_count;
+  return status;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_f1_compact_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  const float *m_mu,
+  const float *m_lambda,
+  double f1,
+  char *error,
+  size_t error_size)
+{
+  size_t words_per_profile;
+  size_t word_count;
+  size_t word_bytes;
+  size_t profile_offset_bytes;
+  size_t candidate_bytes;
+  size_t scan_workspace_bytes = 0;
+  cudaError_t status;
+
+  if (batch == nullptr) {
+    set_error(error, error_size, "sequence batch is null");
+    return -1;
+  }
+  batch->f1_device_candidates_valid = 0;
+  batch->cached_f1_candidate_count = 0;
+  if (batch->sequence_count > SIZE_MAX - 31) {
+    set_error(error, error_size, "fused F1 mask size overflow");
+    return -1;
+  }
+  words_per_profile = (batch->sequence_count + 31) / 32;
+  if (!checked_product(profile_count, words_per_profile, &word_count)) {
+    set_error(error, error_size, "fused F1 mask size overflow");
+    return -1;
+  }
+  if (word_count > static_cast<size_t>(INT_MAX)) {
+    set_error(error, error_size,
+              "fused F1 mask exceeds the CUB scan item limit");
+    return -1;
+  }
+
+  if (sequence_batch_f1_mask_many_impl(
+        batch, packed_scores, packed_score_count, profiles, profile_count,
+        m_mu, m_lambda, f1, nullptr, 0, false, error, error_size) != 0)
+    return -1;
+
+  if (profile_count == SIZE_MAX ||
+      !checked_product(profile_count + 1, sizeof(size_t),
+                       &profile_offset_bytes)) {
+    set_error(error, error_size, "F1 candidate offset size overflow");
+    return -1;
+  }
+  if (profile_offset_bytes > batch->host_candidate_offset_capacity) {
+    void *replacement = realloc(batch->host_candidate_offsets,
+                                profile_offset_bytes);
+    if (replacement == nullptr) {
+      set_error(error, error_size, "host F1 candidate offset allocation failed");
+      return -1;
+    }
+    batch->host_candidate_offsets = static_cast<size_t *>(replacement);
+    batch->host_candidate_offset_capacity = profile_offset_bytes;
+  }
+
+  if (word_count == 0) {
+    for (size_t profile = 0; profile <= profile_count; ++profile)
+      batch->host_candidate_offsets[profile] = 0;
+    batch->cached_f1_profile_count = profile_count;
+    batch->cached_f1_candidate_count = 0;
+    batch->f1_cache_valid = 1;
+    batch->f1_device_candidates_valid = 1;
+    ++batch->f1_device_compaction_run_count;
+    return 0;
+  }
+
+  if (!checked_product(word_count, sizeof(uint64_t), &word_bytes)) {
+    set_error(error, error_size, "F1 candidate scan size overflow");
+    return -1;
+  }
+  if (grow_device_buffer(&batch->device_candidate_word_counts,
+                         &batch->device_candidate_word_count_capacity,
+                         word_bytes,
+                         "cudaMalloc(F1 candidate word counts)",
+                         "cudaFree(F1 candidate word counts)",
+                         error, error_size) != 0 ||
+      grow_device_buffer(&batch->device_candidate_word_offsets,
+                         &batch->device_candidate_word_offset_capacity,
+                         word_bytes,
+                         "cudaMalloc(F1 candidate word offsets)",
+                         "cudaFree(F1 candidate word offsets)",
+                         error, error_size) != 0 ||
+      grow_device_buffer(&batch->device_candidate_profile_offsets,
+                         &batch->device_candidate_profile_offset_capacity,
+                         profile_offset_bytes,
+                         "cudaMalloc(F1 candidate profile offsets)",
+                         "cudaFree(F1 candidate profile offsets)",
+                         error, error_size) != 0)
+    return -1;
+  status = cub::DeviceScan::ExclusiveSum(
+    nullptr, scan_workspace_bytes, batch->device_candidate_word_counts,
+    batch->device_candidate_word_offsets, static_cast<int>(word_count));
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "CUB F1 scan workspace query", status);
+    return -1;
+  }
+  if (grow_device_buffer(&batch->device_candidate_scan_workspace,
+                         &batch->device_candidate_scan_workspace_capacity,
+                         scan_workspace_bytes,
+                         "cudaMalloc(F1 candidate scan workspace)",
+                         "cudaFree(F1 candidate scan workspace)",
+                         error, error_size) != 0)
+    return -1;
+
+#define CUDA_TRY_COMPACT(call)                                                \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, #call, status);                       \
+      return -1;                                                              \
+    }                                                                         \
+  } while (0)
+
+  const unsigned word_blocks = static_cast<unsigned>(
+    (word_count + kThreads - 1) / kThreads);
+  candidate_word_counts_kernel<<<word_blocks, kThreads>>>(
+    batch->device_candidate_words, word_count,
+    batch->device_candidate_word_counts);
+  CUDA_TRY_COMPACT(cudaGetLastError());
+  CUDA_TRY_COMPACT(cub::DeviceScan::ExclusiveSum(
+    batch->device_candidate_scan_workspace, scan_workspace_bytes,
+    batch->device_candidate_word_counts,
+    batch->device_candidate_word_offsets, static_cast<int>(word_count)));
+
+  const unsigned profile_blocks = static_cast<unsigned>(
+    (profile_count + 1 + kThreads - 1) / kThreads);
+  candidate_profile_offsets_kernel<<<profile_blocks, kThreads>>>(
+    batch->device_candidate_word_counts,
+    batch->device_candidate_word_offsets,
+    words_per_profile,
+    profile_count,
+    batch->device_candidate_profile_offsets);
+  CUDA_TRY_COMPACT(cudaGetLastError());
+  CUDA_TRY_COMPACT(cudaMemcpy(batch->host_candidate_offsets,
+                              batch->device_candidate_profile_offsets,
+                              profile_offset_bytes,
+                              cudaMemcpyDeviceToHost));
+
+  const size_t candidate_count = batch->host_candidate_offsets[profile_count];
+  if (!checked_product(candidate_count, sizeof(plan7_bias_candidate),
+                       &candidate_bytes)) {
+    set_error(error, error_size, "F1 candidate mapping size overflow");
+    return -1;
+  }
+  if (candidate_bytes > batch->host_bias_candidate_capacity) {
+    void *replacement = realloc(batch->host_bias_candidates, candidate_bytes);
+    if (replacement == nullptr) {
+      set_error(error, error_size, "host F1 candidate allocation failed");
+      return -1;
+    }
+    batch->host_bias_candidates =
+      static_cast<plan7_bias_candidate *>(replacement);
+    batch->host_bias_candidate_capacity = candidate_bytes;
+  }
+  if (grow_device_buffer(&batch->device_bias_candidates,
+                         &batch->device_bias_candidate_capacity,
+                         candidate_bytes,
+                         "cudaMalloc(compact F1 candidates)",
+                         "cudaFree(compact F1 candidates)",
+                         error, error_size) != 0)
+    return -1;
+
+  if (candidate_count != 0) {
+    candidate_scatter_kernel<<<word_blocks, kThreads>>>(
+      batch->device_candidate_words,
+      batch->device_candidate_word_offsets,
+      word_count,
+      words_per_profile,
+      batch->device_bias_candidates);
+    CUDA_TRY_COMPACT(cudaGetLastError());
+    CUDA_TRY_COMPACT(cudaMemcpy(batch->host_bias_candidates,
+                                batch->device_bias_candidates,
+                                candidate_bytes,
+                                cudaMemcpyDeviceToHost));
+  }
+
+  batch->cached_f1_profile_count = profile_count;
+  batch->cached_f1_candidate_count = candidate_count;
+  batch->f1_device_candidates_valid = 1;
+  ++batch->f1_device_compaction_run_count;
+#undef CUDA_TRY_COMPACT
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_get_f1_candidate_view(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_ssv_f1_candidate_view *view,
+  char *error,
+  size_t error_size)
+{
+  if (batch == nullptr || view == nullptr) {
+    set_error(error, error_size, "invalid F1 candidate view request");
+    return -1;
+  }
+  if (!batch->f1_device_candidates_valid ||
+      batch->host_candidate_offsets == nullptr) {
+    set_error(error, error_size, "device-compacted F1 candidates are unavailable");
+    return -1;
+  }
+  view->profile_count = batch->cached_f1_profile_count;
+  view->candidate_count = batch->cached_f1_candidate_count;
+  view->candidate_offsets = batch->host_candidate_offsets;
+  view->candidates = batch->host_bias_candidates;
   return 0;
 }
 
@@ -2121,6 +2456,7 @@ plan7_ssv_sequence_batch_bias_candidates_many(
   size_t length_term_bytes;
   int current_device;
   int maximum_grid_x;
+  bool use_cached_device_candidates;
 
   if (batch == nullptr) {
     set_error(error, error_size, "sequence batch is null");
@@ -2163,11 +2499,22 @@ plan7_ssv_sequence_batch_bias_candidates_many(
     return -1;
   }
 
+  use_cached_device_candidates = batch->f1_device_candidates_valid &&
+    batch->cached_f1_profile_count == profile_count &&
+    batch->cached_f1_candidate_count == candidate_count &&
+    batch->host_candidate_offsets != nullptr &&
+    batch->host_bias_candidates != nullptr;
+
   for (size_t profile = 0; profile < profile_count; ++profile) {
     if (candidate_offsets[profile] > candidate_offsets[profile + 1]) {
       set_error(error, error_size, "invalid bias candidate offsets");
       return -1;
     }
+    if (use_cached_device_candidates &&
+        (batch->host_candidate_offsets[profile] != candidate_offsets[profile] ||
+         batch->host_candidate_offsets[profile + 1] !=
+           candidate_offsets[profile + 1]))
+      use_cached_device_candidates = false;
     for (size_t candidate = candidate_offsets[profile];
          candidate < candidate_offsets[profile + 1]; ++candidate) {
       if (candidate_indices[candidate] >= batch->sequence_count) {
@@ -2175,6 +2522,11 @@ plan7_ssv_sequence_batch_bias_candidates_many(
                   "bias candidate sequence index is out of range");
         return -1;
       }
+      if (use_cached_device_candidates &&
+          (batch->host_bias_candidates[candidate].profile_index != profile ||
+           batch->host_bias_candidates[candidate].sequence_index !=
+             candidate_indices[candidate]))
+        use_cached_device_candidates = false;
     }
   }
   if (candidate_count == 0) return 0;
@@ -2219,7 +2571,10 @@ plan7_ssv_sequence_batch_bias_candidates_many(
     return -1;
   }
 
-  if (candidate_bytes > batch->host_bias_candidate_capacity) {
+  if (candidate_bytes > batch->device_bias_candidate_capacity)
+    use_cached_device_candidates = false;
+  if (!use_cached_device_candidates &&
+      candidate_bytes > batch->host_bias_candidate_capacity) {
     void *replacement = realloc(batch->host_bias_candidates, candidate_bytes);
     if (replacement == nullptr) {
       set_error(error, error_size, "host bias candidate allocation failed");
@@ -2229,12 +2584,14 @@ plan7_ssv_sequence_batch_bias_candidates_many(
       static_cast<plan7_bias_candidate *>(replacement);
     batch->host_bias_candidate_capacity = candidate_bytes;
   }
-  for (size_t profile = 0; profile < profile_count; ++profile) {
-    for (size_t candidate = candidate_offsets[profile];
-         candidate < candidate_offsets[profile + 1]; ++candidate) {
-      batch->host_bias_candidates[candidate] = {
-        static_cast<uint32_t>(profile), candidate_indices[candidate]
-      };
+  if (!use_cached_device_candidates) {
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      for (size_t candidate = candidate_offsets[profile];
+           candidate < candidate_offsets[profile + 1]; ++candidate) {
+        batch->host_bias_candidates[candidate] = {
+          static_cast<uint32_t>(profile), candidate_indices[candidate]
+        };
+      }
     }
   }
 
@@ -2307,10 +2664,16 @@ plan7_ssv_sequence_batch_bias_candidates_many(
                            bias_profiles,
                            profile_bytes,
                            cudaMemcpyHostToDevice));
-  CUDA_TRY_BIAS(cudaMemcpy(batch->device_bias_candidates,
-                           batch->host_bias_candidates,
-                           candidate_bytes,
-                           cudaMemcpyHostToDevice));
+  if (use_cached_device_candidates) {
+    ++batch->f1_candidate_upload_avoided_count;
+  } else {
+    CUDA_TRY_BIAS(cudaMemcpy(batch->device_bias_candidates,
+                             batch->host_bias_candidates,
+                             candidate_bytes,
+                             cudaMemcpyHostToDevice));
+    batch->f1_device_candidates_valid = 0;
+    ++batch->f1_candidate_upload_count;
+  }
   if (!batch->bias_length_terms_device_valid) {
     CUDA_TRY_BIAS(cudaMemcpy(batch->device_bias_logp,
                              batch->host_bias_logp,
@@ -2380,6 +2743,7 @@ sequence_batch_postfilter_candidates_many_impl(
   size_t length_term_bytes;
   int current_device;
   int maximum_grid_x;
+  bool use_cached_device_candidates;
 
   if (reason_statistics != nullptr) *reason_statistics = {};
 
@@ -2427,11 +2791,21 @@ sequence_batch_postfilter_candidates_many_impl(
     set_error(error, error_size, "invalid post-filter candidate offsets");
     return -1;
   }
+  use_cached_device_candidates = batch->f1_device_candidates_valid &&
+    batch->cached_f1_profile_count == profile_count &&
+    batch->cached_f1_candidate_count == candidate_count &&
+    batch->host_candidate_offsets != nullptr &&
+    batch->host_bias_candidates != nullptr;
   for (size_t profile = 0; profile < profile_count; ++profile) {
     if (candidate_offsets[profile] > candidate_offsets[profile + 1]) {
       set_error(error, error_size, "invalid post-filter candidate offsets");
       return -1;
     }
+    if (use_cached_device_candidates &&
+        (batch->host_candidate_offsets[profile] != candidate_offsets[profile] ||
+         batch->host_candidate_offsets[profile + 1] !=
+           candidate_offsets[profile + 1]))
+      use_cached_device_candidates = false;
     for (size_t candidate = candidate_offsets[profile];
          candidate < candidate_offsets[profile + 1]; ++candidate) {
       if (candidate_indices[candidate] >= batch->sequence_count) {
@@ -2439,6 +2813,11 @@ sequence_batch_postfilter_candidates_many_impl(
                   "post-filter candidate sequence index is out of range");
         return -1;
       }
+      if (use_cached_device_candidates &&
+          (batch->host_bias_candidates[candidate].profile_index != profile ||
+           batch->host_bias_candidates[candidate].sequence_index !=
+             candidate_indices[candidate]))
+        use_cached_device_candidates = false;
     }
   }
   if (candidate_count == 0) return 0;
@@ -2495,7 +2874,10 @@ sequence_batch_postfilter_candidates_many_impl(
     set_error(error, error_size, "post-filter candidate batch size overflow");
     return -1;
   }
-  if (candidate_bytes > batch->host_bias_candidate_capacity) {
+  if (candidate_bytes > batch->device_bias_candidate_capacity)
+    use_cached_device_candidates = false;
+  if (!use_cached_device_candidates &&
+      candidate_bytes > batch->host_bias_candidate_capacity) {
     void *replacement = realloc(batch->host_bias_candidates, candidate_bytes);
     if (replacement == nullptr) {
       set_error(error, error_size,
@@ -2506,12 +2888,14 @@ sequence_batch_postfilter_candidates_many_impl(
       static_cast<plan7_bias_candidate *>(replacement);
     batch->host_bias_candidate_capacity = candidate_bytes;
   }
-  for (size_t profile = 0; profile < profile_count; ++profile) {
-    for (size_t candidate = candidate_offsets[profile];
-         candidate < candidate_offsets[profile + 1]; ++candidate) {
-      batch->host_bias_candidates[candidate] = {
-        static_cast<uint32_t>(profile), candidate_indices[candidate]
-      };
+  if (!use_cached_device_candidates) {
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      for (size_t candidate = candidate_offsets[profile];
+           candidate < candidate_offsets[profile + 1]; ++candidate) {
+        batch->host_bias_candidates[candidate] = {
+          static_cast<uint32_t>(profile), candidate_indices[candidate]
+        };
+      }
     }
   }
 
@@ -2571,9 +2955,15 @@ sequence_batch_postfilter_candidates_many_impl(
   CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_profiles,
                                  bias_profiles, profile_bytes,
                                  cudaMemcpyHostToDevice));
-  CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_candidates,
-                                 batch->host_bias_candidates,
-                                 candidate_bytes, cudaMemcpyHostToDevice));
+  if (use_cached_device_candidates) {
+    ++batch->f1_candidate_upload_avoided_count;
+  } else {
+    CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_candidates,
+                                   batch->host_bias_candidates,
+                                   candidate_bytes, cudaMemcpyHostToDevice));
+    batch->f1_device_candidates_valid = 0;
+    ++batch->f1_candidate_upload_count;
+  }
   if (!batch->bias_length_terms_device_valid) {
     CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_logp,
                                    batch->host_bias_logp,

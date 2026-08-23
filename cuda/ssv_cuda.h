@@ -64,6 +64,10 @@ struct plan7_postfilter_reason_statistics;
 struct plan7_forward_workspace;
 
 typedef struct plan7_ssv_workspace_statistics {
+  uint64_t f1_device_compaction_run_count;
+  uint64_t f1_host_expansion_run_count;
+  uint64_t f1_candidate_upload_count;
+  uint64_t f1_candidate_upload_avoided_count;
   uint64_t postfilter_device_bytes;
   uint64_t postfilter_dp_capacity_bytes;
   uint64_t postfilter_growth_count;
@@ -137,7 +141,11 @@ enum plan7_ssv_device_capacity {
   PLAN7_SSV_CAPACITY_FORWARD_SURVIVOR_CANDIDATES = 32,
   PLAN7_SSV_CAPACITY_FORWARD_SURVIVOR_OFFSETS = 33,
   PLAN7_SSV_CAPACITY_FORWARD_GATHERED = 34,
-  PLAN7_SSV_DEVICE_CAPACITY_COUNT = 35
+  PLAN7_SSV_CAPACITY_CANDIDATE_WORD_COUNTS = 35,
+  PLAN7_SSV_CAPACITY_CANDIDATE_WORD_OFFSETS = 36,
+  PLAN7_SSV_CAPACITY_CANDIDATE_PROFILE_OFFSETS = 37,
+  PLAN7_SSV_CAPACITY_CANDIDATE_SCAN_WORKSPACE = 38,
+  PLAN7_SSV_DEVICE_CAPACITY_COUNT = 39
 };
 
 typedef struct plan7_ssv_memory_snapshot {
@@ -162,6 +170,16 @@ typedef struct plan7_ssv_sequence_batch_view {
   const uint64_t *device_offsets;
   uint64_t input_device_bytes;
 } plan7_ssv_sequence_batch_view;
+
+/* Host mirror of the stable device-compacted F1 mapping. The batch owns the
+ * pointed-to storage; it remains valid only until the next operation on that
+ * serialized batch. */
+typedef struct plan7_ssv_f1_candidate_view {
+  size_t profile_count;
+  size_t candidate_count;
+  const size_t *candidate_offsets;
+  const plan7_bias_candidate *candidates;
+} plan7_ssv_f1_candidate_view;
 
 int plan7_cuda_device_count(char *error, size_t error_size);
 int plan7_cuda_memory_info(int *device_ordinal,
@@ -312,6 +330,27 @@ int plan7_ssv_sequence_batch_f1_mask_many(
   double f1,
   uint32_t *profile_major_candidate_words,
   size_t candidate_word_count,
+  char *error,
+  size_t error_size);
+
+/* Run the exact fused F1 kernel, then stably compact its cached device mask.
+ * CUB accepts an int item count, so callers must retain the mask API as the
+ * explicit fallback when profile_count * ceil(sequence_count/32) > INT_MAX. */
+int plan7_ssv_sequence_batch_f1_compact_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  const float *m_mu,
+  const float *m_lambda,
+  double f1,
+  char *error,
+  size_t error_size);
+
+int plan7_ssv_sequence_batch_get_f1_candidate_view(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_ssv_f1_candidate_view *view,
   char *error,
   size_t error_size);
 

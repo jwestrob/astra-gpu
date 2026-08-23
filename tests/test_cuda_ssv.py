@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import io
 import json
 import math
@@ -609,6 +610,110 @@ class CudaSsvTests(unittest.TestCase):
                 self.assertEqual(
                     list(indices[offsets[1] : offsets[2]]),
                     list(range(target_count)),
+                )
+
+    def test_device_candidate_compaction_matches_host_mask_oracle(self):
+        first = self.optimized(HMM_20AA)
+        profiles = [first.copy(), self.optimized(HMM_M1), first.copy()]
+        packed = _pack_profiles(profiles)
+        parameters = [profile.evalue_parameters.as_vector() for profile in profiles]
+        ordinary_mu = array("f", [value[0] for value in parameters])
+        ordinary_lambda = array("f", [value[1] for value in parameters])
+        values = ["G", "ACDEX", "ACDEFGHIKLMNPQRSTVWY", "A", "G" * 31]
+
+        for target_count in (33, 65):
+            sequences = self.sequences(
+                first, [values[index % len(values)] for index in range(target_count)]
+            )
+            cases = (
+                ("mixed", ordinary_mu, 0.02),
+                (
+                    "near-all-pass",
+                    array("f", [math.nan, ordinary_mu[1], math.nan]),
+                    0.02,
+                ),
+            )
+            with self.subTest(target_count=target_count), SequenceBatch(
+                sequences
+            ) as batch:
+                native = _sequence_native(batch)
+                for name, m_mu, threshold in cases:
+                    with self.subTest(case=name):
+                        host_indices, host_offsets = (
+                            native.cpu_candidates_many_csr_raw(
+                                *packed,
+                                m_mu,
+                                ordinary_lambda,
+                                threshold,
+                                _host_candidate_expansion=True,
+                            )
+                        )
+                        device_indices, device_offsets = (
+                            native.cpu_candidates_many_csr_raw(
+                                *packed, m_mu, ordinary_lambda, threshold
+                            )
+                        )
+                        self.assertEqual(device_offsets, host_offsets)
+                        self.assertEqual(device_indices, host_indices)
+                        if name == "near-all-pass":
+                            self.assertGreaterEqual(len(host_indices), 2 * target_count)
+                        self.assertEqual(
+                            hashlib.sha256(
+                                device_offsets.tobytes() + device_indices.tobytes()
+                            ).digest(),
+                            hashlib.sha256(
+                                host_offsets.tobytes() + host_indices.tobytes()
+                            ).digest(),
+                        )
+
+                synthetic_pack = (
+                    bytearray(3 * 29),
+                    array("Q", [0, 29, 58]),
+                    array("Q", [29, 29, 29]),
+                    array("i", [29, 29, 29]),
+                    array("i", [1, 1, 1]),
+                    bytearray([0, 0, 128, 0] * 3),
+                    array("f", [1.0, 2.0, 1.0]),
+                )
+                synthetic_mu = array("f", [0.0, 0.0, 0.0])
+                synthetic_lambda = array("f", [1.0, 1.0, 1.0])
+                rejected_indices, rejected_offsets = (
+                    native.cpu_candidates_many_csr_raw(
+                        *synthetic_pack,
+                        synthetic_mu,
+                        synthetic_lambda,
+                        0.0,
+                        _host_candidate_expansion=True,
+                    )
+                )
+                compact_rejected_indices, compact_rejected_offsets = (
+                    native.cpu_candidates_many_csr_raw(
+                        *synthetic_pack, synthetic_mu, synthetic_lambda, 0.0
+                    )
+                )
+                self.assertEqual(rejected_indices.tolist(), [])
+                self.assertEqual(compact_rejected_indices, rejected_indices)
+                self.assertEqual(compact_rejected_offsets, rejected_offsets)
+
+                empty_indices, empty_offsets = native.cpu_candidates_many_csr_raw(
+                    *_pack_profiles([]), array("f"), array("f"), 0.02
+                )
+                self.assertEqual(empty_indices.tolist(), [])
+                self.assertEqual(empty_offsets.tolist(), [0])
+                statistics = native.workspace_statistics
+                self.assertEqual(statistics["f1_device_compaction_run_count"], 4)
+                self.assertEqual(statistics["f1_host_expansion_run_count"], 3)
+                snapshot = native.memory_snapshot
+                capacities = snapshot["capacity_bytes"]
+                self.assertGreater(capacities["candidate_word_counts"], 0)
+                self.assertEqual(
+                    capacities["candidate_word_counts"],
+                    capacities["candidate_word_offsets"],
+                )
+                self.assertGreater(capacities["candidate_profile_offsets"], 0)
+                self.assertGreater(capacities["candidate_scan_workspace"], 0)
+                self.assertEqual(
+                    snapshot["persistent_device_bytes"], sum(capacities.values())
                 )
 
     def test_compact_candidate_csr_matches_diagnostic_lists(self):
