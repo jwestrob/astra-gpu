@@ -5496,6 +5496,7 @@ cdef plan7_continuation_journal_v3 *_v3_validate_packet(
 cdef void _v3_drop_direct_staging(_SealedPostfilterBatch sealed) except *:
     """Release every dense planning view after direct v3 is authenticated."""
     cdef object empty_bytes = b""
+    cdef object empty_q = memoryview(b"").cast("Q")
     cdef object zero_q = memoryview(bytes(sizeof(uint64_t))).cast("Q")
     cdef object empty_f = memoryview(b"").cast("f")
     if not sealed._direct_v3_source:
@@ -5519,6 +5520,9 @@ cdef void _v3_drop_direct_staging(_SealedPostfilterBatch sealed) except *:
     sealed._journal_compact_trace_offsets = zero_q
     sealed._journal_compact_traces = empty_bytes
     sealed._journal_compact_null2 = empty_f
+    sealed._source_identity_tokens = empty_q
+    sealed._source_profile_fingerprints = empty_bytes
+    sealed._source_sequence_fingerprint = empty_bytes
 
 
 cdef plan7_continuation_journal_v3 *_v3_validate_capsule(
@@ -9266,6 +9270,7 @@ def _sealed_resident_memory_bound(sealed_object):
     cdef object shared_identity_bytes
     cdef object sparse_journal_v3_bytes
     cdef object dense_replay_retained_bytes
+    cdef object direct_v3_staging_retained_bytes = 0
     cdef dict evidence
 
     if type(sealed_object) is not _SealedPostfilterBatch:
@@ -9368,6 +9373,14 @@ def _sealed_resident_memory_bound(sealed_object):
         + int(sealed._journal_compact_traces.shape[0])
         + int(sealed._journal_compact_null2.shape[0]) * sizeof(float)
     )
+    if sealed._direct_v3_source:
+        direct_v3_staging_retained_bytes = (
+            int(sealed._source_identity_tokens.shape[0]) * sizeof(uint64_t)
+            + int(sealed._source_profile_fingerprints.shape[0])
+            + int(sealed._source_sequence_fingerprint.shape[0])
+        )
+        if direct_v3_staging_retained_bytes:
+            raise RuntimeError("direct v3 staging identity remains retained")
     evidence = {
         "schema_version": 1,
         "owned_host_bytes": owned_host_bytes,
@@ -9393,7 +9406,9 @@ def _sealed_resident_memory_bound(sealed_object):
         "excluded_shared_identity_bytes": shared_identity_bytes,
         "direct_v3_source": bool(sealed._direct_v3_source),
         "dense_replay_retained_bytes": dense_replay_retained_bytes,
-        "direct_v3_staging_retained_bytes": 0,
+        "direct_v3_staging_retained_bytes": (
+            direct_v3_staging_retained_bytes
+        ),
         "eliminated_v2_bytes": sealed._direct_v3_eliminated_v2_bytes,
     }
     if sparse_journal_v3_bytes:

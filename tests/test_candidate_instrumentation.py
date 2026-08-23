@@ -187,6 +187,32 @@ class CandidateResidentMemoryTests(unittest.TestCase):
 
 
 class PrivateTransportSourceCompatibilityTests(unittest.TestCase):
+    def test_direct_v3_releases_identity_staging_before_zero_accounting(self):
+        source = (ROOT / "python/plan7_gpu/_pipeline.pyx").read_text()
+        drop = source[
+            source.index("cdef void _v3_drop_direct_staging"):
+            source.index("cdef plan7_continuation_journal_v3 *_v3_validate_capsule")
+        ]
+        resident = source[
+            source.index("def _sealed_resident_memory_bound"):
+            source.index("def _search_hmm_candidates")
+        ]
+
+        for field in (
+            "_source_identity_tokens",
+            "_source_profile_fingerprints",
+            "_source_sequence_fingerprint",
+        ):
+            self.assertIn(f"sealed.{field} = ", drop)
+        self.assertIn(
+            'raise RuntimeError("direct v3 staging identity remains retained")',
+            resident,
+        )
+        self.assertIn(
+            '"direct_v3_staging_retained_bytes": (',
+            resident,
+        )
+
     def test_default_capsule_shape_and_all_direct_callers_are_deliberate(self):
         native = (ROOT / "python/plan7_gpu/_native.pyx").read_text()
         adapter = (ROOT / "python/plan7_gpu/adapter.py").read_text()
