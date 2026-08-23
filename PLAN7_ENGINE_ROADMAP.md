@@ -43,8 +43,8 @@ the complete oracle suite and representative end-to-end workloads.
 | Phase | Scope | State | Source commit | Evidence / decision |
 |---|---|---|---|---|
 | 0 | Per-profile/chunk work telemetry and real CPU-fallback taxonomy | complete | through `f9ef356` | source-fact H200 job 1182345 PASS; immutable NFS report exact |
-| 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | production opt-in H200 oracle passed; representative benchmark pending | through `9a078c2` | jobs 1182321 and 1182344 PASS; see Phase 1A notes |
-| 1B | Produce sparse certificate before dense host materialization | blocked on 1A | pending | pending |
+| 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | complete; production performance rejected | through `039c092` | exact full job 1182349 was 3.82% slower despite 41.35% fewer packet bytes |
+| 1B | Produce sparse certificate before dense host materialization | active | pending | must eliminate measured v2-to-v3 construction overhead and dense retention |
 | 2 | Device-side stable F1 candidate compaction | blocked on 1B | pending | pending |
 | 3 | Device-resident Forward -> Backward/domain -> rescore chain | blocked on 2 | pending | pending |
 | 4 | Forward/Backward/rescore candidates-per-warp variants | blocked on 3 | pending | pending |
@@ -135,6 +135,15 @@ Focused H200 job 1182344 exercised the reusable seal-owned packet through real
 profile and all exercised Forward, simple, and compact routes. It remains
 opt-in until the representative first-1000 and full-workload benchmark proves
 the output and measures total wall time honestly.
+
+Full job 1182349 proved exact output but rejected the present performance
+hypothesis. The opt-in took 567.080 seconds versus 546.221 seconds for sealed
+dense v2. It removed 4.089 GB (41.35%) of retained continuation payload, but
+the dense-to-sparse plan and validation added 28.945 seconds and continuation
+wall did not improve. Phase 1A therefore remains an audit/reference path, not
+the production default. Phase 1B is justified only as direct sparse generation
+that eliminates both the measured conversion overhead and dense replay
+retention.
 
 ## Later phase order
 

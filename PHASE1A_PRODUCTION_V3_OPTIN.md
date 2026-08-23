@@ -45,11 +45,27 @@ state, TopHits, and target/domain table bytes. Direct production
 profile. The result JSON SHA-256 is
 `caf9eaca0ad5cd2a2b910f8c313fdb1ba2caaae3eed5f29a31deaf94ade8b101`.
 
-## Benchmark status
+## Benchmark result
 
-The authenticated H200 correctness gate passed. The tiny fixture reduced the
-production packet from 85,248 to 63,700 bytes and the forced simple-fallback
-packet from 80,912 to 30,348 bytes; those values are correctness-scale
-evidence, not a performance claim. The implementation remains behind the
-explicit opt-in pending the representative first-1000 and full-workload wall
-time and output oracle.
+The current-code first-1000 gate passed exactly in Slurm job `1182348`. The
+full 300,186-target by 27,481-profile request then completed in job `1182349`
+with byte-identical output:
+
+- SHA-256 `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`;
+- 39,010,327 bytes and 383,235 lines;
+- all candidate, continuation-route, compact-accept, and retry counts exact.
+
+The performance hypothesis failed in its present form. Outer request time was
+567.080 seconds versus 546.221 seconds for sealed dense v2: 20.859 seconds, or
+3.82%, slower. Generation was 502.286 seconds, continuation/output 404.272
+seconds, and measured overlap 347.054 seconds. Dense-v2 payload fell from
+9,890,721,120 to 5,801,342,068 bytes (41.35%), but building the sparse packet
+from the completed dense history and structurally validating it cost 28.945
+seconds. CPU continuation itself did not materially improve.
+
+## Decision
+
+Do not enable this Phase 1A implementation by default. Retain it as the exact
+audit/reference path and as the semantic foundation for Phase 1B. The next
+experiment must generate v3 directly and avoid constructing and retaining the
+dense replay history; merely compacting v2 after the fact is rejected.
