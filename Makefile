@@ -207,7 +207,6 @@ $(PIPELINE_C): python/plan7_gpu/_pipeline.pyx python/plan7_gpu/_abi.py \
 		$(PYHMMER_PACKAGE_DIR)/plan7.pxd \
 		$(PYHMMER_PACKAGE_DIR)/easel.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libeasel/alphabet.pxd \
-		$(PYHMMER_CYTHON_INCLUDE)/libeasel/hmm.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libeasel/random.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libeasel/sq.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/p7_alidisplay.pxd \

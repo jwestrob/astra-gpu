@@ -45,6 +45,14 @@ class SemanticFingerprintTests(unittest.TestCase):
         background = pyhmmer.plan7.Background(cls.alphabet)
         return cls.hmm.to_profile(background, L=400).to_optimized()
 
+    @classmethod
+    def distinct_optimized_profile(cls):
+        changed_hmm = cls.hmm.copy()
+        changed_hmm.match_emissions[1, 0] = 0.0
+        changed_hmm.renormalize()
+        background = pyhmmer.plan7.Background(cls.alphabet)
+        return changed_hmm.to_profile(background, L=400).to_optimized()
+
     @staticmethod
     def pipeline(**options):
         defaults = {
@@ -123,7 +131,33 @@ class SemanticFingerprintTests(unittest.TestCase):
             )
         self.assertEqual(len(set(encodings)), 1)
         self.assertEqual(len(set(hit_encodings)), 1)
-        self.assertIn(b"background.fhmm.state_present", encodings[0])
+        self.assertIn(b"background.fhmm.state", encodings[0])
+        self.assertIn(b"excluded-unproven", encodings[0])
+        for numeric_field in (
+            b"background.fhmm.M",
+            b"background.fhmm.K",
+            b"background.fhmm.pi[",
+            b"background.fhmm.t[",
+            b"background.fhmm.e[",
+            b"background.fhmm.eo[",
+        ):
+            self.assertNotIn(numeric_field, encodings[0])
+
+    def test_bias_setter_after_disabled_search_never_exposes_filter_hmm(self):
+        encodings = []
+        for _ in range(10):
+            pipeline, profile, _ = self.search(bias_filter=False)
+            pipeline.bias_filter = True
+            encoding = _pipeline._semantic_pipeline_state_encoding_bound(
+                pipeline, profile
+            )
+            self.assertIn(b"excluded-unproven", encoding)
+            self.assertNotIn(b"background.fhmm.pi[", encoding)
+            self.assertNotIn(b"background.fhmm.t[", encoding)
+            self.assertNotIn(b"background.fhmm.e[", encoding)
+            self.assertNotIn(b"background.fhmm.eo[", encoding)
+            encodings.append(encoding)
+        self.assertEqual(len(set(encodings)), 1)
 
     def test_raw_ieee_threshold_bits_are_sensitive(self):
         positive_zero = self.pipeline(T=0.0)
@@ -134,7 +168,10 @@ class SemanticFingerprintTests(unittest.TestCase):
         self.assertIn(struct.pack("<Q", 0x8000000000000000), negative)
 
         comparison = _pipeline._semantic_dual_state_compare_bound(
-            positive_zero, negative_zero
+            positive_zero,
+            negative_zero,
+            left_optimized_profile=self.optimized_profile(),
+            right_optimized_profile=self.optimized_profile(),
         )
         self.assertFalse(comparison["pipeline"]["equal"])
         self.assertIsNotNone(comparison["pipeline"]["first_difference"])
@@ -331,23 +368,60 @@ class SemanticFingerprintTests(unittest.TestCase):
                 )
 
     def test_dual_oracle_rejects_distinct_immutable_profile_identity(self):
-        changed_hmm = self.hmm.copy()
-        changed_hmm.match_emissions[1, 0] = 0.0
-        changed_hmm.renormalize()
-        background = pyhmmer.plan7.Background(self.alphabet)
-        changed_profile = changed_hmm.to_profile(
-            background, L=400
-        ).to_optimized()
+        empty = pyhmmer.easel.DigitalSequenceBlock(self.alphabet)
+        changed_profile = self.distinct_optimized_profile()
         original_profile = self.optimized_profile()
         self.assertEqual(original_profile.name, changed_profile.name)
         self.assertEqual(original_profile.accession, changed_profile.accession)
         self.assertEqual(original_profile.M, changed_profile.M)
+        left_pipeline = self.pipeline(bias_filter=False)
+        right_pipeline = self.pipeline(bias_filter=False)
+        left_hits = left_pipeline.search_hmm(original_profile, empty)
+        right_hits = right_pipeline.search_hmm(changed_profile, empty)
         with self.assertRaisesRegex(ValueError, "identities differ"):
             _pipeline._semantic_dual_state_compare_bound(
-                self.pipeline(),
-                self.pipeline(),
+                left_pipeline,
+                right_pipeline,
+                left_hits,
+                right_hits,
                 left_optimized_profile=original_profile,
                 right_optimized_profile=changed_profile,
+            )
+
+    def test_dual_oracle_requires_profiles_even_for_empty_results(self):
+        empty = pyhmmer.easel.DigitalSequenceBlock(self.alphabet)
+        left_profile = self.optimized_profile()
+        right_profile = self.distinct_optimized_profile()
+        left_pipeline = self.pipeline(bias_filter=False)
+        right_pipeline = self.pipeline(bias_filter=False)
+        left_hits = left_pipeline.search_hmm(left_profile, empty)
+        right_hits = right_pipeline.search_hmm(right_profile, empty)
+        with self.assertRaisesRegex(ValueError, "profiles are required"):
+            _pipeline._semantic_dual_state_compare_bound(
+                left_pipeline,
+                right_pipeline,
+                left_hits,
+                right_hits,
+            )
+
+    def test_dual_oracle_binds_optimized_tophits_queries_to_profiles(self):
+        empty = pyhmmer.easel.DigitalSequenceBlock(self.alphabet)
+        left_profile = self.optimized_profile()
+        right_profile = self.optimized_profile()
+        left_pipeline = self.pipeline(bias_filter=False)
+        right_pipeline = self.pipeline(bias_filter=False)
+        left_hits = left_pipeline.search_hmm(left_profile, empty)
+        right_hits = right_pipeline.search_hmm(right_profile, empty)
+        unrelated_left = self.distinct_optimized_profile()
+        unrelated_right = unrelated_left.copy()
+        with self.assertRaisesRegex(ValueError, "TopHits query identity differs"):
+            _pipeline._semantic_dual_state_compare_bound(
+                left_pipeline,
+                right_pipeline,
+                left_hits,
+                right_hits,
+                unrelated_left,
+                unrelated_right,
             )
 
     def test_canonical_encoding_excludes_dormant_and_pointer_fields(self):
@@ -391,6 +465,8 @@ class SemanticFingerprintTests(unittest.TestCase):
 
     def test_private_entry_points_reject_nonexact_types_and_half_pairs(self):
         pipeline = self.pipeline()
+        left_profile = self.optimized_profile()
+        right_profile = self.optimized_profile()
         with self.assertRaises(TypeError):
             _pipeline._semantic_pipeline_state_encoding_bound(object())
         with self.assertRaises(TypeError):
@@ -400,12 +476,26 @@ class SemanticFingerprintTests(unittest.TestCase):
                 pipeline,
                 self.pipeline(),
                 pyhmmer.plan7.TopHits(self.hmm),
+                left_optimized_profile=left_profile,
+                right_optimized_profile=right_profile,
             )
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "profiles are required"):
             _pipeline._semantic_dual_state_compare_bound(
                 pipeline,
                 self.pipeline(),
-                left_optimized_profile=self.optimized_profile(),
+            )
+        with self.assertRaisesRegex(ValueError, "profiles are required"):
+            _pipeline._semantic_dual_state_compare_bound(
+                pipeline,
+                self.pipeline(),
+                left_optimized_profile=left_profile,
+            )
+        with self.assertRaises(TypeError):
+            _pipeline._semantic_dual_state_compare_bound(
+                pipeline,
+                self.pipeline(),
+                left_optimized_profile=object(),
+                right_optimized_profile=right_profile,
             )
 
 

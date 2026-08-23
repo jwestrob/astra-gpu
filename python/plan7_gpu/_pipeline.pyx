@@ -46,7 +46,6 @@ from libeasel cimport (
     eslOK,
 )
 from libeasel.alphabet cimport eslAMINO
-from libeasel.hmm cimport ESL_HMM
 from libeasel.random cimport (
     ESL_RANDOMNESS,
     eslRND_FAST,
@@ -6103,16 +6102,12 @@ cdef void _semantic_encode_background(
     bytearray output,
     const P7_BG *bg,
     bytes prefix,
-    bint include_filter_state,
 ) except *:
-    cdef const ESL_HMM *fhmm
     cdef int i
-    cdef int j
-    if bg == NULL or bg.abc == NULL or bg.f == NULL or bg.fhmm == NULL:
+    if bg == NULL or bg.abc == NULL or bg.f == NULL:
         raise ValueError("pipeline background state is unavailable")
     if bg.abc.type != eslAMINO:
         raise ValueError("semantic fingerprint requires a protein alphabet")
-    fhmm = bg.fhmm
     _semantic_i32(output, prefix + b".alphabet.type", bg.abc.type)
     _semantic_i32(output, prefix + b".alphabet.K", bg.abc.K)
     _semantic_i32(output, prefix + b".alphabet.Kp", bg.abc.Kp)
@@ -6125,73 +6120,16 @@ cdef void _semantic_encode_background(
             bg.f[i],
         )
 
-    # esl_hmm_Create() leaves its numeric buffers undefined. NewModel calls
-    # p7_bg_SetFilter() before they can be consumed. With no prior model the
-    # filter state is therefore both nonsemantic and unsafe to inspect.
-    _semantic_bool(output, prefix + b".fhmm.state_present", include_filter_state)
-    if not include_filter_state:
-        return
-    if (
-        fhmm.abc != bg.abc
-        or fhmm.M <= 0
-        or fhmm.K != bg.abc.K
-        or fhmm.pi == NULL
-        or fhmm.t == NULL
-        or fhmm.e == NULL
-        or fhmm.eo == NULL
-    ):
-        raise ValueError("background filter HMM is inconsistent")
-
-    _semantic_i32(output, prefix + b".fhmm.M", fhmm.M)
-    _semantic_i32(output, prefix + b".fhmm.K", fhmm.K)
-    # pi[M] is the implicit-end probability for an empty sequence. HMMER's
-    # protein pipeline skips empty targets, and p7_bg_SetFilter() initializes
-    # only pi[0..M-1], so the dormant pi[M] slot must not be inspected.
-    for i in range(fhmm.M):
-        _semantic_f32(
-            output,
-            prefix + b".fhmm.pi[" + str(i).encode("ascii") + b"]",
-            fhmm.pi[i],
-        )
-    for i in range(fhmm.M):
-        if fhmm.t[i] == NULL or fhmm.e[i] == NULL:
-            raise ValueError("background filter HMM row is unavailable")
-        for j in range(fhmm.M + 1):
-            _semantic_f32(
-                output,
-                prefix
-                + b".fhmm.t["
-                + str(i).encode("ascii")
-                + b"]["
-                + str(j).encode("ascii")
-                + b"]",
-                fhmm.t[i][j],
-            )
-        for j in range(fhmm.K):
-            _semantic_f32(
-                output,
-                prefix
-                + b".fhmm.e["
-                + str(i).encode("ascii")
-                + b"]["
-                + str(j).encode("ascii")
-                + b"]",
-                fhmm.e[i][j],
-            )
-    for i in range(bg.abc.Kp):
-        if fhmm.eo[i] == NULL:
-            raise ValueError("background filter HMM odds row is unavailable")
-        for j in range(fhmm.M):
-            _semantic_f32(
-                output,
-                prefix
-                + b".fhmm.eo["
-                + str(i).encode("ascii")
-                + b"]["
-                + str(j).encode("ascii")
-                + b"]",
-                fhmm.eo[i][j],
-            )
+    # P7_PIPELINE has no provenance bit recording whether the most recent
+    # p7_pli_NewModel() call initialized fhmm.  The live do_biasfilter option
+    # is mutable independently, so neither it nor nmodels proves that these
+    # numeric buffers are initialized.  Do not inspect any fhmm storage until
+    # the audit executor can supply explicit NewModel provenance.
+    _semantic_bytes(
+        output,
+        prefix + b".fhmm.state",
+        b"excluded-unproven",
+    )
 
 
 cdef void _semantic_encode_oprofile(
@@ -6292,6 +6230,100 @@ cdef void _semantic_encode_query_identity(
     _semantic_nullable_bytes(output, prefix + b".name", name)
     _semantic_nullable_bytes(output, prefix + b".accession", accession)
     _semantic_i32(output, prefix + b".M", model_length)
+
+
+cdef bytes _semantic_checked_profile_identity_fingerprint(
+    OptimizedProfile optimized_profile,
+    str label,
+):
+    cdef object fingerprint
+    if optimized_profile._om == NULL or optimized_profile._om.abc == NULL:
+        raise ValueError(f"{label} optimized profile state is unavailable")
+    fingerprint = _fingerprint_module.optimized_profile_fingerprint(
+        optimized_profile
+    )
+    if type(fingerprint) is not bytes or len(fingerprint) != 32:
+        raise ValueError(
+            f"{label} optimized-profile identity fingerprint is invalid"
+        )
+    return fingerprint
+
+
+cdef void _semantic_validate_tophits_profile_binding(
+    TopHits hits,
+    OptimizedProfile optimized_profile,
+    bytes expected_fingerprint,
+    str label,
+) except *:
+    cdef object query = hits._query
+    cdef object query_name
+    cdef object query_accession
+    cdef object query_description
+    cdef bytes query_fingerprint
+    cdef int query_model_length
+    cdef int query_alphabet_type
+    cdef int query_alphabet_k
+    cdef int query_alphabet_kp
+    cdef HMM hmm
+    cdef Profile profile
+    cdef OptimizedProfile optimized
+
+    if isinstance(query, _pyhmmer.plan7.OptimizedProfile):
+        optimized = query
+        query_fingerprint = _semantic_checked_profile_identity_fingerprint(
+            optimized,
+            label + " TopHits query",
+        )
+        if query_fingerprint != expected_fingerprint:
+            raise ValueError(
+                f"{label} TopHits query identity differs from the supplied "
+                "optimized profile"
+            )
+        return
+
+    if isinstance(query, _pyhmmer.plan7.HMM):
+        hmm = query
+        if hmm._hmm == NULL or hmm._hmm.abc == NULL:
+            raise ValueError(f"{label} TopHits HMM query state is unavailable")
+        query_name = _semantic_cstring(hmm._hmm.name)
+        query_accession = _semantic_cstring(hmm._hmm.acc)
+        query_description = _semantic_cstring(hmm._hmm.desc)
+        query_model_length = hmm._hmm.M
+        query_alphabet_type = hmm._hmm.abc.type
+        query_alphabet_k = hmm._hmm.abc.K
+        query_alphabet_kp = hmm._hmm.abc.Kp
+    elif isinstance(query, _pyhmmer.plan7.Profile):
+        profile = query
+        if profile._gm == NULL or profile._gm.abc == NULL:
+            raise ValueError(
+                f"{label} TopHits profile query state is unavailable"
+            )
+        query_name = _semantic_cstring(profile._gm.name)
+        query_accession = _semantic_cstring(profile._gm.acc)
+        query_description = _semantic_cstring(profile._gm.desc)
+        query_model_length = profile._gm.M
+        query_alphabet_type = profile._gm.abc.type
+        query_alphabet_k = profile._gm.abc.K
+        query_alphabet_kp = profile._gm.abc.Kp
+    else:
+        raise TypeError(
+            f"{label} TopHits query must be an HMM, Profile, or "
+            "OptimizedProfile"
+        )
+
+    if (
+        query_name != _semantic_cstring(optimized_profile._om.name)
+        or query_accession != _semantic_cstring(optimized_profile._om.acc)
+        or query_description != _semantic_cstring(optimized_profile._om.desc)
+        or query_model_length != optimized_profile._om.M
+        or query_alphabet_type != optimized_profile._om.abc.type
+        or query_alphabet_k != optimized_profile._om.abc.K
+        or query_alphabet_kp != optimized_profile._om.abc.Kp
+    ):
+        raise ValueError(
+            f"{label} TopHits query metadata differs from the supplied "
+            "optimized profile"
+        )
 
 
 cdef void _semantic_encode_alidisplay(
@@ -6481,7 +6513,6 @@ cdef bytes _semantic_pipeline_state_encoding(
         output,
         bg,
         b"background",
-        pli.nmodels != 0 and pli.do_biasfilter,
     )
     _semantic_bool(output, b"optimized_profile.present", include_optimized_profile)
     if include_optimized_profile:
@@ -6633,40 +6664,52 @@ def _semantic_dual_state_compare_bound(
     cdef bytes right_hits_encoding
     cdef bytes left_profile_fingerprint
     cdef bytes right_profile_fingerprint
+    if left_optimized_profile is None or right_optimized_profile is None:
+        raise ValueError("both optimized profiles are required")
+    if type(left_optimized_profile) is not _pyhmmer.plan7.OptimizedProfile:
+        raise TypeError(
+            "left_optimized_profile must be exactly "
+            "pyhmmer.plan7.OptimizedProfile"
+        )
+    if type(right_optimized_profile) is not _pyhmmer.plan7.OptimizedProfile:
+        raise TypeError(
+            "right_optimized_profile must be exactly "
+            "pyhmmer.plan7.OptimizedProfile"
+        )
     if (left_hits is None) != (right_hits is None):
         raise ValueError("both TopHits values must be supplied together")
-    if (left_optimized_profile is None) != (right_optimized_profile is None):
-        raise ValueError("both optimized profiles must be supplied together")
-    if left_optimized_profile is not None:
-        if type(left_optimized_profile) is not _pyhmmer.plan7.OptimizedProfile:
-            raise TypeError(
-                "left_optimized_profile must be exactly "
-                "pyhmmer.plan7.OptimizedProfile"
-            )
-        if type(right_optimized_profile) is not _pyhmmer.plan7.OptimizedProfile:
-            raise TypeError(
-                "right_optimized_profile must be exactly "
-                "pyhmmer.plan7.OptimizedProfile"
-            )
-        left_profile_fingerprint = (
-            _fingerprint_module.optimized_profile_fingerprint(
-                left_optimized_profile
-            )
+    left_profile_fingerprint = (
+        _semantic_checked_profile_identity_fingerprint(
+            left_optimized_profile,
+            "left",
         )
-        right_profile_fingerprint = (
-            _fingerprint_module.optimized_profile_fingerprint(
-                right_optimized_profile
-            )
+    )
+    right_profile_fingerprint = (
+        _semantic_checked_profile_identity_fingerprint(
+            right_optimized_profile,
+            "right",
         )
-        if (
-            type(left_profile_fingerprint) is not bytes
-            or len(left_profile_fingerprint) != 32
-            or type(right_profile_fingerprint) is not bytes
-            or len(right_profile_fingerprint) != 32
-        ):
-            raise ValueError("optimized-profile identity fingerprint is invalid")
-        if left_profile_fingerprint != right_profile_fingerprint:
-            raise ValueError("optimized-profile identities differ")
+    )
+    if left_profile_fingerprint != right_profile_fingerprint:
+        raise ValueError("optimized-profile identities differ")
+
+    if left_hits is not None:
+        if type(left_hits) is not _pyhmmer.plan7.TopHits:
+            raise TypeError("left_hits must be exactly pyhmmer.plan7.TopHits")
+        if type(right_hits) is not _pyhmmer.plan7.TopHits:
+            raise TypeError("right_hits must be exactly pyhmmer.plan7.TopHits")
+        _semantic_validate_tophits_profile_binding(
+            left_hits,
+            left_optimized_profile,
+            left_profile_fingerprint,
+            "left",
+        )
+        _semantic_validate_tophits_profile_binding(
+            right_hits,
+            right_optimized_profile,
+            right_profile_fingerprint,
+            "right",
+        )
 
     left_pipeline_encoding = _semantic_pipeline_state_encoding_bound(
         left_pipeline, left_optimized_profile
@@ -6689,10 +6732,6 @@ def _semantic_dual_state_compare_bound(
         "tophits": None,
     }
     if left_hits is not None:
-        if type(left_hits) is not _pyhmmer.plan7.TopHits:
-            raise TypeError("left_hits must be exactly pyhmmer.plan7.TopHits")
-        if type(right_hits) is not _pyhmmer.plan7.TopHits:
-            raise TypeError("right_hits must be exactly pyhmmer.plan7.TopHits")
         left_hits_encoding = _semantic_tophits_encoding(left_hits)
         right_hits_encoding = _semantic_tophits_encoding(right_hits)
         result["tophits"] = {
