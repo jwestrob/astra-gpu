@@ -27,6 +27,25 @@ enum plan7_forward_status {
   PLAN7_FORWARD_EMPTY = 255
 };
 
+/* Version-1 diagnostic facts are derived from the exact native classification
+ * predicate and are transported outside the result/provenance ABI. */
+enum plan7_forward_reason_fact {
+  PLAN7_FORWARD_REASON_KERNEL_STATUS_NON_OK = UINT16_C(0x0001),
+  PLAN7_FORWARD_REASON_TARGET_EMPTY = UINT16_C(0x0002),
+  PLAN7_FORWARD_REASON_FWDSC_NONFINITE = UINT16_C(0x0004),
+  PLAN7_FORWARD_REASON_FILTERSC_NONFINITE = UINT16_C(0x0008),
+  PLAN7_FORWARD_REASON_TAU_NONFINITE = UINT16_C(0x0010),
+  PLAN7_FORWARD_REASON_LAMBDA_INVALID = UINT16_C(0x0020),
+  PLAN7_FORWARD_REASON_F3_REJECT = UINT16_C(0x0040),
+  PLAN7_FORWARD_REASON_OUTPUT_CAP = UINT16_C(0x0080),
+  PLAN7_FORWARD_REASON_SURVIVOR_GATHERED = UINT16_C(0x0100),
+  PLAN7_FORWARD_REASON_OTHER_CPU_REQUIRED = UINT16_C(0x0200)
+};
+
+enum plan7_forward_call_reason_fact {
+  PLAN7_FORWARD_CALL_REASON_CONTRACT_FALLBACK = UINT8_C(0x01)
+};
+
 /* One record is returned for every input F2 survivor, in input order.
  * Special-state rows are returned only for DEFINITE_PASS records. */
 typedef struct plan7_forward_result {
@@ -273,6 +292,11 @@ const plan7_forward_statistics *plan7_forward_output_statistics(
 float plan7_forward_output_upload_milliseconds(
   const plan7_forward_output *output);
 float plan7_forward_output_total_milliseconds(
+  const plan7_forward_output *output);
+
+/* True only for the exact call-wide conservative fallback at the native
+ * contract/environment gate. It is not inferred from row actions. */
+int plan7_forward_output_contract_fallback(
   const plan7_forward_output *output);
 const plan7_forward_provenance *plan7_forward_output_provenance(
   const plan7_forward_output *output);

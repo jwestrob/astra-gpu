@@ -221,13 +221,20 @@ __device__ __forceinline__ uint64_t dp_cell(int row, int q, int state,
              kSubwarp + lane;
 }
 
+template <bool CollectReasonFacts>
+__device__ __forceinline__ void add_rescore_reason(
+    uint32_t *reason_facts, size_t region, uint32_t reason) {
+  if constexpr (CollectReasonFacts) reason_facts[region] |= reason;
+}
+
+template <bool CollectReasonFacts>
 __global__ void isolated_forward_kernel(
     const uint8_t *residues, const uint64_t *sequence_offsets,
     const plan7_forward_device_profile *profiles, const float *emissions,
     const float *transitions, const RegionWork *work,
     const uint64_t *matrix_offsets, const uint64_t *special_offsets,
     size_t work_count, float *forward_matrix, float *forward_specials,
-    plan7_domain_rescore_result *results) {
+    plan7_domain_rescore_result *results, uint32_t *reason_facts) {
   const int lane = threadIdx.x & 31;
   const int warp_in_block = threadIdx.x >> 5;
   if (lane >= kSubwarp) return;
@@ -388,6 +395,9 @@ __global__ void isolated_forward_kernel(
       result.forward_score = nanf("");
       result.status = PLAN7_DOMAIN_RESCORE_ERANGE;
       result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      add_rescore_reason<CollectReasonFacts>(
+          reason_facts, region,
+          PLAN7_DOMAIN_RESCORE_REASON_FORWARD_SCORE_INVALID);
     } else {
       result.forward_score = static_cast<float>(
           static_cast<double>(totscale) +
@@ -396,6 +406,7 @@ __global__ void isolated_forward_kernel(
   }
 }
 
+template <bool CollectReasonFacts>
 __global__ void isolated_backward_decode_kernel(
     const uint8_t *residues, const uint64_t *sequence_offsets,
     const plan7_forward_device_profile *profiles, const float *emissions,
@@ -403,7 +414,8 @@ __global__ void isolated_backward_decode_kernel(
     const uint64_t *matrix_offsets, const uint64_t *special_offsets,
     size_t work_count, const float *forward_matrix,
     const float *forward_specials, float *posterior_matrix,
-    float *posterior_specials, plan7_domain_rescore_result *results) {
+    float *posterior_specials, plan7_domain_rescore_result *results,
+    uint32_t *reason_facts) {
   const int lane = threadIdx.x & 31;
   const int warp_in_block = threadIdx.x >> 5;
   if (lane >= kSubwarp) return;
@@ -634,10 +646,16 @@ __global__ void isolated_backward_decode_kernel(
     bx[p7X_E] = 0.0f;
     bx[p7X_SCALE] = 1.0f;
     result.has_own_scales = own_scales ? 1 : 0;
+    if (own_scales)
+      add_rescore_reason<CollectReasonFacts>(
+          reason_facts, region, PLAN7_DOMAIN_RESCORE_REASON_OWN_SCALES);
     if (isnan(xN) || xN == 0.0f || isinf(xN)) {
       result.backward_score = nanf("");
       result.status = PLAN7_DOMAIN_RESCORE_ERANGE;
       result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      add_rescore_reason<CollectReasonFacts>(
+          reason_facts, region,
+          PLAN7_DOMAIN_RESCORE_REASON_BACKWARD_SCORE_INVALID);
     } else {
       result.backward_score = static_cast<float>(
           static_cast<double>(totscale) + log(static_cast<double>(xN)));
@@ -703,6 +721,9 @@ __global__ void isolated_backward_decode_kernel(
   if (sublane == 0 && isinf(scaleproduct)) {
     result.status = PLAN7_DOMAIN_RESCORE_ERANGE;
     result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+    add_rescore_reason<CollectReasonFacts>(
+        reason_facts, region,
+        PLAN7_DOMAIN_RESCORE_REASON_SCALEPRODUCT_INVALID);
   }
 }
 
@@ -851,6 +872,7 @@ __device__ float trace_postprob(const float *pp, const float *px,
   return 0.0f;
 }
 
+template <bool CollectReasonFacts>
 __global__ void isolated_null2_oa_trace_kernel(
     const uint8_t *residues, const uint64_t *sequence_offsets,
     const plan7_forward_device_profile *profiles, const float *emissions,
@@ -860,7 +882,7 @@ __global__ void isolated_null2_oa_trace_kernel(
     float *oa_matrix, float *oa_specials, const float *posterior_matrix,
     const float *posterior_specials, float *null2,
     plan7_domain_rescore_trace_step *traces, uint32_t *trace_counts,
-    plan7_domain_rescore_result *results) {
+    plan7_domain_rescore_result *results, uint32_t *reason_facts) {
   const int lane = threadIdx.x & 31;
   const int warp_in_block = threadIdx.x >> 5;
   if (lane >= kSubwarp) return;
@@ -885,7 +907,12 @@ __global__ void isolated_null2_oa_trace_kernel(
   float *row_null2 = null2 + region * PLAN7_DOMAIN_RESCORE_NULL2_COUNT;
   plan7_domain_rescore_result &result = results[region];
   if (result.status != PLAN7_DOMAIN_RESCORE_OK || result.has_own_scales) {
-    if (sublane == 0) result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+    if (sublane == 0) {
+      result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      if (result.has_own_scales)
+        add_rescore_reason<CollectReasonFacts>(
+            reason_facts, region, PLAN7_DOMAIN_RESCORE_REASON_OWN_SCALES);
+    }
     return;
   }
 
@@ -950,6 +977,9 @@ __global__ void isolated_null2_oa_trace_kernel(
     if (!finite || !isfinite(correction)) {
       result.status = PLAN7_DOMAIN_RESCORE_ERANGE;
       result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      add_rescore_reason<CollectReasonFacts>(
+          reason_facts, region,
+          PLAN7_DOMAIN_RESCORE_REASON_NULL2_OR_CORRECTION_INVALID);
     }
   }
   __syncwarp(mask);
@@ -1061,6 +1091,8 @@ __global__ void isolated_null2_oa_trace_kernel(
   if (!isfinite(result.oa_score)) {
     result.status = PLAN7_DOMAIN_RESCORE_ERANGE;
     result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+    add_rescore_reason<CollectReasonFacts>(
+        reason_facts, region, PLAN7_DOMAIN_RESCORE_REASON_OA_SCORE_INVALID);
     return;
   }
 
@@ -1071,6 +1103,9 @@ __global__ void isolated_null2_oa_trace_kernel(
   if (trace_end < trace_begin || trace_end - trace_begin > UINT32_MAX) {
     result.status = PLAN7_DOMAIN_RESCORE_ECAP;
     result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+    add_rescore_reason<CollectReasonFacts>(
+        reason_facts, region,
+        PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAPACITY_EXHAUSTED);
     return;
   }
   plan7_domain_rescore_trace_step *trace = traces + trace_begin;
@@ -1082,6 +1117,9 @@ __global__ void isolated_null2_oa_trace_kernel(
       !append_trace_step(trace, capacity, &count, p7T_C, k, i, 0.0f)) {
     result.status = PLAN7_DOMAIN_RESCORE_ECAP;
     result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+    add_rescore_reason<CollectReasonFacts>(
+        reason_facts, region,
+        PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAPACITY_EXHAUSTED);
     return;
   }
   int previous_state = p7T_C;
@@ -1090,6 +1128,9 @@ __global__ void isolated_null2_oa_trace_kernel(
     if (++iterations > static_cast<uint64_t>(capacity)) {
       result.status = PLAN7_DOMAIN_RESCORE_ERANGE;
       result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      add_rescore_reason<CollectReasonFacts>(
+          reason_facts, region,
+          PLAN7_DOMAIN_RESCORE_REASON_TRACE_ITERATION_INVALID);
       return;
     }
     int state = -1;
@@ -1151,6 +1192,9 @@ __global__ void isolated_null2_oa_trace_kernel(
     if (state < 0 || k < 0 || i < 0) {
       result.status = PLAN7_DOMAIN_RESCORE_ERANGE;
       result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      add_rescore_reason<CollectReasonFacts>(
+          reason_facts, region,
+          PLAN7_DOMAIN_RESCORE_REASON_TRACE_PREDECESSOR_INVALID);
       return;
     }
     const float posterior = trace_postprob(
@@ -1159,6 +1203,9 @@ __global__ void isolated_null2_oa_trace_kernel(
                            static_cast<uint8_t>(state), k, i, posterior)) {
       result.status = PLAN7_DOMAIN_RESCORE_ECAP;
       result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      add_rescore_reason<CollectReasonFacts>(
+          reason_facts, region,
+          PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAPACITY_EXHAUSTED);
       return;
     }
     if ((state == p7T_N || state == p7T_J || state == p7T_C) &&
@@ -1205,6 +1252,9 @@ __global__ void isolated_null2_oa_trace_kernel(
       last_model == 0 || last_model > static_cast<uint32_t>(M)) {
     result.status = PLAN7_DOMAIN_RESCORE_ERANGE;
     result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+    add_rescore_reason<CollectReasonFacts>(
+        reason_facts, region,
+        PLAN7_DOMAIN_RESCORE_REASON_TRACE_COORDINATES_INVALID);
     return;
   }
   trace_counts[region] = count;
@@ -1213,6 +1263,8 @@ __global__ void isolated_null2_oa_trace_kernel(
   result.model_begin = first_model;
   result.model_end = last_model;
   result.action = PLAN7_DOMAIN_RESCORE_DEVICE_RESULT;
+  add_rescore_reason<CollectReasonFacts>(
+      reason_facts, region, PLAN7_DOMAIN_RESCORE_REASON_DEVICE_RESULT);
 }
 
 struct DeviceBuffers {
@@ -1228,10 +1280,12 @@ struct DeviceBuffers {
   plan7_domain_rescore_trace_step *traces = nullptr;
   uint32_t *trace_counts = nullptr;
   plan7_domain_rescore_result *results = nullptr;
+  uint32_t *reason_facts = nullptr;
 };
 
 void free_device_buffers(DeviceBuffers *buffers) {
   if (buffers == nullptr) return;
+  cudaFree(buffers->reason_facts);
   cudaFree(buffers->results);
   cudaFree(buffers->trace_counts);
   cudaFree(buffers->traces);
@@ -1399,13 +1453,33 @@ bool validate_upstream_seal(
          provenance.region_hash == hash_u64(region_hash, region_count);
 }
 
+bool merge_rescore_reason_facts(
+    const uint32_t *active_result_indices, const uint32_t *active_facts,
+    size_t active_count, uint32_t *source_facts, size_t source_count) {
+  if ((active_count != 0 &&
+       (active_result_indices == nullptr || active_facts == nullptr)) ||
+      (source_count != 0 && source_facts == nullptr))
+    return false;
+  uint32_t previous = 0;
+  bool have_previous = false;
+  for (size_t active = 0; active < active_count; ++active) {
+    const uint32_t source = active_result_indices[active];
+    if (source >= source_count || (have_previous && source <= previous))
+      return false;
+    source_facts[source] = active_facts[active];
+    previous = source;
+    have_previous = true;
+  }
+  return true;
+}
+
 bool seal_rescore_provenance(struct plan7_domain_rescore_output *output);
 int domain_rescore_run_impl(
     const plan7_forward_database *database,
     const plan7_ssv_sequence_batch *batch,
     const plan7_backward_domain_output *upstream,
     uint64_t compact_byte_budget, uint64_t matrix_byte_budget,
-    uint64_t trace_byte_budget,
+    uint64_t trace_byte_budget, bool collect_reason_facts,
     plan7_domain_rescore_output **output,
     char *error, size_t error_size);
 
@@ -1416,6 +1490,7 @@ struct plan7_domain_rescore_output {
   std::vector<uint64_t> trace_offsets;
   std::vector<plan7_domain_rescore_trace_step> traces;
   std::vector<float> null2;
+  std::vector<uint32_t> reason_facts;
   plan7_domain_rescore_provenance provenance;
   plan7_domain_rescore_statistics statistics;
 };
@@ -1431,7 +1506,31 @@ extern "C" int plan7_domain_rescore_run(
   try {
     return domain_rescore_run_impl(
         database, batch, upstream, compact_byte_budget,
-        matrix_byte_budget, trace_byte_budget, output, error, error_size);
+        matrix_byte_budget, trace_byte_budget, false,
+        output, error, error_size);
+  } catch (const std::bad_alloc &) {
+    set_error(error, error_size, "isolated-domain host allocation failed");
+    return -1;
+  } catch (...) {
+    set_error(error, error_size,
+              "isolated-domain unexpected native failure");
+    return -1;
+  }
+}
+
+extern "C" int plan7_domain_rescore_run_with_reason_facts(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const plan7_backward_domain_output *upstream,
+    uint64_t compact_byte_budget, uint64_t matrix_byte_budget,
+    uint64_t trace_byte_budget,
+    plan7_domain_rescore_output **output,
+    char *error, size_t error_size) {
+  try {
+    return domain_rescore_run_impl(
+        database, batch, upstream, compact_byte_budget,
+        matrix_byte_budget, trace_byte_budget, true,
+        output, error, error_size);
   } catch (const std::bad_alloc &) {
     set_error(error, error_size, "isolated-domain host allocation failed");
     return -1;
@@ -1464,6 +1563,27 @@ plan7_domain_rescore_output_results(
     const plan7_domain_rescore_output *output) {
   return output == nullptr || output->results.empty()
              ? nullptr : output->results.data();
+}
+
+extern "C" size_t plan7_domain_rescore_output_reason_count(
+    const plan7_domain_rescore_output *output) {
+  return output == nullptr ? 0 : output->reason_facts.size();
+}
+
+extern "C" const uint32_t *plan7_domain_rescore_output_reason_facts(
+    const plan7_domain_rescore_output *output) {
+  return output == nullptr || output->reason_facts.empty()
+             ? nullptr : output->reason_facts.data();
+}
+
+extern "C" int plan7_domain_rescore_merge_reason_facts_for_test(
+    const uint32_t *active_result_indices, const uint32_t *active_facts,
+    size_t active_count, uint32_t *source_facts, size_t source_count) {
+  return merge_rescore_reason_facts(
+             active_result_indices, active_facts, active_count,
+             source_facts, source_count)
+             ? 0
+             : -1;
 }
 
 extern "C" const uint64_t *plan7_domain_rescore_output_trace_offsets(
@@ -1773,7 +1893,7 @@ int domain_rescore_run_impl(
     const plan7_ssv_sequence_batch *batch,
     const plan7_backward_domain_output *upstream,
     uint64_t compact_byte_budget, uint64_t matrix_byte_budget,
-    uint64_t trace_byte_budget,
+    uint64_t trace_byte_budget, bool collect_reason_facts,
     plan7_domain_rescore_output **output,
     char *error, size_t error_size) {
   const auto total_begin = std::chrono::steady_clock::now();
@@ -1857,6 +1977,15 @@ int domain_rescore_run_impl(
   created->provenance.backward = *upstream_provenance;
   created->statistics.upstream_row_count = upstream_row_count;
   created->statistics.region_count = region_count;
+  if (collect_reason_facts) {
+    try {
+      created->reason_facts.assign(region_count, 0);
+    } catch (...) {
+      set_error(error, error_size,
+                "isolated-domain reason allocation failed");
+      return -1;
+    }
+  }
   const uint64_t requested_compact_limit = compact_byte_budget == 0
       ? kCompactOutputByteLimit
       : std::min(compact_byte_budget, kCompactOutputByteLimit);
@@ -1890,6 +2019,9 @@ int domain_rescore_run_impl(
     created->statistics.cpu_required_count = region_count;
     created->statistics.cap_fallback_count = region_count;
     created->statistics.global_cpu_fallback_count = region_count;
+    if (collect_reason_facts)
+      std::fill(created->reason_facts.begin(), created->reason_facts.end(),
+                PLAN7_DOMAIN_RESCORE_REASON_GLOBAL_COMPACT_BUDGET);
     created->statistics.compact_output_bytes = sizeof(uint64_t);
     created->statistics.total_milliseconds =
         std::chrono::duration<float, std::milli>(
@@ -1997,6 +2129,10 @@ int domain_rescore_run_impl(
      * own scales. Keep that row in the sealed result journal, but conservatively
      * leave its isolated envelopes on the CPU. */
     bool row_fits = !source.has_own_scales;
+    bool row_work_cap = false;
+    bool matrix_cap = false;
+    bool trace_cap = false;
+    bool run_work_cap = false;
     for (uint64_t region = region_begin; region < region_end; ++region) {
       const auto interval = upstream_regions[region];
       plan7_domain_rescore_result &result = created->results[region];
@@ -2016,6 +2152,9 @@ int domain_rescore_run_impl(
                           : PLAN7_DOMAIN_RESCORE_ECAP;
       result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
       result.has_own_scales = source.has_own_scales;
+      if (collect_reason_facts && source.has_own_scales)
+        created->reason_facts[region] |=
+            PLAN7_DOMAIN_RESCORE_REASON_UPSTREAM_OWN_SCALES;
       result_rows[region] = static_cast<uint32_t>(row);
       if (interval.begin == 0 || interval.begin > interval.end ||
           interval.end > target_length ||
@@ -2052,17 +2191,36 @@ int domain_rescore_run_impl(
         set_error(error, error_size, "isolated-domain work size overflow");
         return -1;
       }
-      if (region_work > kMaximumRowWorkCells) row_fits = false;
+      if (region_work > kMaximumRowWorkCells) {
+        row_fits = false;
+        if (collect_reason_facts)
+          created->reason_facts[region] |=
+              PLAN7_DOMAIN_RESCORE_REASON_REGION_WORK_CAP;
+      }
     }
-    if (row_work_cells > kMaximumRowWorkCells ||
+    row_work_cap = row_work_cells > kMaximumRowWorkCells;
+    matrix_cap =
         dense_bytes > matrix_limit - std::min(matrix_limit, row_dense_bytes) ||
-        row_dense_bytes > matrix_limit - dense_bytes ||
+        row_dense_bytes > matrix_limit - dense_bytes;
+    trace_cap =
         trace_bytes > trace_limit - std::min(trace_limit, row_trace_bytes) ||
-        row_trace_bytes > trace_limit - trace_bytes ||
+        row_trace_bytes > trace_limit - trace_bytes;
+    run_work_cap =
         work_cells > kMaximumRunWorkCells -
                          std::min(kMaximumRunWorkCells, row_work_cells) ||
-        row_work_cells > kMaximumRunWorkCells - work_cells)
+        row_work_cells > kMaximumRunWorkCells - work_cells;
+    if (row_work_cap || matrix_cap || trace_cap || run_work_cap)
       row_fits = false;
+    if (collect_reason_facts &&
+        (row_work_cap || matrix_cap || trace_cap || run_work_cap)) {
+      uint32_t facts = 0;
+      if (row_work_cap) facts |= PLAN7_DOMAIN_RESCORE_REASON_ROW_WORK_CAP;
+      if (matrix_cap) facts |= PLAN7_DOMAIN_RESCORE_REASON_MATRIX_CAP;
+      if (trace_cap) facts |= PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAP;
+      if (run_work_cap) facts |= PLAN7_DOMAIN_RESCORE_REASON_RUN_WORK_CAP;
+      for (uint64_t region = region_begin; region < region_end; ++region)
+        created->reason_facts[region] |= facts;
+    }
     if (!row_fits) {
       continue;
     }
@@ -2104,6 +2262,13 @@ int domain_rescore_run_impl(
   std::vector<float> active_null2(
       active_count * PLAN7_DOMAIN_RESCORE_NULL2_COUNT, NAN);
   std::vector<uint32_t> active_trace_counts(active_count, 0);
+  std::vector<uint32_t> active_reason_facts;
+  if (collect_reason_facts) {
+    active_reason_facts.resize(active_count);
+    for (size_t active = 0; active < active_count; ++active)
+      active_reason_facts[active] =
+          created->reason_facts[active_work[active].result_index];
+  }
   std::vector<plan7_domain_rescore_trace_step> active_traces(
       static_cast<size_t>(trace_capacity_offsets.back()));
   if (active_count != 0) {
@@ -2115,6 +2280,7 @@ int domain_rescore_run_impl(
     size_t null2_bytes;
     size_t trace_storage_bytes;
     size_t trace_count_bytes;
+    size_t reason_bytes = 0;
     if (!checked_bytes(active_count, sizeof(RegionWork), &work_bytes) ||
         !checked_bytes(active_count + 1, sizeof(uint64_t), &offset_bytes) ||
         !checked_bytes(static_cast<size_t>(matrix_offsets.back()),
@@ -2127,7 +2293,9 @@ int domain_rescore_run_impl(
         !checked_bytes(active_traces.size(),
                        sizeof(plan7_domain_rescore_trace_step),
                        &trace_storage_bytes) ||
-        !checked_bytes(active_count, sizeof(uint32_t), &trace_count_bytes)) {
+        !checked_bytes(active_count, sizeof(uint32_t), &trace_count_bytes) ||
+        (collect_reason_facts &&
+         !checked_bytes(active_count, sizeof(uint32_t), &reason_bytes))) {
       set_error(error, error_size, "isolated-domain device size overflow");
       return -1;
     }
@@ -2157,6 +2325,8 @@ int domain_rescore_run_impl(
     CUDA_RUN(cudaMalloc(&buffers.traces, trace_storage_bytes));
     CUDA_RUN(cudaMalloc(&buffers.trace_counts, trace_count_bytes));
     CUDA_RUN(cudaMalloc(&buffers.results, result_bytes));
+    if (collect_reason_facts)
+      CUDA_RUN(cudaMalloc(&buffers.reason_facts, reason_bytes));
     CUDA_RUN(cudaMemcpy(buffers.work, active_work.data(), work_bytes,
                         cudaMemcpyHostToDevice));
     CUDA_RUN(cudaMemcpy(buffers.matrix_offsets, matrix_offsets.data(),
@@ -2169,6 +2339,9 @@ int domain_rescore_run_impl(
                         cudaMemcpyHostToDevice));
     CUDA_RUN(cudaMemcpy(buffers.null2, active_null2.data(), null2_bytes,
                         cudaMemcpyHostToDevice));
+    if (collect_reason_facts)
+      CUDA_RUN(cudaMemcpy(buffers.reason_facts, active_reason_facts.data(),
+                          reason_bytes, cudaMemcpyHostToDevice));
     CUDA_RUN(cudaMemset(buffers.traces, 0, trace_storage_bytes));
     CUDA_RUN(cudaMemset(buffers.trace_counts, 0, trace_count_bytes));
     created->statistics.upload_milliseconds =
@@ -2180,29 +2353,58 @@ int domain_rescore_run_impl(
     CUDA_RUN(cudaEventRecord(begin_event));
     const unsigned blocks = static_cast<unsigned>(
         (active_count + kRegionsPerBlock - 1) / kRegionsPerBlock);
-    isolated_forward_kernel<<<blocks, kThreads>>>(
-        sequence_view.device_residues, sequence_view.device_offsets,
-        profile_view.profiles, profile_view.emissions, profile_view.transitions,
-        buffers.work, buffers.matrix_offsets, buffers.special_offsets,
-        active_count, buffers.forward_matrix, buffers.forward_specials,
-        buffers.results);
+    if (collect_reason_facts)
+      isolated_forward_kernel<true><<<blocks, kThreads>>>(
+          sequence_view.device_residues, sequence_view.device_offsets,
+          profile_view.profiles, profile_view.emissions,
+          profile_view.transitions, buffers.work, buffers.matrix_offsets,
+          buffers.special_offsets, active_count, buffers.forward_matrix,
+          buffers.forward_specials, buffers.results, buffers.reason_facts);
+    else
+      isolated_forward_kernel<false><<<blocks, kThreads>>>(
+          sequence_view.device_residues, sequence_view.device_offsets,
+          profile_view.profiles, profile_view.emissions,
+          profile_view.transitions, buffers.work, buffers.matrix_offsets,
+          buffers.special_offsets, active_count, buffers.forward_matrix,
+          buffers.forward_specials, buffers.results, nullptr);
     CUDA_RUN(cudaGetLastError());
-    isolated_backward_decode_kernel<<<blocks, kThreads>>>(
-        sequence_view.device_residues, sequence_view.device_offsets,
-        profile_view.profiles, profile_view.emissions, profile_view.transitions,
-        buffers.work, buffers.matrix_offsets, buffers.special_offsets,
-        active_count, buffers.forward_matrix, buffers.forward_specials,
-        buffers.posterior_matrix, buffers.posterior_specials,
-        buffers.results);
+    if (collect_reason_facts)
+      isolated_backward_decode_kernel<true><<<blocks, kThreads>>>(
+          sequence_view.device_residues, sequence_view.device_offsets,
+          profile_view.profiles, profile_view.emissions,
+          profile_view.transitions, buffers.work, buffers.matrix_offsets,
+          buffers.special_offsets, active_count, buffers.forward_matrix,
+          buffers.forward_specials, buffers.posterior_matrix,
+          buffers.posterior_specials, buffers.results, buffers.reason_facts);
+    else
+      isolated_backward_decode_kernel<false><<<blocks, kThreads>>>(
+          sequence_view.device_residues, sequence_view.device_offsets,
+          profile_view.profiles, profile_view.emissions,
+          profile_view.transitions, buffers.work, buffers.matrix_offsets,
+          buffers.special_offsets, active_count, buffers.forward_matrix,
+          buffers.forward_specials, buffers.posterior_matrix,
+          buffers.posterior_specials, buffers.results, nullptr);
     CUDA_RUN(cudaGetLastError());
-    isolated_null2_oa_trace_kernel<<<blocks, kThreads>>>(
-        sequence_view.device_residues, sequence_view.device_offsets,
-        profile_view.profiles, profile_view.emissions, profile_view.transitions,
-        buffers.work, buffers.matrix_offsets, buffers.special_offsets,
-        buffers.trace_offsets, active_count, buffers.forward_matrix,
-        buffers.forward_specials, buffers.posterior_matrix,
-        buffers.posterior_specials, buffers.null2, buffers.traces,
-        buffers.trace_counts, buffers.results);
+    if (collect_reason_facts)
+      isolated_null2_oa_trace_kernel<true><<<blocks, kThreads>>>(
+          sequence_view.device_residues, sequence_view.device_offsets,
+          profile_view.profiles, profile_view.emissions,
+          profile_view.transitions, buffers.work, buffers.matrix_offsets,
+          buffers.special_offsets, buffers.trace_offsets, active_count,
+          buffers.forward_matrix, buffers.forward_specials,
+          buffers.posterior_matrix, buffers.posterior_specials,
+          buffers.null2, buffers.traces, buffers.trace_counts, buffers.results,
+          buffers.reason_facts);
+    else
+      isolated_null2_oa_trace_kernel<false><<<blocks, kThreads>>>(
+          sequence_view.device_residues, sequence_view.device_offsets,
+          profile_view.profiles, profile_view.emissions,
+          profile_view.transitions, buffers.work, buffers.matrix_offsets,
+          buffers.special_offsets, buffers.trace_offsets, active_count,
+          buffers.forward_matrix, buffers.forward_specials,
+          buffers.posterior_matrix, buffers.posterior_specials,
+          buffers.null2, buffers.traces, buffers.trace_counts, buffers.results,
+          nullptr);
     CUDA_RUN(cudaGetLastError());
     CUDA_RUN(cudaEventRecord(end_event));
     CUDA_RUN(cudaEventSynchronize(end_event));
@@ -2222,6 +2424,9 @@ int domain_rescore_run_impl(
                         trace_count_bytes, cudaMemcpyDeviceToHost));
     CUDA_RUN(cudaMemcpy(active_traces.data(), buffers.traces,
                         trace_storage_bytes, cudaMemcpyDeviceToHost));
+    if (collect_reason_facts)
+      CUDA_RUN(cudaMemcpy(active_reason_facts.data(), buffers.reason_facts,
+                          reason_bytes, cudaMemcpyDeviceToHost));
     created->statistics.download_milliseconds =
         std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - download_begin).count();
@@ -2231,6 +2436,20 @@ int domain_rescore_run_impl(
 
   /* A source row is atomic: one failed/capped envelope sends every envelope
    * in that row through the ordinary CPU continuation. */
+  std::vector<uint32_t> active_result_indices;
+  if (collect_reason_facts) {
+    active_result_indices.resize(active_count);
+    for (size_t active = 0; active < active_count; ++active)
+      active_result_indices[active] = active_work[active].result_index;
+    if (!merge_rescore_reason_facts(
+            active_result_indices.data(), active_reason_facts.data(),
+            active_count, created->reason_facts.data(),
+            created->reason_facts.size())) {
+      set_error(error, error_size,
+                "isolated-domain reason source remap changed");
+      return -1;
+    }
+  }
   for (size_t active = 0; active < active_count; ++active) {
     const size_t result_index = active_work[active].result_index;
     const auto expected = created->results[result_index];
@@ -2247,6 +2466,9 @@ int domain_rescore_run_impl(
       created->results[result_index].status = PLAN7_DOMAIN_RESCORE_ERANGE;
       created->results[result_index].action =
           PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      if (collect_reason_facts)
+        created->reason_facts[result_index] |=
+            PLAN7_DOMAIN_RESCORE_REASON_IDENTITY_MISMATCH;
     }
     std::copy_n(
         active_null2.data() +
@@ -2255,6 +2477,9 @@ int domain_rescore_run_impl(
         created->null2.data() +
             result_index * PLAN7_DOMAIN_RESCORE_NULL2_COUNT);
   }
+  std::vector<size_t> active_for_result(region_count, SIZE_MAX);
+  for (size_t active = 0; active < active_count; ++active)
+    active_for_result[active_work[active].result_index] = active;
   std::vector<uint8_t> row_failed(upstream_row_count, 0);
   for (size_t result_index = 0; result_index < region_count; ++result_index) {
     auto &result = created->results[result_index];
@@ -2280,8 +2505,12 @@ int domain_rescore_run_impl(
         result.alignment_end > result.envelope_end ||
         result.model_begin == 0 ||
         result.model_begin > result.model_end ||
-        result.model_end > snapshot.model_length)
+        result.model_end > snapshot.model_length) {
       row_failed[source_row] = 1;
+      if (collect_reason_facts && active_for_result[result_index] != SIZE_MAX)
+        created->reason_facts[result_index] |=
+            PLAN7_DOMAIN_RESCORE_REASON_HOST_RESULT_INVALID;
+    }
   }
 
   /* Device traceback and null2 are compact final outputs, not diagnostics.
@@ -2295,37 +2524,49 @@ int domain_rescore_run_impl(
         trace_capacity_offsets[active + 1] -
         trace_capacity_offsets[active];
     const uint32_t count = active_trace_counts[active];
-    bool valid = count >= 2 && count <= capacity;
+    bool trace_valid = count >= 2 && count <= capacity;
     const size_t trace_begin =
         static_cast<size_t>(trace_capacity_offsets[active]);
     const auto &work = active_work[active];
     const auto &snapshot = snapshots[work.profile_index];
-    if (valid)
-      valid = validate_compact_trace(
+    if (trace_valid)
+      trace_valid = validate_compact_trace(
           active_traces.data() + trace_begin, count,
           created->results[result_index], snapshot.model_length);
     const float *row_null2 =
         active_null2.data() +
         active * PLAN7_DOMAIN_RESCORE_NULL2_COUNT;
+    bool null2_valid = true;
     for (size_t residue = 0;
-         valid && residue < PLAN7_DOMAIN_RESCORE_NULL2_COUNT; ++residue)
-      valid = std::isfinite(row_null2[residue]) && row_null2[residue] > 0.0f;
-    if (!valid) row_failed[source_row] = 1;
+         null2_valid && residue < PLAN7_DOMAIN_RESCORE_NULL2_COUNT; ++residue)
+      null2_valid =
+          std::isfinite(row_null2[residue]) && row_null2[residue] > 0.0f;
+    if (!trace_valid || !null2_valid) {
+      row_failed[source_row] = 1;
+      if (collect_reason_facts) {
+        if (!trace_valid)
+          created->reason_facts[result_index] |=
+              PLAN7_DOMAIN_RESCORE_REASON_HOST_TRACE_INVALID;
+        if (!null2_valid)
+          created->reason_facts[result_index] |=
+              PLAN7_DOMAIN_RESCORE_REASON_HOST_NULL2_INVALID;
+      }
+    }
   }
 
   for (size_t result_index = 0; result_index < region_count; ++result_index)
     if (row_failed[result_rows[result_index]]) {
       created->results[result_index].action =
           PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+      if (collect_reason_facts)
+        created->reason_facts[result_index] |=
+            PLAN7_DOMAIN_RESCORE_REASON_ROW_ATOMIC_PROPAGATION;
       std::fill_n(
           created->null2.data() +
               result_index * PLAN7_DOMAIN_RESCORE_NULL2_COUNT,
           PLAN7_DOMAIN_RESCORE_NULL2_COUNT, NAN);
     }
 
-  std::vector<size_t> active_for_result(region_count, SIZE_MAX);
-  for (size_t active = 0; active < active_count; ++active)
-    active_for_result[active_work[active].result_index] = active;
   try {
     for (size_t result_index = 0; result_index < region_count; ++result_index) {
       created->trace_offsets[result_index] = created->traces.size();
@@ -2352,7 +2593,9 @@ int domain_rescore_run_impl(
     return -1;
   }
 
-  for (const auto &result : created->results) {
+  for (size_t result_index = 0; result_index < created->results.size();
+       ++result_index) {
+    const auto &result = created->results[result_index];
     if (result.action == PLAN7_DOMAIN_RESCORE_DEVICE_RESULT)
       ++created->statistics.device_result_count;
     else {
@@ -2361,6 +2604,9 @@ int domain_rescore_run_impl(
         ++created->statistics.cap_fallback_count;
       else
         ++created->statistics.numeric_fallback_count;
+      if (collect_reason_facts && created->reason_facts[result_index] == 0)
+        created->reason_facts[result_index] |=
+            PLAN7_DOMAIN_RESCORE_REASON_OTHER_CPU_REQUIRED;
     }
   }
   created->statistics.work_cells = work_cells;

@@ -1659,6 +1659,61 @@ class CompactDomainProfileSessionTests(ProfileSessionFixture, unittest.TestCase)
                     self.semantic_pipeline_state(expected),
                 )
 
+    @unittest.skipUnless(
+        forward_seam_available() and simple_region_seam_available(),
+        "fused continuation seams are unavailable",
+    )
+    def test_phase0_telemetry_preserves_default_results_and_source_order(self):
+        indices = (2, 0)
+        pairs = tuple(self.pairs[index] for index in indices)
+        with ProfileSession(self.pairs) as session:
+            with session.select(indices) as selection:
+                with SequenceBatch(self.targets) as batch:
+                    ordinary = batch._postfilter_forward_selection(
+                        selection,
+                        **self.options,
+                        bias_filter=True,
+                        pipeline=self.pipeline(**self.options),
+                    )
+                    instrumented = batch._postfilter_forward_selection(
+                        selection,
+                        **self.options,
+                        bias_filter=True,
+                        pipeline=self.pipeline(**self.options),
+                        telemetry=True,
+                    )
+
+        self.assertIsNone(ordinary.generation_statistics)
+        generation = instrumented.generation_statistics
+        self.assertIs(type(generation), dict)
+        self.assertEqual(generation["profile_count"], len(indices))
+        self.assertEqual(generation["target_count"], len(self.targets))
+        self.assertEqual(
+            tuple(profile["profile_index"] for profile in generation["profiles"]),
+            tuple(range(len(indices))),
+        )
+        self.assertEqual(
+            [ordinary.candidate_count(row) for row in range(len(indices))],
+            [instrumented.candidate_count(row) for row in range(len(indices))],
+        )
+        for row, pair in enumerate(pairs):
+            ordinary_pipeline = self.pipeline(**self.options)
+            instrumented_pipeline = self.pipeline(**self.options)
+            ordinary_hits = ordinary.search(row, ordinary_pipeline)
+            instrumented_hits, continuation = instrumented.search(
+                row, instrumented_pipeline, return_telemetry=True
+            )
+            self.assert_hits_close(instrumented_hits, ordinary_hits)
+            self.assertEqual(
+                self.semantic_pipeline_state(instrumented_hits),
+                self.semantic_pipeline_state(ordinary_hits),
+            )
+            self.assertEqual(continuation["target_count"], len(self.targets))
+            self.assertEqual(
+                sum(continuation["routes"].values()), len(self.targets)
+            )
+            self.assertEqual(instrumented_hits.query.name, pair.hmm.name)
+
     def test_production_compact_path_is_near_exact_multi_domain_and_reusable(self):
         pairs = tuple(self.pairs[index] for index in self.selection_indices)
         with ProfileSession(self.pairs) as session:

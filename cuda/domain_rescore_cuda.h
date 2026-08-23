@@ -37,6 +37,36 @@ enum plan7_domain_rescore_status {
   PLAN7_DOMAIN_RESCORE_EMPTY = 255
 };
 
+/* Opt-in source-transition facts. They are intentionally not part of the
+ * version-1 compact result or its provenance seal. */
+enum plan7_domain_rescore_reason_fact {
+  PLAN7_DOMAIN_RESCORE_REASON_GLOBAL_COMPACT_BUDGET = UINT32_C(0x00000001),
+  PLAN7_DOMAIN_RESCORE_REASON_OWN_SCALES = UINT32_C(0x00000002),
+  PLAN7_DOMAIN_RESCORE_REASON_REGION_WORK_CAP = UINT32_C(0x00000004),
+  PLAN7_DOMAIN_RESCORE_REASON_ROW_WORK_CAP = UINT32_C(0x00000008),
+  PLAN7_DOMAIN_RESCORE_REASON_MATRIX_CAP = UINT32_C(0x00000010),
+  PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAP = UINT32_C(0x00000020),
+  PLAN7_DOMAIN_RESCORE_REASON_RUN_WORK_CAP = UINT32_C(0x00000040),
+  PLAN7_DOMAIN_RESCORE_REASON_FORWARD_SCORE_INVALID = UINT32_C(0x00000080),
+  PLAN7_DOMAIN_RESCORE_REASON_BACKWARD_SCORE_INVALID = UINT32_C(0x00000100),
+  PLAN7_DOMAIN_RESCORE_REASON_SCALEPRODUCT_INVALID = UINT32_C(0x00000200),
+  PLAN7_DOMAIN_RESCORE_REASON_NULL2_OR_CORRECTION_INVALID = UINT32_C(0x00000400),
+  PLAN7_DOMAIN_RESCORE_REASON_OA_SCORE_INVALID = UINT32_C(0x00000800),
+  PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAPACITY_EXHAUSTED = UINT32_C(0x00001000),
+  PLAN7_DOMAIN_RESCORE_REASON_TRACE_ITERATION_INVALID = UINT32_C(0x00002000),
+  PLAN7_DOMAIN_RESCORE_REASON_TRACE_PREDECESSOR_INVALID = UINT32_C(0x00004000),
+  PLAN7_DOMAIN_RESCORE_REASON_TRACE_COORDINATES_INVALID = UINT32_C(0x00008000),
+  PLAN7_DOMAIN_RESCORE_REASON_IDENTITY_MISMATCH = UINT32_C(0x00010000),
+  PLAN7_DOMAIN_RESCORE_REASON_HOST_RESULT_INVALID = UINT32_C(0x00020000),
+  PLAN7_DOMAIN_RESCORE_REASON_HOST_TRACE_INVALID = UINT32_C(0x00040000),
+  PLAN7_DOMAIN_RESCORE_REASON_HOST_NULL2_INVALID = UINT32_C(0x00080000),
+  PLAN7_DOMAIN_RESCORE_REASON_ROW_ATOMIC_PROPAGATION = UINT32_C(0x00100000),
+  PLAN7_DOMAIN_RESCORE_REASON_DEVICE_RESULT = UINT32_C(0x00200000),
+  PLAN7_DOMAIN_RESCORE_REASON_OTHER_CPU_REQUIRED = UINT32_C(0x00400000),
+  /* Distinct from OWN_SCALES discovered after isolated DP was admitted. */
+  PLAN7_DOMAIN_RESCORE_REASON_UPSTREAM_OWN_SCALES = UINT32_C(0x00800000)
+};
+
 /* One record describes one simple region. All coordinates are one-based and
  * refer to the original target. Trace and null2 payloads live in separate
  * pointer-free arrays owned by the opaque output handle. */
@@ -124,6 +154,17 @@ int plan7_domain_rescore_run(
   char *error,
   size_t error_size);
 
+int plan7_domain_rescore_run_with_reason_facts(
+  const plan7_forward_database *database,
+  const plan7_ssv_sequence_batch *batch,
+  const plan7_backward_domain_output *upstream,
+  uint64_t compact_byte_budget,
+  uint64_t matrix_byte_budget,
+  uint64_t trace_byte_budget,
+  plan7_domain_rescore_output **output,
+  char *error,
+  size_t error_size);
+
 int plan7_domain_rescore_output_destroy(
   plan7_domain_rescore_output **output,
   char *error,
@@ -147,6 +188,20 @@ const plan7_domain_rescore_provenance *plan7_domain_rescore_output_provenance(
   const plan7_domain_rescore_output *output);
 const plan7_domain_rescore_statistics *plan7_domain_rescore_output_statistics(
   const plan7_domain_rescore_output *output);
+size_t plan7_domain_rescore_output_reason_count(
+  const plan7_domain_rescore_output *output);
+const uint32_t *plan7_domain_rescore_output_reason_facts(
+  const plan7_domain_rescore_output *output);
+
+/* Host-only test boundary for the exact compact-active-region -> source-region
+ * reason merge used by production. Existing facts for inactive regions remain
+ * untouched. */
+int plan7_domain_rescore_merge_reason_facts_for_test(
+  const uint32_t *active_result_indices,
+  const uint32_t *active_facts,
+  size_t active_count,
+  uint32_t *source_facts,
+  size_t source_count);
 
 /* Test-only boundary predicates shared with the device implementation. */
 int plan7_domain_rescore_own_scale_required_for_test(float xB);

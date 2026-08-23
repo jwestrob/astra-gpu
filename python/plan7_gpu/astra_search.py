@@ -167,9 +167,16 @@ def _prepare_candidates(
     return candidates
 
 
-def _search_row(candidates: CandidateBatch, row: int, pipeline: Any) -> Any:
+def _search_row(
+    candidates: CandidateBatch,
+    row: int,
+    pipeline: Any,
+    telemetry: bool,
+) -> Any:
     try:
-        hits = candidates.search(row, pipeline)
+        hits = candidates.search(
+            row, pipeline, return_telemetry=telemetry
+        )
     except BaseException:
         # Match PyHMMER's worker lifecycle and leave no dirty pipeline queued
         # for another row if the failure happened after pipeline mutation.
@@ -185,16 +192,18 @@ def _search_row(candidates: CandidateBatch, row: int, pipeline: Any) -> Any:
 def _serial_hmmsearch(
     candidates: CandidateBatch,
     pipeline_options: dict[str, Any],
+    telemetry: bool,
 ) -> Iterator[Any]:
     pipeline = pyhmmer.plan7.Pipeline(**pipeline_options)
     for row in range(len(candidates)):
-        yield _search_row(candidates, row, pipeline)
+        yield _search_row(candidates, row, pipeline, telemetry)
 
 
 def _threaded_hmmsearch(
     candidates: CandidateBatch,
     cpus: int,
     pipeline_options: dict[str, Any],
+    telemetry: bool,
 ) -> Iterator[Any]:
     worker_count = min(cpus, len(candidates))
     worker_state = local()
@@ -222,7 +231,9 @@ def _threaded_hmmsearch(
         hits = []
         for row in range(start, stop):
             try:
-                hits.append(_search_row(candidates, row, pipeline))
+                hits.append(
+                    _search_row(candidates, row, pipeline, telemetry)
+                )
             except BaseException as error:
                 # A task must preserve row-wise failure order: successful rows
                 # before the failing row are yielded before this exact error.
@@ -279,6 +290,7 @@ def hmmsearch(
     *,
     cpus: int = 1,
     postfilter: bool = False,
+    telemetry: bool = False,
     **pipeline_options: Any,
 ) -> Iterator[Any]:
     """Yield candidate-aware HMM searches in supplied query order.
@@ -301,6 +313,8 @@ def hmmsearch(
     worker_count = _positive_cpus(cpus)
     if type(postfilter) is not bool:
         raise TypeError("postfilter must be bool")
+    if type(telemetry) is not bool:
+        raise TypeError("telemetry must be bool")
     pairs = _pressed_pairs(profile_pairs)
     options = dict(pipeline_options)
     candidates = _prepare_candidates(pairs, batch, options, postfilter)
@@ -312,8 +326,10 @@ def hmmsearch(
     if not pairs:
         return iter(())
     if worker_count == 1:
-        return _serial_hmmsearch(candidates, options)
-    return _threaded_hmmsearch(candidates, worker_count, options)
+        return _serial_hmmsearch(candidates, options, telemetry)
+    return _threaded_hmmsearch(
+        candidates, worker_count, options, telemetry
+    )
 
 
 __all__ = ["hmmsearch"]

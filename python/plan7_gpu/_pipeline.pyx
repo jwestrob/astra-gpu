@@ -63,8 +63,14 @@ import pyhmmer as _pyhmmer
 from pyhmmer.errors import AlphabetMismatch, UnexpectedError
 from array import array as _array
 import importlib.util as _importlib_util
+import time as _time
 from pathlib import Path as _Path
 from threading import Lock as _Lock
+
+# Keep the extension's established direct-file loading boundary usable by
+# provenance/concurrency tests: a relative import has no parent package when
+# importlib loads this DSO under its bare ``_pipeline`` initialization name.
+from plan7_gpu import _telemetry as _telemetry_module
 
 cdef extern from "dlfcn.h" nogil:
     ctypedef struct Dl_info:
@@ -362,6 +368,18 @@ cdef struct _forward_result:
 
 
 cdef struct _compact_consumption_statistics:
+    uint64_t target_count
+    uint64_t postfilter_record_count
+    uint64_t f1_reject_count
+    uint64_t cpu_pipeline_count
+    uint64_t definite_reject_count
+    uint64_t filter_continuation_count
+    uint64_t forward_continuation_count
+    uint64_t simple_continuation_count
+    uint64_t journal_match_count
+    uint64_t journal_cpu_required_count
+    uint64_t journal_no_region_count
+    uint64_t journal_simple_count
     uint64_t attempt_count
     uint64_t accepted_count
     uint64_t invalid_retry_count
@@ -537,6 +555,7 @@ cdef class _SealedPostfilterBatch:
     cdef object _excluded_residue_offsets_bytes
     cdef object _excluded_background_fingerprint_bytes
     cdef object _native_stage_timings
+    cdef object _generation_statistics
     cdef _pipeline_tail_snapshot _pipeline_options
     cdef _pipeline_from_filter_scores_f _filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam
@@ -551,6 +570,7 @@ cdef class _SealedPostfilterBatch:
         self._excluded_residue_offsets_bytes = 0
         self._excluded_background_fingerprint_bytes = 0
         self._native_stage_timings = None
+        self._generation_statistics = None
 
     def __repr__(self):
         return "<opaque sealed post-filter batch>"
@@ -1617,6 +1637,13 @@ cdef int _search_loop_postfilter_forward(
     ):
         compact_generation_matches = True
 
+    if compact_statistics != NULL:
+        if postfilter_count > n_targets:
+            raise RuntimeError("continuation post-filter rows exceed targets")
+        compact_statistics.target_count = n_targets
+        compact_statistics.postfilter_record_count = postfilter_count
+        compact_statistics.f1_reject_count = n_targets - postfilter_count
+
     status = p7_pli_NewModel(pli, om, bg)
     if status == eslEINVAL:
         Pipeline._missing_cutoffs(pli, om)
@@ -1666,13 +1693,25 @@ cdef int _search_loop_postfilter_forward(
                 sizeof(plan7_continuation_journal_row),
             )
             has_journal = journal.sequence_index == postfilter.sequence_index
+        if has_journal and compact_statistics != NULL:
+            compact_statistics.journal_match_count += 1
+            if journal.domain_route == DOMAIN_CPU_REQUIRED:
+                compact_statistics.journal_cpu_required_count += 1
+            elif journal.domain_route == DOMAIN_NO_REGIONS:
+                compact_statistics.journal_no_region_count += 1
+            elif journal.domain_route == DOMAIN_SIMPLE:
+                compact_statistics.journal_simple_count += 1
 
         used_forward_seam = False
         used_simple_regions_seam = False
         used_compact_domains_seam = False
         if postfilter.action == BIAS_CPU_REQUIRED:
+            if compact_statistics != NULL:
+                compact_statistics.cpu_pipeline_count += 1
             status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
         elif isnan(postfilter.filtersc):
+            if compact_statistics != NULL:
+                compact_statistics.definite_reject_count += 1
             status = eslOK
         else:
             usc = <float> postfilter.msv_numerator
@@ -1784,6 +1823,7 @@ cdef int _search_loop_postfilter_forward(
                     if status == eslEINACCURATE:
                         if compact_statistics != NULL:
                             compact_statistics.threshold_retry_count += 1
+                            compact_statistics.cpu_pipeline_count += 1
                         # The guard covers uncertainty in both the compact
                         # domains and the upstream Forward score. Recompute
                         # the entire native pipeline so the retry is exact.
@@ -1792,6 +1832,7 @@ cdef int _search_loop_postfilter_forward(
                     elif status == eslEINVAL:
                         if compact_statistics != NULL:
                             compact_statistics.invalid_retry_count += 1
+                            compact_statistics.forward_continuation_count += 1
                         xmx_count = (
                             special_offsets[forward_cursor + 1]
                             - special_offsets[forward_cursor]
@@ -1819,6 +1860,8 @@ cdef int _search_loop_postfilter_forward(
                     elif status == eslOK and compact_statistics != NULL:
                         compact_statistics.accepted_count += 1
                 else:
+                    if compact_statistics != NULL:
+                        compact_statistics.simple_continuation_count += 1
                     status = simple_regions_seam(
                         pli,
                         om,
@@ -1841,6 +1884,8 @@ cdef int _search_loop_postfilter_forward(
                     )
                     used_simple_regions_seam = True
             elif has_forward and forward.action != FORWARD_CPU_REQUIRED:
+                if compact_statistics != NULL:
+                    compact_statistics.forward_continuation_count += 1
                 xmx_count = (
                     special_offsets[forward_cursor + 1]
                     - special_offsets[forward_cursor]
@@ -1865,6 +1910,8 @@ cdef int _search_loop_postfilter_forward(
                 )
                 used_forward_seam = True
             else:
+                if compact_statistics != NULL:
+                    compact_statistics.filter_continuation_count += 1
                 status = filter_scores_seam(
                     pli,
                     om,
@@ -4336,6 +4383,7 @@ def _seal_profile_selection_continuation_bound(
     Pipeline pipeline,
     double guard_band,
     native_stage_timings=None,
+    generation_statistics=None,
 ):
     """Consume one package-internal journal into an opaque continuation batch.
 
@@ -4405,6 +4453,8 @@ def _seal_profile_selection_continuation_bound(
     cdef size_t postfilter_stop
     cdef size_t forward_start
     cdef size_t forward_stop
+    cdef size_t journal_start
+    cdef size_t journal_stop
     cdef bint has_direct = False
     cdef bint row_has_external
     cdef bytearray external_rows = bytearray(profile_count)
@@ -4423,6 +4473,7 @@ def _seal_profile_selection_continuation_bound(
     cdef uint64_t rescore_cap_fallback_count = 0
     cdef uint64_t rescore_global_cpu_fallback_count = 0
     cdef object validated_stage_timings = None
+    cdef object profile_statistics
 
     if type(pipeline) is not _pyhmmer.plan7.Pipeline:
         raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
@@ -4562,6 +4613,51 @@ def _seal_profile_selection_continuation_bound(
             native_stage_timings,
             generation_compact_domains,
         )
+    if generation_statistics is not None:
+        generation_statistics = (
+            _telemetry_module.validate_generation_statistics(
+                generation_statistics
+            )
+        )
+        if generation_statistics["journal"]["allocation_bytes"] != (
+            journal_storage_view.shape[0]
+        ):
+            raise ValueError(
+                "generation telemetry journal allocation differs"
+            )
+        if (
+            generation_statistics["profile_count"] != profile_count
+            or generation_statistics["target_count"] != len(sequences)
+            or generation_statistics["total_target_residues"]
+            != residue_offset_view[len(sequences)]
+        ):
+            raise ValueError(
+                "generation telemetry profile or target identity differs"
+            )
+        for profile in range(profile_count):
+            profile_statistics = generation_statistics["profiles"][profile]
+            postfilter_start = <size_t> postfilter_offset_view[profile]
+            postfilter_stop = <size_t> postfilter_offset_view[profile + 1]
+            journal_start = <size_t> journal_profile_offset_view[profile]
+            journal_stop = <size_t> journal_profile_offset_view[profile + 1]
+            if (
+                profile_statistics["model_length"]
+                != (<OptimizedProfile> profile_tuple[profile])._om.M
+                or profile_statistics["counts"]["f1_candidate_count"]
+                != postfilter_stop - postfilter_start
+                or profile_statistics["counts"]["forward_pass_count"]
+                != journal_stop - journal_start
+                or profile_statistics["journal"]["row_count"]
+                != journal_stop - journal_start
+                or profile_statistics["journal"]["region_count"]
+                != (
+                    journal_region_offset_view[journal_stop]
+                    - journal_region_offset_view[journal_start]
+                )
+            ):
+                raise ValueError(
+                    "generation telemetry profile attribution differs"
+                )
     expected_guard.value = <float> guard_band
     if journal_guard_bits != expected_guard.bits:
         raise ValueError("continuation journal guard band differs")
@@ -4678,6 +4774,7 @@ def _seal_profile_selection_continuation_bound(
             background_view.shape[0]
         )
     sealed._native_stage_timings = validated_stage_timings
+    sealed._generation_statistics = generation_statistics
     sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
     sealed._forward_scores_seam = forward_scores_seam
@@ -4718,9 +4815,47 @@ cdef object _sealed_search_result(
     TopHits hits,
     const _compact_consumption_statistics* statistics,
     bint return_compact_statistics,
+    bint return_route_statistics,
+    object route_path,
+    object start_ns,
 ):
-    if not return_compact_statistics:
+    cdef object elapsed_ns
+    if not return_compact_statistics and not return_route_statistics:
         return hits
+    if return_route_statistics:
+        elapsed_ns = _time.perf_counter_ns() - start_ns
+        return hits, _telemetry_module.build_continuation_statistics(
+            1,
+            route_path,
+            elapsed_ns,
+            statistics.target_count,
+            statistics.postfilter_record_count,
+            (
+                statistics.f1_reject_count,
+                statistics.cpu_pipeline_count,
+                statistics.definite_reject_count,
+                statistics.filter_continuation_count,
+                statistics.forward_continuation_count,
+                statistics.simple_continuation_count,
+                statistics.accepted_count,
+            ),
+            (
+                statistics.journal_match_count,
+                statistics.journal_cpu_required_count,
+                statistics.journal_no_region_count,
+                statistics.journal_simple_count,
+            ),
+            (
+                statistics.attempt_count,
+                statistics.accepted_count,
+                statistics.invalid_retry_count,
+                statistics.threshold_retry_count,
+                statistics.first_row_index,
+                statistics.first_profile_index,
+                statistics.first_sequence_index,
+                statistics.first_domain_count,
+            ),
+        )
     return hits, {
         "attempt_count": statistics.attempt_count,
         "accepted_count": statistics.accepted_count,
@@ -4739,11 +4874,64 @@ cdef object _sealed_search_result(
     }
 
 
+cdef void _count_nonjournal_routes(
+    const uint8_t[::1] postfilter_records,
+    const uint8_t[::1] forward_records,
+    uint64_t target_count,
+    _compact_consumption_statistics* statistics,
+) except *:
+    cdef _postfilter_result postfilter
+    cdef _forward_result forward
+    cdef size_t postfilter_count = (
+        <size_t> postfilter_records.shape[0] // sizeof(_postfilter_result)
+    )
+    cdef size_t forward_count = (
+        <size_t> forward_records.shape[0] // sizeof(_forward_result)
+    )
+    cdef size_t cursor
+    cdef size_t forward_cursor = 0
+    cdef bint has_forward
+    if postfilter_count > target_count:
+        raise RuntimeError("continuation post-filter rows exceed targets")
+    statistics.target_count = target_count
+    statistics.postfilter_record_count = postfilter_count
+    statistics.f1_reject_count = target_count - postfilter_count
+    for cursor in range(postfilter_count):
+        memcpy(
+            &postfilter,
+            &postfilter_records[cursor * sizeof(_postfilter_result)],
+            sizeof(_postfilter_result),
+        )
+        has_forward = False
+        if forward_cursor < forward_count:
+            memcpy(
+                &forward,
+                &forward_records[
+                    forward_cursor * sizeof(_forward_result)
+                ],
+                sizeof(_forward_result),
+            )
+            has_forward = forward.sequence_index == postfilter.sequence_index
+        if postfilter.action == BIAS_CPU_REQUIRED:
+            statistics.cpu_pipeline_count += 1
+        elif isnan(postfilter.filtersc):
+            statistics.definite_reject_count += 1
+        elif has_forward and forward.action != FORWARD_CPU_REQUIRED:
+            statistics.forward_continuation_count += 1
+        else:
+            statistics.filter_continuation_count += 1
+        if has_forward:
+            forward_cursor += 1
+    if forward_cursor != forward_count:
+        raise RuntimeError("continuation telemetry Forward rows changed")
+
+
 def _search_hmm_sealed_postfilter_bound(
     sealed_object,
     Py_ssize_t row,
     Pipeline pipeline,
     bint _return_compact_statistics=False,
+    bint _return_route_statistics=False,
 ):
     """Search one row whose complete immutable batch was already validated."""
     cdef _SealedPostfilterBatch sealed
@@ -4762,8 +4950,21 @@ def _search_hmm_sealed_postfilter_bound(
     cdef bint use_journal
     cdef _compact_consumption_statistics statistics
     cdef _compact_consumption_statistics* compact_statistics = NULL
+    cdef object start_ns = None
 
-    if _return_compact_statistics:
+    if _return_compact_statistics or _return_route_statistics:
+        statistics.target_count = 0
+        statistics.postfilter_record_count = 0
+        statistics.f1_reject_count = 0
+        statistics.cpu_pipeline_count = 0
+        statistics.definite_reject_count = 0
+        statistics.filter_continuation_count = 0
+        statistics.forward_continuation_count = 0
+        statistics.simple_continuation_count = 0
+        statistics.journal_match_count = 0
+        statistics.journal_cpu_required_count = 0
+        statistics.journal_no_region_count = 0
+        statistics.journal_simple_count = 0
         statistics.attempt_count = 0
         statistics.accepted_count = 0
         statistics.invalid_retry_count = 0
@@ -4773,6 +4974,8 @@ def _search_hmm_sealed_postfilter_bound(
         statistics.first_sequence_index = 0
         statistics.first_domain_count = 0
         compact_statistics = &statistics
+    if _return_route_statistics:
+        start_ns = _time.perf_counter_ns()
 
     if type(sealed_object) is not _SealedPostfilterBatch:
         raise TypeError("sealed batch has the wrong extension type")
@@ -4814,6 +5017,16 @@ def _search_hmm_sealed_postfilter_bound(
         and pipeline._pli.do_biasfilter == sealed._generation_bias_filter
     )
     if not use_forward:
+        if _return_route_statistics:
+            _count_nonjournal_routes(
+                sealed._postfilter_records[
+                    postfilter_start * sizeof(_postfilter_result):
+                    postfilter_stop * sizeof(_postfilter_result)
+                ],
+                sealed._forward_records[0:0],
+                len(sealed._sequences),
+                &statistics,
+            )
         return _sealed_search_result(
             _search_postfilter_validated(
                 pipeline,
@@ -4829,6 +5042,9 @@ def _search_hmm_sealed_postfilter_bound(
             ),
             &statistics,
             _return_compact_statistics,
+            _return_route_statistics,
+            "postfilter",
+            start_ns,
         )
     use_journal = (
         sealed._journal_storage.shape[0] != 0
@@ -4884,6 +5100,22 @@ def _search_hmm_sealed_postfilter_bound(
             ),
             &statistics,
             _return_compact_statistics,
+            _return_route_statistics,
+            "journal",
+            start_ns,
+        )
+    if _return_route_statistics:
+        _count_nonjournal_routes(
+            sealed._postfilter_records[
+                postfilter_start * sizeof(_postfilter_result):
+                postfilter_stop * sizeof(_postfilter_result)
+            ],
+            sealed._forward_records[
+                forward_start * sizeof(_forward_result):
+                forward_stop * sizeof(_forward_result)
+            ],
+            len(sealed._sequences),
+            &statistics,
         )
     return _sealed_search_result(
         _search_postfilter_forward_validated(
@@ -4907,6 +5139,9 @@ def _search_hmm_sealed_postfilter_bound(
         ),
         &statistics,
         _return_compact_statistics,
+        _return_route_statistics,
+        "forward",
+        start_ns,
     )
 
 
@@ -4991,6 +5226,19 @@ def _sealed_continuation_statistics_bound(sealed_object):
             else None
         ),
     }
+
+
+def _sealed_generation_statistics_bound(sealed_object):
+    """Return a defensive copy of optional versioned generation telemetry."""
+    cdef _SealedPostfilterBatch sealed
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    return _telemetry_module.defensive_generation_statistics(
+        sealed._generation_statistics
+    )
 
 
 def _sealed_resident_memory_bound(sealed_object):

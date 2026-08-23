@@ -21,6 +21,7 @@ import array as _array
 import pyhmmer as _pyhmmer
 
 from . import _abi as _abi_module
+from . import _telemetry as _telemetry_module
 from ._fingerprint import (
     optimized_profile_fingerprint as _profile_fingerprint,
     sequence_content_fingerprint as _sequence_content_fingerprint,
@@ -44,12 +45,22 @@ if _runtime_abi_sha256 != PYHMMER_PRIVATE_ABI_SHA256:
 
 
 cdef carray _UINT32_ARRAY_TEMPLATE = _array.array("I")
+cdef carray _UINT16_ARRAY_TEMPLATE = _array.array("H")
 cdef carray _UINT64_ARRAY_TEMPLATE = _array.array("Q")
 cdef carray _FLOAT_ARRAY_TEMPLATE = _array.array("f")
 cdef uint64_t _sealed_journal_build_count = 0
 cdef uint64_t _sealed_journal_payload_bytes = 0
 cdef uint64_t _sealed_journal_duplicate_python_bytes = 0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
+GENERATION_TELEMETRY_SCHEMA_VERSION = 1
+
+# Host F2 decisions are made in this Cython translation unit, so their exact
+# version-1 facts intentionally live beside that source predicate.
+F2_REASON_POSTFILTER_NOT_PASS_OR_HOST_ENVIRONMENT_UNATTESTED = 0x01
+F2_REASON_INPUT_INVALID = 0x02
+F2_REASON_MSV_THRESHOLD_EXCEEDED = 0x04
+F2_REASON_VITERBI_THRESHOLD_EXCEEDED = 0x08
+F2_REASON_PASS = 0x10
 
 _DEVICE_CAPACITY_NAMES = (
     "input_residues",
@@ -525,6 +536,22 @@ cdef extern from "postfilter_cuda.h" nogil:
         uint8_t action
         float vfsc
 
+    cdef enum plan7_postfilter_reason_fact:
+        PLAN7_POSTFILTER_REASON_RAW_F1_REJECT
+        PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE
+        PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU
+        PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO
+        PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED
+        PLAN7_POSTFILTER_REASON_BIAS_SCORE_NONFINITE
+        PLAN7_POSTFILTER_REASON_BIAS_CUTOFF_UNRESOLVED
+        PLAN7_POSTFILTER_REASON_VITERBI_ERANGE
+        PLAN7_POSTFILTER_REASON_VITERBI_NO_RESULT_OR_OTHER_STATUS
+        PLAN7_POSTFILTER_REASON_FINAL_CPU_REQUIRED
+        PLAN7_POSTFILTER_REASON_FINAL_REJECT
+        PLAN7_POSTFILTER_REASON_FINAL_PASS
+        PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED
+        PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK
+
     ctypedef struct plan7_viterbi_database:
         pass
 
@@ -667,6 +694,23 @@ cdef extern from "postfilter_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
+        plan7_ssv_sequence_batch *batch,
+        const plan7_bias_profile *bias_profiles,
+        size_t profile_count,
+        const size_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        size_t candidate_count,
+        const uintptr_t *source_profile_pointers,
+        const plan7_viterbi_database *viterbi_database,
+        plan7_postfilter_result *results,
+        size_t result_count,
+        uint16_t *reason_facts,
+        size_t reason_count,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_ssv_filter_cuda(
         const uint8_t *striped_scores,
         size_t striped_score_count,
@@ -707,6 +751,21 @@ cdef extern from "forward_cuda.h" nogil:
         PLAN7_FORWARD_ENORESULT
         PLAN7_FORWARD_EMPTY
 
+    cdef enum plan7_forward_reason_fact:
+        PLAN7_FORWARD_REASON_KERNEL_STATUS_NON_OK
+        PLAN7_FORWARD_REASON_TARGET_EMPTY
+        PLAN7_FORWARD_REASON_FWDSC_NONFINITE
+        PLAN7_FORWARD_REASON_FILTERSC_NONFINITE
+        PLAN7_FORWARD_REASON_TAU_NONFINITE
+        PLAN7_FORWARD_REASON_LAMBDA_INVALID
+        PLAN7_FORWARD_REASON_F3_REJECT
+        PLAN7_FORWARD_REASON_OUTPUT_CAP
+        PLAN7_FORWARD_REASON_SURVIVOR_GATHERED
+        PLAN7_FORWARD_REASON_OTHER_CPU_REQUIRED
+
+    cdef enum plan7_forward_call_reason_fact:
+        PLAN7_FORWARD_CALL_REASON_CONTRACT_FALLBACK
+
     ctypedef struct plan7_forward_result:
         uint32_t sequence_index
         float fwdsc
@@ -745,6 +804,18 @@ cdef extern from "forward_cuda.h" nogil:
     ctypedef struct plan7_forward_output:
         pass
 
+    ctypedef struct plan7_forward_snapshot_profile:
+        uint64_t emission_offset
+        uint64_t transition_offset
+        uint32_t q
+        uint32_t model_length
+        float e_move
+        float e_loop
+        float f_tau
+        float f_lambda
+        float nj
+        int32_t mode
+
     int plan7_forward_database_create(
         const uintptr_t *profile_pointers,
         size_t profile_count,
@@ -773,6 +844,14 @@ cdef extern from "forward_cuda.h" nogil:
 
     float plan7_forward_database_upload_milliseconds(
         const plan7_forward_database *database,
+    )
+
+    int plan7_forward_database_get_profile_snapshot(
+        const plan7_forward_database *database,
+        size_t profile_index,
+        plan7_forward_snapshot_profile *profile,
+        char *error,
+        size_t error_size,
     )
 
     int plan7_forward_run(
@@ -845,6 +924,10 @@ cdef extern from "forward_cuda.h" nogil:
         const plan7_forward_output *output,
     )
 
+    int plan7_forward_output_contract_fallback(
+        const plan7_forward_output *output,
+    )
+
     const plan7_forward_provenance *plan7_forward_output_provenance(
         const plan7_forward_output *output,
     )
@@ -870,6 +953,24 @@ cdef extern from "backward_domain_cuda.h" nogil:
         PLAN7_BACKWARD_DOMAIN_ERANGE
         PLAN7_BACKWARD_DOMAIN_ENORESULT
         PLAN7_BACKWARD_DOMAIN_EMPTY
+
+    cdef enum plan7_backward_domain_reason_fact:
+        PLAN7_BACKWARD_DOMAIN_REASON_TARGET_EMPTY
+        PLAN7_BACKWARD_DOMAIN_REASON_FORWARD_SPECIAL_NONFINITE
+        PLAN7_BACKWARD_DOMAIN_REASON_FORWARD_SCALE_INVALID
+        PLAN7_BACKWARD_DOMAIN_REASON_HOST_FLOAT_ENV_INVALID
+        PLAN7_BACKWARD_DOMAIN_REASON_MODE_OR_NJ_UNSUPPORTED
+        PLAN7_BACKWARD_DOMAIN_REASON_WORK_CAP
+        PLAN7_BACKWARD_DOMAIN_REASON_WORKSPACE_CAP
+        PLAN7_BACKWARD_DOMAIN_REASON_TERMINAL_SCORE_INVALID
+        PLAN7_BACKWARD_DOMAIN_REASON_POSTERIOR_OR_BACKWARD_SCORE_NONFINITE
+        PLAN7_BACKWARD_DOMAIN_REASON_NEXPECTED_INVALID
+        PLAN7_BACKWARD_DOMAIN_REASON_HAS_OWN_SCALES
+        PLAN7_BACKWARD_DOMAIN_REASON_THRESHOLD_UNCERTAIN
+        PLAN7_BACKWARD_DOMAIN_REASON_MULTIDOMAIN
+        PLAN7_BACKWARD_DOMAIN_REASON_NO_REGIONS
+        PLAN7_BACKWARD_DOMAIN_REASON_SIMPLE
+        PLAN7_BACKWARD_DOMAIN_REASON_REGION_OUTPUT_CAP
 
     cdef enum plan7_backward_domain_test_fault:
         PLAN7_BACKWARD_DOMAIN_TEST_TAMPER_RESULT_HASH
@@ -956,6 +1057,25 @@ cdef extern from "backward_domain_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_backward_domain_run_with_reason_facts(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_candidate *candidates,
+        size_t candidate_count,
+        const plan7_forward_provenance *provenance,
+        const uint64_t *forward_offsets,
+        const float *forward_specials,
+        size_t forward_special_count,
+        float rt1,
+        float rt2,
+        float rt3,
+        float guard_band,
+        uint64_t posterior_byte_budget,
+        plan7_backward_domain_output **output,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_backward_domain_unsealed_test_run(
         const plan7_forward_database *database,
         const plan7_ssv_sequence_batch *batch,
@@ -1020,6 +1140,23 @@ cdef extern from "backward_domain_cuda.h" nogil:
         const plan7_backward_domain_output *output,
     )
 
+    size_t plan7_backward_domain_output_reason_count(
+        const plan7_backward_domain_output *output,
+    )
+
+    const uint16_t *plan7_backward_domain_output_reason_facts(
+        const plan7_backward_domain_output *output,
+    )
+
+    int c_plan7_backward_domain_merge_reason_facts_for_test \
+            "plan7_backward_domain_merge_reason_facts_for_test"(
+        const uint64_t *active_sources,
+        const uint16_t *active_facts,
+        size_t active_count,
+        uint16_t *source_facts,
+        size_t source_count,
+    )
+
     int plan7_backward_domain_output_apply_test_fault(
         plan7_backward_domain_output *output,
         int fault,
@@ -1068,6 +1205,32 @@ cdef extern from "domain_rescore_cuda.h" nogil:
         PLAN7_DOMAIN_RESCORE_ENORESULT
         PLAN7_DOMAIN_RESCORE_ECAP
         PLAN7_DOMAIN_RESCORE_EMPTY
+
+    cdef enum plan7_domain_rescore_reason_fact:
+        PLAN7_DOMAIN_RESCORE_REASON_GLOBAL_COMPACT_BUDGET
+        PLAN7_DOMAIN_RESCORE_REASON_OWN_SCALES
+        PLAN7_DOMAIN_RESCORE_REASON_REGION_WORK_CAP
+        PLAN7_DOMAIN_RESCORE_REASON_ROW_WORK_CAP
+        PLAN7_DOMAIN_RESCORE_REASON_MATRIX_CAP
+        PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAP
+        PLAN7_DOMAIN_RESCORE_REASON_RUN_WORK_CAP
+        PLAN7_DOMAIN_RESCORE_REASON_FORWARD_SCORE_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_BACKWARD_SCORE_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_SCALEPRODUCT_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_NULL2_OR_CORRECTION_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_OA_SCORE_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAPACITY_EXHAUSTED
+        PLAN7_DOMAIN_RESCORE_REASON_TRACE_ITERATION_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_TRACE_PREDECESSOR_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_TRACE_COORDINATES_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_IDENTITY_MISMATCH
+        PLAN7_DOMAIN_RESCORE_REASON_HOST_RESULT_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_HOST_TRACE_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_HOST_NULL2_INVALID
+        PLAN7_DOMAIN_RESCORE_REASON_ROW_ATOMIC_PROPAGATION
+        PLAN7_DOMAIN_RESCORE_REASON_DEVICE_RESULT
+        PLAN7_DOMAIN_RESCORE_REASON_OTHER_CPU_REQUIRED
+        PLAN7_DOMAIN_RESCORE_REASON_UPSTREAM_OWN_SCALES
 
     ctypedef struct plan7_domain_rescore_result:
         uint32_t row_index
@@ -1142,6 +1305,18 @@ cdef extern from "domain_rescore_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_domain_rescore_run_with_reason_facts(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_output *upstream,
+        uint64_t compact_byte_budget,
+        uint64_t matrix_byte_budget,
+        uint64_t trace_byte_budget,
+        plan7_domain_rescore_output **output,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_domain_rescore_output_destroy(
         plan7_domain_rescore_output **output,
         char *error,
@@ -1182,6 +1357,23 @@ cdef extern from "domain_rescore_cuda.h" nogil:
 
     const plan7_domain_rescore_statistics *plan7_domain_rescore_output_statistics(
         const plan7_domain_rescore_output *output,
+    )
+
+    size_t plan7_domain_rescore_output_reason_count(
+        const plan7_domain_rescore_output *output,
+    )
+
+    const uint32_t *plan7_domain_rescore_output_reason_facts(
+        const plan7_domain_rescore_output *output,
+    )
+
+    int c_plan7_domain_rescore_merge_reason_facts_for_test \
+            "plan7_domain_rescore_merge_reason_facts_for_test"(
+        const uint32_t *active_result_indices,
+        const uint32_t *active_facts,
+        size_t active_count,
+        uint32_t *source_facts,
+        size_t source_count,
     )
 
     int c_plan7_domain_rescore_own_scale_required_for_test \
@@ -1387,6 +1579,7 @@ cdef object _build_continuation_journal_capsule(
     float rt2,
     float rt3,
     float guard_band,
+    uint64_t *journal_total_bytes,
 ):
     cdef const plan7_forward_result *forward_results
     cdef const float *forward_specials
@@ -1967,6 +2160,8 @@ cdef object _build_continuation_journal_capsule(
                 )
 
         journal.integrity_tag = plan7_continuation_journal_integrity(journal)
+        if journal_total_bytes != NULL:
+            journal_total_bytes[0] = <uint64_t> cursor
         capsule = PyCapsule_New(
             journal,
             PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME,
@@ -1979,6 +2174,189 @@ cdef object _build_continuation_journal_capsule(
     finally:
         if journal != NULL:
             free(journal)
+
+
+cdef enum generation_metric_index:
+    GENERATION_MODEL_LENGTH = 0
+    GENERATION_TARGET_COUNT = 1
+    GENERATION_TARGET_RESIDUES = 2
+    GENERATION_F1_CANDIDATE_COUNT = 3
+    GENERATION_F1_REJECT_COUNT = 4
+    GENERATION_F1_LOGICAL_CELLS = 5
+    GENERATION_POSTFILTER_LOGICAL_CELLS = 6
+    GENERATION_F2_PASS_COUNT = 7
+    GENERATION_FORWARD_LOGICAL_CELLS = 8
+    GENERATION_FORWARD_CPU_COUNT = 9
+    GENERATION_FORWARD_REJECT_COUNT = 10
+    GENERATION_FORWARD_PASS_COUNT = 11
+    GENERATION_BACKWARD_LOGICAL_CELLS = 12
+    GENERATION_BACKWARD_CPU_COUNT = 13
+    GENERATION_BACKWARD_NO_REGION_COUNT = 14
+    GENERATION_BACKWARD_SIMPLE_COUNT = 15
+    GENERATION_JOURNAL_ROW_COUNT = 16
+    GENERATION_JOURNAL_REGION_COUNT = 17
+    GENERATION_RESCORE_LOGICAL_CELLS = 18
+    GENERATION_RESCORE_CPU_COUNT = 19
+    GENERATION_RESCORE_DEVICE_COUNT = 20
+    GENERATION_RESCORE_REGION_COUNT = 21
+    GENERATION_METRIC_COUNT = 22
+
+
+cdef enum generation_reason_width:
+    GENERATION_POSTFILTER_REASON_COUNT = 14
+    GENERATION_F2_REASON_COUNT = 5
+    GENERATION_FORWARD_REASON_COUNT = 10
+    GENERATION_BACKWARD_REASON_COUNT = 16
+    GENERATION_RESCORE_REASON_COUNT = 24
+
+
+GENERATION_REASON_FACT_LAYOUT = (
+    (
+        PLAN7_POSTFILTER_REASON_RAW_F1_REJECT,
+        PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE,
+        PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU,
+        PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO,
+        PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED,
+        PLAN7_POSTFILTER_REASON_BIAS_SCORE_NONFINITE,
+        PLAN7_POSTFILTER_REASON_BIAS_CUTOFF_UNRESOLVED,
+        PLAN7_POSTFILTER_REASON_VITERBI_ERANGE,
+        PLAN7_POSTFILTER_REASON_VITERBI_NO_RESULT_OR_OTHER_STATUS,
+        PLAN7_POSTFILTER_REASON_FINAL_CPU_REQUIRED,
+        PLAN7_POSTFILTER_REASON_FINAL_REJECT,
+        PLAN7_POSTFILTER_REASON_FINAL_PASS,
+        PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED,
+        PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK,
+    ),
+    (
+        F2_REASON_POSTFILTER_NOT_PASS_OR_HOST_ENVIRONMENT_UNATTESTED,
+        F2_REASON_INPUT_INVALID,
+        F2_REASON_MSV_THRESHOLD_EXCEEDED,
+        F2_REASON_VITERBI_THRESHOLD_EXCEEDED,
+        F2_REASON_PASS,
+    ),
+    (
+        PLAN7_FORWARD_REASON_KERNEL_STATUS_NON_OK,
+        PLAN7_FORWARD_REASON_TARGET_EMPTY,
+        PLAN7_FORWARD_REASON_FWDSC_NONFINITE,
+        PLAN7_FORWARD_REASON_FILTERSC_NONFINITE,
+        PLAN7_FORWARD_REASON_TAU_NONFINITE,
+        PLAN7_FORWARD_REASON_LAMBDA_INVALID,
+        PLAN7_FORWARD_REASON_F3_REJECT,
+        PLAN7_FORWARD_REASON_OUTPUT_CAP,
+        PLAN7_FORWARD_REASON_SURVIVOR_GATHERED,
+        PLAN7_FORWARD_REASON_OTHER_CPU_REQUIRED,
+    ),
+    tuple(1 << index for index in range(GENERATION_BACKWARD_REASON_COUNT)),
+    tuple(1 << index for index in range(GENERATION_RESCORE_REASON_COUNT)),
+)
+GENERATION_REASON_FACT_LAYOUT = (
+    _telemetry_module.validate_generation_reason_fact_layout(
+        GENERATION_REASON_FACT_LAYOUT
+    )
+)
+
+
+cdef inline void _count_postfilter_reason(
+    vector[uint64_t]& counts, size_t base, uint16_t facts,
+) noexcept nogil:
+    if facts & PLAN7_POSTFILTER_REASON_RAW_F1_REJECT: counts[base] += 1
+    if facts & PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE: counts[base + 1] += 1
+    if facts & PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU: counts[base + 2] += 1
+    if facts & PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO: counts[base + 3] += 1
+    if facts & PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED: counts[base + 4] += 1
+    if facts & PLAN7_POSTFILTER_REASON_BIAS_SCORE_NONFINITE: counts[base + 5] += 1
+    if facts & PLAN7_POSTFILTER_REASON_BIAS_CUTOFF_UNRESOLVED: counts[base + 6] += 1
+    if facts & PLAN7_POSTFILTER_REASON_VITERBI_ERANGE: counts[base + 7] += 1
+    if facts & PLAN7_POSTFILTER_REASON_VITERBI_NO_RESULT_OR_OTHER_STATUS: counts[base + 8] += 1
+    if facts & PLAN7_POSTFILTER_REASON_FINAL_CPU_REQUIRED: counts[base + 9] += 1
+    if facts & PLAN7_POSTFILTER_REASON_FINAL_REJECT: counts[base + 10] += 1
+    if facts & PLAN7_POSTFILTER_REASON_FINAL_PASS: counts[base + 11] += 1
+    if facts & PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED: counts[base + 12] += 1
+    if facts & PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK: counts[base + 13] += 1
+
+
+cdef inline void _count_forward_reason(
+    vector[uint64_t]& counts, size_t base, uint16_t facts,
+) noexcept nogil:
+    if facts & PLAN7_FORWARD_REASON_KERNEL_STATUS_NON_OK: counts[base] += 1
+    if facts & PLAN7_FORWARD_REASON_TARGET_EMPTY: counts[base + 1] += 1
+    if facts & PLAN7_FORWARD_REASON_FWDSC_NONFINITE: counts[base + 2] += 1
+    if facts & PLAN7_FORWARD_REASON_FILTERSC_NONFINITE: counts[base + 3] += 1
+    if facts & PLAN7_FORWARD_REASON_TAU_NONFINITE: counts[base + 4] += 1
+    if facts & PLAN7_FORWARD_REASON_LAMBDA_INVALID: counts[base + 5] += 1
+    if facts & PLAN7_FORWARD_REASON_F3_REJECT: counts[base + 6] += 1
+    if facts & PLAN7_FORWARD_REASON_OUTPUT_CAP: counts[base + 7] += 1
+    if facts & PLAN7_FORWARD_REASON_SURVIVOR_GATHERED: counts[base + 8] += 1
+    if facts & PLAN7_FORWARD_REASON_OTHER_CPU_REQUIRED: counts[base + 9] += 1
+
+
+cdef inline void _count_backward_reason(
+    vector[uint64_t]& counts, size_t base, uint16_t facts,
+) noexcept nogil:
+    cdef uint16_t bit = 1
+    cdef size_t index
+    for index in range(GENERATION_BACKWARD_REASON_COUNT):
+        if facts & bit: counts[base + index] += 1
+        bit <<= 1
+
+
+cdef inline void _count_rescore_reason(
+    vector[uint64_t]& counts, size_t base, uint32_t facts,
+) noexcept nogil:
+    cdef uint32_t bit = 1
+    cdef size_t index
+    for index in range(GENERATION_RESCORE_REASON_COUNT):
+        if facts & bit: counts[base + index] += 1
+        bit <<= 1
+
+
+cdef inline bint _rescore_reason_admitted_work(uint32_t facts) noexcept nogil:
+    return not (
+        facts & (
+            PLAN7_DOMAIN_RESCORE_REASON_GLOBAL_COMPACT_BUDGET
+            | PLAN7_DOMAIN_RESCORE_REASON_UPSTREAM_OWN_SCALES
+            | PLAN7_DOMAIN_RESCORE_REASON_REGION_WORK_CAP
+            | PLAN7_DOMAIN_RESCORE_REASON_ROW_WORK_CAP
+            | PLAN7_DOMAIN_RESCORE_REASON_MATRIX_CAP
+            | PLAN7_DOMAIN_RESCORE_REASON_TRACE_CAP
+            | PLAN7_DOMAIN_RESCORE_REASON_RUN_WORK_CAP
+        )
+    )
+
+
+def domain_rescore_reason_admitted_work_for_test(uint32_t facts):
+    """Host boundary for exact rescore preflight-versus-active facts."""
+    if facts & <uint32_t> 0xff000000:
+        raise ValueError("rescore reason facts contain unknown bits")
+    return bool(_rescore_reason_admitted_work(facts))
+
+
+cdef inline void _count_reason_cells16(
+    vector[uint64_t]& cells,
+    size_t base,
+    size_t width,
+    uint16_t facts,
+    uint64_t logical_cells,
+) noexcept nogil:
+    cdef uint16_t bit = 1
+    cdef size_t index
+    for index in range(width):
+        if facts & bit: cells[base + index] += logical_cells
+        bit <<= 1
+
+
+cdef inline void _count_reason_cells32(
+    vector[uint64_t]& cells,
+    size_t base,
+    size_t width,
+    uint32_t facts,
+    uint64_t logical_cells,
+) noexcept nogil:
+    cdef uint32_t bit = 1
+    cdef size_t index
+    for index in range(width):
+        if facts & bit: cells[base + index] += logical_cells
+        bit <<= 1
 
 
 def bias_environment_attested():
@@ -3080,6 +3458,64 @@ def domain_rescore_oatrace_j_predecessor_for_test(
         j_loop_enabled,
         e_loop_enabled,
     ))
+
+
+def backward_domain_merge_reason_facts_for_test(
+    const uint64_t[::1] active_sources,
+    const uint16_t[::1] active_facts,
+    const uint16_t[::1] source_facts,
+):
+    """Exercise production's compact Backward-row reason remapping."""
+    cdef carray output
+    cdef int status
+    if active_sources.shape[0] != active_facts.shape[0]:
+        raise ValueError("Backward active reason rows differ")
+    output = clone(_UINT16_ARRAY_TEMPLATE, source_facts.shape[0], False)
+    if source_facts.shape[0]:
+        memcpy(
+            output.data.as_ushorts,
+            &source_facts[0],
+            source_facts.shape[0] * sizeof(uint16_t),
+        )
+    status = c_plan7_backward_domain_merge_reason_facts_for_test(
+        &active_sources[0] if active_sources.shape[0] else NULL,
+        &active_facts[0] if active_facts.shape[0] else NULL,
+        active_sources.shape[0],
+        output.data.as_ushorts if source_facts.shape[0] else NULL,
+        source_facts.shape[0],
+    )
+    if status != 0:
+        raise ValueError("invalid Backward active reason source mapping")
+    return output
+
+
+def domain_rescore_merge_reason_facts_for_test(
+    const uint32_t[::1] active_result_indices,
+    const uint32_t[::1] active_facts,
+    const uint32_t[::1] source_facts,
+):
+    """Exercise production's compact rescore-region reason remapping."""
+    cdef carray output
+    cdef int status
+    if active_result_indices.shape[0] != active_facts.shape[0]:
+        raise ValueError("rescore active reason rows differ")
+    output = clone(_UINT32_ARRAY_TEMPLATE, source_facts.shape[0], False)
+    if source_facts.shape[0]:
+        memcpy(
+            output.data.as_uints,
+            &source_facts[0],
+            source_facts.shape[0] * sizeof(uint32_t),
+        )
+    status = c_plan7_domain_rescore_merge_reason_facts_for_test(
+        &active_result_indices[0] if active_result_indices.shape[0] else NULL,
+        &active_facts[0] if active_facts.shape[0] else NULL,
+        active_result_indices.shape[0],
+        output.data.as_uints if source_facts.shape[0] else NULL,
+        source_facts.shape[0],
+    )
+    if status != 0:
+        raise ValueError("invalid rescore active reason source mapping")
+    return output
 
 
 cdef class ProfileSelection:
@@ -4836,6 +5272,7 @@ cdef class SequenceBatch:
         float rt2,
         float rt3,
         float guard_band,
+        object generation_telemetry_seed,
     ):
         """Run selection-aware F2/F3 without reading a live optimized profile."""
         cdef plan7_profile_selection_view view = selection._view()
@@ -4849,6 +5286,18 @@ cdef class SequenceBatch:
         cdef vector[size_t] pass_sources
         cdef vector[uint64_t] pass_special_offsets
         cdef vector[uint64_t] journal_profile_offsets
+        cdef vector[uint64_t] generation_metrics
+        cdef vector[uint64_t] postfilter_reason_counts
+        cdef vector[uint64_t] f2_reason_counts
+        cdef vector[uint64_t] forward_reason_counts
+        cdef vector[uint64_t] backward_reason_counts
+        cdef vector[uint64_t] rescore_reason_counts
+        cdef vector[uint64_t] postfilter_reason_cells
+        cdef vector[uint64_t] f2_reason_cells
+        cdef vector[uint64_t] forward_reason_cells
+        cdef vector[uint64_t] backward_reason_cells
+        cdef vector[uint64_t] rescore_reason_cells
+        cdef vector[plan7_forward_snapshot_profile] forward_snapshots
         cdef plan7_backward_domain_candidate domain_candidate
         cdef plan7_postfilter_result record
         cdef float_bits vfsc_bits
@@ -4856,6 +5305,11 @@ cdef class SequenceBatch:
         cdef float usc
         cdef float bit_score
         cdef double probability
+        cdef uint16_t reason16
+        cdef uint32_t reason32
+        cdef uint16_t forward_facts
+        cdef uint8_t forward_call_facts = 0
+        cdef uint16_t backward_preflight_mask
         cdef uint32_t previous
         cdef bint have_previous
         cdef bint host_attested
@@ -4878,6 +5332,12 @@ cdef class SequenceBatch:
         cdef const plan7_forward_statistics *native_statistics
         cdef const plan7_backward_domain_statistics *native_domain_statistics
         cdef const plan7_domain_rescore_statistics *native_rescore_statistics
+        cdef const uint16_t *native_domain_reasons
+        cdef const uint32_t *native_rescore_reasons
+        cdef const plan7_backward_domain_result *native_domain_results = NULL
+        cdef const uint64_t *native_domain_region_offsets = NULL
+        cdef const plan7_simple_region *native_domain_regions = NULL
+        cdef const plan7_domain_rescore_result *native_rescore_results = NULL
         cdef char error[512]
         cdef char destroy_error[512]
         cdef int status = 0
@@ -4889,6 +5349,16 @@ cdef class SequenceBatch:
         cdef size_t special_bytes
         cdef size_t pass_count
         cdef size_t source
+        cdef size_t reason_count
+        cdef size_t region
+        cdef size_t row
+        cdef size_t reason_base = 0
+        cdef uint64_t total_target_residues = 0
+        cdef uint64_t journal_total_bytes = 0
+        cdef uint64_t logical_cells
+        cdef bint collect_generation_telemetry = (
+            generation_telemetry_seed is not None
+        )
         cdef bytes records
         cdef bytes offset_storage
         cdef bytes special_storage
@@ -4902,6 +5372,16 @@ cdef class SequenceBatch:
         cdef object sealed_stage_timings = None
         cdef object rescore_payload = None
         cdef object upstream_payload = None
+        cdef object generation_statistics = None
+        cdef object profile_records
+        cdef object metric_values
+        cdef object reason_values
+        cdef object reason_cell_values
+        cdef object stage_reason_values
+        cdef object stage_reason_cell_values
+        cdef object native_totals
+        cdef object postfilter_reason_storage = None
+        cdef const uint16_t[::1] postfilter_reason_view
         cdef bytes profile_fingerprint_storage = b""
         cdef const uint8_t[::1] profile_fingerprint_view
         cdef const uint8_t[::1] sequence_fingerprint_view
@@ -4970,6 +5450,81 @@ cdef class SequenceBatch:
         ):
             raise RuntimeError("profile selection storage is incomplete")
 
+        if collect_generation_telemetry:
+            if (
+                not isinstance(generation_telemetry_seed, tuple)
+                or len(generation_telemetry_seed) != 2
+                or generation_telemetry_seed[0]
+                    != GENERATION_TELEMETRY_SCHEMA_VERSION
+                or not isinstance(generation_telemetry_seed[1], bytes)
+            ):
+                raise ValueError("invalid generation telemetry seed")
+            postfilter_reason_storage = generation_telemetry_seed[1]
+            if len(postfilter_reason_storage) != record_count * sizeof(uint16_t):
+                raise ValueError("post-filter reason fact count changed")
+            postfilter_reason_view = memoryview(
+                postfilter_reason_storage
+            ).cast("H")
+            generation_metrics.resize(profile_count * GENERATION_METRIC_COUNT)
+            postfilter_reason_counts.resize(
+                profile_count * GENERATION_POSTFILTER_REASON_COUNT
+            )
+            f2_reason_counts.resize(
+                profile_count * GENERATION_F2_REASON_COUNT
+            )
+            forward_reason_counts.resize(
+                profile_count * GENERATION_FORWARD_REASON_COUNT
+            )
+            backward_reason_counts.resize(
+                profile_count * GENERATION_BACKWARD_REASON_COUNT
+            )
+            rescore_reason_counts.resize(
+                profile_count * GENERATION_RESCORE_REASON_COUNT
+            )
+            postfilter_reason_cells.resize(
+                profile_count * GENERATION_POSTFILTER_REASON_COUNT
+            )
+            f2_reason_cells.resize(
+                profile_count * GENERATION_F2_REASON_COUNT
+            )
+            forward_reason_cells.resize(
+                profile_count * GENERATION_FORWARD_REASON_COUNT
+            )
+            backward_reason_cells.resize(
+                profile_count * GENERATION_BACKWARD_REASON_COUNT
+            )
+            rescore_reason_cells.resize(
+                profile_count * GENERATION_RESCORE_REASON_COUNT
+            )
+            forward_snapshots.resize(profile_count)
+            for cursor in range(self._sequence_count):
+                if self._lengths[cursor] > (<uint64_t> -1) - total_target_residues:
+                    raise OverflowError("target residue total overflows uint64")
+                total_target_residues += self._lengths[cursor]
+            for profile_index in range(profile_count):
+                reason_base = profile_index * GENERATION_METRIC_COUNT
+                generation_metrics[reason_base + GENERATION_MODEL_LENGTH] = (
+                    <uint64_t> view.profiles[profile_index].model_length
+                )
+                generation_metrics[reason_base + GENERATION_TARGET_COUNT] = (
+                    self._sequence_count
+                )
+                generation_metrics[
+                    reason_base + GENERATION_TARGET_RESIDUES
+                ] = total_target_residues
+                if (
+                    view.profiles[profile_index].model_length > 0
+                    and total_target_residues > (<uint64_t> -1) // (
+                        <uint64_t> view.profiles[profile_index].model_length
+                    )
+                ):
+                    raise OverflowError("F1 logical cell count overflows uint64")
+                generation_metrics[
+                    reason_base + GENERATION_F1_LOGICAL_CELLS
+                ] = total_target_residues * (
+                    <uint64_t> view.profiles[profile_index].model_length
+                )
+
         host_attested = plan7_bias_host_environment_attested() == 1
         candidate_offsets.reserve(profile_count + 1)
         candidate_offsets.push_back(0)
@@ -4978,6 +5533,16 @@ cdef class SequenceBatch:
             stop = <size_t> postfilter_offsets[profile_index + 1]
             if start > stop or stop > record_count:
                 raise ValueError("post-filter row offsets are not monotone")
+            if collect_generation_telemetry:
+                reason_base = profile_index * GENERATION_METRIC_COUNT
+                if stop - start > self._sequence_count:
+                    raise RuntimeError("F1 candidate count exceeds target count")
+                generation_metrics[
+                    reason_base + GENERATION_F1_CANDIDATE_COUNT
+                ] = stop - start
+                generation_metrics[
+                    reason_base + GENERATION_F1_REJECT_COUNT
+                ] = self._sequence_count - (stop - start)
             previous = 0
             have_previous = False
             for cursor in range(start, stop):
@@ -4994,7 +5559,53 @@ cdef class SequenceBatch:
                     )
                 previous = record.sequence_index
                 have_previous = True
+                if collect_generation_telemetry:
+                    reason16 = postfilter_reason_view[cursor]
+                    if reason16 & <uint16_t> 0xc000:
+                        raise RuntimeError(
+                            "post-filter reason facts contain unknown bits"
+                        )
+                    _count_postfilter_reason(
+                        postfilter_reason_counts,
+                        profile_index * GENERATION_POSTFILTER_REASON_COUNT,
+                        reason16,
+                    )
+                    sequence_length = self._lengths[record.sequence_index]
+                    if (
+                        view.profiles[profile_index].model_length > 0
+                        and sequence_length > (<uint64_t> -1) // (
+                            <uint64_t> view.profiles[profile_index].model_length
+                        )
+                    ):
+                        raise OverflowError(
+                            "post-filter logical cell count overflows uint64"
+                        )
+                    logical_cells = sequence_length * (
+                        <uint64_t> view.profiles[profile_index].model_length
+                    )
+                    if reason16 & PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK:
+                        logical_cells = 0
+                    if logical_cells > (<uint64_t> -1) - generation_metrics[
+                        reason_base + GENERATION_POSTFILTER_LOGICAL_CELLS
+                    ]:
+                        raise OverflowError(
+                            "post-filter logical cell total overflows uint64"
+                        )
+                    generation_metrics[
+                        reason_base + GENERATION_POSTFILTER_LOGICAL_CELLS
+                    ] += logical_cells
+                    _count_reason_cells16(
+                        postfilter_reason_cells,
+                        profile_index * GENERATION_POSTFILTER_REASON_COUNT,
+                        GENERATION_POSTFILTER_REASON_COUNT,
+                        reason16,
+                        logical_cells,
+                    )
                 if not host_attested or record.action != PLAN7_BIAS_DEFINITE_PASS:
+                    if collect_generation_telemetry:
+                        f2_reason_counts[
+                            profile_index * GENERATION_F2_REASON_COUNT
+                        ] += 1
                     continue
                 vfsc_bits.value = record.vfsc
                 if (
@@ -5007,6 +5618,10 @@ cdef class SequenceBatch:
                     or not isfinite(view.profiles[profile_index].scale)
                     or view.profiles[profile_index].scale <= 0.0
                 ):
+                    if collect_generation_telemetry:
+                        f2_reason_counts[
+                            profile_index * GENERATION_F2_REASON_COUNT + 1
+                        ] += 1
                     continue
                 usc = <float> record.msv_numerator
                 usc = usc / view.profiles[profile_index].scale
@@ -5018,6 +5633,10 @@ cdef class SequenceBatch:
                     view.m_lambda[profile_index],
                 )
                 if probability > f2:
+                    if collect_generation_telemetry:
+                        f2_reason_counts[
+                            profile_index * GENERATION_F2_REASON_COUNT + 2
+                        ] += 1
                     bit_score = <float> (
                         (record.vfsc - record.filtersc) / eslCONST_LOG2
                     )
@@ -5027,6 +5646,10 @@ cdef class SequenceBatch:
                         view.v_lambda[profile_index],
                     )
                     if probability > f2:
+                        if collect_generation_telemetry:
+                            f2_reason_counts[
+                                profile_index * GENERATION_F2_REASON_COUNT + 3
+                            ] += 1
                         continue
                 if residue_offsets[record.sequence_index + 1] < (
                     residue_offsets[record.sequence_index]
@@ -5043,6 +5666,13 @@ cdef class SequenceBatch:
                 uncorrected_scores.push_back(usc)
                 candidate_records.push_back(record)
                 candidate_profiles.push_back(<uint32_t> profile_index)
+                if collect_generation_telemetry:
+                    f2_reason_counts[
+                        profile_index * GENERATION_F2_REASON_COUNT + 4
+                    ] += 1
+                    generation_metrics[
+                        reason_base + GENERATION_F2_PASS_COUNT
+                    ] += 1
             candidate_offsets.push_back(candidate_indices.size())
 
         candidate_count = candidate_indices.size()
@@ -5059,6 +5689,19 @@ cdef class SequenceBatch:
             status = plan7_profile_selection_stage_forward(
                 selection._selection, &database, error, sizeof(error)
             )
+        if status == 0 and collect_generation_telemetry:
+            for profile_index in range(profile_count):
+                error[0] = 0
+                with nogil:
+                    status = plan7_forward_database_get_profile_snapshot(
+                        database,
+                        profile_index,
+                        &forward_snapshots[profile_index],
+                        error,
+                        sizeof(error),
+                    )
+                if status != 0:
+                    break
         if status == 0:
             with nogil:
                 status = plan7_forward_run_batch_workspace(
@@ -5101,6 +5744,122 @@ cdef class SequenceBatch:
                 ):
                     raise RuntimeError("Forward journal storage is incomplete")
 
+                if collect_generation_telemetry:
+                    if plan7_forward_output_contract_fallback(output) == 1:
+                        forward_call_facts |= (
+                            PLAN7_FORWARD_CALL_REASON_CONTRACT_FALLBACK
+                        )
+                    for profile_index in range(profile_count):
+                        reason_base = profile_index * GENERATION_METRIC_COUNT
+                        start = <size_t> candidate_offsets[profile_index]
+                        stop = <size_t> candidate_offsets[profile_index + 1]
+                        for source in range(start, stop):
+                            sequence_length = self._lengths[
+                                candidate_indices[source]
+                            ]
+                            logical_cells = 0
+                            if forward_call_facts == 0:
+                                logical_cells = sequence_length * (
+                                    <uint64_t> forward_snapshots[
+                                        profile_index
+                                    ].model_length
+                                )
+                                if logical_cells > (<uint64_t> -1) - (
+                                    generation_metrics[
+                                        reason_base
+                                        + GENERATION_FORWARD_LOGICAL_CELLS
+                                    ]
+                                ):
+                                    raise OverflowError(
+                                        "Forward logical cell total overflows uint64"
+                                    )
+                                generation_metrics[
+                                    reason_base
+                                    + GENERATION_FORWARD_LOGICAL_CELLS
+                                ] += logical_cells
+                            forward_facts = 0
+                            # A call-wide contract fallback preinitializes
+                            # conservative rows without launching Forward.
+                            # Its exact source transition is the call fact;
+                            # default row fields are not kernel facts.
+                            if forward_call_facts == 0:
+                                if native_results[source].status != PLAN7_FORWARD_OK:
+                                    forward_facts |= (
+                                        PLAN7_FORWARD_REASON_KERNEL_STATUS_NON_OK
+                                    )
+                                if sequence_length == 0:
+                                    forward_facts |= PLAN7_FORWARD_REASON_TARGET_EMPTY
+                                if not isfinite(native_results[source].fwdsc):
+                                    forward_facts |= (
+                                        PLAN7_FORWARD_REASON_FWDSC_NONFINITE
+                                    )
+                                if not isfinite(filter_scores[source]):
+                                    forward_facts |= (
+                                        PLAN7_FORWARD_REASON_FILTERSC_NONFINITE
+                                    )
+                                if not isfinite(
+                                    forward_snapshots[profile_index].f_tau
+                                ):
+                                    forward_facts |= (
+                                        PLAN7_FORWARD_REASON_TAU_NONFINITE
+                                    )
+                                if (
+                                    not isfinite(
+                                        forward_snapshots[profile_index].f_lambda
+                                    )
+                                    or forward_snapshots[
+                                        profile_index
+                                    ].f_lambda <= 0.0
+                                ):
+                                    forward_facts |= (
+                                        PLAN7_FORWARD_REASON_LAMBDA_INVALID
+                                    )
+                            if native_results[source].action == (
+                                PLAN7_FORWARD_DEFINITE_REJECT
+                            ):
+                                forward_facts |= PLAN7_FORWARD_REASON_F3_REJECT
+                                generation_metrics[
+                                    reason_base
+                                    + GENERATION_FORWARD_REJECT_COUNT
+                                ] += 1
+                            elif native_results[source].action == (
+                                PLAN7_FORWARD_DEFINITE_PASS
+                            ):
+                                forward_facts |= (
+                                    PLAN7_FORWARD_REASON_SURVIVOR_GATHERED
+                                )
+                                generation_metrics[
+                                    reason_base + GENERATION_FORWARD_PASS_COUNT
+                                ] += 1
+                            elif native_results[source].action == (
+                                PLAN7_FORWARD_CPU_REQUIRED
+                            ):
+                                generation_metrics[
+                                    reason_base + GENERATION_FORWARD_CPU_COUNT
+                                ] += 1
+                                if forward_call_facts == 0 and forward_facts == 0:
+                                    forward_facts |= (
+                                        PLAN7_FORWARD_REASON_OUTPUT_CAP
+                                    )
+                            else:
+                                raise RuntimeError(
+                                    "Forward result action is invalid"
+                                )
+                            _count_forward_reason(
+                                forward_reason_counts,
+                                profile_index
+                                * GENERATION_FORWARD_REASON_COUNT,
+                                forward_facts,
+                            )
+                            _count_reason_cells16(
+                                forward_reason_cells,
+                                profile_index
+                                * GENERATION_FORWARD_REASON_COUNT,
+                                GENERATION_FORWARD_REASON_COUNT,
+                                forward_facts,
+                                logical_cells,
+                            )
+
                 pass_special_offsets.push_back(0)
                 journal_profile_offsets.push_back(0)
                 pass_count = 0
@@ -5131,27 +5890,158 @@ cdef class SequenceBatch:
                     raise RuntimeError("Forward pass provenance count changed")
 
                 error[0] = 0
-                with nogil:
-                    status = plan7_backward_domain_run(
-                        database,
-                        self._batch,
-                        domain_candidates.data() if pass_count else NULL,
-                        pass_count,
-                        native_provenance,
-                        pass_special_offsets.data(),
-                        native_specials if special_count else NULL,
-                        special_count,
-                        rt1,
-                        rt2,
-                        rt3,
-                        guard_band,
-                        0,
-                        &domain_output,
-                        error,
-                        sizeof(error),
-                    )
+                if collect_generation_telemetry:
+                    with nogil:
+                        status = plan7_backward_domain_run_with_reason_facts(
+                            database,
+                            self._batch,
+                            domain_candidates.data() if pass_count else NULL,
+                            pass_count,
+                            native_provenance,
+                            pass_special_offsets.data(),
+                            native_specials if special_count else NULL,
+                            special_count,
+                            rt1,
+                            rt2,
+                            rt3,
+                            guard_band,
+                            0,
+                            &domain_output,
+                            error,
+                            sizeof(error),
+                        )
+                else:
+                    with nogil:
+                        status = plan7_backward_domain_run(
+                            database,
+                            self._batch,
+                            domain_candidates.data() if pass_count else NULL,
+                            pass_count,
+                            native_provenance,
+                            pass_special_offsets.data(),
+                            native_specials if special_count else NULL,
+                            special_count,
+                            rt1,
+                            rt2,
+                            rt3,
+                            guard_band,
+                            0,
+                            &domain_output,
+                            error,
+                            sizeof(error),
+                        )
                 if status != 0:
                     raise RuntimeError(error.decode("utf-8", "replace"))
+                if collect_generation_telemetry:
+                    reason_count = (
+                        plan7_backward_domain_output_reason_count(
+                            domain_output
+                        )
+                    )
+                    native_domain_reasons = (
+                        plan7_backward_domain_output_reason_facts(
+                            domain_output
+                        )
+                    )
+                    native_domain_results = (
+                        plan7_backward_domain_output_results(domain_output)
+                    )
+                    native_domain_region_offsets = (
+                        plan7_backward_domain_output_region_offsets(
+                            domain_output
+                        )
+                    )
+                    native_domain_regions = (
+                        plan7_backward_domain_output_regions(domain_output)
+                    )
+                    if (
+                        reason_count != pass_count
+                        or (pass_count and native_domain_reasons == NULL)
+                        or (pass_count and native_domain_results == NULL)
+                        or native_domain_region_offsets == NULL
+                    ):
+                        raise RuntimeError(
+                            "Backward/domain reason storage is incomplete"
+                        )
+                    backward_preflight_mask = (
+                        PLAN7_BACKWARD_DOMAIN_REASON_TARGET_EMPTY
+                        | PLAN7_BACKWARD_DOMAIN_REASON_FORWARD_SPECIAL_NONFINITE
+                        | PLAN7_BACKWARD_DOMAIN_REASON_FORWARD_SCALE_INVALID
+                        | PLAN7_BACKWARD_DOMAIN_REASON_HOST_FLOAT_ENV_INVALID
+                        | PLAN7_BACKWARD_DOMAIN_REASON_MODE_OR_NJ_UNSUPPORTED
+                        | PLAN7_BACKWARD_DOMAIN_REASON_WORK_CAP
+                        | PLAN7_BACKWARD_DOMAIN_REASON_WORKSPACE_CAP
+                    )
+                    for row in range(pass_count):
+                        profile_index = domain_candidates[row].profile_index
+                        reason_base = profile_index * GENERATION_METRIC_COUNT
+                        reason16 = native_domain_reasons[row]
+                        logical_cells = 0
+                        generation_metrics[
+                            reason_base + GENERATION_JOURNAL_ROW_COUNT
+                        ] += 1
+                        region = (
+                            native_domain_region_offsets[row + 1]
+                            - native_domain_region_offsets[row]
+                        )
+                        generation_metrics[
+                            reason_base + GENERATION_JOURNAL_REGION_COUNT
+                        ] += region
+                        if native_domain_results[row].route == (
+                            PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED
+                        ):
+                            generation_metrics[
+                                reason_base + GENERATION_BACKWARD_CPU_COUNT
+                            ] += 1
+                        elif native_domain_results[row].route == (
+                            PLAN7_BACKWARD_DOMAIN_NO_REGIONS
+                        ):
+                            generation_metrics[
+                                reason_base
+                                + GENERATION_BACKWARD_NO_REGION_COUNT
+                            ] += 1
+                        elif native_domain_results[row].route == (
+                            PLAN7_BACKWARD_DOMAIN_SIMPLE
+                        ):
+                            generation_metrics[
+                                reason_base + GENERATION_BACKWARD_SIMPLE_COUNT
+                            ] += 1
+                        if not (reason16 & backward_preflight_mask):
+                            sequence_length = self._lengths[
+                                domain_candidates[row].sequence_index
+                            ]
+                            logical_cells = sequence_length * (
+                                <uint64_t> forward_snapshots[
+                                    profile_index
+                                ].model_length
+                            )
+                            if logical_cells > (<uint64_t> -1) - (
+                                generation_metrics[
+                                    reason_base
+                                    + GENERATION_BACKWARD_LOGICAL_CELLS
+                                ]
+                            ):
+                                raise OverflowError(
+                                    "Backward logical cell total overflows uint64"
+                                )
+                            generation_metrics[
+                                reason_base
+                                + GENERATION_BACKWARD_LOGICAL_CELLS
+                            ] += logical_cells
+                        _count_backward_reason(
+                            backward_reason_counts,
+                            profile_index
+                            * GENERATION_BACKWARD_REASON_COUNT,
+                            reason16,
+                        )
+                        _count_reason_cells16(
+                            backward_reason_cells,
+                            profile_index
+                            * GENERATION_BACKWARD_REASON_COUNT,
+                            GENERATION_BACKWARD_REASON_COUNT,
+                            reason16,
+                            logical_cells,
+                        )
                 if (
                     rescore_simple_diagnostic
                     or generation_tail_fingerprint != 0
@@ -5172,20 +6062,197 @@ cdef class SequenceBatch:
                                 error.decode("utf-8", "replace")
                             )
                     error[0] = 0
-                    with nogil:
-                        status = plan7_domain_rescore_run(
-                            database,
-                            self._batch,
-                            domain_output,
-                            rescore_compact_byte_budget,
-                            rescore_matrix_byte_budget,
-                            rescore_trace_byte_budget,
-                            &rescore_output,
-                            error,
-                            sizeof(error),
-                        )
+                    if collect_generation_telemetry:
+                        with nogil:
+                            status = (
+                                plan7_domain_rescore_run_with_reason_facts(
+                                    database,
+                                    self._batch,
+                                    domain_output,
+                                    rescore_compact_byte_budget,
+                                    rescore_matrix_byte_budget,
+                                    rescore_trace_byte_budget,
+                                    &rescore_output,
+                                    error,
+                                    sizeof(error),
+                                )
+                            )
+                    else:
+                        with nogil:
+                            status = plan7_domain_rescore_run(
+                                database,
+                                self._batch,
+                                domain_output,
+                                rescore_compact_byte_budget,
+                                rescore_matrix_byte_budget,
+                                rescore_trace_byte_budget,
+                                &rescore_output,
+                                error,
+                                sizeof(error),
+                            )
                     if status != 0:
                         raise RuntimeError(error.decode("utf-8", "replace"))
+                    if collect_generation_telemetry:
+                        reason_count = (
+                            plan7_domain_rescore_output_reason_count(
+                                rescore_output
+                            )
+                        )
+                        native_rescore_reasons = (
+                            plan7_domain_rescore_output_reason_facts(
+                                rescore_output
+                            )
+                        )
+                        result_count = (
+                            plan7_domain_rescore_output_result_count(
+                                rescore_output
+                            )
+                        )
+                        native_rescore_results = (
+                            plan7_domain_rescore_output_results(rescore_output)
+                        )
+                        if (
+                            (reason_count and native_rescore_reasons == NULL)
+                            or (result_count and native_rescore_results == NULL)
+                            or (
+                                result_count != 0
+                                and result_count != reason_count
+                            )
+                        ):
+                            raise RuntimeError(
+                                "isolated-domain reason storage is incomplete"
+                            )
+                        if result_count:
+                            for region in range(result_count):
+                                profile_index = (
+                                    native_rescore_results[
+                                        region
+                                    ].profile_index
+                                )
+                                if profile_index >= profile_count:
+                                    raise RuntimeError(
+                                        "isolated-domain reason profile changed"
+                                    )
+                                reason_base = (
+                                    profile_index * GENERATION_METRIC_COUNT
+                                )
+                                reason32 = native_rescore_reasons[region]
+                                if reason32 & <uint32_t> 0xff000000:
+                                    raise RuntimeError(
+                                        "rescore reason facts contain unknown bits"
+                                    )
+                                logical_cells = 0
+                                _count_rescore_reason(
+                                    rescore_reason_counts,
+                                    profile_index
+                                    * GENERATION_RESCORE_REASON_COUNT,
+                                    reason32,
+                                )
+                                generation_metrics[
+                                    reason_base
+                                    + GENERATION_RESCORE_REGION_COUNT
+                                ] += 1
+                                if native_rescore_results[region].action == (
+                                    PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+                                ):
+                                    generation_metrics[
+                                        reason_base
+                                        + GENERATION_RESCORE_DEVICE_COUNT
+                                    ] += 1
+                                elif native_rescore_results[region].action == (
+                                    PLAN7_DOMAIN_RESCORE_CPU_REQUIRED
+                                ):
+                                    generation_metrics[
+                                        reason_base
+                                        + GENERATION_RESCORE_CPU_COUNT
+                                    ] += 1
+                                else:
+                                    raise RuntimeError(
+                                        "rescore result action is invalid"
+                                    )
+                                if _rescore_reason_admitted_work(reason32):
+                                    sequence_length = (
+                                        native_rescore_results[
+                                            region
+                                        ].envelope_end
+                                        - native_rescore_results[
+                                            region
+                                        ].envelope_begin
+                                        + 1
+                                    )
+                                    logical_cells = sequence_length * (
+                                        <uint64_t> forward_snapshots[
+                                            profile_index
+                                        ].model_length
+                                    )
+                                    if logical_cells > (<uint64_t> -1) - (
+                                        generation_metrics[
+                                            reason_base
+                                            + GENERATION_RESCORE_LOGICAL_CELLS
+                                        ]
+                                    ):
+                                        raise OverflowError(
+                                            "rescore logical cell total overflows uint64"
+                                        )
+                                    generation_metrics[
+                                        reason_base
+                                        + GENERATION_RESCORE_LOGICAL_CELLS
+                                    ] += logical_cells
+                                _count_reason_cells32(
+                                    rescore_reason_cells,
+                                    profile_index
+                                    * GENERATION_RESCORE_REASON_COUNT,
+                                    GENERATION_RESCORE_REASON_COUNT,
+                                    reason32,
+                                    logical_cells,
+                                )
+                        elif reason_count:
+                            region = 0
+                            for row in range(pass_count):
+                                profile_index = domain_candidates[
+                                    row
+                                ].profile_index
+                                start = <size_t> native_domain_region_offsets[row]
+                                stop = <size_t> native_domain_region_offsets[
+                                    row + 1
+                                ]
+                                while region < stop:
+                                    reason32 = native_rescore_reasons[region]
+                                    if reason32 & <uint32_t> 0xff000000:
+                                        raise RuntimeError(
+                                            "rescore reason facts contain unknown bits"
+                                        )
+                                    _count_rescore_reason(
+                                        rescore_reason_counts,
+                                        profile_index
+                                        * GENERATION_RESCORE_REASON_COUNT,
+                                        reason32,
+                                    )
+                                    _count_reason_cells32(
+                                        rescore_reason_cells,
+                                        profile_index
+                                        * GENERATION_RESCORE_REASON_COUNT,
+                                        GENERATION_RESCORE_REASON_COUNT,
+                                        reason32,
+                                        0,
+                                    )
+                                    reason_base = (
+                                        profile_index
+                                        * GENERATION_METRIC_COUNT
+                                    )
+                                    generation_metrics[
+                                        reason_base
+                                        + GENERATION_RESCORE_REGION_COUNT
+                                    ] += 1
+                                    generation_metrics[
+                                        reason_base
+                                        + GENERATION_RESCORE_CPU_COUNT
+                                    ] += 1
+                                    region += 1
+                            if region != reason_count:
+                                raise RuntimeError(
+                                    "global rescore reason attribution changed"
+                                )
                     if rescore_simple_diagnostic:
                         upstream_payload = (
                             _backward_domain_route_payload_from_output(
@@ -5238,6 +6305,7 @@ cdef class SequenceBatch:
                     rt2,
                     rt3,
                     guard_band,
+                    &journal_total_bytes,
                 )
                 native_statistics = plan7_forward_output_statistics(output)
                 native_domain_statistics = (
@@ -5289,6 +6357,165 @@ cdef class SequenceBatch:
                         else None
                     ),
                 )
+                if collect_generation_telemetry:
+                    profile_records = []
+                    for profile_index in range(profile_count):
+                        metric_values = []
+                        reason_base = (
+                            profile_index * GENERATION_METRIC_COUNT
+                        )
+                        for cursor in range(GENERATION_METRIC_COUNT):
+                            metric_values.append(
+                                generation_metrics[reason_base + cursor]
+                            )
+                        stage_reason_values = []
+                        stage_reason_cell_values = []
+                        reason_values = []
+                        reason_cell_values = []
+                        reason_base = (
+                            profile_index
+                            * GENERATION_POSTFILTER_REASON_COUNT
+                        )
+                        for cursor in range(
+                            GENERATION_POSTFILTER_REASON_COUNT
+                        ):
+                            reason_values.append(
+                                postfilter_reason_counts[
+                                    reason_base + cursor
+                                ]
+                            )
+                            reason_cell_values.append(
+                                postfilter_reason_cells[
+                                    reason_base + cursor
+                                ]
+                            )
+                        stage_reason_values.append(tuple(reason_values))
+                        stage_reason_cell_values.append(
+                            tuple(reason_cell_values)
+                        )
+                        reason_values = []
+                        reason_cell_values = []
+                        reason_base = (
+                            profile_index * GENERATION_F2_REASON_COUNT
+                        )
+                        for cursor in range(GENERATION_F2_REASON_COUNT):
+                            reason_values.append(
+                                f2_reason_counts[reason_base + cursor]
+                            )
+                            reason_cell_values.append(
+                                f2_reason_cells[reason_base + cursor]
+                            )
+                        stage_reason_values.append(tuple(reason_values))
+                        stage_reason_cell_values.append(
+                            tuple(reason_cell_values)
+                        )
+                        reason_values = []
+                        reason_cell_values = []
+                        reason_base = (
+                            profile_index * GENERATION_FORWARD_REASON_COUNT
+                        )
+                        for cursor in range(GENERATION_FORWARD_REASON_COUNT):
+                            reason_values.append(
+                                forward_reason_counts[reason_base + cursor]
+                            )
+                            reason_cell_values.append(
+                                forward_reason_cells[reason_base + cursor]
+                            )
+                        stage_reason_values.append(tuple(reason_values))
+                        stage_reason_cell_values.append(
+                            tuple(reason_cell_values)
+                        )
+                        reason_values = []
+                        reason_cell_values = []
+                        reason_base = (
+                            profile_index * GENERATION_BACKWARD_REASON_COUNT
+                        )
+                        for cursor in range(GENERATION_BACKWARD_REASON_COUNT):
+                            reason_values.append(
+                                backward_reason_counts[reason_base + cursor]
+                            )
+                            reason_cell_values.append(
+                                backward_reason_cells[reason_base + cursor]
+                            )
+                        stage_reason_values.append(tuple(reason_values))
+                        stage_reason_cell_values.append(
+                            tuple(reason_cell_values)
+                        )
+                        reason_values = []
+                        reason_cell_values = []
+                        reason_base = (
+                            profile_index * GENERATION_RESCORE_REASON_COUNT
+                        )
+                        for cursor in range(GENERATION_RESCORE_REASON_COUNT):
+                            reason_values.append(
+                                rescore_reason_counts[reason_base + cursor]
+                            )
+                            reason_cell_values.append(
+                                rescore_reason_cells[reason_base + cursor]
+                            )
+                        stage_reason_values.append(tuple(reason_values))
+                        stage_reason_cell_values.append(
+                            tuple(reason_cell_values)
+                        )
+                        profile_records.append(
+                            (
+                                tuple(metric_values),
+                                tuple(stage_reason_values),
+                                tuple(stage_reason_cell_values),
+                            )
+                        )
+                    native_totals = {
+                        "forward": {
+                            "candidate_count": native_statistics.candidate_count,
+                            "survivor_count": native_statistics.survivor_count,
+                            "work_cells": native_statistics.work_cells,
+                            "output_cap_fallback_count": (
+                                native_statistics.output_cap_fallback_count
+                            ),
+                        },
+                        "backward_domain": {
+                            "candidate_count": (
+                                native_domain_statistics.candidate_count
+                            ),
+                            "device_result_count": (
+                                native_domain_statistics.device_result_count
+                            ),
+                            "cpu_required_count": (
+                                native_domain_statistics.cpu_required_count
+                            ),
+                            "work_cells": native_domain_statistics.work_cells,
+                        },
+                        "rescore": (
+                            {
+                                "region_count": (
+                                    native_rescore_statistics.region_count
+                                ),
+                                "device_result_count": (
+                                    native_rescore_statistics.device_result_count
+                                ),
+                                "cpu_required_count": (
+                                    native_rescore_statistics.cpu_required_count
+                                ),
+                                "work_cells": (
+                                    native_rescore_statistics.work_cells
+                                ),
+                            }
+                            if native_rescore_statistics != NULL
+                            else None
+                        ),
+                    }
+                    generation_statistics = (
+                        _telemetry_module.build_generation_statistics(
+                            GENERATION_TELEMETRY_SCHEMA_VERSION,
+                            profile_count,
+                            self._sequence_count,
+                            total_target_residues,
+                            tuple(profile_records),
+                            int(forward_call_facts),
+                            int(journal_total_bytes),
+                            native_totals,
+                        )
+                    )
             except:
                 if rescore_output != NULL:
                     plan7_domain_rescore_output_destroy(
@@ -5334,6 +6561,12 @@ cdef class SequenceBatch:
                 plan7_forward_output_destroy(&output, NULL, 0)
             if rescore_simple_diagnostic:
                 return journal_capsule, rescore_payload
+            if collect_generation_telemetry:
+                return (
+                    journal_capsule,
+                    sealed_stage_timings,
+                    generation_statistics,
+                )
             return journal_capsule, sealed_stage_timings
 
         try:
@@ -5466,6 +6699,7 @@ cdef class SequenceBatch:
             <float> 0.10,
             <float> 0.20,
             <float> 2.0e-4,
+            None,
         )
 
     def _postfilter_forward_domain_selection_sealed(
@@ -5483,6 +6717,7 @@ cdef class SequenceBatch:
         int _rescore_test_fault=0,
         uint64_t generation_tail_fingerprint=0,
         bint _return_stage_timings=False,
+        bint _return_generation_statistics=False,
     ):
         """Run the fused package-internal path and return one opaque seal.
 
@@ -5492,17 +6727,34 @@ cdef class SequenceBatch:
         cdef object postfilter_records
         cdef object postfilter_offsets
         cdef object result
+        cdef object generation_telemetry_seed = None
+        cdef object postfilter_reason_facts = None
         cdef carray residue_offsets
         cdef size_t index
 
-        if rescore_simple_diagnostic and _return_stage_timings:
+        if rescore_simple_diagnostic and (
+            _return_stage_timings or _return_generation_statistics
+        ):
             raise ValueError(
-                "stage-timing transport cannot be combined with rescore diagnostics"
+                "sealed telemetry cannot be combined with rescore diagnostics"
             )
 
-        postfilter_records, postfilter_offsets = (
-            self.postfilter_profile_selection_csr_raw(selection, f1)
-        )
+        if _return_generation_statistics:
+            (
+                postfilter_records,
+                postfilter_offsets,
+                postfilter_reason_facts,
+            ) = self.postfilter_profile_selection_csr_raw(
+                selection, f1, _return_reason_facts=True
+            )
+            generation_telemetry_seed = (
+                GENERATION_TELEMETRY_SCHEMA_VERSION,
+                postfilter_reason_facts,
+            )
+        else:
+            postfilter_records, postfilter_offsets = (
+                self.postfilter_profile_selection_csr_raw(selection, f1)
+            )
         residue_offsets = clone(
             _UINT64_ARRAY_TEMPLATE, self._sequence_count + 1, False
         )
@@ -5538,8 +6790,13 @@ cdef class SequenceBatch:
             <float> 0.10,
             <float> 0.20,
             guard_band,
+            generation_telemetry_seed,
         )
-        if rescore_simple_diagnostic or _return_stage_timings:
+        if (
+            rescore_simple_diagnostic
+            or _return_stage_timings
+            or _return_generation_statistics
+        ):
             return result
         return result[0]
 
@@ -5644,6 +6901,7 @@ cdef class SequenceBatch:
         self,
         ProfileSelection selection,
         double f1,
+        bint _return_reason_facts=False,
     ):
         """Run a sealed selection without reading any live optimized profile."""
         cdef plan7_profile_selection_view view = selection._view()
@@ -5661,6 +6919,8 @@ cdef class SequenceBatch:
         cdef bytearray records
         cdef uint8_t[::1] record_view
         cdef carray offsets
+        cdef vector[uint16_t] reason_facts
+        cdef bytes reason_storage
 
         if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
             raise RuntimeError("array('Q') is not native uint64")
@@ -5691,6 +6951,8 @@ cdef class SequenceBatch:
         candidate_count = self._candidate_indices.size()
         self._bias_candidate_offsets[profile_count] = candidate_count
         self._postfilter_results.resize(candidate_count)
+        if _return_reason_facts:
+            reason_facts.resize(candidate_count)
 
         if candidate_count:
             error[0] = 0
@@ -5699,21 +6961,42 @@ cdef class SequenceBatch:
                     selection._selection, &database, error, sizeof(error)
                 )
             if status == 0:
-                with nogil:
-                    status = plan7_ssv_sequence_batch_postfilter_candidates_many(
-                        self._batch,
-                        self._bias_profiles.data(),
-                        profile_count,
-                        self._bias_candidate_offsets.data(),
-                        self._candidate_indices.data(),
-                        candidate_count,
-                        view.identity_tokens,
-                        database,
-                        self._postfilter_results.data(),
-                        candidate_count,
-                        error,
-                        sizeof(error),
-                    )
+                if _return_reason_facts:
+                    with nogil:
+                        status = (
+                            plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
+                                self._batch,
+                                self._bias_profiles.data(),
+                                profile_count,
+                                self._bias_candidate_offsets.data(),
+                                self._candidate_indices.data(),
+                                candidate_count,
+                                view.identity_tokens,
+                                database,
+                                self._postfilter_results.data(),
+                                candidate_count,
+                                reason_facts.data(),
+                                candidate_count,
+                                error,
+                                sizeof(error),
+                            )
+                        )
+                else:
+                    with nogil:
+                        status = plan7_ssv_sequence_batch_postfilter_candidates_many(
+                            self._batch,
+                            self._bias_profiles.data(),
+                            profile_count,
+                            self._bias_candidate_offsets.data(),
+                            self._candidate_indices.data(),
+                            candidate_count,
+                            view.identity_tokens,
+                            database,
+                            self._postfilter_results.data(),
+                            candidate_count,
+                            error,
+                            sizeof(error),
+                        )
                 destroy_error[0] = 0
                 with nogil:
                     destroy_status = plan7_viterbi_database_destroy(
@@ -5738,6 +7021,19 @@ cdef class SequenceBatch:
             offsets.data.as_ulonglongs[profile_index] = <uint64_t> (
                 self._bias_candidate_offsets[profile_index]
             )
+        if _return_reason_facts:
+            if candidate_count > (<size_t> PY_SSIZE_T_MAX // sizeof(uint16_t)):
+                raise OverflowError("post-filter reason facts exceed Python limits")
+            reason_storage = PyBytes_FromStringAndSize(
+                NULL, candidate_count * sizeof(uint16_t)
+            )
+            if candidate_count:
+                memcpy(
+                    PyBytes_AS_STRING(reason_storage),
+                    reason_facts.data(),
+                    candidate_count * sizeof(uint16_t),
+                )
+            return records, offsets, reason_storage
         return records, offsets
 
     cdef size_t _run_postfilter_candidates_many(

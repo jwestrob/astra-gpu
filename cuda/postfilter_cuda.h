@@ -15,6 +15,26 @@ enum plan7_postfilter_abi {
   PLAN7_POSTFILTER_RECORD_SIZE = 16
 };
 
+/* Opt-in, nonsemantic source-transition facts. These bits live in a separate
+ * diagnostic sidecar and never enter the version-1 result record or its
+ * provenance. Multiple facts may apply to one retained F1 row. */
+enum plan7_postfilter_reason_fact {
+  PLAN7_POSTFILTER_REASON_RAW_F1_REJECT = UINT16_C(0x0001),
+  PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE = UINT16_C(0x0002),
+  PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU = UINT16_C(0x0004),
+  PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO = UINT16_C(0x0008),
+  PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED = UINT16_C(0x0010),
+  PLAN7_POSTFILTER_REASON_BIAS_SCORE_NONFINITE = UINT16_C(0x0020),
+  PLAN7_POSTFILTER_REASON_BIAS_CUTOFF_UNRESOLVED = UINT16_C(0x0040),
+  PLAN7_POSTFILTER_REASON_VITERBI_ERANGE = UINT16_C(0x0080),
+  PLAN7_POSTFILTER_REASON_VITERBI_NO_RESULT_OR_OTHER_STATUS = UINT16_C(0x0100),
+  PLAN7_POSTFILTER_REASON_FINAL_CPU_REQUIRED = UINT16_C(0x0200),
+  PLAN7_POSTFILTER_REASON_FINAL_REJECT = UINT16_C(0x0400),
+  PLAN7_POSTFILTER_REASON_FINAL_PASS = UINT16_C(0x0800),
+  PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED = UINT16_C(0x1000),
+  PLAN7_POSTFILTER_REASON_CONTRACT_FALLBACK = UINT16_C(0x2000)
+};
+
 /*
  * Version 1 deliberately preserves plan7_bias_result as its 12-byte prefix.
  * A finite vfsc or +INFINITY is an exact external Viterbi score. A NaN vfsc
@@ -251,6 +271,32 @@ int plan7_postfilter_candidates_device_with_workspace(
   plan7_bias_ssv_input *device_msv_inputs,
   size_t candidate_count,
   plan7_postfilter_result *host_results,
+  char *error,
+  size_t error_size);
+
+/* Opt-in diagnostic twin of the resident-workspace entry point. The ordinary
+ * function above has no reason-sidecar allocation, kernel writes, or copies.
+ * reason_facts has exactly candidate_count uint16_t entries. */
+int plan7_postfilter_candidates_device_with_workspace_reason_facts(
+  plan7_postfilter_workspace *workspace,
+  const plan7_viterbi_database *database,
+  const uint8_t *device_residues,
+  const uint64_t *device_sequence_offsets,
+  const uint64_t *host_sequence_lengths,
+  size_t sequence_count,
+  const float *device_null_scores,
+  const uint8_t *device_compact_scores,
+  const plan7_ssv_f1_profile *device_f1_profiles,
+  const uint8_t *device_tjb,
+  const float *device_length_logp,
+  const float *device_length_log1mp,
+  const plan7_bias_profile *device_bias_profiles,
+  const plan7_bias_candidate *device_candidates,
+  const plan7_bias_candidate *host_candidates,
+  plan7_bias_ssv_input *device_msv_inputs,
+  size_t candidate_count,
+  plan7_postfilter_result *host_results,
+  uint16_t *reason_facts,
   char *error,
   size_t error_size);
 

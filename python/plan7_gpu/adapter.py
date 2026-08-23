@@ -1001,6 +1001,21 @@ class CandidateBatch:
             raise RuntimeError("candidate resident bytes are not exact nonnegative int")
         return value
 
+    @property
+    def generation_statistics(self) -> dict[str, Any] | None:
+        """Return defensive opt-in generation telemetry, if it was collected."""
+        state = _candidate_state(self)
+        if state.sealed_postfilter is None:
+            return None
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        value = _pipeline._sealed_generation_statistics_bound(
+            state.sealed_postfilter
+        )
+        if value is not None and type(value) is not dict:
+            raise RuntimeError("sealed generation statistics are not a dict")
+        return value
+
     def _row_index(self, row: int) -> int:
         if isinstance(row, bool):
             raise TypeError("candidate row must be an integer, not bool")
@@ -1032,13 +1047,21 @@ class CandidateBatch:
         offsets = memoryview(state.offsets).cast("Q")
         return offsets[row_index + 1] - offsets[row_index]
 
-    def search(self, row: int, pipeline: Any) -> Any:
+    def search(
+        self,
+        row: int,
+        pipeline: Any,
+        *,
+        return_telemetry: bool = False,
+    ) -> Any:
         """Search one bound row using an exclusively owned matching pipeline.
 
         The caller must not inspect, mutate, clear, or use ``pipeline`` from
         another thread until this call returns.
         """
         row_index = self._row_index(row)
+        if type(return_telemetry) is not bool:
+            raise TypeError("return_telemetry must be bool")
         if type(pipeline) is not pyhmmer.plan7.Pipeline:
             raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
         if not _native.bias_host_environment_attested():
@@ -1054,11 +1077,23 @@ class CandidateBatch:
         if sealed_postfilter is not None:
             with _lease_pipeline(pipeline):
                 with state.lock:
+                    if return_telemetry:
+                        return _pipeline._search_hmm_sealed_postfilter_bound(
+                            sealed_postfilter,
+                            row_index,
+                            pipeline,
+                            _return_route_statistics=True,
+                        )
+                    # Preserve the exact pre-telemetry call boundary in the
+                    # default path, including monkeypatched/private callers.
                     return _pipeline._search_hmm_sealed_postfilter_bound(
-                        sealed_postfilter,
-                        row_index,
-                        pipeline,
+                        sealed_postfilter, row_index, pipeline
                     )
+
+        if return_telemetry:
+            raise ValueError(
+                "continuation telemetry requires a sealed fused batch"
+            )
 
         postfilter_records = candidate_state.postfilter_records
         forward = candidate_state.forward
@@ -1629,6 +1664,7 @@ class SequenceBatch:
         _rescore_matrix_byte_budget: int = 0,
         _rescore_trace_byte_budget: int = 0,
         _rescore_test_fault: int = 0,
+        telemetry: bool = False,
     ) -> CandidateBatch:
         """Build a sealed selection batch with bounded Forward results."""
         try:
@@ -1638,6 +1674,8 @@ class SequenceBatch:
             raise ValueError("Forward thresholds must be real numbers") from error
         if type(bias_filter) is not bool:
             raise TypeError("bias_filter must be bool")
+        if type(telemetry) is not bool:
+            raise TypeError("telemetry must be bool")
         if pipeline is not None:
             return self._postfilter_forward_domain_selection(
                 selection,
@@ -1651,6 +1689,7 @@ class SequenceBatch:
                 _rescore_matrix_byte_budget,
                 _rescore_trace_byte_budget,
                 _rescore_test_fault,
+                telemetry,
             )
         if any(
             value != 0
@@ -1662,6 +1701,10 @@ class SequenceBatch:
             )
         ):
             raise ValueError("domain-rescore controls require a pipeline")
+        if telemetry:
+            raise ValueError(
+                "generation telemetry requires a sealed fused pipeline batch"
+            )
         return self._postfilter_selection(
             selection, F1, (f2, f3, bias_filter)
         )
@@ -1679,6 +1722,7 @@ class SequenceBatch:
         rescore_matrix_byte_budget: int,
         rescore_trace_byte_budget: int,
         rescore_test_fault: int,
+        telemetry: bool,
     ) -> CandidateBatch:
         """Build one opaque fused Forward/domain continuation batch."""
         from . import _pipeline  # type: ignore[attr-defined]
@@ -1752,6 +1796,7 @@ class SequenceBatch:
         unique_locks = {id(state.lock): state.lock for state in states}
         capsule: Any | None = None
         native_stage_timings: Any | None = None
+        generation_statistics: Any | None = None
         compact_tail_fingerprint = 0
 
         with _lease_pipeline(pipeline):
@@ -1804,7 +1849,7 @@ class SequenceBatch:
                         raise RuntimeError(
                             "native profile selection fingerprint changed"
                         )
-                    capsule, native_stage_timings = (
+                    native_result = (
                         sequence_state.native._postfilter_forward_domain_selection_sealed(
                             selection_state.native,
                             threshold,
@@ -1826,8 +1871,17 @@ class SequenceBatch:
                                 compact_tail_fingerprint
                             ),
                             _return_stage_timings=True,
+                            _return_generation_statistics=telemetry,
                         )
                     )
+                    if telemetry:
+                        (
+                            capsule,
+                            native_stage_timings,
+                            generation_statistics,
+                        ) = native_result
+                    else:
+                        capsule, native_stage_timings = native_result
 
             with ExitStack() as locks:
                 for lock_id in sorted(unique_locks):
@@ -1868,10 +1922,12 @@ class SequenceBatch:
                         pipeline,
                         guard,
                         native_stage_timings,
+                        generation_statistics,
                     )
                 )
                 capsule = None
                 native_stage_timings = None
+                generation_statistics = None
 
         offsets = array("Q", [0]) * (len(selection_state.pairs) + 1)
         return _new_candidate_batch(

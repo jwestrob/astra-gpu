@@ -642,6 +642,83 @@ __global__ void merge_results_kernel(
   results[candidate] = output;
 }
 
+__global__ void postfilter_reason_facts_kernel(
+    const plan7_bias_profile *profiles,
+    const plan7_bias_candidate *candidates,
+    const plan7_bias_ssv_input *msv_results,
+    const uint8_t *states,
+    const plan7_bias_ssv_input *bias_inputs,
+    const plan7_bias_result *bias_results,
+    const VitResult *vit_results,
+    const plan7_postfilter_result *results,
+    size_t candidate_count,
+    uint16_t *reason_facts) {
+  const size_t candidate =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (candidate >= candidate_count) return;
+
+  const CandidateState state = static_cast<CandidateState>(states[candidate]);
+  const plan7_bias_result bias = bias_results[candidate];
+  const plan7_postfilter_result output = results[candidate];
+  uint16_t facts = 0;
+  if (state == kCandidateRawReject)
+    facts |= PLAN7_POSTFILTER_REASON_RAW_F1_REJECT;
+  else if (state == kCandidateMsvRange)
+    facts |= PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE;
+  else if (state == kCandidateCpu)
+    facts |= PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU;
+
+  if (state == kCandidateFinite) {
+    const plan7_bias_ssv_input bias_input = bias_inputs[candidate];
+    if (bias_input.status != PLAN7_SSV_OK) {
+      facts |= PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO;
+    } else if (!isfinite(bias.filtersc)) {
+      /* bias_filter_score writes filtersc only after its complete finite
+       * recurrence, so a nonfinite retained value is its exact false path. */
+      facts |= PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED;
+    } else {
+      const plan7_bias_candidate mapping = candidates[candidate];
+      const plan7_bias_profile profile = profiles[mapping.profile_index];
+      float usc = __int2float_rn(static_cast<int>(bias_input.numerator));
+      usc = __fdiv_rn(usc, profile.scale);
+      usc = __fsub_rn(usc, 3.0f);
+      const float bit_score = __double2float_rn(__ddiv_rn(
+          static_cast<double>(__fsub_rn(usc, bias.filtersc)), kLog2));
+      if (!isfinite(usc) || !isfinite(bit_score))
+        facts |= PLAN7_POSTFILTER_REASON_BIAS_SCORE_NONFINITE;
+      else if (bias.action == PLAN7_BIAS_CPU_REQUIRED)
+        facts |= PLAN7_POSTFILTER_REASON_BIAS_CUTOFF_UNRESOLVED;
+    }
+
+    if (bias.action != PLAN7_BIAS_CPU_REQUIRED) {
+      if (vit_results[candidate].status == PLAN7_SSV_ERANGE)
+        facts |= PLAN7_POSTFILTER_REASON_VITERBI_ERANGE;
+      else if (vit_results[candidate].status != PLAN7_SSV_OK)
+        facts |= PLAN7_POSTFILTER_REASON_VITERBI_NO_RESULT_OR_OTHER_STATUS;
+    }
+  }
+
+  if (output.action == PLAN7_BIAS_CPU_REQUIRED) {
+    facts |= PLAN7_POSTFILTER_REASON_FINAL_CPU_REQUIRED;
+    constexpr uint16_t explained =
+        PLAN7_POSTFILTER_REASON_FULL_MSV_ERANGE |
+        PLAN7_POSTFILTER_REASON_CANDIDATE_STATE_CPU |
+        PLAN7_POSTFILTER_REASON_BIAS_INPUT_STATUS_NONZERO |
+        PLAN7_POSTFILTER_REASON_BIAS_FILTER_SCORE_FAILED |
+        PLAN7_POSTFILTER_REASON_BIAS_SCORE_NONFINITE |
+        PLAN7_POSTFILTER_REASON_BIAS_CUTOFF_UNRESOLVED |
+        PLAN7_POSTFILTER_REASON_VITERBI_ERANGE |
+        PLAN7_POSTFILTER_REASON_VITERBI_NO_RESULT_OR_OTHER_STATUS;
+    if ((facts & explained) == 0)
+      facts |= PLAN7_POSTFILTER_REASON_OTHER_CPU_REQUIRED;
+  } else if (output.action == PLAN7_BIAS_DEFINITE_REJECT) {
+    facts |= PLAN7_POSTFILTER_REASON_FINAL_REJECT;
+  } else if (output.action == PLAN7_BIAS_DEFINITE_PASS) {
+    facts |= PLAN7_POSTFILTER_REASON_FINAL_PASS;
+  }
+  reason_facts[candidate] = facts;
+}
+
 }  // namespace
 
 namespace {
@@ -2199,7 +2276,14 @@ extern "C" int plan7_viterbi_database_matches_ssv(
   return 0;
 }
 
-extern "C" int plan7_postfilter_candidates_device_with_workspace(
+namespace {
+
+struct ScopedReasonFacts {
+  uint16_t *device = nullptr;
+  ~ScopedReasonFacts() { cudaFree(device); }
+};
+
+int postfilter_candidates_device_with_workspace_impl(
     plan7_postfilter_workspace *workspace,
     const plan7_viterbi_database *database, const uint8_t *device_residues,
     const uint64_t *device_sequence_offsets,
@@ -2212,7 +2296,8 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
     const plan7_bias_candidate *device_candidates,
     const plan7_bias_candidate *host_candidates,
     plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
-    plan7_postfilter_result *host_results, char *error, size_t error_size) {
+    plan7_postfilter_result *host_results, uint16_t *host_reason_facts,
+    char *error, size_t error_size) {
   if (workspace == nullptr || database == nullptr || device_residues == nullptr ||
       device_sequence_offsets == nullptr || host_sequence_lengths == nullptr ||
       device_null_scores == nullptr || device_compact_scores == nullptr ||
@@ -2329,6 +2414,7 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
   size_t bias_result_bytes;
   size_t vit_result_bytes;
   size_t post_result_bytes;
+  size_t reason_fact_bytes = 0;
   if (!checked_bytes(candidate_count + 1, sizeof(uint64_t), &offset_bytes) ||
       !checked_bytes(candidate_count, sizeof(VitLengthTransitions),
                      &move_bytes) ||
@@ -2339,6 +2425,8 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
       !checked_bytes(candidate_count, sizeof(VitResult), &vit_result_bytes) ||
       !checked_bytes(candidate_count, sizeof(plan7_postfilter_result),
                      &post_result_bytes) ||
+      (host_reason_facts != nullptr &&
+       !checked_bytes(candidate_count, sizeof(uint16_t), &reason_fact_bytes)) ||
       !checked_bytes(candidate_count, 1, &candidate_bytes)) {
     set_error(error, error_size, "post-filter workspace size overflow");
     return -1;
@@ -2346,6 +2434,7 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
 
   const unsigned blocks = static_cast<unsigned>(
       (candidate_count - 1) / kThreads + 1);
+  ScopedReasonFacts reason_storage;
 
 #define CUDA_RUN(call)                                                        \
   do {                                                                        \
@@ -2402,6 +2491,8 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
                             "cudaMalloc(post-filter results)", error,
                             error_size) != 0)
     return -1;
+  if (host_reason_facts != nullptr)
+    CUDA_RUN(cudaMalloc(&reason_storage.device, reason_fact_bytes));
   CUDA_RUN(cudaMemcpy(workspace->device_moves, host_moves.data(), move_bytes,
                       cudaMemcpyHostToDevice));
   CUDA_RUN(cudaMemcpy(workspace->device_msv_offsets, host_msv_offsets.data(),
@@ -2459,10 +2550,73 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
       workspace->device_bias_results, workspace->device_vit_results,
       candidate_count, workspace->device_results);
   CUDA_RUN(cudaGetLastError());
+  if (host_reason_facts != nullptr) {
+    postfilter_reason_facts_kernel<<<blocks, kThreads>>>(
+        device_bias_profiles, device_candidates, device_msv_inputs,
+        workspace->device_states, workspace->device_bias_inputs,
+        workspace->device_bias_results, workspace->device_vit_results,
+        workspace->device_results, candidate_count, reason_storage.device);
+    CUDA_RUN(cudaGetLastError());
+    CUDA_RUN(cudaMemcpy(host_reason_facts, reason_storage.device,
+                        reason_fact_bytes, cudaMemcpyDeviceToHost));
+  }
   CUDA_RUN(cudaMemcpy(host_results, workspace->device_results, post_result_bytes,
                       cudaMemcpyDeviceToHost));
   return 0;
 #undef CUDA_RUN
+}
+
+}  // namespace
+
+extern "C" int plan7_postfilter_candidates_device_with_workspace(
+    plan7_postfilter_workspace *workspace,
+    const plan7_viterbi_database *database, const uint8_t *device_residues,
+    const uint64_t *device_sequence_offsets,
+    const uint64_t *host_sequence_lengths, size_t sequence_count,
+    const float *device_null_scores, const uint8_t *device_compact_scores,
+    const plan7_ssv_f1_profile *device_f1_profiles,
+    const uint8_t *device_tjb, const float *device_length_logp,
+    const float *device_length_log1mp,
+    const plan7_bias_profile *device_bias_profiles,
+    const plan7_bias_candidate *device_candidates,
+    const plan7_bias_candidate *host_candidates,
+    plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
+    plan7_postfilter_result *host_results, char *error, size_t error_size) {
+  return postfilter_candidates_device_with_workspace_impl(
+      workspace, database, device_residues, device_sequence_offsets,
+      host_sequence_lengths, sequence_count, device_null_scores,
+      device_compact_scores, device_f1_profiles, device_tjb,
+      device_length_logp, device_length_log1mp, device_bias_profiles,
+      device_candidates, host_candidates, device_msv_inputs, candidate_count,
+      host_results, nullptr, error, error_size);
+}
+
+extern "C" int plan7_postfilter_candidates_device_with_workspace_reason_facts(
+    plan7_postfilter_workspace *workspace,
+    const plan7_viterbi_database *database, const uint8_t *device_residues,
+    const uint64_t *device_sequence_offsets,
+    const uint64_t *host_sequence_lengths, size_t sequence_count,
+    const float *device_null_scores, const uint8_t *device_compact_scores,
+    const plan7_ssv_f1_profile *device_f1_profiles,
+    const uint8_t *device_tjb, const float *device_length_logp,
+    const float *device_length_log1mp,
+    const plan7_bias_profile *device_bias_profiles,
+    const plan7_bias_candidate *device_candidates,
+    const plan7_bias_candidate *host_candidates,
+    plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
+    plan7_postfilter_result *host_results, uint16_t *reason_facts,
+    char *error, size_t error_size) {
+  if (candidate_count != 0 && reason_facts == nullptr) {
+    set_error(error, error_size, "post-filter reason output is null");
+    return -1;
+  }
+  return postfilter_candidates_device_with_workspace_impl(
+      workspace, database, device_residues, device_sequence_offsets,
+      host_sequence_lengths, sequence_count, device_null_scores,
+      device_compact_scores, device_f1_profiles, device_tjb,
+      device_length_logp, device_length_log1mp, device_bias_profiles,
+      device_candidates, host_candidates, device_msv_inputs, candidate_count,
+      host_results, reason_facts, error, error_size);
 }
 
 extern "C" int plan7_postfilter_candidates_device(

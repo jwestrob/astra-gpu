@@ -340,6 +340,24 @@ int plan7_ssv_sequence_batch_postfilter_candidates_many(
   char *error,
   size_t error_size);
 
+/* Additive diagnostic entry point. The result ABI is unchanged; one uint16_t
+ * source-fact word is returned for each ordinary result row. */
+int plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  const uintptr_t *source_profile_pointers,
+  const struct plan7_viterbi_database *viterbi_database,
+  struct plan7_postfilter_result *results,
+  size_t result_count,
+  uint16_t *reason_facts,
+  size_t reason_count,
+  char *error,
+  size_t error_size);
+
 int plan7_ssv_filter_cuda(const uint8_t *striped_scores,
                           size_t striped_score_count,
                           int score_stride,

@@ -262,6 +262,13 @@ __device__ __forceinline__ float emission_value(
                        kSubwarp + sublane];
 }
 
+template <bool CollectReasonFacts>
+__device__ __forceinline__ void add_backward_reason(
+    uint16_t *reason_facts, size_t candidate, uint16_t reason) {
+  if constexpr (CollectReasonFacts) reason_facts[candidate] |= reason;
+}
+
+template <bool CollectReasonFacts>
 __global__ void backward_domain_kernel(
     const uint8_t *residues, const uint64_t *sequence_offsets,
     const plan7_forward_device_profile *profiles, const float *emissions,
@@ -273,7 +280,8 @@ __global__ void backward_domain_kernel(
     float rt1, float rt2, float rt3, float guard_band,
     float *dp_storage, float *backward_specials,
     plan7_domain_posterior *posteriors,
-    plan7_backward_domain_result *results) {
+    plan7_backward_domain_result *results,
+    uint16_t *reason_facts) {
   const int lane = threadIdx.x & 31;
   const int warp_in_block = threadIdx.x >> 5;
   if (lane >= kSubwarp) return;
@@ -499,7 +507,14 @@ __global__ void backward_domain_kernel(
     result.status = PLAN7_BACKWARD_DOMAIN_OK;
     result.route = PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED;
     result.has_own_scales = own_scales ? 1 : 0;
+    if (own_scales)
+      add_backward_reason<CollectReasonFacts>(
+          reason_facts, candidate,
+          PLAN7_BACKWARD_DOMAIN_REASON_HAS_OWN_SCALES);
     if (isnan(xN) || xN == 0.0f || isinf(xN)) {
+      add_backward_reason<CollectReasonFacts>(
+          reason_facts, candidate,
+          PLAN7_BACKWARD_DOMAIN_REASON_TERMINAL_SCORE_INVALID);
       result.backward_score = nanf("");
       result.status = PLAN7_BACKWARD_DOMAIN_ERANGE;
       results[candidate] = result;
@@ -552,6 +567,9 @@ __global__ void backward_domain_kernel(
                isfinite(posterior[i].mocc);
     }
     if (!finite || !isfinite(result.backward_score)) {
+      add_backward_reason<CollectReasonFacts>(
+          reason_facts, candidate,
+          PLAN7_BACKWARD_DOMAIN_REASON_POSTERIOR_OR_BACKWARD_SCORE_NONFINITE);
       result.status = PLAN7_BACKWARD_DOMAIN_ERANGE;
       results[candidate] = result;
       return;
@@ -595,16 +613,32 @@ __global__ void backward_domain_kernel(
     result.uncertain_count = uncertain;
     result.region_count = regions;
     result.multidomain_count = multidomain;
+    if (uncertain != 0)
+      add_backward_reason<CollectReasonFacts>(
+          reason_facts, candidate,
+          PLAN7_BACKWARD_DOMAIN_REASON_THRESHOLD_UNCERTAIN);
+    if (multidomain != 0)
+      add_backward_reason<CollectReasonFacts>(
+          reason_facts, candidate,
+          PLAN7_BACKWARD_DOMAIN_REASON_MULTIDOMAIN);
     result.nexpected = posterior[L].btot;
     if (!(result.nexpected >= 0.0f) ||
         !(result.nexpected <= static_cast<float>(L))) {
+      add_backward_reason<CollectReasonFacts>(
+          reason_facts, candidate,
+          PLAN7_BACKWARD_DOMAIN_REASON_NEXPECTED_INVALID);
       result.status = PLAN7_BACKWARD_DOMAIN_ERANGE;
       results[candidate] = result;
       return;
     }
-    if (uncertain == 0 && multidomain == 0)
+    if (uncertain == 0 && multidomain == 0) {
       result.route = regions == 0 ? PLAN7_BACKWARD_DOMAIN_NO_REGIONS
                                   : PLAN7_BACKWARD_DOMAIN_SIMPLE;
+      add_backward_reason<CollectReasonFacts>(
+          reason_facts, candidate,
+          regions == 0 ? PLAN7_BACKWARD_DOMAIN_REASON_NO_REGIONS
+                       : PLAN7_BACKWARD_DOMAIN_REASON_SIMPLE);
+    }
     results[candidate] = result;
   }
 }
@@ -661,10 +695,12 @@ struct DeviceBuffers {
   plan7_domain_posterior *posteriors = nullptr;
   plan7_simple_region *regions = nullptr;
   plan7_backward_domain_result *results = nullptr;
+  uint16_t *reason_facts = nullptr;
 };
 
 void free_device_buffers(DeviceBuffers *buffers) {
   if (buffers == nullptr) return;
+  cudaFree(buffers->reason_facts);
   cudaFree(buffers->results);
   cudaFree(buffers->regions);
   cudaFree(buffers->posteriors);
@@ -688,6 +724,7 @@ struct plan7_backward_domain_output {
   std::vector<plan7_domain_posterior> posteriors;
   std::vector<uint64_t> region_offsets;
   std::vector<plan7_simple_region> regions;
+  std::vector<uint16_t> reason_facts;
   plan7_backward_domain_statistics statistics;
   plan7_backward_domain_provenance provenance;
   float rt1 = NAN;
@@ -698,6 +735,27 @@ struct plan7_backward_domain_output {
 };
 
 namespace {
+
+template <typename SourceIndex>
+bool merge_backward_reason_facts(
+    const SourceIndex *active_sources, const uint16_t *active_facts,
+    size_t active_count, uint16_t *source_facts, size_t source_count) {
+  if ((active_count != 0 &&
+       (active_sources == nullptr || active_facts == nullptr)) ||
+      (source_count != 0 && source_facts == nullptr))
+    return false;
+  size_t previous = 0;
+  bool have_previous = false;
+  for (size_t active = 0; active < active_count; ++active) {
+    const uint64_t source = static_cast<uint64_t>(active_sources[active]);
+    if (source >= source_count || (have_previous && source <= previous))
+      return false;
+    source_facts[static_cast<size_t>(source)] = active_facts[active];
+    previous = static_cast<size_t>(source);
+    have_previous = true;
+  }
+  return true;
+}
 
 bool seal_backward_domain_provenance(
     plan7_backward_domain_output *output,
@@ -766,7 +824,7 @@ int backward_domain_run_impl(
     const float *forward_specials, size_t forward_special_count,
     float rt1, float rt2, float rt3, float guard_band,
     uint64_t posterior_byte_budget,
-    bool unsealed_test,
+    bool unsealed_test, bool collect_reason_facts,
     plan7_backward_domain_output **output,
     char *error, size_t error_size) {
   const auto total_begin = std::chrono::steady_clock::now();
@@ -884,6 +942,8 @@ int backward_domain_run_impl(
     created->results.resize(candidate_count);
     created->posterior_offsets.assign(candidate_count + 1, 0);
     created->region_offsets.assign(candidate_count + 1, 0);
+    if (collect_reason_facts)
+      created->reason_facts.assign(candidate_count, 0);
   } catch (...) {
     set_error(error, error_size, "Backward/domain output allocation failed");
     return -1;
@@ -985,6 +1045,9 @@ int backward_domain_run_impl(
     result.route = PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED;
     if (L == 0) {
       result.status = PLAN7_BACKWARD_DOMAIN_EMPTY;
+      if (collect_reason_facts)
+        created->reason_facts[candidate] |=
+            PLAN7_BACKWARD_DOMAIN_REASON_TARGET_EMPTY;
       continue;
     }
     bool forward_valid = true;
@@ -992,6 +1055,9 @@ int backward_domain_run_impl(
          cell < forward_offsets[candidate + 1]; ++cell)
       if (!std::isfinite(forward_specials[cell])) {
         forward_valid = false;
+        if (collect_reason_facts)
+          created->reason_facts[candidate] |=
+              PLAN7_BACKWARD_DOMAIN_REASON_FORWARD_SPECIAL_NONFINITE;
         break;
       }
     if (forward_valid) {
@@ -1000,6 +1066,9 @@ int backward_domain_run_impl(
             forward_offsets[candidate] + i * p7X_NXCELLS + p7X_SCALE];
         if (!(row_scale >= 1.0f) || !std::isfinite(row_scale)) {
           forward_valid = false;
+          if (collect_reason_facts)
+            created->reason_facts[candidate] |=
+                PLAN7_BACKWARD_DOMAIN_REASON_FORWARD_SCALE_INVALID;
           break;
         }
       }
@@ -1010,12 +1079,18 @@ int backward_domain_run_impl(
     }
     if (!sequence_view.host_float_environment_valid) {
       result.status = PLAN7_BACKWARD_DOMAIN_ENORESULT;
+      if (collect_reason_facts)
+        created->reason_facts[candidate] |=
+            PLAN7_BACKWARD_DOMAIN_REASON_HOST_FLOAT_ENV_INVALID;
       continue;
     }
     if (profile.mode != p7_LOCAL || profile.nj != 1.0f) {
       /* The compact continuation currently supports canonical multihit-local
        * rows only. Do not emit a route that its HMMER consumer must reject. */
       result.status = PLAN7_BACKWARD_DOMAIN_ENORESULT;
+      if (collect_reason_facts)
+        created->reason_facts[candidate] |=
+            PLAN7_BACKWARD_DOMAIN_REASON_MODE_OR_NJ_UNSUPPORTED;
       continue;
     }
 
@@ -1042,6 +1117,9 @@ int backward_domain_run_impl(
         work_cells > kMaximumRunWorkCells - row_work_cells) {
       result.status = PLAN7_BACKWARD_DOMAIN_OK;
       ++created->statistics.work_cap_fallback_count;
+      if (collect_reason_facts)
+        created->reason_facts[candidate] |=
+            PLAN7_BACKWARD_DOMAIN_REASON_WORK_CAP;
       continue;
     }
     uint64_t next_posterior_bytes;
@@ -1064,6 +1142,9 @@ int backward_domain_run_impl(
         next_forward_bytes > kForwardSpecialByteLimit) {
       result.status = PLAN7_BACKWARD_DOMAIN_OK;
       ++created->statistics.output_cap_fallback_count;
+      if (collect_reason_facts)
+        created->reason_facts[candidate] |=
+            PLAN7_BACKWARD_DOMAIN_REASON_WORKSPACE_CAP;
       continue;
     }
     active_sources.push_back(candidate);
@@ -1092,6 +1173,8 @@ int backward_domain_run_impl(
   const size_t active_count = active_candidates.size();
   std::vector<plan7_backward_domain_result> active_results;
   active_results.resize(active_count);
+  std::vector<uint16_t> active_reason_facts;
+  if (collect_reason_facts) active_reason_facts.resize(active_count);
 
   DeviceBuffers buffers{};
   if (active_count != 0) {
@@ -1100,6 +1183,7 @@ int backward_domain_run_impl(
     size_t offset_bytes;
     size_t forward_special_bytes;
     size_t posterior_bytes;
+    size_t reason_bytes = 0;
     if (!checked_bytes(active_count,
                        sizeof(plan7_backward_domain_candidate),
                        &candidate_bytes) ||
@@ -1108,7 +1192,9 @@ int backward_domain_run_impl(
         !checked_bytes(active_count + 1, sizeof(uint64_t), &offset_bytes) ||
         !checked_bytes(active_forward_specials.size(), sizeof(float),
                        &forward_special_bytes) ||
-        requested_posterior_bytes > SIZE_MAX) {
+        requested_posterior_bytes > SIZE_MAX ||
+        (collect_reason_facts &&
+         !checked_bytes(active_count, sizeof(uint16_t), &reason_bytes))) {
       set_error(error, error_size, "Backward/domain device size overflow");
       return -1;
     }
@@ -1138,6 +1224,10 @@ int backward_domain_run_impl(
                         static_cast<size_t>(backward_bytes)));
     CUDA_RUN(cudaMalloc(&buffers.posteriors, posterior_bytes));
     CUDA_RUN(cudaMalloc(&buffers.results, result_bytes));
+    if (collect_reason_facts) {
+      CUDA_RUN(cudaMalloc(&buffers.reason_facts, reason_bytes));
+      CUDA_RUN(cudaMemset(buffers.reason_facts, 0, reason_bytes));
+    }
     CUDA_RUN(cudaMemcpy(buffers.candidates, active_candidates.data(),
                         candidate_bytes, cudaMemcpyHostToDevice));
     CUDA_RUN(cudaMemcpy(buffers.forward_offsets,
@@ -1163,14 +1253,29 @@ int backward_domain_run_impl(
     CUDA_RUN(cudaEventRecord(begin_event));
     const size_t block_count =
         (active_count + kCandidatesPerBlock - 1) / kCandidatesPerBlock;
-    backward_domain_kernel<<<static_cast<unsigned>(block_count), kThreads>>>(
-        sequence_view.device_residues, sequence_view.device_offsets,
-        profile_view.profiles, profile_view.emissions, profile_view.transitions,
-        buffers.candidates, buffers.forward_offsets, buffers.forward_specials,
-        buffers.dp_offsets, buffers.backward_offsets,
-        buffers.posterior_offsets, active_count, rt1, rt2, rt3, guard_band,
-        buffers.dp, buffers.backward_specials, buffers.posteriors,
-        buffers.results);
+    if (collect_reason_facts) {
+      backward_domain_kernel<true><<<
+          static_cast<unsigned>(block_count), kThreads>>>(
+          sequence_view.device_residues, sequence_view.device_offsets,
+          profile_view.profiles, profile_view.emissions,
+          profile_view.transitions, buffers.candidates,
+          buffers.forward_offsets, buffers.forward_specials,
+          buffers.dp_offsets, buffers.backward_offsets,
+          buffers.posterior_offsets, active_count, rt1, rt2, rt3, guard_band,
+          buffers.dp, buffers.backward_specials, buffers.posteriors,
+          buffers.results, buffers.reason_facts);
+    } else {
+      backward_domain_kernel<false><<<
+          static_cast<unsigned>(block_count), kThreads>>>(
+          sequence_view.device_residues, sequence_view.device_offsets,
+          profile_view.profiles, profile_view.emissions,
+          profile_view.transitions, buffers.candidates,
+          buffers.forward_offsets, buffers.forward_specials,
+          buffers.dp_offsets, buffers.backward_offsets,
+          buffers.posterior_offsets, active_count, rt1, rt2, rt3, guard_band,
+          buffers.dp, buffers.backward_specials, buffers.posteriors,
+          buffers.results, nullptr);
+    }
     CUDA_RUN(cudaGetLastError());
     CUDA_RUN(cudaEventRecord(end_event));
     CUDA_RUN(cudaEventSynchronize(end_event));
@@ -1184,6 +1289,9 @@ int backward_domain_run_impl(
     const auto download_begin = std::chrono::steady_clock::now();
     CUDA_RUN(cudaMemcpy(active_results.data(), buffers.results, result_bytes,
                         cudaMemcpyDeviceToHost));
+    if (collect_reason_facts)
+      CUDA_RUN(cudaMemcpy(active_reason_facts.data(), buffers.reason_facts,
+                          reason_bytes, cudaMemcpyDeviceToHost));
 
     std::vector<uint64_t> active_region_offsets;
     std::vector<uint64_t> active_diagnostic_offsets;
@@ -1217,6 +1325,9 @@ int backward_domain_run_impl(
             next_region_bytes > kSimpleRegionOutputByteLimit) {
           result.route = PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED;
           ++created->statistics.output_cap_fallback_count;
+          if (collect_reason_facts)
+            active_reason_facts[active] |=
+                PLAN7_BACKWARD_DOMAIN_REASON_REGION_OUTPUT_CAP;
         } else {
           region_count = next_regions;
         }
@@ -1290,6 +1401,14 @@ int backward_domain_run_impl(
 
     for (size_t active = 0; active < active_count; ++active)
       created->results[active_sources[active]] = active_results[active];
+    if (collect_reason_facts && !merge_backward_reason_facts(
+            active_sources.data(), active_reason_facts.data(), active_count,
+            created->reason_facts.data(), created->reason_facts.size())) {
+      free_device_buffers(&buffers);
+      set_error(error, error_size,
+                "Backward/domain reason source remap changed");
+      return -1;
+    }
     size_t active = 0;
     uint64_t posterior_offset = 0;
     uint64_t region_offset = 0;
@@ -1372,7 +1491,33 @@ extern "C" int plan7_backward_domain_run(
     return backward_domain_run_impl(
         database, batch, candidates, candidate_count, provenance,
         forward_offsets, forward_specials, forward_special_count,
-        rt1, rt2, rt3, guard_band, posterior_byte_budget, false,
+        rt1, rt2, rt3, guard_band, posterior_byte_budget, false, false,
+        output, error, error_size);
+  } catch (const std::bad_alloc &) {
+    set_error(error, error_size, "Backward/domain host allocation failed");
+    return -1;
+  } catch (...) {
+    set_error(error, error_size, "Backward/domain unexpected native failure");
+    return -1;
+  }
+}
+
+extern "C" int plan7_backward_domain_run_with_reason_facts(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const plan7_backward_domain_candidate *candidates,
+    size_t candidate_count, const plan7_forward_provenance *provenance,
+    const uint64_t *forward_offsets,
+    const float *forward_specials, size_t forward_special_count,
+    float rt1, float rt2, float rt3, float guard_band,
+    uint64_t posterior_byte_budget,
+    plan7_backward_domain_output **output,
+    char *error, size_t error_size) {
+  try {
+    return backward_domain_run_impl(
+        database, batch, candidates, candidate_count, provenance,
+        forward_offsets, forward_specials, forward_special_count,
+        rt1, rt2, rt3, guard_band, posterior_byte_budget, false, true,
         output, error, error_size);
   } catch (const std::bad_alloc &) {
     set_error(error, error_size, "Backward/domain host allocation failed");
@@ -1397,7 +1542,7 @@ extern "C" int plan7_backward_domain_unsealed_test_run(
     return backward_domain_run_impl(
         database, batch, candidates, candidate_count, nullptr,
         forward_offsets, forward_specials, forward_special_count,
-        rt1, rt2, rt3, guard_band, posterior_byte_budget, true,
+        rt1, rt2, rt3, guard_band, posterior_byte_budget, true, false,
         output, error, error_size);
   } catch (const std::bad_alloc &) {
     set_error(error, error_size,
@@ -1431,6 +1576,27 @@ plan7_backward_domain_output_results(
     const plan7_backward_domain_output *output) {
   return output == nullptr || output->results.empty()
              ? nullptr : output->results.data();
+}
+
+extern "C" size_t plan7_backward_domain_output_reason_count(
+    const plan7_backward_domain_output *output) {
+  return output == nullptr ? 0 : output->reason_facts.size();
+}
+
+extern "C" const uint16_t *plan7_backward_domain_output_reason_facts(
+    const plan7_backward_domain_output *output) {
+  return output == nullptr || output->reason_facts.empty()
+             ? nullptr : output->reason_facts.data();
+}
+
+extern "C" int plan7_backward_domain_merge_reason_facts_for_test(
+    const uint64_t *active_sources, const uint16_t *active_facts,
+    size_t active_count, uint16_t *source_facts, size_t source_count) {
+  return merge_backward_reason_facts(
+             active_sources, active_facts, active_count,
+             source_facts, source_count)
+             ? 0
+             : -1;
 }
 
 extern "C" const uint64_t *

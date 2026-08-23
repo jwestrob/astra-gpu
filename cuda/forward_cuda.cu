@@ -549,6 +549,7 @@ struct plan7_forward_output {
   plan7_forward_provenance provenance;
   float upload_milliseconds;
   float total_milliseconds;
+  bool contract_fallback = false;
 };
 
 namespace {
@@ -1575,6 +1576,7 @@ extern "C" int plan7_forward_run_with_workspace(
   if (!std::isfinite(f3) || f3 < 0.0 || batch_view.alphabet_size != 29 ||
       !batch_view.host_float_environment_valid ||
       plan7_bias_environment_attested(nullptr, 0) != 1) {
+    created->contract_fallback = true;
     if (!seal_forward_provenance(created.get(), database, batch_view, nullptr,
                                  filter_scores, generation_f3.bits)) {
       set_error(error, error_size, "Forward provenance sealing failed");
@@ -2096,6 +2098,11 @@ extern "C" float plan7_forward_output_upload_milliseconds(
 extern "C" float plan7_forward_output_total_milliseconds(
     const plan7_forward_output *output) {
   return output == nullptr ? 0.0f : output->total_milliseconds;
+}
+
+extern "C" int plan7_forward_output_contract_fallback(
+    const plan7_forward_output *output) {
+  return output != nullptr && output->contract_fallback ? 1 : 0;
 }
 
 extern "C" const plan7_forward_provenance *

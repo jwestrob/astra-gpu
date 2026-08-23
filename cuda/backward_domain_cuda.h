@@ -34,6 +34,28 @@ enum plan7_backward_domain_status {
   PLAN7_BACKWARD_DOMAIN_EMPTY = 255
 };
 
+/* Opt-in source-transition facts, kept out of the version-2 row and sealed
+ * provenance. Multiple facts may coexist on a conservative route. */
+enum plan7_backward_domain_reason_fact {
+  PLAN7_BACKWARD_DOMAIN_REASON_TARGET_EMPTY = UINT16_C(0x0001),
+  PLAN7_BACKWARD_DOMAIN_REASON_FORWARD_SPECIAL_NONFINITE = UINT16_C(0x0002),
+  PLAN7_BACKWARD_DOMAIN_REASON_FORWARD_SCALE_INVALID = UINT16_C(0x0004),
+  PLAN7_BACKWARD_DOMAIN_REASON_HOST_FLOAT_ENV_INVALID = UINT16_C(0x0008),
+  PLAN7_BACKWARD_DOMAIN_REASON_MODE_OR_NJ_UNSUPPORTED = UINT16_C(0x0010),
+  PLAN7_BACKWARD_DOMAIN_REASON_WORK_CAP = UINT16_C(0x0020),
+  PLAN7_BACKWARD_DOMAIN_REASON_WORKSPACE_CAP = UINT16_C(0x0040),
+  PLAN7_BACKWARD_DOMAIN_REASON_TERMINAL_SCORE_INVALID = UINT16_C(0x0080),
+  PLAN7_BACKWARD_DOMAIN_REASON_POSTERIOR_OR_BACKWARD_SCORE_NONFINITE =
+      UINT16_C(0x0100),
+  PLAN7_BACKWARD_DOMAIN_REASON_NEXPECTED_INVALID = UINT16_C(0x0200),
+  PLAN7_BACKWARD_DOMAIN_REASON_HAS_OWN_SCALES = UINT16_C(0x0400),
+  PLAN7_BACKWARD_DOMAIN_REASON_THRESHOLD_UNCERTAIN = UINT16_C(0x0800),
+  PLAN7_BACKWARD_DOMAIN_REASON_MULTIDOMAIN = UINT16_C(0x1000),
+  PLAN7_BACKWARD_DOMAIN_REASON_NO_REGIONS = UINT16_C(0x2000),
+  PLAN7_BACKWARD_DOMAIN_REASON_SIMPLE = UINT16_C(0x4000),
+  PLAN7_BACKWARD_DOMAIN_REASON_REGION_OUTPUT_CAP = UINT16_C(0x8000)
+};
+
 /* Deliberately inaccessible from production wrappers. These mutations let
  * tests prove that the next opaque stage rejects corrupt seals and retains a
  * valid, sealed own-scale row on CPU. */
@@ -138,6 +160,26 @@ int plan7_backward_domain_run(
   char *error,
   size_t error_size);
 
+/* Additive diagnostic twin. The ordinary entry point does not allocate,
+ * upload, write, or download a reason sidecar. */
+int plan7_backward_domain_run_with_reason_facts(
+  const plan7_forward_database *database,
+  const plan7_ssv_sequence_batch *batch,
+  const plan7_backward_domain_candidate *candidates,
+  size_t candidate_count,
+  const plan7_forward_provenance *provenance,
+  const uint64_t *forward_offsets,
+  const float *forward_specials,
+  size_t forward_special_count,
+  float rt1,
+  float rt2,
+  float rt3,
+  float guard_band,
+  uint64_t posterior_byte_budget,
+  plan7_backward_domain_output **output,
+  char *error,
+  size_t error_size);
+
 /* Test-only recurrence seam for synthetic Forward scale fixtures. It never
  * validates provenance or seals output and forces every returned route to
  * CPU_REQUIRED, so its journal cannot be consumed by production code. */
@@ -185,6 +227,20 @@ plan7_backward_domain_output_provenance(
 const plan7_backward_domain_statistics *
 plan7_backward_domain_output_statistics(
   const plan7_backward_domain_output *output);
+size_t plan7_backward_domain_output_reason_count(
+  const plan7_backward_domain_output *output);
+const uint16_t *plan7_backward_domain_output_reason_facts(
+  const plan7_backward_domain_output *output);
+
+/* Host-only test boundary for the exact compact-active-row -> source-row
+ * reason merge used by production. Existing destination facts are preserved
+ * for inactive source rows. */
+int plan7_backward_domain_merge_reason_facts_for_test(
+  const uint64_t *active_sources,
+  const uint16_t *active_facts,
+  size_t active_count,
+  uint16_t *source_facts,
+  size_t source_count);
 
 /* Returns 1 only for a sealed production output generated with canonical
  * domain thresholds and the calibrated >=2e-4 ambiguity guard. */
