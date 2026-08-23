@@ -7158,13 +7158,23 @@ cdef class SequenceBatch:
                         direct_region_end = (
                             <size_t> native_domain_region_offsets[row + 1]
                         )
-                        if (
-                            direct_region_begin > direct_region_end
-                            or native_domain_results[row].region_count
-                            != direct_region_end - direct_region_begin
-                        ):
+                        if direct_region_begin > direct_region_end:
                             raise RuntimeError(
                                 "direct v3 domain region mapping changed"
+                            )
+                        if (
+                            native_domain_results[row].route
+                            == PLAN7_BACKWARD_DOMAIN_SIMPLE
+                        ):
+                            if native_domain_results[row].region_count != (
+                                direct_region_end - direct_region_begin
+                            ):
+                                raise RuntimeError(
+                                    "direct v3 SIMPLE region mapping changed"
+                                )
+                        elif direct_region_begin != direct_region_end:
+                            raise RuntimeError(
+                                "direct v3 non-SIMPLE region mapping changed"
                             )
 
                         direct_compact_route = (
