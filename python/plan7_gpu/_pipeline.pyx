@@ -350,6 +350,15 @@ if _abi_spec is None or _abi_spec.loader is None:
 _abi_module = _importlib_util.module_from_spec(_abi_spec)
 _abi_spec.loader.exec_module(_abi_module)
 
+_fingerprint_spec = _importlib_util.spec_from_file_location(
+    "_plan7_gpu_profile_fingerprint",
+    _Path(__file__).resolve().with_name("_fingerprint.py"),
+)
+if _fingerprint_spec is None or _fingerprint_spec.loader is None:
+    raise ImportError("cannot load the plan7_gpu optimized-profile fingerprint")
+_fingerprint_module = _importlib_util.module_from_spec(_fingerprint_spec)
+_fingerprint_spec.loader.exec_module(_fingerprint_module)
+
 
 PYHMMER_PRIVATE_ABI = "0.12.0"
 PYHMMER_PRIVATE_ABI_SHA256 = PYHMMER_ABI_SHA256
@@ -6008,6 +6017,23 @@ cdef void _semantic_encode_domaindef(
         raise ValueError(
             "semantic fingerprint requires successful reusable domain state"
         )
+    if (
+        ddef.sp.nsamples != 0
+        or ddef.sp.n != 0
+        or ddef.sp.nc != 0
+        or ddef.sp.nsigc != 0
+        or ddef.tr.N != 0
+        or ddef.tr.M != 0
+        or ddef.tr.L != 0
+        or ddef.tr.ndom != 0
+        or ddef.gtr.N != 0
+        or ddef.gtr.M != 0
+        or ddef.gtr.L != 0
+        or ddef.gtr.ndom != 0
+    ):
+        raise ValueError(
+            "semantic fingerprint requires reusable domain child state"
+        )
 
     _semantic_f32(output, prefix + b".rt1", ddef.rt1)
     _semantic_f32(output, prefix + b".rt2", ddef.rt2)
@@ -6026,6 +6052,18 @@ cdef void _semantic_encode_domaindef(
     _semantic_i32(output, prefix + b".reusable.nclustered", ddef.nclustered)
     _semantic_i32(output, prefix + b".reusable.noverlaps", ddef.noverlaps)
     _semantic_i32(output, prefix + b".reusable.nenvelopes", ddef.nenvelopes)
+    _semantic_i32(output, prefix + b".reusable.sp.nsamples", ddef.sp.nsamples)
+    _semantic_i32(output, prefix + b".reusable.sp.n", ddef.sp.n)
+    _semantic_i32(output, prefix + b".reusable.sp.nc", ddef.sp.nc)
+    _semantic_i32(output, prefix + b".reusable.sp.nsigc", ddef.sp.nsigc)
+    _semantic_i32(output, prefix + b".reusable.tr.N", ddef.tr.N)
+    _semantic_i32(output, prefix + b".reusable.tr.M", ddef.tr.M)
+    _semantic_i32(output, prefix + b".reusable.tr.L", ddef.tr.L)
+    _semantic_i32(output, prefix + b".reusable.tr.ndom", ddef.tr.ndom)
+    _semantic_i32(output, prefix + b".reusable.gtr.N", ddef.gtr.N)
+    _semantic_i32(output, prefix + b".reusable.gtr.M", ddef.gtr.M)
+    _semantic_i32(output, prefix + b".reusable.gtr.L", ddef.gtr.L)
+    _semantic_i32(output, prefix + b".reusable.gtr.ndom", ddef.gtr.ndom)
 
 
 cdef void _semantic_encode_reusable_omx(
@@ -6443,12 +6481,13 @@ cdef bytes _semantic_pipeline_state_encoding(
         output,
         bg,
         b"background",
-        pli.nmodels != 0,
+        pli.nmodels != 0 and pli.do_biasfilter,
     )
     _semantic_bool(output, b"optimized_profile.present", include_optimized_profile)
     if include_optimized_profile:
         if (
-            optimized_profile._om.abc == NULL
+            optimized_profile._om == NULL
+            or optimized_profile._om.abc == NULL
             or optimized_profile._om.abc.type != bg.abc.type
             or optimized_profile._om.abc.K != bg.abc.K
             or optimized_profile._om.abc.Kp != bg.abc.Kp
@@ -6496,9 +6535,11 @@ cdef bytes _semantic_tophits_encoding(TopHits hits):
     cdef uintptr_t limit
     cdef uintptr_t pointer
     cdef uintptr_t distance
+    cdef uintptr_t storage_bytes
     cdef uint64_t i
     cdef uint64_t order_index
     cdef bytes prefix
+    cdef object seen_order = set()
     if type(hits) is not _pyhmmer.plan7.TopHits:
         raise TypeError("hits must be exactly pyhmmer.plan7.TopHits")
     if th == NULL:
@@ -6526,9 +6567,12 @@ cdef bytes _semantic_tophits_encoding(TopHits hits):
 
     if th.N != 0:
         base = <uintptr_t> th.unsrt
-        limit = base + th.N * sizeof(P7_HIT)
-        if limit < base:
+        if th.N > (<uintptr_t> -1) // sizeof(P7_HIT):
+            raise OverflowError("TopHits storage size overflow")
+        storage_bytes = <uintptr_t> th.N * sizeof(P7_HIT)
+        if base > (<uintptr_t> -1) - storage_bytes:
             raise OverflowError("TopHits storage address overflow")
+        limit = base + storage_bytes
         for i in range(th.N):
             pointer = <uintptr_t> th.hit[i]
             if pointer < base or pointer >= limit:
@@ -6537,11 +6581,16 @@ cdef bytes _semantic_tophits_encoding(TopHits hits):
             if distance % sizeof(P7_HIT) != 0:
                 raise ValueError("TopHits order pointer is misaligned")
             order_index = distance // sizeof(P7_HIT)
+            if order_index in seen_order:
+                raise ValueError("TopHits order is not a unique permutation")
+            seen_order.add(order_index)
             _semantic_u64(
                 output,
                 b"tophits.order[" + str(i).encode("ascii") + b"]",
                 order_index,
             )
+        if len(seen_order) != th.N:
+            raise ValueError("TopHits order is not a complete permutation")
         for i in range(th.N):
             prefix = b"tophits.unsrt[" + str(i).encode("ascii") + b"]"
             _semantic_encode_hit(output, &th.unsrt[i], prefix)
@@ -6582,10 +6631,42 @@ def _semantic_dual_state_compare_bound(
     cdef bytes right_pipeline_encoding
     cdef bytes left_hits_encoding
     cdef bytes right_hits_encoding
+    cdef bytes left_profile_fingerprint
+    cdef bytes right_profile_fingerprint
     if (left_hits is None) != (right_hits is None):
         raise ValueError("both TopHits values must be supplied together")
     if (left_optimized_profile is None) != (right_optimized_profile is None):
         raise ValueError("both optimized profiles must be supplied together")
+    if left_optimized_profile is not None:
+        if type(left_optimized_profile) is not _pyhmmer.plan7.OptimizedProfile:
+            raise TypeError(
+                "left_optimized_profile must be exactly "
+                "pyhmmer.plan7.OptimizedProfile"
+            )
+        if type(right_optimized_profile) is not _pyhmmer.plan7.OptimizedProfile:
+            raise TypeError(
+                "right_optimized_profile must be exactly "
+                "pyhmmer.plan7.OptimizedProfile"
+            )
+        left_profile_fingerprint = (
+            _fingerprint_module.optimized_profile_fingerprint(
+                left_optimized_profile
+            )
+        )
+        right_profile_fingerprint = (
+            _fingerprint_module.optimized_profile_fingerprint(
+                right_optimized_profile
+            )
+        )
+        if (
+            type(left_profile_fingerprint) is not bytes
+            or len(left_profile_fingerprint) != 32
+            or type(right_profile_fingerprint) is not bytes
+            or len(right_profile_fingerprint) != 32
+        ):
+            raise ValueError("optimized-profile identity fingerprint is invalid")
+        if left_profile_fingerprint != right_profile_fingerprint:
+            raise ValueError("optimized-profile identities differ")
 
     left_pipeline_encoding = _semantic_pipeline_state_encoding_bound(
         left_pipeline, left_optimized_profile
@@ -6625,3 +6706,70 @@ def _semantic_dual_state_compare_bound(
             ),
         }
     return result
+
+
+def _semantic_test_swapped_tophits_order_encoding_bound(TopHits hits):
+    """Return a temporary swapped-order encoding and restore the input."""
+    cdef P7_HIT *temporary
+    if type(hits) is not _pyhmmer.plan7.TopHits:
+        raise TypeError("hits must be exactly pyhmmer.plan7.TopHits")
+    if hits._th == NULL or hits._th.N < 2 or hits._th.hit == NULL:
+        raise ValueError("TopHits needs at least two ordered hits")
+    temporary = hits._th.hit[0]
+    hits._th.hit[0] = hits._th.hit[1]
+    hits._th.hit[1] = temporary
+    try:
+        return _semantic_tophits_encoding(hits)
+    finally:
+        temporary = hits._th.hit[0]
+        hits._th.hit[0] = hits._th.hit[1]
+        hits._th.hit[1] = temporary
+
+
+def _semantic_test_dirty_reusable_state_rejected_bound(
+    Pipeline pipeline,
+    str field,
+):
+    """Temporarily dirty one reuse cursor and prove the oracle rejects it."""
+    cdef int *value = NULL
+    cdef int previous
+    if type(pipeline) is not _pyhmmer.plan7.Pipeline:
+        raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+    if pipeline._pli == NULL or pipeline._pli.ddef == NULL:
+        raise ValueError("pipeline domain-definition state is unavailable")
+    if field == "sp.nsamples":
+        value = &pipeline._pli.ddef.sp.nsamples
+    elif field == "sp.n":
+        value = &pipeline._pli.ddef.sp.n
+    elif field == "sp.nc":
+        value = &pipeline._pli.ddef.sp.nc
+    elif field == "sp.nsigc":
+        value = &pipeline._pli.ddef.sp.nsigc
+    elif field == "tr.N":
+        value = &pipeline._pli.ddef.tr.N
+    elif field == "tr.M":
+        value = &pipeline._pli.ddef.tr.M
+    elif field == "tr.L":
+        value = &pipeline._pli.ddef.tr.L
+    elif field == "tr.ndom":
+        value = &pipeline._pli.ddef.tr.ndom
+    elif field == "gtr.N":
+        value = &pipeline._pli.ddef.gtr.N
+    elif field == "gtr.M":
+        value = &pipeline._pli.ddef.gtr.M
+    elif field == "gtr.L":
+        value = &pipeline._pli.ddef.gtr.L
+    elif field == "gtr.ndom":
+        value = &pipeline._pli.ddef.gtr.ndom
+    else:
+        raise ValueError("unknown reusable-state field")
+    previous = value[0]
+    value[0] = 1
+    try:
+        try:
+            _semantic_pipeline_state_encoding(pipeline, None, False)
+        except ValueError:
+            return True
+        return False
+    finally:
+        value[0] = previous

@@ -108,6 +108,23 @@ class SemanticFingerprintTests(unittest.TestCase):
         self.assertIsNone(comparison["pipeline"]["first_difference"])
         self.assertIsNone(comparison["tophits"]["first_difference"])
 
+    def test_bias_disabled_equivalent_states_never_read_filter_hmm(self):
+        encodings = []
+        hit_encodings = []
+        for _ in range(10):
+            pipeline, profile, hits = self.search(bias_filter=False)
+            encodings.append(
+                _pipeline._semantic_pipeline_state_encoding_bound(
+                    pipeline, profile
+                )
+            )
+            hit_encodings.append(
+                _pipeline._semantic_tophits_encoding_bound(hits)
+            )
+        self.assertEqual(len(set(encodings)), 1)
+        self.assertEqual(len(set(hit_encodings)), 1)
+        self.assertIn(b"background.fhmm.state_present", encodings[0])
+
     def test_raw_ieee_threshold_bits_are_sensitive(self):
         positive_zero = self.pipeline(T=0.0)
         negative_zero = self.pipeline(T=-0.0)
@@ -264,10 +281,73 @@ class SemanticFingerprintTests(unittest.TestCase):
             _pipeline._semantic_tophits_fingerprint_bound(copied),
         )
         if len(copied) > 1:
-            copied.sort(by="seqidx")
+            before = _pipeline._semantic_tophits_encoding_bound(copied)
+            swapped = (
+                _pipeline._semantic_test_swapped_tophits_order_encoding_bound(
+                    copied
+                )
+            )
+            self.assertNotEqual(before, swapped)
+            # The private audit helper must restore the input exactly.
             self.assertNotEqual(
-                _pipeline._semantic_tophits_fingerprint_bound(full_hits),
-                _pipeline._semantic_tophits_fingerprint_bound(copied),
+                swapped,
+                _pipeline._semantic_tophits_encoding_bound(copied),
+            )
+            self.assertEqual(
+                before,
+                _pipeline._semantic_tophits_encoding_bound(copied),
+            )
+
+    def test_reusable_domain_child_state_is_required(self):
+        pipeline, profile, _ = self.search()
+        before = _pipeline._semantic_pipeline_state_encoding_bound(
+            pipeline, profile
+        )
+        for field in (
+            "sp.nsamples",
+            "sp.n",
+            "sp.nc",
+            "sp.nsigc",
+            "tr.N",
+            "tr.M",
+            "tr.L",
+            "tr.ndom",
+            "gtr.N",
+            "gtr.M",
+            "gtr.L",
+            "gtr.ndom",
+        ):
+            with self.subTest(field=field):
+                self.assertTrue(
+                    _pipeline._semantic_test_dirty_reusable_state_rejected_bound(
+                        pipeline, field
+                    )
+                )
+                self.assertEqual(
+                    before,
+                    _pipeline._semantic_pipeline_state_encoding_bound(
+                        pipeline, profile
+                    ),
+                )
+
+    def test_dual_oracle_rejects_distinct_immutable_profile_identity(self):
+        changed_hmm = self.hmm.copy()
+        changed_hmm.match_emissions[1, 0] = 0.0
+        changed_hmm.renormalize()
+        background = pyhmmer.plan7.Background(self.alphabet)
+        changed_profile = changed_hmm.to_profile(
+            background, L=400
+        ).to_optimized()
+        original_profile = self.optimized_profile()
+        self.assertEqual(original_profile.name, changed_profile.name)
+        self.assertEqual(original_profile.accession, changed_profile.accession)
+        self.assertEqual(original_profile.M, changed_profile.M)
+        with self.assertRaisesRegex(ValueError, "identities differ"):
+            _pipeline._semantic_dual_state_compare_bound(
+                self.pipeline(),
+                self.pipeline(),
+                left_optimized_profile=original_profile,
+                right_optimized_profile=changed_profile,
             )
 
     def test_canonical_encoding_excludes_dormant_and_pointer_fields(self):
