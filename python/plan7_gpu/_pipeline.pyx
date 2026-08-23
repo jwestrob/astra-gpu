@@ -6890,9 +6890,11 @@ cdef tuple _consume_validate_direct_v3_staging(
     for index in range(16, 31):
         if type(source[index]) not in (int, bool):
             raise TypeError("direct v3 staging metadata must be integral")
-    for index in range(31, 35):
+    for index in range(31, 34):
         if type(source[index]) is not bytes:
             raise TypeError("direct v3 staging identity must be bytes")
+    if type(source[34]) is not int or source[34] < 0:
+        raise TypeError("direct v3 staging F1 bits must be nonnegative int")
     if type(source[35]) is not float or type(source[36]) is not float:
         raise TypeError("direct v3 staging thresholds must be float")
     if type(source[37]) is not bool:
