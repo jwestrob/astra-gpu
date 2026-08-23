@@ -136,12 +136,16 @@ class GenerationTelemetryTests(unittest.TestCase):
     def build(self):
         records, native = valid_transport()
         return _telemetry.build_generation_statistics(
-            1, 1, 3, 20, records, 0, 4096, native
+            _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
+            1, 3, 20, records, 0, 4096, native
         )
 
     def test_schema_preserves_exact_bits_aggregates_cells_and_journal(self):
         value = self.build()
-        self.assertEqual(value["schema_version"], 1)
+        self.assertEqual(
+            value["schema_version"],
+            _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
+        )
         self.assertEqual(value["scope"], "generation")
         self.assertEqual(value["journal"]["allocation_bytes"], 4096)
         profile = value["profiles"][0]
@@ -182,6 +186,29 @@ class GenerationTelemetryTests(unittest.TestCase):
         returned["native_totals"]["forward"]["work_cells"] = 999
         self.assertEqual(stored["profiles"][0]["counts"]["f2_pass_count"], 1)
         self.assertEqual(stored["native_totals"]["forward"]["work_cells"], 50)
+
+    def test_sealed_batch_identity_binding_is_exact_and_one_way(self):
+        unbound = self.build()
+        self.assertIsNone(unbound["batch_identity"])
+        bound = _telemetry.bind_generation_statistics_identity(
+            unbound, (11, 22, 33)
+        )
+        self.assertEqual(bound["batch_identity"], {
+            "session_id": 11,
+            "selection_id": 22,
+            "batch_generation": 33,
+        })
+        self.assertIsNone(unbound["batch_identity"])
+        self.assertEqual(
+            _telemetry.bind_generation_statistics_identity(
+                bound, (11, 22, 33)
+            ),
+            bound,
+        )
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            _telemetry.bind_generation_statistics_identity(
+                bound, (11, 22, 34)
+            )
 
     def test_route_native_and_reason_cell_mismatches_fail_closed(self):
         records, native = valid_transport()
@@ -245,7 +272,8 @@ class GenerationTelemetryTests(unittest.TestCase):
             with self.subTest(profile=profile, native=native_totals):
                 with self.assertRaises(ValueError):
                     _telemetry.build_generation_statistics(
-                        1, 1, 3, 20, (profile,), 0, 4096, native_totals
+                        _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
+                        1, 3, 20, (profile,), 0, 4096, native_totals
                     )
 
     def test_f2_msv_failure_then_viterbi_pass_is_valid_multilabel_history(self):
@@ -258,7 +286,8 @@ class GenerationTelemetryTests(unittest.TestCase):
             records[0][2],
         )
         value = _telemetry.build_generation_statistics(
-            1, 1, 3, 20, (profile,), 0, 4096, native
+            _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
+            1, 3, 20, (profile,), 0, 4096, native
         )
         f2 = dict(value["profiles"][0]["reason_counts"]["f2"])
         self.assertEqual(f2["msv_threshold_exceeded"], 1)
@@ -276,7 +305,8 @@ class GenerationTelemetryTests(unittest.TestCase):
             ValueError, "MSV/Viterbi transition attribution"
         ):
             _telemetry.build_generation_statistics(
-                1, 1, 3, 20, (invalid,), 0, 4096, native
+                _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
+                1, 3, 20, (invalid,), 0, 4096, native
             )
 
     def test_forward_call_fallback_does_not_claim_unrun_row_transitions(self):
@@ -308,7 +338,7 @@ class GenerationTelemetryTests(unittest.TestCase):
             "rescore": None,
         }
         value = _telemetry.build_generation_statistics(
-            1,
+            _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
             1,
             3,
             20,
@@ -349,7 +379,7 @@ class GenerationTelemetryTests(unittest.TestCase):
             },
         }
         value = _telemetry.build_generation_statistics(
-            1,
+            _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
             1,
             3,
             20,
@@ -375,7 +405,7 @@ class GenerationTelemetryTests(unittest.TestCase):
 
     def test_continuation_routes_cover_omitted_f1_rows_and_exact_retries(self):
         value = _telemetry.build_continuation_statistics(
-            1,
+            _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
             "journal",
             123,
             10,
@@ -394,7 +424,7 @@ class GenerationTelemetryTests(unittest.TestCase):
 
     def test_continuation_partitions_fail_closed(self):
         valid = dict(
-            schema_version=1,
+            schema_version=_telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
             path="journal",
             wall_ns=1,
             target_count=4,
@@ -428,7 +458,7 @@ class GenerationTelemetryTests(unittest.TestCase):
 
     def test_continuation_bypass_facts_are_path_specific_and_complete(self):
         value = _telemetry.build_continuation_statistics(
-            1,
+            _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
             "forward",
             1,
             2,
@@ -445,7 +475,7 @@ class GenerationTelemetryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "decision facts"):
             _telemetry.build_continuation_statistics(
-                1,
+                _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
                 "forward",
                 1,
                 2,

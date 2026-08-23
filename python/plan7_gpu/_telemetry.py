@@ -12,7 +12,7 @@ import copy
 from typing import Any
 
 
-GENERATION_TELEMETRY_SCHEMA_VERSION = 1
+GENERATION_TELEMETRY_SCHEMA_VERSION = 2
 _UINT64_MAX = (1 << 64) - 1
 
 _METRIC_NAMES = (
@@ -162,7 +162,7 @@ def validate_generation_reason_fact_layout(value: Any) -> tuple[tuple[int, ...],
     if type(value) is not tuple or any(type(row) is not tuple for row in value):
         raise ImportError("native generation reason layout is not immutable")
     if value != expected:
-        raise ImportError("native generation reason layout differs from schema 1")
+        raise ImportError("native generation reason layout differs from registry")
     return expected
 
 
@@ -177,6 +177,47 @@ def _checked_sum(values: list[int], field: str) -> int:
     if total > _UINT64_MAX:
         raise OverflowError(f"{field} total exceeds uint64")
     return total
+
+
+def _batch_identity(
+    value: Any, field: str, *, allow_unbound: bool
+) -> tuple[int, int, int] | None:
+    if value is None:
+        if allow_unbound:
+            return None
+        raise ValueError(f"{field} is unbound")
+    if type(value) is not tuple or len(value) != 3:
+        raise ValueError(f"{field} must be an exact identity tuple")
+    identity = tuple(
+        _uint64(item, f"{field}[{index}]")
+        for index, item in enumerate(value)
+    )
+    if any(item == 0 for item in identity):
+        raise ValueError(f"{field} contains a zero identity")
+    return identity
+
+
+def _batch_identity_record(
+    identity: tuple[int, int, int] | None,
+) -> dict[str, int] | None:
+    if identity is None:
+        return None
+    return {
+        "session_id": identity[0],
+        "selection_id": identity[1],
+        "batch_generation": identity[2],
+    }
+
+
+def _batch_identity_tuple(value: Any, field: str) -> tuple[int, int, int] | None:
+    if value is None:
+        return None
+    names = ("session_id", "selection_id", "batch_generation")
+    if type(value) is not dict or set(value) != set(names):
+        raise ValueError(f"{field} fields changed")
+    return _batch_identity(
+        tuple(value[name] for name in names), field, allow_unbound=False
+    )
 
 
 def build_generation_statistics(
@@ -195,10 +236,17 @@ def build_generation_statistics(
     forward_call_reason_facts: int,
     journal_allocation_bytes: int,
     native_totals: dict[str, Any],
+    batch_identity: tuple[int, int, int] | None = None,
 ) -> dict[str, Any]:
     """Validate the fixed native transport and return canonical evidence."""
-    if type(schema_version) is not int or schema_version != 1:
+    if (
+        type(schema_version) is not int
+        or schema_version != GENERATION_TELEMETRY_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported generation telemetry schema")
+    bound_identity = _batch_identity(
+        batch_identity, "generation batch identity", allow_unbound=True
+    )
     profile_count = _uint64(profile_count, "profile_count")
     target_count = _uint64(target_count, "target_count")
     total_target_residues = _uint64(
@@ -570,6 +618,7 @@ def build_generation_statistics(
     return {
         "schema_version": GENERATION_TELEMETRY_SCHEMA_VERSION,
         "scope": "generation",
+        "batch_identity": _batch_identity_record(bound_identity),
         "profile_count": profile_count,
         "target_count": target_count,
         "total_target_residues": total_target_residues,
@@ -595,11 +644,16 @@ def build_generation_statistics(
 
 def validate_generation_statistics(value: Any) -> dict[str, Any]:
     """Fail closed on a stored sidecar and return a private canonical copy."""
-    if type(value) is not dict or value.get("schema_version") != 1:
+    if (
+        type(value) is not dict
+        or value.get("schema_version")
+        != GENERATION_TELEMETRY_SCHEMA_VERSION
+    ):
         raise ValueError("invalid generation statistics schema")
     required = {
         "schema_version",
         "scope",
+        "batch_identity",
         "profile_count",
         "target_count",
         "total_target_residues",
@@ -626,6 +680,9 @@ def validate_generation_statistics(value: Any) -> dict[str, Any]:
     target_count = _uint64(value.get("target_count"), "target_count")
     total_target_residues = _uint64(
         value.get("total_target_residues"), "total_target_residues"
+    )
+    batch_identity = _batch_identity_tuple(
+        value.get("batch_identity"), "generation batch identity"
     )
 
     def expand_sparse(
@@ -743,10 +800,28 @@ def validate_generation_statistics(value: Any) -> dict[str, Any]:
         forward_call_bits,
         journal_total.get("allocation_bytes"),
         value.get("native_totals"),
+        batch_identity,
     )
     if rebuilt != value:
         raise ValueError("generation telemetry aggregate reconciliation changed")
     return rebuilt
+
+
+def bind_generation_statistics_identity(
+    value: dict[str, Any], batch_identity: tuple[int, int, int]
+) -> dict[str, Any]:
+    """Bind native generation evidence to its validated sealed journal."""
+    canonical = validate_generation_statistics(value)
+    identity = _batch_identity(
+        batch_identity, "generation batch identity", allow_unbound=False
+    )
+    existing = _batch_identity_tuple(
+        canonical["batch_identity"], "generation batch identity"
+    )
+    if existing is not None and existing != identity:
+        raise ValueError("generation batch identity changed")
+    canonical["batch_identity"] = _batch_identity_record(identity)
+    return validate_generation_statistics(canonical)
 
 
 def defensive_generation_statistics(value: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -766,10 +841,17 @@ def build_continuation_statistics(
     source_counts: tuple[int, ...],
     decision_counts: tuple[int, ...],
     identity: tuple[int, ...],
+    batch_identity: tuple[int, int, int] | None = None,
 ) -> dict[str, Any]:
     """Validate one opt-in CPU-consumption record and name every route."""
-    if type(schema_version) is not int or schema_version != 1:
+    if (
+        type(schema_version) is not int
+        or schema_version != GENERATION_TELEMETRY_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported continuation telemetry schema")
+    bound_identity = _batch_identity(
+        batch_identity, "continuation batch identity", allow_unbound=True
+    )
     if path not in {"postfilter", "forward", "journal"}:
         raise ValueError("invalid continuation telemetry path")
     wall_ns = _uint64(wall_ns, "wall_ns")
@@ -892,6 +974,7 @@ def build_continuation_statistics(
     return {
         "schema_version": GENERATION_TELEMETRY_SCHEMA_VERSION,
         "scope": "continuation",
+        "batch_identity": _batch_identity_record(bound_identity),
         "path": path,
         "wall_ns": wall_ns,
         "target_count": target_count,
@@ -959,6 +1042,7 @@ def validate_continuation_statistics(value: Any) -> dict[str, Any]:
     required = {
         "schema_version",
         "scope",
+        "batch_identity",
         "path",
         "wall_ns",
         "target_count",
@@ -974,6 +1058,9 @@ def validate_continuation_statistics(value: Any) -> dict[str, Any]:
         raise ValueError("continuation statistics fields changed")
     if value.get("scope") != "continuation":
         raise ValueError("continuation statistics scope changed")
+    batch_identity = _batch_identity_tuple(
+        value.get("batch_identity"), "continuation batch identity"
+    )
 
     routes = value.get("routes")
     route_names = (
@@ -1080,6 +1167,7 @@ def validate_continuation_statistics(value: Any) -> dict[str, Any]:
         tuple(source[name] for name in source_names),
         tuple(decision_values),
         tuple(identity[name] for name in identity_names),
+        batch_identity,
     )
     if rebuilt != value:
         raise ValueError("continuation telemetry reconciliation changed")

@@ -907,6 +907,9 @@ cdef class _SealedPostfilterBatch:
     cdef object _excluded_background_fingerprint_bytes
     cdef object _native_stage_timings
     cdef object _generation_statistics
+    cdef uint64_t _telemetry_session_id
+    cdef uint64_t _telemetry_selection_id
+    cdef uint64_t _telemetry_batch_generation
     cdef _pipeline_tail_snapshot _pipeline_options
     cdef _pipeline_from_filter_scores_f _filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam
@@ -922,6 +925,9 @@ cdef class _SealedPostfilterBatch:
         self._excluded_background_fingerprint_bytes = 0
         self._native_stage_timings = None
         self._generation_statistics = None
+        self._telemetry_session_id = 0
+        self._telemetry_selection_id = 0
+        self._telemetry_batch_generation = 0
 
     def __repr__(self):
         return "<opaque sealed post-filter batch>"
@@ -6976,6 +6982,16 @@ def _seal_profile_selection_continuation_bound(
                 raise ValueError(
                     "generation telemetry profile attribution differs"
                 )
+        generation_statistics = (
+            _telemetry_module.bind_generation_statistics_identity(
+                generation_statistics,
+                (
+                    int(expected_session_id),
+                    int(expected_selection_id),
+                    int(batch_generation),
+                ),
+            )
+        )
     expected_guard.value = <float> guard_band
     if journal_guard_bits != expected_guard.bits:
         raise ValueError("continuation journal guard band differs")
@@ -7093,6 +7109,10 @@ def _seal_profile_selection_continuation_bound(
         )
     sealed._native_stage_timings = validated_stage_timings
     sealed._generation_statistics = generation_statistics
+    if generation_statistics is not None:
+        sealed._telemetry_session_id = expected_session_id
+        sealed._telemetry_selection_id = expected_selection_id
+        sealed._telemetry_batch_generation = batch_generation
     sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
     sealed._forward_scores_seam = forward_scores_seam
@@ -7667,6 +7687,9 @@ cdef object _sealed_search_result(
     bint return_route_statistics,
     object route_path,
     object start_ns,
+    uint64_t telemetry_session_id,
+    uint64_t telemetry_selection_id,
+    uint64_t telemetry_batch_generation,
 ):
     cdef object elapsed_ns
     if not return_compact_statistics and not return_route_statistics:
@@ -7730,6 +7753,15 @@ cdef object _sealed_search_result(
                 statistics.requested_profile_index,
                 statistics.journal_row_start,
                 statistics.journal_row_stop,
+            ),
+            (
+                None
+                if telemetry_session_id == 0
+                else (
+                    int(telemetry_session_id),
+                    int(telemetry_selection_id),
+                    int(telemetry_batch_generation),
+                )
             ),
         )
     return hits, {
@@ -7926,6 +7958,9 @@ def _search_hmm_sealed_postfilter_bound(
             _return_route_statistics,
             "postfilter",
             start_ns,
+            sealed._telemetry_session_id,
+            sealed._telemetry_selection_id,
+            sealed._telemetry_batch_generation,
         )
     use_journal = (
         sealed._journal_storage.shape[0] != 0
@@ -7987,6 +8022,9 @@ def _search_hmm_sealed_postfilter_bound(
             _return_route_statistics,
             "journal",
             start_ns,
+            sealed._telemetry_session_id,
+            sealed._telemetry_selection_id,
+            sealed._telemetry_batch_generation,
         )
     if _return_route_statistics:
         statistics.decision_journal_storage_unavailable = (
@@ -8039,6 +8077,9 @@ def _search_hmm_sealed_postfilter_bound(
         _return_route_statistics,
         "forward",
         start_ns,
+        sealed._telemetry_session_id,
+        sealed._telemetry_selection_id,
+        sealed._telemetry_batch_generation,
     )
 
 

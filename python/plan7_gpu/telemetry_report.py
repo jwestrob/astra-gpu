@@ -22,9 +22,25 @@ from ._telemetry import (
 )
 
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+
+
+class TelemetryReportCommittedError(RuntimeError):
+    """Report publication committed, but parent-directory fsync failed.
+
+    ``target`` names the immutable report that now exists.  Callers must audit
+    that target rather than retrying the no-replace publication.
+    """
+
+    def __init__(self, target: Path, error: OSError) -> None:
+        self.target = target
+        self.os_error = error
+        super().__init__(
+            f"telemetry report is committed at {target}, but parent fsync "
+            f"failed: {error}"
+        )
 
 
 def _exact_nonnegative_int(value: Any, field: str) -> int:
@@ -102,6 +118,14 @@ def _publish_directory_noreplace(stage: Path, target: Path) -> None:
         raise OSError(error_number, os.strerror(error_number), target)
 
 
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _reason_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     reason_bits = profile["_reason_fact_bits"]
@@ -137,6 +161,7 @@ class TelemetryCollector:
         self._lock = Lock()
         self._chunks: list[dict[str, Any]] = []
         self._profiles: dict[int, dict[str, Any]] = {}
+        self._batch_identities: set[tuple[int, int, int]] = set()
         self._expected_profile_ordinals: tuple[int, ...] | None = None
 
     def bind_expected_profiles(self, profile_ordinals: Iterable[int]) -> None:
@@ -164,7 +189,17 @@ class TelemetryCollector:
     ) -> int:
         """Record one instrumented generation chunk and its global mapping."""
         generation = validate_generation_statistics(generation_statistics)
+        batch_identity = generation["batch_identity"]
+        if batch_identity is None:
+            raise ValueError(
+                "collector generation evidence requires a sealed batch identity"
+            )
         count = generation["profile_count"]
+        identity_tuple = (
+            batch_identity["session_id"],
+            batch_identity["selection_id"],
+            batch_identity["batch_generation"],
+        )
         ordinals = _profile_ordinals(profile_ordinals, count)
         keys = _profile_keys(profile_keys, count)
         with self._lock:
@@ -184,6 +219,8 @@ class TelemetryCollector:
             )
             if duplicate is not None:
                 raise ValueError(f"profile ordinal {duplicate} was already recorded")
+            if identity_tuple in self._batch_identities:
+                raise ValueError("sealed batch identity was already recorded")
             chunk_index = len(self._chunks)
             shared = {
                 name: copy.deepcopy(value)
@@ -198,6 +235,7 @@ class TelemetryCollector:
                     "generation": shared,
                 }
             )
+            self._batch_identities.add(identity_tuple)
             reason_fact_bits = generation["reason_fact_bits"]
             for local_index, (ordinal, key, row) in enumerate(
                 zip(ordinals, keys, generation["profiles"], strict=True)
@@ -209,6 +247,7 @@ class TelemetryCollector:
                     "chunk_profile_index": local_index,
                     "target_count": generation["target_count"],
                     "target_residues": generation["total_target_residues"],
+                    "batch_identity": copy.deepcopy(batch_identity),
                     "generation": copy.deepcopy(row),
                     "continuation": None,
                     "_reason_fact_bits": copy.deepcopy(reason_fact_bits),
@@ -242,6 +281,50 @@ class TelemetryCollector:
                 raise ValueError(
                     "continuation local profile identity differs from generation"
                 )
+            generation = profile["generation"]
+            if continuation["target_count"] != profile["target_count"]:
+                raise ValueError(
+                    "continuation target count differs from generation"
+                )
+            if (
+                continuation["postfilter_record_count"]
+                != generation["counts"]["f1_candidate_count"]
+            ):
+                raise ValueError(
+                    "continuation post-filter count differs from generation"
+                )
+            generation_identity = profile["batch_identity"]
+            if continuation["batch_identity"] != generation_identity:
+                raise ValueError(
+                    "continuation batch identity differs from generation"
+                )
+            if continuation["path"] == "journal":
+                row_start = sum(
+                    other["generation"]["journal"]["row_count"]
+                    for other in self._profiles.values()
+                    if (
+                        other["chunk_index"] == profile["chunk_index"]
+                        and other["chunk_profile_index"]
+                        < profile["chunk_profile_index"]
+                    )
+                )
+                row_stop = row_start + generation["journal"]["row_count"]
+                identity = continuation["identity"]
+                if (
+                    identity["journal_row_start"] != row_start
+                    or identity["journal_row_stop"] != row_stop
+                    or continuation["journal"]["match_count"]
+                    != generation["journal"]["row_count"]
+                    or continuation["journal"]["cpu_required_count"]
+                    != generation["counts"]["backward_cpu_required_count"]
+                    or continuation["journal"]["no_region_count"]
+                    != generation["counts"]["backward_no_region_count"]
+                    or continuation["journal"]["simple_count"]
+                    != generation["counts"]["backward_simple_count"]
+                ):
+                    raise ValueError(
+                        "continuation journal attribution differs from generation"
+                    )
             profile["continuation"] = continuation
 
     def snapshot(self, *, require_complete: bool = True) -> dict[str, Any]:
@@ -399,18 +482,13 @@ class TelemetryCollector:
                 stream.flush()
                 os.fsync(stream.fileno())
             manifest_path.chmod(0o444)
-            directory_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _fsync_directory(stage)
             stage.chmod(0o555)
             _publish_directory_noreplace(stage, target)
-            parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
+                _fsync_directory(parent)
+            except OSError as error:
+                raise TelemetryReportCommittedError(target, error) from error
         except BaseException:
             if stage.exists():
                 stage.chmod(0o700)
@@ -463,6 +541,9 @@ class TelemetryCollector:
             "profile_key",
             "chunk_index",
             "chunk_profile_index",
+            "batch_session_id",
+            "batch_selection_id",
+            "batch_generation",
             "model_length",
             "target_count",
             "target_residues",
@@ -484,6 +565,9 @@ class TelemetryCollector:
                     profile["profile_key"] or "",
                     profile["chunk_index"],
                     profile["chunk_profile_index"],
+                    profile["batch_identity"]["session_id"],
+                    profile["batch_identity"]["selection_id"],
+                    profile["batch_identity"]["batch_generation"],
                     generation["model_length"],
                     profile["target_count"],
                     profile["target_residues"],
@@ -545,4 +629,8 @@ class TelemetryCollector:
         }
 
 
-__all__ = ["REPORT_SCHEMA_VERSION", "TelemetryCollector"]
+__all__ = [
+    "REPORT_SCHEMA_VERSION",
+    "TelemetryCollector",
+    "TelemetryReportCommittedError",
+]

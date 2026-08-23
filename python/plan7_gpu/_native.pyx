@@ -52,7 +52,7 @@ cdef uint64_t _sealed_journal_build_count = 0
 cdef uint64_t _sealed_journal_payload_bytes = 0
 cdef uint64_t _sealed_journal_duplicate_python_bytes = 0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
-GENERATION_TELEMETRY_SCHEMA_VERSION = 1
+GENERATION_TELEMETRY_SCHEMA_VERSION = 2
 
 # Host F2 decisions are made in this Cython translation unit, so their exact
 # version-1 facts intentionally live beside that source predicate.

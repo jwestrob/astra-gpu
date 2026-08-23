@@ -178,6 +178,7 @@ def _search_row(
     collector: TelemetryCollector | None = None,
     profile_ordinal: int | None = None,
 ) -> Any:
+    continuation_to_record = None
     try:
         if collector is None:
             result = candidates.search(
@@ -192,8 +193,14 @@ def _search_row(
             if profile_ordinal is None:
                 raise RuntimeError("collector search lacks a profile ordinal")
             hits, continuation = result
-            collector.record_continuation(profile_ordinal, continuation)
+            continuation_to_record = (profile_ordinal, continuation)
             result = result if telemetry else hits
+        # A row is not committed to the collector until the reusable pipeline
+        # has completed its required cleanup.  A final-row clear failure must
+        # therefore leave the report incomplete rather than falsely complete.
+        pipeline.clear()
+        if continuation_to_record is not None:
+            collector.record_continuation(*continuation_to_record)
     except BaseException:
         # Match PyHMMER's worker lifecycle and leave no dirty pipeline queued
         # for another row if the failure happened after pipeline mutation.
@@ -202,7 +209,6 @@ def _search_row(
         except BaseException:
             pass
         raise
-    pipeline.clear()
     return result
 
 

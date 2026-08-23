@@ -1,6 +1,6 @@
 # Phase 0 route telemetry
 
-Phase 0 adds an opt-in, version-1 diagnostic sidecar without changing any
+Phase 0 adds an opt-in, version-2 diagnostic sidecar without changing any
 postfilter, Forward, Backward/domain, compact-result, provenance, or
 continuation-journal-v2 record. The ordinary entry points and Python return
 shapes remain the production defaults; detailed reason buffers and Python
@@ -28,7 +28,9 @@ that one profile. Astra's bridge preserves query order and forwards the same
 opt-in tuple in serial and threaded modes.
 The continuation record also carries source-route counts, exact Forward and
 journal configuration-bypass facts, exact compact-bypass facts, and the bound
-profile/journal-row identity. Validation reconstructs every terminal route
+profile/journal-row identity. Both generation and continuation records carry
+the same exact nonzero session, selection, and target-batch generation
+identity copied from the validated sealed journal. Validation reconstructs every terminal route
 from those source decisions, requires compact attempts to be a subset of the
 SIMPLE journal rows, and binds the first attempt to the requested profile,
 target range, and journal slice.
@@ -58,7 +60,11 @@ payload rather than Python-object RSS.
 thread-safe join between generation chunks and CPU continuation rows. The
 caller supplies immutable global profile ordinals for each chunk; the
 collector rejects duplicates, missing continuation rows, and any mismatch
-between a continuation's local profile identity and its generation row.
+between a continuation and its exact generation row. The join binds the sealed
+batch identity, target and postfilter counts, and, on the journal path, the
+exact cumulative row span and Backward CPU/no-region/SIMPLE route census.
+Continuation evidence is committed only after the row's pipeline cleanup has
+succeeded.
 Before work, `bind_expected_profiles(...)` seals the full intended ordinal
 universe; complete snapshots and exports fail if any generation chunk or CPU
 continuation row is absent.
@@ -72,6 +78,9 @@ report as one same-parent atomic directory rename. It writes canonical JSON,
 profile/reason/summary/Pareto TSV files, and a SHA-256 manifest, fsyncs their
 contents and directory metadata, and seals the resulting files `0444` and
 directory `0555`.
+If the atomic rename succeeds but fsync of the parent directory fails,
+`TelemetryReportCommittedError` reports the exact already-committed target;
+callers must audit that target and must not retry publication blindly.
 
 The local Astra bridge does not attempt to synthesize generation telemetry.
 `telemetry=True` or an explicit collector accepts only a precomputed sealed
