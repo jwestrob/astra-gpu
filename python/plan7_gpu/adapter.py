@@ -1077,6 +1077,17 @@ class CandidateBatch:
         if sealed_postfilter is not None:
             with _lease_pipeline(pipeline):
                 with state.lock:
+                    if _pipeline._sealed_sparse_journal_v3_enabled_bound(
+                        sealed_postfilter
+                    ):
+                        return (
+                            _pipeline._search_hmm_sealed_sparse_journal_v3_bound(
+                                sealed_postfilter,
+                                row_index,
+                                pipeline,
+                                _return_route_statistics=return_telemetry,
+                            )
+                        )
                     if return_telemetry:
                         return _pipeline._search_hmm_sealed_postfilter_bound(
                             sealed_postfilter,
@@ -1665,6 +1676,7 @@ class SequenceBatch:
         _rescore_trace_byte_budget: int = 0,
         _rescore_test_fault: int = 0,
         telemetry: bool = False,
+        sparse_journal_v3: bool = False,
     ) -> CandidateBatch:
         """Build a sealed selection batch with bounded Forward results."""
         try:
@@ -1676,6 +1688,8 @@ class SequenceBatch:
             raise TypeError("bias_filter must be bool")
         if type(telemetry) is not bool:
             raise TypeError("telemetry must be bool")
+        if type(sparse_journal_v3) is not bool:
+            raise TypeError("sparse_journal_v3 must be bool")
         if pipeline is not None:
             return self._postfilter_forward_domain_selection(
                 selection,
@@ -1690,6 +1704,7 @@ class SequenceBatch:
                 _rescore_trace_byte_budget,
                 _rescore_test_fault,
                 telemetry,
+                sparse_journal_v3,
             )
         if any(
             value != 0
@@ -1704,6 +1719,10 @@ class SequenceBatch:
         if telemetry:
             raise ValueError(
                 "generation telemetry requires a sealed fused pipeline batch"
+            )
+        if sparse_journal_v3:
+            raise ValueError(
+                "sparse journal v3 requires a sealed fused pipeline batch"
             )
         return self._postfilter_selection(
             selection, F1, (f2, f3, bias_filter)
@@ -1723,6 +1742,7 @@ class SequenceBatch:
         rescore_trace_byte_budget: int,
         rescore_test_fault: int,
         telemetry: bool,
+        sparse_journal_v3: bool,
     ) -> CandidateBatch:
         """Build one opaque fused Forward/domain continuation batch."""
         from . import _pipeline  # type: ignore[attr-defined]
@@ -1923,6 +1943,7 @@ class SequenceBatch:
                         guard,
                         native_stage_timings,
                         generation_statistics,
+                        sparse_journal_v3,
                     )
                 )
                 capsule = None

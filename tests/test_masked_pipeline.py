@@ -241,6 +241,7 @@ class MaskedPipelineTests(unittest.TestCase):
         *,
         pipeline=None,
         f1=0.02,
+        sparse_journal_v3=False,
     ):
         """Mint a complete v2-backed seal with no Forward/domain rows."""
         if pipeline is None:
@@ -270,6 +271,7 @@ class MaskedPipelineTests(unittest.TestCase):
             array("f"),
             pipeline,
             2.0e-4,
+            sparse_journal_v3,
         )
 
     def seal_v2_f3_reject_fixture(self, sequences, target, *, pipeline):
@@ -1453,6 +1455,109 @@ print(json.dumps(after_repeat, sort_keys=True))
         )
         with self.assertRaisesRegex(TypeError, "invalid or consumed"):
             _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
+
+    def test_seal_owned_sparse_v3_is_opt_in_reusable_and_fail_safe(self):
+        records = b"".join(
+            (
+                self.postfilter_record(1, math.nan, -12, 0, 1, math.nan),
+                self.postfilter_record(5, math.nan, 0, 173, 0, math.nan),
+            )
+        )
+        options = {"F1": 0.02, "F2": 0.0, "F3": 0.0}
+        dense = self.seal_v2_terminal_fixture(
+            self.sequences, records, pipeline=self.pipeline(**options)
+        )
+        sparse = self.seal_v2_terminal_fixture(
+            self.sequences,
+            records,
+            pipeline=self.pipeline(**options),
+            sparse_journal_v3=True,
+        )
+        self.assertFalse(
+            _pipeline._sealed_sparse_journal_v3_enabled_bound(dense)
+        )
+        self.assertTrue(
+            _pipeline._sealed_sparse_journal_v3_enabled_bound(sparse)
+        )
+
+        expected = _pipeline._search_hmm_sealed_postfilter_bound(
+            dense, 0, self.pipeline(**options)
+        )
+        first, telemetry = (
+            _pipeline._search_hmm_sealed_sparse_journal_v3_bound(
+                sparse,
+                0,
+                self.pipeline(**options),
+                _return_route_statistics=True,
+            )
+        )
+        second = _pipeline._search_hmm_sealed_sparse_journal_v3_bound(
+            sparse, 0, self.pipeline(**options)
+        )
+        self.assert_exact_hits(expected, first)
+        self.assert_exact_hits(expected, second)
+        self.assertEqual(telemetry["path"], "journal")
+        self.assertGreaterEqual(telemetry["wall_ns"], 0)
+        preparation = _pipeline._sealed_continuation_statistics_bound(
+            sparse
+        )["sparse_journal_v3"]
+        self.assertTrue(preparation["enabled"])
+        self.assertGreater(preparation["packet_bytes"], 0)
+        self.assertGreaterEqual(preparation["planning_ns"], 0)
+        self.assertGreaterEqual(preparation["validation_ns"], 0)
+        self.assertEqual(
+            _pipeline._sealed_resident_memory_bound(sparse)[
+                "sparse_journal_v3_bytes"
+            ],
+            preparation["packet_bytes"],
+        )
+
+        row_offsets = array("Q", [0, 0, 0])
+        multi = _pipeline._seal_continuation_journal_v2_test_fixture_bound(
+            tuple(self.hmms[:2]),
+            tuple(profile.copy() for profile in self.optimized_profiles[:2]),
+            self.sequences,
+            self.residue_offsets(self.sequences),
+            options["F1"],
+            self.background_fingerprint(self.pipeline(**options).background),
+            b"",
+            row_offsets,
+            b"",
+            row_offsets,
+            array("Q", [0]),
+            array("f"),
+            row_offsets,
+            b"",
+            array("Q", [0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("f"),
+            self.pipeline(**options),
+            2.0e-4,
+            True,
+        )
+        expected_row = _pipeline._search_hmm_sealed_postfilter_bound(
+            multi, 1, self.pipeline(**options)
+        )
+        actual_row = _pipeline._search_hmm_sealed_sparse_journal_v3_bound(
+            multi, 1, self.pipeline(**options)
+        )
+        self.assert_exact_hits(expected_row, actual_row)
+        self.assertEqual(actual_row.searched_models, 1)
+
+        mismatch = self.pipeline(F1=0.5, F2=0.0, F3=0.0)
+        before = _pipeline._semantic_pipeline_state_fingerprint_bound(mismatch)
+        with self.assertRaisesRegex(ValueError, "options differ"):
+            _pipeline._search_hmm_sealed_sparse_journal_v3_bound(
+                sparse, 0, mismatch
+            )
+        self.assertEqual(
+            _pipeline._semantic_pipeline_state_fingerprint_bound(mismatch),
+            before,
+        )
 
     def test_journal_v3_postclaim_failure_stays_consumed(self):
         options = {

@@ -254,6 +254,39 @@ class SealedCandidateTests(unittest.TestCase):
         self.assertGreater(copied["owned_background_fingerprint_bytes"], 0)
         self.assertEqual(copied["excluded_shared_identity_bytes"], 0)
 
+    def test_sparse_v3_dispatch_is_batch_scoped_and_default_stays_dense(self):
+        candidates = self.candidates()
+        dense_marker = object()
+        sparse_marker = object()
+        with mock.patch.object(
+            _pipeline,
+            "_sealed_sparse_journal_v3_enabled_bound",
+            return_value=False,
+        ), mock.patch.object(
+            _pipeline,
+            "_search_hmm_sealed_postfilter_bound",
+            return_value=dense_marker,
+        ) as dense_search, mock.patch.object(
+            _pipeline,
+            "_search_hmm_sealed_sparse_journal_v3_bound",
+            return_value=sparse_marker,
+        ) as sparse_search:
+            self.assertIs(candidates.search(0, self.pipeline()), dense_marker)
+            dense_search.assert_called_once()
+            sparse_search.assert_not_called()
+
+        with mock.patch.object(
+            _pipeline,
+            "_sealed_sparse_journal_v3_enabled_bound",
+            return_value=True,
+        ), mock.patch.object(
+            _pipeline,
+            "_search_hmm_sealed_sparse_journal_v3_bound",
+            return_value=sparse_marker,
+        ) as sparse_search:
+            self.assertIs(candidates.search(0, self.pipeline()), sparse_marker)
+            sparse_search.assert_called_once()
+
     def test_pipeline_lease_and_duplicate_pair_lock_remain_exclusive(self):
         cases = (
             (self.candidates(), self.pipeline(), "pipeline lease"),

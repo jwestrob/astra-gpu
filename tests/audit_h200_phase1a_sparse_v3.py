@@ -114,8 +114,12 @@ def require_environment() -> dict[str, object]:
     return {"provenance": provenance, "seams": seams}
 
 
-def audit_seal(sealed: object, alphabet: object) -> dict[str, object]:
+def audit_seal(
+    sealed: object, candidates: object, alphabet: object
+) -> dict[str, object]:
     generation = _pipeline._sealed_continuation_statistics_bound(sealed)
+    if not _pipeline._sealed_sparse_journal_v3_enabled_bound(sealed):
+        raise AssertionError("fused generation did not retain sparse v3")
     packet = _pipeline._plan_continuation_journal_v3_bound(sealed)
     summary = _pipeline._validate_continuation_journal_v3_bound(
         packet, sealed, include_details=True
@@ -140,6 +144,30 @@ def audit_seal(sealed: object, alphabet: object) -> dict[str, object]:
         raise AssertionError(
             "dense-v2/sparse-v3 mismatch: "
             f"route={route_failures}, semantic={semantic_failures}"
+        )
+    production_pipeline = pipeline(alphabet)
+    production_rows = []
+    for row, expected in enumerate(audit["dense_hits"]):
+        actual, telemetry = candidates.search(
+            row, production_pipeline, return_telemetry=True
+        )
+        expected_fingerprint = (
+            _pipeline._semantic_tophits_fingerprint_bound(expected).hex()
+        )
+        actual_fingerprint = (
+            _pipeline._semantic_tophits_fingerprint_bound(actual).hex()
+        )
+        if actual_fingerprint != expected_fingerprint:
+            raise AssertionError(
+                f"production sparse-v3 dispatch differs at profile {row}"
+            )
+        production_rows.append(
+            {
+                "profile_index": row,
+                "tophits_sha256": actual_fingerprint,
+                "consumer_ns": telemetry["wall_ns"],
+                "path": telemetry["path"],
+            }
         )
     return {
         "generation": generation,
@@ -166,6 +194,7 @@ def audit_seal(sealed: object, alphabet: object) -> dict[str, object]:
             "compact_accepted": accepted,
             "rows": audit["rows"],
         },
+        "production_rows": production_rows,
     }
 
 
@@ -186,6 +215,7 @@ def audit_fixture() -> dict[str, object]:
                 **OPTIONS,
                 bias_filter=True,
                 pipeline=pipeline(alphabet),
+                sparse_journal_v3=True,
             )
             simple_fallback = batch._postfilter_forward_selection(
                 selection,
@@ -193,6 +223,7 @@ def audit_fixture() -> dict[str, object]:
                 bias_filter=True,
                 pipeline=pipeline(alphabet),
                 _rescore_compact_byte_budget=1,
+                sparse_journal_v3=True,
             )
             production_seal = _candidate_state(production).sealed_postfilter
             simple_seal = _candidate_state(simple_fallback).sealed_postfilter
@@ -201,8 +232,12 @@ def audit_fixture() -> dict[str, object]:
             workspace = dict(_sequence_state(batch).native.workspace_statistics)
 
         cases = {
-            "production": audit_seal(production_seal, alphabet),
-            "compact_cap_simple_fallback": audit_seal(simple_seal, alphabet),
+            "production": audit_seal(
+                production_seal, production, alphabet
+            ),
+            "compact_cap_simple_fallback": audit_seal(
+                simple_seal, simple_fallback, alphabet
+            ),
         }
 
     routes = {
