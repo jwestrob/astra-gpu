@@ -110,10 +110,34 @@ def continuation_statistics(local_index, wall_ns):
     )
 
 
-def journal_generation_statistics():
+def journal_generation_statistics(*, forward_reject=False):
     from tests.test_phase0_route_telemetry import valid_transport
 
     records, native = valid_transport()
+    if forward_reject:
+        metrics = list(records[0][0])
+        metrics[7] = 2
+        metrics[8] = 100
+        metrics[10] = 1
+        reasons = [list(row) for row in records[0][1]]
+        reason_cells = [list(row) for row in records[0][2]]
+        reasons[1][0] = 0
+        reasons[1][4] = 2
+        reasons[2][6] = 1
+        reason_cells[2][6] = 50
+        native = {
+            **native,
+            "forward": {
+                **native["forward"],
+                "candidate_count": 2,
+                "work_cells": 100,
+            },
+        }
+        records = ((
+            tuple(metrics),
+            tuple(tuple(row) for row in reasons),
+            tuple(tuple(row) for row in reason_cells),
+        ),)
     doubled_native = {
         stage: (
             None
@@ -135,17 +159,27 @@ def journal_generation_statistics():
     )
 
 
-def journal_continuation_statistics(local_index, row_start):
+def journal_continuation_statistics(
+    local_index, row_start, *, forward_reject=False
+):
     return _telemetry.build_continuation_statistics(
         _telemetry.GENERATION_TELEMETRY_SCHEMA_VERSION,
         "journal",
         10,
         3,
         2,
-        (1, 0, 1, 0, 0, 0, 1),
+        (
+            (1, 0, 0, 0, 1, 0, 1)
+            if forward_reject
+            else (1, 0, 1, 0, 0, 0, 1)
+        ),
         (1, 0, 0, 1),
         (1, 1, 0, 0, row_start, local_index, 1, 1),
-        (0, 1, 0, 0, 1, 0),
+        (
+            (0, 0, 0, 1, 1, 0)
+            if forward_reject
+            else (0, 1, 0, 0, 1, 0)
+        ),
         (0,) * 12,
         (local_index, row_start, row_start + 1),
         BATCH_IDENTITY,
@@ -277,6 +311,13 @@ class TelemetryCollectorTests(unittest.TestCase):
         journal_collector.record_generation(
             journal_generation_statistics(), (10, 20)
         )
+        with self.assertRaisesRegex(ValueError, "journal attribution"):
+            journal_collector.record_continuation(
+                10,
+                journal_continuation_statistics(
+                    0, 0, forward_reject=True
+                ),
+            )
         journal_collector.record_continuation(
             10, journal_continuation_statistics(0, 0)
         )
@@ -288,6 +329,21 @@ class TelemetryCollectorTests(unittest.TestCase):
             20, journal_continuation_statistics(1, 1)
         )
         self.assertTrue(journal_collector.snapshot()["complete"])
+
+        reject_collector = TelemetryCollector()
+        reject_collector.bind_expected_profiles((10, 20))
+        reject_collector.record_generation(
+            journal_generation_statistics(forward_reject=True), (10, 20)
+        )
+        reject_collector.record_continuation(
+            10,
+            journal_continuation_statistics(0, 0, forward_reject=True),
+        )
+        reject_collector.record_continuation(
+            20,
+            journal_continuation_statistics(1, 1, forward_reject=True),
+        )
+        self.assertTrue(reject_collector.snapshot()["complete"])
 
     def test_unbound_or_incomplete_profile_universe_cannot_export(self):
         unbound = TelemetryCollector()

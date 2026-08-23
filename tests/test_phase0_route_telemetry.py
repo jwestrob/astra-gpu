@@ -639,6 +639,18 @@ class DisabledShapeAndSearchTelemetryTests(unittest.TestCase):
         )
         self.assertIsNone(candidates.generation_statistics)
 
+    def test_compiled_continuation_builder_uses_current_schema_constant(self):
+        source = (ROOT / "python/plan7_gpu/_pipeline.pyx").read_text(
+            encoding="utf-8"
+        )
+        marker = "_telemetry_module.build_continuation_statistics("
+        start = source.index(marker)
+        call = source[start:start + 256]
+        self.assertIn(
+            "_telemetry_module.GENERATION_TELEMETRY_SCHEMA_VERSION",
+            call,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

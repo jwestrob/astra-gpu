@@ -321,6 +321,11 @@ class TelemetryCollector:
                     != generation["counts"]["backward_no_region_count"]
                     or continuation["journal"]["simple_count"]
                     != generation["counts"]["backward_simple_count"]
+                    or continuation["source_routes"]["forward_count"]
+                    != (
+                        generation["counts"]["forward_reject_count"]
+                        + continuation["journal"]["cpu_required_count"]
+                    )
                 ):
                     raise ValueError(
                         "continuation journal attribution differs from generation"

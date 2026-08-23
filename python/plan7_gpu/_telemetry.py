@@ -956,8 +956,10 @@ def build_continuation_statistics(
             raise ValueError("journal row bounds changed")
         if source[4] != journal[2] + journal[3]:
             raise ValueError("journal eligible route attribution changed")
-        if source[3] != journal[1]:
-            raise ValueError("journal CPU route attribution changed")
+        if source[3] < journal[1]:
+            raise ValueError(
+                "journal CPU routes exceed Forward continuation sources"
+            )
         if compact[0] > journal[3]:
             raise ValueError("compact attempts exceed SIMPLE journal rows")
     elif any(identity_values[1:]):

@@ -7697,7 +7697,7 @@ cdef object _sealed_search_result(
     if return_route_statistics:
         elapsed_ns = _time.perf_counter_ns() - start_ns
         return hits, _telemetry_module.build_continuation_statistics(
-            1,
+            _telemetry_module.GENERATION_TELEMETRY_SCHEMA_VERSION,
             route_path,
             elapsed_ns,
             statistics.target_count,
