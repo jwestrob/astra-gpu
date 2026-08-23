@@ -52,9 +52,19 @@ cases include:
 - overflow, floating-point-environment drift, malformed state, and one-shot
   ownership failures.
 
-An independent source review found no remaining host-semantic blocker.  The
-Forward, simple-domain, compact-result, and compact-retry routes still require
-the authenticated real-CUDA dual oracle before production activation.
+An independent source review found no remaining host-semantic blocker.
+
+The authenticated real-CUDA gate passed on an attested H200 in Slurm job
+1182321 (exit 0). The source revision was
+`4649a91e4b3fe9ffea1519feca9ff577a79005d0`; the loaded native and pipeline
+extension SHA-256 values were respectively
+`8067fb336e3ef7412a0b01972177d94a867b01a8307c70396ad9b8bc6fd35b03`
+and `fa3dff21bdf35f7f9e8f1fee10748f3aa3e51e77726bfcf191c1a382339f66`.
+The fixture exercised 10 Forward-score, 3 simple-region, and 3 compact-domain
+routes, with 3 compact results accepted. Dense and sparse pipeline/TopHits
+fingerprints and target/domain table bytes matched exactly in every profile.
+The result JSON SHA-256 is
+`ebb10bf2cf665f8efc120725f0ba7693585c231f019df325a68e4ed2d79f463b`.
 
 ## Benchmark status
 
@@ -63,10 +73,16 @@ and validator deliberately rebuild and byte-compare an expected packet before
 execution.  That work is useful for proof but must be removed from, or timed
 separately from, the production path before measuring continuation speed.
 
+For scale only, the production-route fixture's v2 packet was 85,248 bytes and
+its v3 packet was 63,700 bytes. A forced genuine simple-fallback case changed
+80,912 bytes to 30,348 bytes. These tiny-fixture byte reductions are
+correctness evidence, not a full-workload forecast.
+
 ## Decision
 
-Retain this as the Phase 1A equivalence/reference implementation.  Keep
-journal v2 as production until the real-route CUDA oracle passes and the proof
-validation cost is separated.  The next optimization step is to generate the
-sparse certificate before dense host materialization while preserving this
-dual oracle as the audit path.
+Retain this as the Phase 1A equivalence/reference implementation. Keep journal
+v2 as production until the proof-validation cost is separated and the sparse
+path's total wall time is measured. The next optimization step is to switch
+the CPU continuation to validated v3, then generate the sparse certificate
+before dense host materialization while preserving this dual oracle as the
+audit path.

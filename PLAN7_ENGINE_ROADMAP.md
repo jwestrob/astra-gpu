@@ -42,8 +42,8 @@ the complete oracle suite and representative end-to-end workloads.
 
 | Phase | Scope | State | Source commit | Evidence / decision |
 |---|---|---|---|---|
-| 0 | Per-profile/chunk work telemetry and real CPU-fallback taxonomy | in progress | pending | pending |
-| 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | pending | pending | pending |
+| 0 | Per-profile/chunk work telemetry and real CPU-fallback taxonomy | implementation complete; H200 census pending | `d8a1e1a`, `d602d14`, `e3196b6`, `3e757a8`, `d3f6213` | opt-in host validation complete; source-fact H200 run pending |
+| 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | H200 oracle passed; production switch/benchmark pending | through `4649a91` | job 1182321 PASS; see `PHASE1A_SPARSE_CONSUMER.md` |
 | 1B | Produce sparse certificate before dense host materialization | blocked on 1A | pending | pending |
 | 2 | Device-side stable F1 candidate compaction | blocked on 1B | pending | pending |
 | 3 | Device-resident Forward -> Backward/domain -> rescore chain | blocked on 2 | pending | pending |
@@ -113,6 +113,21 @@ continuation, without changing any meaningful `P7_PIPELINE` state or `TopHits`.
 - Material CPU-continuation improvement demonstrated before Phase 1B begins;
   otherwise record the negative result and investigate rather than forcing the
   design forward.
+
+### Current evidence
+
+The host implementation includes journal-v3 planning, checked sparse
+certificate execution, a canonical semantic pipeline/TopHits fingerprint, and
+an independent dense-v2/sparse-v3 dual oracle. The integrated CUDA-hidden
+regression suite passed at revision
+`4649a91e4b3fe9ffea1519feca9ff577a79005d0`.
+
+Focused H200 job 1182321 then generated authenticated fused CUDA batches and
+exercised real Forward, simple-region, and compact-domain continuation. Dense
+v2 and sparse v3 had identical semantic fingerprints and target/domain table
+bytes in every profile. This closes the real-route correctness gate, but not
+the phase: journal v2 remains the production default until the sparse switch
+is implemented and its total wall time is measured honestly.
 
 ## Later phase order
 
