@@ -11512,6 +11512,10 @@ cdef void _v3_complete_row_route_statistics(
         statistics.source_journal_eligible_count += (
             certificate.no_region_count
         )
+        statistics.source_simple_bypass_count += certificate.no_region_count
+        statistics.decision_compact_route_not_device += (
+            certificate.no_region_count
+        )
 
     for exception_index in range(profile.exception_count):
         exception = &exceptions[profile.exception_begin + exception_index]
