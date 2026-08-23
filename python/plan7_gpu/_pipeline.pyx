@@ -20,7 +20,7 @@ from libc.stdint cimport (
     uint64_t,
     uintptr_t,
 )
-from libc.stdlib cimport free, malloc
+from libc.stdlib cimport calloc, free, malloc
 from libc.string cimport memcmp, memcpy, strlen
 from cpython.bytes cimport (
     PyBytes_AS_STRING,
@@ -29,8 +29,11 @@ from cpython.bytes cimport (
 from cpython.buffer cimport Py_buffer, PyBuffer_FillInfo
 from cpython.pycapsule cimport (
     PyCapsule_Destructor,
+    PyCapsule_GetContext,
     PyCapsule_GetPointer,
     PyCapsule_IsValid,
+    PyCapsule_New,
+    PyCapsule_SetContext,
     PyCapsule_SetDestructor,
     PyCapsule_SetName,
     PyCapsule_SetPointer,
@@ -52,7 +55,14 @@ from libeasel.random cimport (
     eslRND_MERSENNE,
 )
 from libeasel.sq cimport ESL_SQ
-from libhmmer cimport p7_MLAMBDA, p7_MMU, p7_VLAMBDA, p7_VMU
+from libhmmer cimport (
+    p7_FLAMBDA,
+    p7_FTAU,
+    p7_MLAMBDA,
+    p7_MMU,
+    p7_VLAMBDA,
+    p7_VMU,
+)
 from libhmmer.impl.p7_oprofile cimport (
     P7_OPROFILE,
     p7_oprofile_Compare,
@@ -140,14 +150,69 @@ cdef extern from "esl_gumbel.h" nogil:
     double esl_gumbel_surv(double, double, double)
 
 
+cdef extern from "esl_exponential.h" nogil:
+    double esl_exp_surv(double, double, double)
+
+
 cdef extern from "continuation_journal.h":
     const char *PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME
     const char *PLAN7_CONTINUATION_JOURNAL_CONSUMED_NAME
+    const char *PLAN7_CONTINUATION_JOURNAL_V3_CAPSULE_NAME
+    const char *PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
 
     cdef enum plan7_continuation_journal_abi:
         PLAN7_CONTINUATION_JOURNAL_VERSION
         PLAN7_CONTINUATION_JOURNAL_MAGIC
         PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE
+
+    cdef enum plan7_continuation_journal_v3_abi:
+        PLAN7_CONTINUATION_JOURNAL_V3_VERSION
+        PLAN7_CONTINUATION_JOURNAL_V3_MAGIC
+        PLAN7_CONTINUATION_JOURNAL_V3_SEQUENCE_FINGERPRINT_SIZE
+
+    cdef enum plan7_continuation_journal_v3_source_kind:
+        PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL
+        PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
+
+    cdef enum plan7_continuation_journal_v3_source_stage:
+        PLAN7_CONTINUATION_V3_BEFORE_F1
+        PLAN7_CONTINUATION_V3_RAW_F1_REJECT
+        PLAN7_CONTINUATION_V3_BIAS_REJECT
+        PLAN7_CONTINUATION_V3_F2_REJECT
+        PLAN7_CONTINUATION_V3_F3_REJECT
+        PLAN7_CONTINUATION_V3_DOMAIN_NO_REGIONS
+        PLAN7_CONTINUATION_V3_CPU_REQUIRED
+        PLAN7_CONTINUATION_V3_F2_SURVIVOR
+        PLAN7_CONTINUATION_V3_F3_SURVIVOR
+        PLAN7_CONTINUATION_V3_DOMAIN_CPU_REQUIRED
+        PLAN7_CONTINUATION_V3_DOMAIN_SIMPLE
+        PLAN7_CONTINUATION_V3_DOMAIN_COMPACT
+
+    cdef enum plan7_continuation_journal_v3_exception_route:
+        PLAN7_CONTINUATION_V3_FULL_PIPELINE
+        PLAN7_CONTINUATION_V3_FILTER_SCORES
+        PLAN7_CONTINUATION_V3_FORWARD_SCORES
+        PLAN7_CONTINUATION_V3_SIMPLE_REGIONS
+        PLAN7_CONTINUATION_V3_COMPACT_DOMAINS
+
+    cdef enum plan7_continuation_journal_v3_payload:
+        PLAN7_CONTINUATION_V3_HAS_POSTFILTER
+        PLAN7_CONTINUATION_V3_HAS_FORWARD
+        PLAN7_CONTINUATION_V3_HAS_DOMAIN
+        PLAN7_CONTINUATION_V3_HAS_SPECIALS
+        PLAN7_CONTINUATION_V3_HAS_REGIONS
+        PLAN7_CONTINUATION_V3_HAS_COMPACT
+
+    cdef enum plan7_continuation_journal_v3_precondition:
+        PLAN7_CONTINUATION_V3_PRE_F2_SURVIVOR
+        PLAN7_CONTINUATION_V3_PRE_DIRECT_FORWARD
+        PLAN7_CONTINUATION_V3_PRE_F3_SURVIVOR
+        PLAN7_CONTINUATION_V3_PRE_DOMAIN_SAFE
+        PLAN7_CONTINUATION_V3_PRE_COMPACT_DEVICE
+
+    cdef enum plan7_continuation_journal_v3_profile_flag:
+        PLAN7_CONTINUATION_V3_PROFILE_HAS_V2_IDENTITY
+        PLAN7_CONTINUATION_V3_PROFILE_HAS_FINGERPRINT
 
     cdef enum plan7_domain_rescore_abi:
         PLAN7_DOMAIN_RESCORE_RECORD_VERSION
@@ -323,8 +388,195 @@ cdef extern from "continuation_journal.h":
         plan7_domain_rescore_provenance rescore
         uint64_t integrity_tag
 
+    ctypedef struct plan7_continuation_journal_v3_options:
+        uint64_t f1_bits
+        uint64_t f2_bits
+        uint64_t f3_bits
+        uint64_t E_bits
+        uint64_t T_bits
+        uint64_t domE_bits
+        uint64_t domT_bits
+        uint64_t incE_bits
+        uint64_t incT_bits
+        uint64_t incdomE_bits
+        uint64_t incdomT_bits
+        uint64_t Z_bits
+        uint64_t domZ_bits
+        uint32_t rt1_bits
+        uint32_t rt2_bits
+        uint32_t rt3_bits
+        int32_t do_biasfilter
+        int32_t do_null2
+        int32_t do_alignment_score_calc
+        int32_t by_E
+        int32_t dom_by_E
+        int32_t inc_by_E
+        int32_t incdom_by_E
+        int32_t use_bit_cutoffs
+        int32_t Z_setby
+        int32_t domZ_setby
+        int32_t mode
+        int32_t long_targets
+        uint32_t complete
+        uint32_t reserved
+
+    ctypedef struct plan7_continuation_journal_v3_certificate:
+        uint64_t target_begin
+        uint64_t target_end
+        uint64_t residue_prefix_begin
+        uint64_t residue_prefix_end
+        uint64_t target_delta
+        uint64_t residue_delta
+        uint64_t before_f1_count
+        uint64_t raw_f1_reject_count
+        uint64_t bias_reject_count
+        uint64_t f2_reject_count
+        uint64_t f3_reject_count
+        uint64_t no_region_count
+        uint64_t n_past_msv_delta
+        uint64_t n_past_bias_delta
+        uint64_t n_past_vit_delta
+        uint64_t n_past_fwd_delta
+        uint32_t profile_index
+        uint32_t segment_index
+        uint64_t segment_tag
+
+    ctypedef struct plan7_continuation_journal_v3_profile:
+        uint64_t certificate_begin
+        uint64_t certificate_count
+        uint64_t exception_begin
+        uint64_t exception_count
+        uint64_t target_count
+        uint64_t total_residues
+        uint64_t source_postfilter_begin
+        uint64_t source_postfilter_count
+        uint64_t source_forward_begin
+        uint64_t source_forward_count
+        uint64_t source_domain_begin
+        uint64_t source_domain_count
+        uint64_t identity_token
+        uint32_t profile_index
+        uint32_t flags
+        uint8_t profile_fingerprint[32]
+        uint64_t profile_tag
+
+    ctypedef struct plan7_continuation_journal_v3_exception:
+        uint64_t source_postfilter_index
+        uint64_t source_forward_index
+        uint64_t source_domain_index
+        uint64_t residue_prefix_begin
+        uint64_t residue_prefix_end
+        uint64_t residue_delta
+        uint64_t special_begin
+        uint64_t special_count
+        uint64_t region_begin
+        uint64_t region_count
+        uint64_t compact_result_begin
+        uint64_t compact_result_count
+        uint64_t compact_trace_begin
+        uint64_t compact_trace_count
+        uint64_t compact_null2_begin
+        uint64_t compact_null2_count
+        uint32_t profile_index
+        uint32_t sequence_index
+        uint32_t exception_index
+        uint8_t source_stage
+        uint8_t route
+        uint8_t payload_flags
+        uint8_t preconditions
+        uint8_t postfilter_record[16]
+        uint8_t forward_record[12]
+        uint8_t domain_record[64]
+        uint32_t reserved
+        uint64_t exception_tag
+
+    ctypedef struct plan7_continuation_journal_v3:
+        uint32_t magic
+        uint16_t version
+        uint16_t header_size
+        uint32_t profile_size
+        uint32_t certificate_size
+        uint32_t exception_size
+        uint32_t region_size
+        uint32_t compact_result_size
+        uint32_t compact_trace_step_size
+        uint32_t compact_null2_stride
+        uint32_t source_kind
+        uint32_t reserved0
+        uint64_t total_bytes
+        uint64_t source_seal_token
+        uint64_t session_id
+        uint64_t selection_id
+        uint64_t batch_generation
+        uint64_t profile_count
+        uint64_t target_count
+        uint64_t total_residues
+        uint64_t source_postfilter_count
+        uint64_t source_forward_count
+        uint64_t source_domain_count
+        uint64_t certificate_count
+        uint64_t exception_count
+        uint64_t special_count
+        uint64_t region_count
+        uint64_t compact_result_count
+        uint64_t compact_trace_offset_count
+        uint64_t compact_trace_count
+        uint64_t compact_null2_count
+        uint64_t source_v2_total_bytes
+        uint64_t source_v2_integrity_tag
+        uint64_t generation_tail_fingerprint
+        uint64_t profiles_offset
+        uint64_t certificates_offset
+        uint64_t exceptions_offset
+        uint64_t specials_offset
+        uint64_t regions_offset
+        uint64_t compact_results_offset
+        uint64_t compact_trace_offsets_offset
+        uint64_t compact_traces_offset
+        uint64_t compact_null2_offset
+        uint64_t background_fingerprint_offset
+        uint64_t background_fingerprint_bytes
+        uint8_t sequence_content_fingerprint[32]
+        plan7_continuation_journal_v3_options options
+        plan7_forward_provenance forward
+        plan7_backward_domain_provenance backward
+        plan7_domain_rescore_provenance rescore
+        uint64_t integrity_tag
+
+    ctypedef struct plan7_continuation_journal_v3_owner:
+        uint64_t allocation_bytes
+        uint64_t source_seal_token
+
     uint64_t plan7_continuation_journal_integrity(
         const plan7_continuation_journal *journal,
+    ) nogil
+
+    uint64_t plan7_continuation_journal_v3_integrity(
+        const plan7_continuation_journal_v3 *journal,
+    ) nogil
+
+    uint64_t plan7_continuation_journal_v3_certificate_tag(
+        const plan7_continuation_journal_v3_certificate *certificate,
+    ) nogil
+
+    uint64_t plan7_continuation_journal_v3_profile_tag(
+        const plan7_continuation_journal_v3_profile *profile,
+    ) nogil
+
+    uint64_t plan7_continuation_journal_v3_exception_tag(
+        const plan7_continuation_journal_v3_exception *exception,
+    ) nogil
+
+    int plan7_continuation_journal_v3_checked_add(
+        uint64_t left,
+        uint64_t right,
+        uint64_t *sum,
+    ) nogil
+
+    int plan7_continuation_journal_v3_checked_multiply(
+        uint64_t left,
+        uint64_t right,
+        uint64_t *product,
     ) nogil
 
     int plan7_continuation_journal_rescore_hashes(
@@ -1178,6 +1430,90 @@ def _validate_simple_region_generation_bound(
     return (0.25, 0.10, 0.20, observed_float.value)
 
 
+cdef int _hmmer_f2_decision(
+    const P7_OPROFILE *profile,
+    const _postfilter_result *record,
+    double f2,
+) noexcept nogil:
+    """Replay HMMER's exact post-bias/F2 predicates.
+
+    Return 1 for an F2 survivor, 0 for an exact F2 reject, and -1 when the
+    supplied source row cannot enter the exact external-score seam.  Keeping
+    this helper shared by Forward selection and journal-v3 planning prevents a
+    second, approximate accounting classifier from drifting away from HMMER.
+    """
+    cdef _float_bits vfsc_bits
+    cdef float usc
+    cdef float bit_score
+    cdef double probability
+
+    if (
+        profile == NULL
+        or record == NULL
+        or record.action != BIAS_DEFINITE_PASS
+        or record.msv_status != SSV_OK
+        or not isfinite(record.filtersc)
+        or not isfinite(profile.scale_b)
+        or profile.scale_b <= 0.0
+    ):
+        return -1
+    vfsc_bits.value = record.vfsc
+    if not isfinite(record.vfsc) and vfsc_bits.bits != 0x7f800000:
+        return -1
+
+    usc = <float> record.msv_numerator
+    usc = usc / profile.scale_b
+    usc = usc - <float> 3.0
+    bit_score = <float> ((usc - record.filtersc) / eslCONST_LOG2)
+    probability = esl_gumbel_surv(
+        bit_score,
+        profile.evparam[<int> p7_MMU],
+        profile.evparam[<int> p7_MLAMBDA],
+    )
+    if probability > f2:
+        bit_score = <float> (
+            (record.vfsc - record.filtersc) / eslCONST_LOG2
+        )
+        probability = esl_gumbel_surv(
+            bit_score,
+            profile.evparam[<int> p7_VMU],
+            profile.evparam[<int> p7_VLAMBDA],
+        )
+        if probability > f2:
+            return 0
+    return 1
+
+
+cdef int _hmmer_f3_decision(
+    const P7_OPROFILE *profile,
+    float filtersc,
+    float fwdsc,
+    double f3,
+) noexcept nogil:
+    """Replay the exact host predicate used by Forward result classification."""
+    cdef float difference
+    cdef float bit_score
+    cdef double probability
+
+    if (
+        profile == NULL
+        or not isfinite(filtersc)
+        or not isfinite(fwdsc)
+        or not isfinite(profile.evparam[<int> p7_FTAU])
+        or not isfinite(profile.evparam[<int> p7_FLAMBDA])
+        or profile.evparam[<int> p7_FLAMBDA] <= 0.0
+    ):
+        return -1
+    difference = fwdsc - filtersc
+    bit_score = <float> (<double> difference / eslCONST_LOG2)
+    probability = esl_exp_surv(
+        bit_score,
+        profile.evparam[<int> p7_FTAU],
+        profile.evparam[<int> p7_FLAMBDA],
+    )
+    return 0 if probability > f3 else 1
+
+
 def _select_forward_inputs_bound(
     profiles,
     const uint8_t[::1] postfilter_records,
@@ -1202,10 +1538,6 @@ def _select_forward_inputs_bound(
     cdef uint32_t previous
     cdef bint have_previous
     cdef uint64_t sequence_length
-    cdef float usc
-    cdef float bit_score
-    cdef double probability
-    cdef _float_bits vfsc_bits
     cdef _postfilter_result record
     cdef OptimizedProfile profile
     cdef object value
@@ -1262,39 +1594,8 @@ def _select_forward_inputs_bound(
 
             if record.action != BIAS_DEFINITE_PASS:
                 continue
-            vfsc_bits.value = record.vfsc
-            if (
-                record.msv_status != SSV_OK
-                or not isfinite(record.filtersc)
-                or (
-                    not isfinite(record.vfsc)
-                    and vfsc_bits.bits != 0x7f800000
-                )
-                or not isfinite(profile._om.scale_b)
-                or profile._om.scale_b <= 0.0
-            ):
+            if _hmmer_f2_decision(profile._om, &record, f2) != 1:
                 continue
-
-            usc = <float> record.msv_numerator
-            usc = usc / profile._om.scale_b
-            usc = usc - <float> 3.0
-            bit_score = <float> ((usc - record.filtersc) / eslCONST_LOG2)
-            probability = esl_gumbel_surv(
-                bit_score,
-                profile._om.evparam[<int> p7_MMU],
-                profile._om.evparam[<int> p7_MLAMBDA],
-            )
-            if probability > f2:
-                bit_score = <float> (
-                    (record.vfsc - record.filtersc) / eslCONST_LOG2
-                )
-                probability = esl_gumbel_surv(
-                    bit_score,
-                    profile._om.evparam[<int> p7_VMU],
-                    profile._om.evparam[<int> p7_VLAMBDA],
-                )
-                if probability > f2:
-                    continue
 
             if residue_offsets[record.sequence_index + 1] < (
                 residue_offsets[record.sequence_index]
@@ -3159,6 +3460,1819 @@ cdef bint _journal_expected_segment(
         return False
     cursor[0] = aligned + byte_count
     return True
+
+
+cdef bint _v3_advance_segment(
+    size_t *cursor,
+    uint64_t count,
+    size_t item_size,
+    uint64_t *offset,
+) noexcept:
+    cdef size_t aligned
+    cdef size_t native_count
+    cdef size_t byte_count
+    if count > <uint64_t> (<size_t> -1):
+        return False
+    native_count = <size_t> count
+    if cursor[0] > (<size_t> -1) - 7:
+        return False
+    aligned = (cursor[0] + 7) & ~<size_t> 7
+    if native_count != 0 and item_size > (<size_t> -1) // native_count:
+        return False
+    byte_count = native_count * item_size
+    if aligned > (<size_t> -1) - byte_count:
+        return False
+    offset[0] = <uint64_t> aligned
+    cursor[0] = aligned + byte_count
+    return True
+
+
+cdef bint _v3_checked_increment(uint64_t *value, uint64_t delta) noexcept:
+    cdef uint64_t updated
+    if not plan7_continuation_journal_v3_checked_add(value[0], delta, &updated):
+        return False
+    value[0] = updated
+    return True
+
+
+cdef bint _v3_domain_continuation_safe(
+    const plan7_continuation_journal_row *row,
+    uint64_t region_begin,
+    uint64_t region_end,
+) noexcept nogil:
+    return (
+        row != NULL
+        and row.domain_status == DOMAIN_OK
+        and row.domain_route in (DOMAIN_NO_REGIONS, DOMAIN_SIMPLE)
+        and not row.has_own_scales
+        and row.uncertain_count == 0
+        and row.multidomain_count == 0
+        and region_begin <= region_end
+        and row.region_count == region_end - region_begin
+    )
+
+
+cdef bint _v3_no_region_certifiable(
+    const plan7_continuation_journal_row *row,
+    uint64_t region_begin,
+    uint64_t region_end,
+    uint64_t compact_begin,
+    uint64_t compact_end,
+) noexcept nogil:
+    return (
+        _v3_domain_continuation_safe(row, region_begin, region_end)
+        and row.domain_route == DOMAIN_NO_REGIONS
+        and row.region_count == 0
+        and region_begin == region_end
+        and row.compact_route == PLAN7_CONTINUATION_COMPACT_NONE
+        and row.compact_result_count == 0
+        and compact_begin == compact_end
+    )
+
+
+cdef void _v3_capsule_destroy(object capsule) noexcept:
+    cdef plan7_continuation_journal_v3 *journal
+    cdef plan7_continuation_journal_v3_owner *owner
+    journal = <plan7_continuation_journal_v3 *> PyCapsule_GetPointer(
+        capsule, PLAN7_CONTINUATION_JOURNAL_V3_CAPSULE_NAME
+    )
+    owner = <plan7_continuation_journal_v3_owner *> PyCapsule_GetContext(
+        capsule
+    )
+    if journal != NULL:
+        free(journal)
+    if owner != NULL:
+        free(owner)
+
+
+cdef void _v3_fill_options(
+    plan7_continuation_journal_v3_options *destination,
+    _SealedPostfilterBatch sealed,
+    bint complete,
+) noexcept:
+    cdef _double_bits f1
+    f1.value = sealed._f1
+    destination.f1_bits = f1.bits
+    destination.f2_bits = sealed._generation_f2_bits
+    destination.f3_bits = sealed._generation_f3_bits
+    destination.do_biasfilter = sealed._generation_bias_filter
+    destination.complete = <uint32_t> complete
+    if not complete:
+        return
+    destination.E_bits = sealed._pipeline_options.E_bits
+    destination.T_bits = sealed._pipeline_options.T_bits
+    destination.domE_bits = sealed._pipeline_options.domE_bits
+    destination.domT_bits = sealed._pipeline_options.domT_bits
+    destination.incE_bits = sealed._pipeline_options.incE_bits
+    destination.incT_bits = sealed._pipeline_options.incT_bits
+    destination.incdomE_bits = sealed._pipeline_options.incdomE_bits
+    destination.incdomT_bits = sealed._pipeline_options.incdomT_bits
+    destination.Z_bits = sealed._pipeline_options.Z_bits
+    destination.domZ_bits = sealed._pipeline_options.domZ_bits
+    destination.rt1_bits = sealed._pipeline_options.rt1_bits
+    destination.rt2_bits = sealed._pipeline_options.rt2_bits
+    destination.rt3_bits = sealed._pipeline_options.rt3_bits
+    destination.do_null2 = sealed._pipeline_options.do_null2
+    destination.do_alignment_score_calc = (
+        sealed._pipeline_options.do_alignment_score_calc
+    )
+    destination.by_E = sealed._pipeline_options.by_E
+    destination.dom_by_E = sealed._pipeline_options.dom_by_E
+    destination.inc_by_E = sealed._pipeline_options.inc_by_E
+    destination.incdom_by_E = sealed._pipeline_options.incdom_by_E
+    destination.use_bit_cutoffs = sealed._pipeline_options.use_bit_cutoffs
+    destination.Z_setby = sealed._pipeline_options.Z_setby
+    destination.domZ_setby = sealed._pipeline_options.domZ_setby
+    destination.mode = sealed._pipeline_options.mode
+    destination.long_targets = sealed._pipeline_options.long_targets
+
+
+cdef bint _v3_fill_certificate(
+    plan7_continuation_journal_v3_certificate *certificate,
+    _SealedPostfilterBatch sealed,
+    uint32_t profile_index,
+    uint32_t segment_index,
+    uint64_t target_begin,
+    uint64_t target_end,
+    uint64_t raw_f1,
+    uint64_t bias_reject,
+    uint64_t f2_reject,
+    uint64_t f3_reject,
+    uint64_t no_region,
+) noexcept:
+    cdef uint64_t terminal_count = 0
+    cdef uint64_t promotion = 0
+    if target_begin > target_end or target_end > sealed._sequences._length:
+        return False
+    certificate.target_begin = target_begin
+    certificate.target_end = target_end
+    certificate.residue_prefix_begin = sealed._residue_offsets[target_begin]
+    certificate.residue_prefix_end = sealed._residue_offsets[target_end]
+    certificate.target_delta = target_end - target_begin
+    if certificate.residue_prefix_end < certificate.residue_prefix_begin:
+        return False
+    certificate.residue_delta = (
+        certificate.residue_prefix_end - certificate.residue_prefix_begin
+    )
+    if (
+        not plan7_continuation_journal_v3_checked_add(
+            raw_f1, bias_reject, &terminal_count
+        )
+        or not _v3_checked_increment(&terminal_count, f2_reject)
+        or not _v3_checked_increment(&terminal_count, f3_reject)
+        or not _v3_checked_increment(&terminal_count, no_region)
+        or terminal_count > certificate.target_delta
+    ):
+        return False
+    certificate.before_f1_count = certificate.target_delta - terminal_count
+    certificate.raw_f1_reject_count = raw_f1
+    certificate.bias_reject_count = bias_reject
+    certificate.f2_reject_count = f2_reject
+    certificate.f3_reject_count = f3_reject
+    certificate.no_region_count = no_region
+    if (
+        not plan7_continuation_journal_v3_checked_add(
+            bias_reject, f2_reject, &promotion
+        )
+        or not _v3_checked_increment(&promotion, f3_reject)
+        or not _v3_checked_increment(&promotion, no_region)
+    ):
+        return False
+    certificate.n_past_msv_delta = promotion
+    if (
+        not plan7_continuation_journal_v3_checked_add(
+            f2_reject, f3_reject, &promotion
+        )
+        or not _v3_checked_increment(&promotion, no_region)
+    ):
+        return False
+    certificate.n_past_bias_delta = promotion
+    if not plan7_continuation_journal_v3_checked_add(
+        f3_reject, no_region, &promotion
+    ):
+        return False
+    certificate.n_past_vit_delta = promotion
+    certificate.n_past_fwd_delta = no_region
+    certificate.profile_index = profile_index
+    certificate.segment_index = segment_index
+    certificate.segment_tag = plan7_continuation_journal_v3_certificate_tag(
+        certificate
+    )
+    return certificate.segment_tag != 0
+
+
+cdef uint8_t _v3_decide_row(
+    const P7_OPROFILE *profile,
+    const _postfilter_result *postfilter,
+    const _forward_result *forward,
+    bint has_forward,
+    const plan7_continuation_journal_row *domain,
+    bint has_domain,
+    uint64_t region_begin,
+    uint64_t region_end,
+    uint64_t compact_begin,
+    uint64_t compact_end,
+    bint compact_available,
+    double f2,
+    double f3,
+) noexcept nogil:
+    cdef int f2_decision
+    cdef int f3_decision
+    cdef uint8_t stage
+    cdef uint8_t route
+
+    if postfilter.action == BIAS_CPU_REQUIRED:
+        stage = PLAN7_CONTINUATION_V3_CPU_REQUIRED
+        route = PLAN7_CONTINUATION_V3_FULL_PIPELINE
+        return <uint8_t> stage | (<uint8_t> route << 4)
+    if isnan(postfilter.filtersc):
+        return <uint8_t> PLAN7_CONTINUATION_V3_RAW_F1_REJECT
+    if postfilter.action == BIAS_DEFINITE_REJECT:
+        return <uint8_t> PLAN7_CONTINUATION_V3_BIAS_REJECT
+
+    f2_decision = _hmmer_f2_decision(profile, postfilter, f2)
+    if not has_forward:
+        if f2_decision == 0:
+            return <uint8_t> PLAN7_CONTINUATION_V3_F2_REJECT
+        stage = PLAN7_CONTINUATION_V3_F2_SURVIVOR
+        route = PLAN7_CONTINUATION_V3_FILTER_SCORES
+        return <uint8_t> stage | (<uint8_t> route << 4)
+
+    if forward.action == FORWARD_CPU_REQUIRED:
+        stage = PLAN7_CONTINUATION_V3_F2_SURVIVOR
+        route = PLAN7_CONTINUATION_V3_FILTER_SCORES
+        return <uint8_t> stage | (<uint8_t> route << 4)
+
+    # Native generation admits Forward rows only for exact F2 survivors.  A
+    # contradictory private fixture stays an exception so the later consumer
+    # can preserve the dense seam's validation/failure behavior.
+    if f2_decision != 1:
+        stage = PLAN7_CONTINUATION_V3_F3_SURVIVOR
+        route = PLAN7_CONTINUATION_V3_FORWARD_SCORES
+        return <uint8_t> stage | (<uint8_t> route << 4)
+
+    f3_decision = _hmmer_f3_decision(
+        profile, postfilter.filtersc, forward.fwdsc, f3
+    )
+    if forward.action == FORWARD_DEFINITE_REJECT and f3_decision == 0:
+        return <uint8_t> PLAN7_CONTINUATION_V3_F3_REJECT
+    if forward.action != FORWARD_DEFINITE_PASS or f3_decision != 1:
+        stage = PLAN7_CONTINUATION_V3_F3_SURVIVOR
+        route = PLAN7_CONTINUATION_V3_FORWARD_SCORES
+        return <uint8_t> stage | (<uint8_t> route << 4)
+
+    if has_domain and _v3_no_region_certifiable(
+        domain, region_begin, region_end, compact_begin, compact_end
+    ):
+        return <uint8_t> PLAN7_CONTINUATION_V3_DOMAIN_NO_REGIONS
+
+    if has_domain and _v3_domain_continuation_safe(
+        domain, region_begin, region_end
+    ):
+        if (
+            domain.domain_route == DOMAIN_SIMPLE
+            and domain.compact_route == PLAN7_CONTINUATION_COMPACT_DEVICE
+            and compact_begin < compact_end
+            and compact_available
+        ):
+            stage = PLAN7_CONTINUATION_V3_DOMAIN_COMPACT
+            route = PLAN7_CONTINUATION_V3_COMPACT_DOMAINS
+        else:
+            stage = PLAN7_CONTINUATION_V3_DOMAIN_SIMPLE
+            route = PLAN7_CONTINUATION_V3_SIMPLE_REGIONS
+        return <uint8_t> stage | (<uint8_t> route << 4)
+
+    stage = (
+        PLAN7_CONTINUATION_V3_DOMAIN_CPU_REQUIRED
+        if has_domain
+        else PLAN7_CONTINUATION_V3_F3_SURVIVOR
+    )
+    route = PLAN7_CONTINUATION_V3_FORWARD_SCORES
+    return <uint8_t> stage | (<uint8_t> route << 4)
+
+
+cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
+    _SealedPostfilterBatch sealed,
+) except NULL:
+    cdef plan7_continuation_journal_v3 *journal = NULL
+    cdef plan7_continuation_journal *source_v2 = NULL
+    cdef plan7_continuation_journal_v3_profile *profiles
+    cdef plan7_continuation_journal_v3_certificate *certificates
+    cdef plan7_continuation_journal_v3_exception *exceptions
+    cdef plan7_continuation_journal_v3_profile *profile_record
+    cdef plan7_continuation_journal_v3_certificate *certificate
+    cdef plan7_continuation_journal_v3_exception *exception
+    cdef plan7_continuation_journal_row domain
+    cdef _postfilter_result postfilter
+    cdef _forward_result forward
+    cdef OptimizedProfile optimized_profile
+    cdef uint8_t *decisions = NULL
+    cdef uint8_t decision
+    cdef uint8_t stage
+    cdef uint8_t route
+    cdef size_t decision_bytes
+    cdef size_t cursor
+    cdef size_t profile_count = len(sealed._optimized_profiles)
+    cdef size_t target_count = sealed._sequences._length
+    cdef size_t postfilter_count
+    cdef size_t forward_count
+    cdef size_t domain_count
+    cdef size_t profile
+    cdef size_t postfilter_cursor
+    cdef size_t postfilter_start
+    cdef size_t postfilter_stop
+    cdef size_t forward_cursor
+    cdef size_t forward_start
+    cdef size_t forward_stop
+    cdef size_t domain_cursor
+    cdef size_t domain_start
+    cdef size_t domain_stop
+    cdef size_t compact_index
+    cdef size_t compact_source
+    cdef uint64_t certificate_count = 0
+    cdef uint64_t exception_count = 0
+    cdef uint64_t special_count = 0
+    cdef uint64_t region_count = 0
+    cdef uint64_t compact_result_count = 0
+    cdef uint64_t compact_trace_offset_count = 0
+    cdef uint64_t compact_trace_count = 0
+    cdef uint64_t compact_null2_count = 0
+    cdef uint64_t profiles_offset = 0
+    cdef uint64_t certificates_offset = 0
+    cdef uint64_t exceptions_offset = 0
+    cdef uint64_t specials_offset = 0
+    cdef uint64_t regions_offset = 0
+    cdef uint64_t compact_results_offset = 0
+    cdef uint64_t compact_trace_offsets_offset = 0
+    cdef uint64_t compact_traces_offset = 0
+    cdef uint64_t compact_null2_offset = 0
+    cdef uint64_t background_fingerprint_offset = 0
+    cdef uint64_t special_begin
+    cdef uint64_t special_end
+    cdef uint64_t region_begin
+    cdef uint64_t region_end
+    cdef uint64_t compact_begin
+    cdef uint64_t compact_end
+    cdef uint64_t trace_begin
+    cdef uint64_t trace_end
+    cdef uint64_t payload_count
+    cdef uint64_t certificate_cursor = 0
+    cdef uint64_t exception_cursor = 0
+    cdef uint64_t special_cursor = 0
+    cdef uint64_t region_cursor = 0
+    cdef uint64_t compact_cursor = 0
+    cdef uint64_t trace_cursor = 0
+    cdef uint64_t null2_cursor = 0
+    cdef uint64_t segment_begin
+    cdef uint64_t raw_f1
+    cdef uint64_t bias_reject
+    cdef uint64_t f2_reject
+    cdef uint64_t f3_reject
+    cdef uint64_t no_region
+    cdef uint64_t profile_certificate_begin
+    cdef uint64_t profile_exception_begin
+    cdef uint64_t source_trace_begin
+    cdef uint64_t source_trace_end
+    cdef uint32_t segment_index
+    cdef int f2_decision
+    cdef int f3_decision
+    cdef bint has_forward
+    cdef bint has_domain
+    cdef bint has_source_v2
+    cdef bint domain_safe
+    cdef bint compact_available
+    cdef _double_bits f2_bits
+    cdef _double_bits f3_bits
+    cdef const uint64_t *source_identity_tokens = NULL
+    cdef const uint8_t *source_profile_fingerprints = NULL
+    cdef uint64_t *compact_trace_offsets
+    cdef uint8_t *destination
+
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    if profile_count > <size_t> 0xffffffff or target_count > <size_t> 0xffffffff:
+        raise OverflowError("journal v3 profile or target index exceeds uint32")
+    postfilter_count = (
+        <size_t> sealed._postfilter_records.shape[0]
+        // sizeof(_postfilter_result)
+    )
+    forward_count = (
+        <size_t> sealed._forward_records.shape[0] // sizeof(_forward_result)
+    )
+    domain_count = (
+        <size_t> sealed._journal_rows.shape[0]
+        // sizeof(plan7_continuation_journal_row)
+    )
+    decision_bytes = postfilter_count
+    if decision_bytes:
+        decisions = <uint8_t *> malloc(decision_bytes)
+        if decisions == NULL:
+            raise MemoryError("journal v3 decision workspace allocation failed")
+
+    f2_bits.bits = sealed._generation_f2_bits
+    f3_bits.bits = sealed._generation_f3_bits
+    has_source_v2 = sealed._journal_storage.shape[0] != 0
+    compact_available = (
+        sealed._compact_domains_seam != NULL
+        and sealed._generation_tail_fingerprint != 0
+    )
+    if has_source_v2:
+        if sealed._journal_storage.shape[0] < sizeof(plan7_continuation_journal):
+            free(decisions)
+            raise ValueError("sealed v2 journal storage is truncated")
+        source_v2 = <plan7_continuation_journal *> &sealed._journal_storage[0]
+        source_identity_tokens = <const uint64_t *> (
+            <const uint8_t *> source_v2 + source_v2.identity_tokens_offset
+        )
+        source_profile_fingerprints = (
+            <const uint8_t *> source_v2
+            + source_v2.profile_fingerprints_offset
+        )
+
+    try:
+        # First pass derives one semantic decision per dense post-filter row and
+        # exact sparse payload sizes.  No Python object is created per row.
+        for profile in range(profile_count):
+            optimized_profile = <OptimizedProfile> sealed._optimized_profiles[profile]
+            postfilter_start = <size_t> sealed._postfilter_offsets[profile]
+            postfilter_stop = <size_t> sealed._postfilter_offsets[profile + 1]
+            forward_start = <size_t> sealed._forward_offsets[profile]
+            forward_stop = <size_t> sealed._forward_offsets[profile + 1]
+            forward_cursor = forward_start
+            if has_source_v2:
+                domain_start = <size_t> sealed._journal_profile_offsets[profile]
+                domain_stop = <size_t> sealed._journal_profile_offsets[profile + 1]
+            else:
+                domain_start = 0
+                domain_stop = 0
+            domain_cursor = domain_start
+
+            for postfilter_cursor in range(postfilter_start, postfilter_stop):
+                memcpy(
+                    &postfilter,
+                    &sealed._postfilter_records[
+                        postfilter_cursor * sizeof(_postfilter_result)
+                    ],
+                    sizeof(_postfilter_result),
+                )
+                has_forward = False
+                if forward_cursor < forward_stop:
+                    memcpy(
+                        &forward,
+                        &sealed._forward_records[
+                            forward_cursor * sizeof(_forward_result)
+                        ],
+                        sizeof(_forward_result),
+                    )
+                    has_forward = forward.sequence_index == postfilter.sequence_index
+                has_domain = False
+                region_begin = 0
+                region_end = 0
+                compact_begin = 0
+                compact_end = 0
+                if domain_cursor < domain_stop:
+                    memcpy(
+                        &domain,
+                        &sealed._journal_rows[
+                            domain_cursor * sizeof(plan7_continuation_journal_row)
+                        ],
+                        sizeof(plan7_continuation_journal_row),
+                    )
+                    has_domain = domain.sequence_index == postfilter.sequence_index
+                    if has_domain:
+                        region_begin = sealed._journal_region_offsets[domain_cursor]
+                        region_end = sealed._journal_region_offsets[domain_cursor + 1]
+                        compact_begin = (
+                            sealed._journal_compact_row_offsets[domain_cursor]
+                        )
+                        compact_end = (
+                            sealed._journal_compact_row_offsets[domain_cursor + 1]
+                        )
+                decision = _v3_decide_row(
+                    optimized_profile._om,
+                    &postfilter,
+                    &forward,
+                    has_forward,
+                    &domain,
+                    has_domain,
+                    region_begin,
+                    region_end,
+                    compact_begin,
+                    compact_end,
+                    compact_available,
+                    f2_bits.value,
+                    f3_bits.value,
+                )
+                decisions[postfilter_cursor] = decision
+                route = <uint8_t> (decision >> 4)
+                if route != 0:
+                    if not _v3_checked_increment(&exception_count, 1):
+                        raise OverflowError("journal v3 exception count overflow")
+                    if route in (
+                        PLAN7_CONTINUATION_V3_FORWARD_SCORES,
+                        PLAN7_CONTINUATION_V3_COMPACT_DOMAINS,
+                    ):
+                        if not has_forward:
+                            raise ValueError("journal v3 Forward route lacks source row")
+                        special_begin = sealed._special_offsets[forward_cursor]
+                        special_end = sealed._special_offsets[forward_cursor + 1]
+                        if special_begin > special_end:
+                            raise ValueError("journal v3 source specials are not monotone")
+                        if not _v3_checked_increment(
+                            &special_count, special_end - special_begin
+                        ):
+                            raise OverflowError("journal v3 special count overflow")
+                    if route in (
+                        PLAN7_CONTINUATION_V3_SIMPLE_REGIONS,
+                        PLAN7_CONTINUATION_V3_COMPACT_DOMAINS,
+                    ):
+                        if not has_domain or region_begin > region_end:
+                            raise ValueError("journal v3 domain route lacks source row")
+                        if not _v3_checked_increment(
+                            &region_count, region_end - region_begin
+                        ):
+                            raise OverflowError("journal v3 region count overflow")
+                    if route == PLAN7_CONTINUATION_V3_COMPACT_DOMAINS:
+                        if compact_begin > compact_end:
+                            raise ValueError("journal v3 compact rows are not monotone")
+                        payload_count = compact_end - compact_begin
+                        if (
+                            not _v3_checked_increment(
+                                &compact_result_count, payload_count
+                            )
+                            or not plan7_continuation_journal_v3_checked_multiply(
+                                payload_count,
+                                PLAN7_DOMAIN_RESCORE_NULL2_COUNT,
+                                &payload_count,
+                            )
+                            or not _v3_checked_increment(
+                                &compact_null2_count, payload_count
+                            )
+                        ):
+                            raise OverflowError("journal v3 compact count overflow")
+                        source_trace_begin = (
+                            sealed._journal_compact_trace_offsets[compact_begin]
+                        )
+                        source_trace_end = (
+                            sealed._journal_compact_trace_offsets[compact_end]
+                        )
+                        if (
+                            source_trace_begin > source_trace_end
+                            or not _v3_checked_increment(
+                                &compact_trace_count,
+                                source_trace_end - source_trace_begin,
+                            )
+                        ):
+                            raise OverflowError("journal v3 compact trace overflow")
+                if has_forward:
+                    forward_cursor += 1
+                if has_domain:
+                    domain_cursor += 1
+            if forward_cursor != forward_stop or domain_cursor != domain_stop:
+                raise ValueError("journal v3 source row mapping is incomplete")
+
+        if not plan7_continuation_journal_v3_checked_add(
+            exception_count, profile_count, &certificate_count
+        ):
+            raise OverflowError("journal v3 certificate count overflow")
+        if not plan7_continuation_journal_v3_checked_add(
+            compact_result_count, 1, &compact_trace_offset_count
+        ):
+            raise OverflowError("journal v3 compact offset count overflow")
+
+        cursor = sizeof(plan7_continuation_journal_v3)
+        if not (
+            _v3_advance_segment(
+                &cursor, profile_count,
+                sizeof(plan7_continuation_journal_v3_profile),
+                &profiles_offset,
+            )
+            and _v3_advance_segment(
+                &cursor, certificate_count,
+                sizeof(plan7_continuation_journal_v3_certificate),
+                &certificates_offset,
+            )
+            and _v3_advance_segment(
+                &cursor, exception_count,
+                sizeof(plan7_continuation_journal_v3_exception),
+                &exceptions_offset,
+            )
+            and _v3_advance_segment(
+                &cursor, special_count, sizeof(float), &specials_offset
+            )
+            and _v3_advance_segment(
+                &cursor, region_count, sizeof(plan7_simple_region),
+                &regions_offset,
+            )
+            and _v3_advance_segment(
+                &cursor, compact_result_count,
+                sizeof(plan7_domain_rescore_result),
+                &compact_results_offset,
+            )
+            and _v3_advance_segment(
+                &cursor, compact_trace_offset_count, sizeof(uint64_t),
+                &compact_trace_offsets_offset,
+            )
+            and _v3_advance_segment(
+                &cursor, compact_trace_count,
+                sizeof(plan7_domain_rescore_trace_step),
+                &compact_traces_offset,
+            )
+            and _v3_advance_segment(
+                &cursor, compact_null2_count, sizeof(float),
+                &compact_null2_offset,
+            )
+            and _v3_advance_segment(
+                &cursor, sealed._background_fingerprint.shape[0], 1,
+                &background_fingerprint_offset,
+            )
+            and cursor <= <size_t> PY_SSIZE_T_MAX
+        ):
+            raise OverflowError("journal v3 storage layout overflow")
+
+        journal = <plan7_continuation_journal_v3 *> calloc(1, cursor)
+        if journal == NULL:
+            raise MemoryError("journal v3 allocation failed")
+        journal.magic = PLAN7_CONTINUATION_JOURNAL_V3_MAGIC
+        journal.version = PLAN7_CONTINUATION_JOURNAL_V3_VERSION
+        journal.header_size = sizeof(plan7_continuation_journal_v3)
+        journal.profile_size = sizeof(plan7_continuation_journal_v3_profile)
+        journal.certificate_size = sizeof(
+            plan7_continuation_journal_v3_certificate
+        )
+        journal.exception_size = sizeof(plan7_continuation_journal_v3_exception)
+        journal.region_size = sizeof(plan7_simple_region)
+        journal.compact_result_size = sizeof(plan7_domain_rescore_result)
+        journal.compact_trace_step_size = sizeof(
+            plan7_domain_rescore_trace_step
+        )
+        journal.compact_null2_stride = PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+        journal.source_kind = (
+            PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
+            if has_source_v2
+            else PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL
+        )
+        journal.total_bytes = cursor
+        journal.source_seal_token = <uint64_t> id(sealed)
+        journal.profile_count = profile_count
+        journal.target_count = target_count
+        journal.total_residues = sealed._residue_offsets[target_count]
+        journal.source_postfilter_count = postfilter_count
+        journal.source_forward_count = forward_count
+        journal.source_domain_count = domain_count
+        journal.certificate_count = certificate_count
+        journal.exception_count = exception_count
+        journal.special_count = special_count
+        journal.region_count = region_count
+        journal.compact_result_count = compact_result_count
+        journal.compact_trace_offset_count = compact_trace_offset_count
+        journal.compact_trace_count = compact_trace_count
+        journal.compact_null2_count = compact_null2_count
+        journal.generation_tail_fingerprint = sealed._generation_tail_fingerprint
+        journal.profiles_offset = profiles_offset
+        journal.certificates_offset = certificates_offset
+        journal.exceptions_offset = exceptions_offset
+        journal.specials_offset = specials_offset
+        journal.regions_offset = regions_offset
+        journal.compact_results_offset = compact_results_offset
+        journal.compact_trace_offsets_offset = compact_trace_offsets_offset
+        journal.compact_traces_offset = compact_traces_offset
+        journal.compact_null2_offset = compact_null2_offset
+        journal.background_fingerprint_offset = background_fingerprint_offset
+        journal.background_fingerprint_bytes = (
+            sealed._background_fingerprint.shape[0]
+        )
+        _v3_fill_options(&journal.options, sealed, has_source_v2)
+        if has_source_v2:
+            journal.session_id = source_v2.session_id
+            journal.selection_id = source_v2.selection_id
+            journal.batch_generation = source_v2.forward.batch_generation
+            journal.source_v2_total_bytes = source_v2.total_bytes
+            journal.source_v2_integrity_tag = source_v2.integrity_tag
+            memcpy(
+                journal.sequence_content_fingerprint,
+                source_v2.sequence_content_fingerprint,
+                PLAN7_CONTINUATION_JOURNAL_V3_SEQUENCE_FINGERPRINT_SIZE,
+            )
+            memcpy(
+                &journal.forward,
+                &source_v2.forward,
+                sizeof(plan7_forward_provenance),
+            )
+            memcpy(
+                &journal.backward,
+                &source_v2.backward,
+                sizeof(plan7_backward_domain_provenance),
+            )
+            memcpy(
+                &journal.rescore,
+                &source_v2.rescore,
+                sizeof(plan7_domain_rescore_provenance),
+            )
+        destination = <uint8_t *> journal
+        if sealed._background_fingerprint.shape[0]:
+            memcpy(
+                destination + background_fingerprint_offset,
+                &sealed._background_fingerprint[0],
+                sealed._background_fingerprint.shape[0],
+            )
+
+        profiles = <plan7_continuation_journal_v3_profile *> (
+            destination + profiles_offset
+        )
+        certificates = <plan7_continuation_journal_v3_certificate *> (
+            destination + certificates_offset
+        )
+        exceptions = <plan7_continuation_journal_v3_exception *> (
+            destination + exceptions_offset
+        )
+        compact_trace_offsets = <uint64_t *> (
+            destination + compact_trace_offsets_offset
+        )
+        compact_trace_offsets[0] = 0
+
+        # Second pass emits ordered certificates and copies only exception
+        # payloads.  Certificate targets never include the following exception.
+        for profile in range(profile_count):
+            optimized_profile = <OptimizedProfile> sealed._optimized_profiles[profile]
+            postfilter_start = <size_t> sealed._postfilter_offsets[profile]
+            postfilter_stop = <size_t> sealed._postfilter_offsets[profile + 1]
+            forward_start = <size_t> sealed._forward_offsets[profile]
+            forward_stop = <size_t> sealed._forward_offsets[profile + 1]
+            forward_cursor = forward_start
+            if has_source_v2:
+                domain_start = <size_t> sealed._journal_profile_offsets[profile]
+                domain_stop = <size_t> sealed._journal_profile_offsets[profile + 1]
+            else:
+                domain_start = 0
+                domain_stop = 0
+            domain_cursor = domain_start
+            profile_certificate_begin = certificate_cursor
+            profile_exception_begin = exception_cursor
+            segment_begin = 0
+            segment_index = 0
+            raw_f1 = 0
+            bias_reject = 0
+            f2_reject = 0
+            f3_reject = 0
+            no_region = 0
+
+            for postfilter_cursor in range(postfilter_start, postfilter_stop):
+                memcpy(
+                    &postfilter,
+                    &sealed._postfilter_records[
+                        postfilter_cursor * sizeof(_postfilter_result)
+                    ],
+                    sizeof(_postfilter_result),
+                )
+                has_forward = False
+                if forward_cursor < forward_stop:
+                    memcpy(
+                        &forward,
+                        &sealed._forward_records[
+                            forward_cursor * sizeof(_forward_result)
+                        ],
+                        sizeof(_forward_result),
+                    )
+                    has_forward = forward.sequence_index == postfilter.sequence_index
+                has_domain = False
+                region_begin = 0
+                region_end = 0
+                compact_begin = 0
+                compact_end = 0
+                if domain_cursor < domain_stop:
+                    memcpy(
+                        &domain,
+                        &sealed._journal_rows[
+                            domain_cursor * sizeof(plan7_continuation_journal_row)
+                        ],
+                        sizeof(plan7_continuation_journal_row),
+                    )
+                    has_domain = domain.sequence_index == postfilter.sequence_index
+                    if has_domain:
+                        region_begin = sealed._journal_region_offsets[domain_cursor]
+                        region_end = sealed._journal_region_offsets[domain_cursor + 1]
+                        compact_begin = (
+                            sealed._journal_compact_row_offsets[domain_cursor]
+                        )
+                        compact_end = (
+                            sealed._journal_compact_row_offsets[domain_cursor + 1]
+                        )
+                decision = decisions[postfilter_cursor]
+                stage = <uint8_t> (decision & 0x0f)
+                route = <uint8_t> (decision >> 4)
+                if route == 0:
+                    if stage == PLAN7_CONTINUATION_V3_RAW_F1_REJECT:
+                        if not _v3_checked_increment(&raw_f1, 1):
+                            raise OverflowError("journal v3 raw-F1 count overflow")
+                    elif stage == PLAN7_CONTINUATION_V3_BIAS_REJECT:
+                        if not _v3_checked_increment(&bias_reject, 1):
+                            raise OverflowError("journal v3 bias count overflow")
+                    elif stage == PLAN7_CONTINUATION_V3_F2_REJECT:
+                        if not _v3_checked_increment(&f2_reject, 1):
+                            raise OverflowError("journal v3 F2 count overflow")
+                    elif stage == PLAN7_CONTINUATION_V3_F3_REJECT:
+                        if not _v3_checked_increment(&f3_reject, 1):
+                            raise OverflowError("journal v3 F3 count overflow")
+                    elif stage == PLAN7_CONTINUATION_V3_DOMAIN_NO_REGIONS:
+                        if not _v3_checked_increment(&no_region, 1):
+                            raise OverflowError("journal v3 no-region count overflow")
+                    else:
+                        raise ValueError("journal v3 terminal source stage is invalid")
+                else:
+                    certificate = &certificates[certificate_cursor]
+                    if not _v3_fill_certificate(
+                        certificate,
+                        sealed,
+                        <uint32_t> profile,
+                        segment_index,
+                        segment_begin,
+                        postfilter.sequence_index,
+                        raw_f1,
+                        bias_reject,
+                        f2_reject,
+                        f3_reject,
+                        no_region,
+                    ):
+                        raise OverflowError("journal v3 certificate is inconsistent")
+                    certificate_cursor += 1
+                    segment_index += 1
+                    segment_begin = <uint64_t> postfilter.sequence_index + 1
+                    raw_f1 = 0
+                    bias_reject = 0
+                    f2_reject = 0
+                    f3_reject = 0
+                    no_region = 0
+
+                    exception = &exceptions[exception_cursor]
+                    exception.source_postfilter_index = postfilter_cursor
+                    exception.source_forward_index = (
+                        forward_cursor
+                        if has_forward
+                        else <uint64_t> -1
+                    )
+                    exception.source_domain_index = (
+                        domain_cursor
+                        if has_domain
+                        else <uint64_t> -1
+                    )
+                    exception.residue_prefix_begin = (
+                        sealed._residue_offsets[postfilter.sequence_index]
+                    )
+                    exception.residue_prefix_end = (
+                        sealed._residue_offsets[postfilter.sequence_index + 1]
+                    )
+                    exception.residue_delta = (
+                        exception.residue_prefix_end
+                        - exception.residue_prefix_begin
+                    )
+                    exception.profile_index = <uint32_t> profile
+                    exception.sequence_index = postfilter.sequence_index
+                    exception.exception_index = <uint32_t> (
+                        exception_cursor - profile_exception_begin
+                    )
+                    exception.source_stage = stage
+                    exception.route = route
+                    exception.payload_flags = PLAN7_CONTINUATION_V3_HAS_POSTFILTER
+                    memcpy(
+                        exception.postfilter_record,
+                        &postfilter,
+                        sizeof(_postfilter_result),
+                    )
+                    if has_forward:
+                        exception.payload_flags |= PLAN7_CONTINUATION_V3_HAS_FORWARD
+                        memcpy(
+                            exception.forward_record,
+                            &forward,
+                            sizeof(_forward_result),
+                        )
+                    if has_domain:
+                        exception.payload_flags |= PLAN7_CONTINUATION_V3_HAS_DOMAIN
+                        memcpy(
+                            exception.domain_record,
+                            &domain,
+                            sizeof(plan7_continuation_journal_row),
+                        )
+                    f2_decision = _hmmer_f2_decision(
+                        optimized_profile._om, &postfilter, f2_bits.value
+                    )
+                    if f2_decision == 1:
+                        exception.preconditions |= (
+                            PLAN7_CONTINUATION_V3_PRE_F2_SURVIVOR
+                        )
+                    if has_forward and forward.action != FORWARD_CPU_REQUIRED:
+                        exception.preconditions |= (
+                            PLAN7_CONTINUATION_V3_PRE_DIRECT_FORWARD
+                        )
+                        f3_decision = _hmmer_f3_decision(
+                            optimized_profile._om,
+                            postfilter.filtersc,
+                            forward.fwdsc,
+                            f3_bits.value,
+                        )
+                        if f3_decision == 1:
+                            exception.preconditions |= (
+                                PLAN7_CONTINUATION_V3_PRE_F3_SURVIVOR
+                            )
+                    domain_safe = has_domain and _v3_domain_continuation_safe(
+                        &domain, region_begin, region_end
+                    )
+                    if domain_safe:
+                        exception.preconditions |= (
+                            PLAN7_CONTINUATION_V3_PRE_DOMAIN_SAFE
+                        )
+                    if (
+                        has_domain
+                        and domain.compact_route
+                        == PLAN7_CONTINUATION_COMPACT_DEVICE
+                    ):
+                        exception.preconditions |= (
+                            PLAN7_CONTINUATION_V3_PRE_COMPACT_DEVICE
+                        )
+
+                    if route in (
+                        PLAN7_CONTINUATION_V3_FORWARD_SCORES,
+                        PLAN7_CONTINUATION_V3_COMPACT_DOMAINS,
+                    ):
+                        special_begin = sealed._special_offsets[forward_cursor]
+                        special_end = sealed._special_offsets[forward_cursor + 1]
+                        exception.special_begin = special_cursor
+                        exception.special_count = special_end - special_begin
+                        if exception.special_count:
+                            exception.payload_flags |= (
+                                PLAN7_CONTINUATION_V3_HAS_SPECIALS
+                            )
+                            memcpy(
+                                destination + specials_offset
+                                + special_cursor * sizeof(float),
+                                &sealed._specials[special_begin],
+                                exception.special_count * sizeof(float),
+                            )
+                        special_cursor += exception.special_count
+                    if route in (
+                        PLAN7_CONTINUATION_V3_SIMPLE_REGIONS,
+                        PLAN7_CONTINUATION_V3_COMPACT_DOMAINS,
+                    ):
+                        exception.region_begin = region_cursor
+                        exception.region_count = region_end - region_begin
+                        if exception.region_count:
+                            exception.payload_flags |= (
+                                PLAN7_CONTINUATION_V3_HAS_REGIONS
+                            )
+                            memcpy(
+                                destination + regions_offset
+                                + region_cursor * sizeof(plan7_simple_region),
+                                &sealed._journal_regions[
+                                    region_begin * sizeof(plan7_simple_region)
+                                ],
+                                exception.region_count
+                                * sizeof(plan7_simple_region),
+                            )
+                        region_cursor += exception.region_count
+                    if route == PLAN7_CONTINUATION_V3_COMPACT_DOMAINS:
+                        exception.payload_flags |= PLAN7_CONTINUATION_V3_HAS_COMPACT
+                        exception.compact_result_begin = compact_cursor
+                        exception.compact_result_count = compact_end - compact_begin
+                        exception.compact_trace_begin = trace_cursor
+                        exception.compact_null2_begin = null2_cursor
+                        if exception.compact_result_count:
+                            memcpy(
+                                destination + compact_results_offset
+                                + compact_cursor
+                                * sizeof(plan7_domain_rescore_result),
+                                &sealed._journal_compact_results[
+                                    compact_begin
+                                    * sizeof(plan7_domain_rescore_result)
+                                ],
+                                exception.compact_result_count
+                                * sizeof(plan7_domain_rescore_result),
+                            )
+                        for compact_index in range(
+                            <size_t> exception.compact_result_count
+                        ):
+                            compact_source = <size_t> compact_begin + compact_index
+                            source_trace_begin = (
+                                sealed._journal_compact_trace_offsets[
+                                    compact_source
+                                ]
+                            )
+                            source_trace_end = (
+                                sealed._journal_compact_trace_offsets[
+                                    compact_source + 1
+                                ]
+                            )
+                            compact_trace_offsets[
+                                compact_cursor + compact_index
+                            ] = trace_cursor
+                            if source_trace_end > source_trace_begin:
+                                memcpy(
+                                    destination + compact_traces_offset
+                                    + trace_cursor
+                                    * sizeof(plan7_domain_rescore_trace_step),
+                                    &sealed._journal_compact_traces[
+                                        source_trace_begin
+                                        * sizeof(
+                                            plan7_domain_rescore_trace_step
+                                        )
+                                    ],
+                                    (source_trace_end - source_trace_begin)
+                                    * sizeof(plan7_domain_rescore_trace_step),
+                                )
+                            trace_cursor += source_trace_end - source_trace_begin
+                        compact_trace_offsets[
+                            compact_cursor + exception.compact_result_count
+                        ] = trace_cursor
+                        exception.compact_trace_count = (
+                            trace_cursor - exception.compact_trace_begin
+                        )
+                        exception.compact_null2_count = (
+                            exception.compact_result_count
+                            * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+                        )
+                        if exception.compact_null2_count:
+                            memcpy(
+                                destination + compact_null2_offset
+                                + null2_cursor * sizeof(float),
+                                &sealed._journal_compact_null2[
+                                    compact_begin
+                                    * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+                                ],
+                                exception.compact_null2_count * sizeof(float),
+                            )
+                        null2_cursor += exception.compact_null2_count
+                        compact_cursor += exception.compact_result_count
+                    exception.exception_tag = (
+                        plan7_continuation_journal_v3_exception_tag(exception)
+                    )
+                    if exception.exception_tag == 0:
+                        raise ValueError("journal v3 exception tag is zero")
+                    exception_cursor += 1
+
+                if has_forward:
+                    forward_cursor += 1
+                if has_domain:
+                    domain_cursor += 1
+
+            certificate = &certificates[certificate_cursor]
+            if not _v3_fill_certificate(
+                certificate,
+                sealed,
+                <uint32_t> profile,
+                segment_index,
+                segment_begin,
+                target_count,
+                raw_f1,
+                bias_reject,
+                f2_reject,
+                f3_reject,
+                no_region,
+            ):
+                raise OverflowError("journal v3 tail certificate is inconsistent")
+            certificate_cursor += 1
+
+            profile_record = &profiles[profile]
+            profile_record.certificate_begin = profile_certificate_begin
+            profile_record.certificate_count = (
+                certificate_cursor - profile_certificate_begin
+            )
+            profile_record.exception_begin = profile_exception_begin
+            profile_record.exception_count = (
+                exception_cursor - profile_exception_begin
+            )
+            profile_record.target_count = target_count
+            profile_record.total_residues = sealed._residue_offsets[target_count]
+            profile_record.source_postfilter_begin = postfilter_start
+            profile_record.source_postfilter_count = postfilter_stop - postfilter_start
+            profile_record.source_forward_begin = forward_start
+            profile_record.source_forward_count = forward_stop - forward_start
+            profile_record.source_domain_begin = domain_start
+            profile_record.source_domain_count = domain_stop - domain_start
+            profile_record.profile_index = <uint32_t> profile
+            if has_source_v2:
+                profile_record.identity_token = source_identity_tokens[profile]
+                profile_record.flags = (
+                    PLAN7_CONTINUATION_V3_PROFILE_HAS_V2_IDENTITY
+                    | PLAN7_CONTINUATION_V3_PROFILE_HAS_FINGERPRINT
+                )
+                memcpy(
+                    profile_record.profile_fingerprint,
+                    source_profile_fingerprints
+                    + profile
+                    * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+                    PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+                )
+            else:
+                profile_record.identity_token = (
+                    <uint64_t> <size_t> optimized_profile._om
+                )
+            profile_record.profile_tag = (
+                plan7_continuation_journal_v3_profile_tag(profile_record)
+            )
+            if profile_record.profile_tag == 0:
+                raise ValueError("journal v3 profile tag is zero")
+
+        if (
+            certificate_cursor != certificate_count
+            or exception_cursor != exception_count
+            or special_cursor != special_count
+            or region_cursor != region_count
+            or compact_cursor != compact_result_count
+            or trace_cursor != compact_trace_count
+            or null2_cursor != compact_null2_count
+            or compact_trace_offsets[compact_result_count]
+            != compact_trace_count
+        ):
+            raise ValueError("journal v3 emitted payload counts differ")
+        journal.integrity_tag = plan7_continuation_journal_v3_integrity(journal)
+        if journal.integrity_tag == 0:
+            raise ValueError("journal v3 integrity tag is zero")
+        return journal
+    except:
+        if journal != NULL:
+            free(journal)
+        raise
+    finally:
+        if decisions != NULL:
+            free(decisions)
+
+
+cdef plan7_continuation_journal_v3 *_v3_validate_capsule(
+    object capsule,
+    _SealedPostfilterBatch sealed,
+    plan7_continuation_journal_v3_owner **owner_out,
+) except NULL:
+    cdef plan7_continuation_journal_v3 *journal
+    cdef plan7_continuation_journal_v3 *expected = NULL
+    cdef plan7_continuation_journal_v3_owner *owner
+    cdef plan7_continuation_journal_v3_profile *profiles
+    cdef plan7_continuation_journal_v3_certificate *certificates
+    cdef plan7_continuation_journal_v3_exception *exceptions
+    cdef plan7_continuation_journal_v3_profile *profile_record
+    cdef plan7_continuation_journal_v3_certificate *certificate
+    cdef plan7_continuation_journal_v3_exception *exception
+    cdef uint8_t *base
+    cdef size_t cursor
+    cdef size_t profile
+    cdef size_t local_index
+    cdef uint64_t target_cursor
+    cdef uint64_t stage_total
+    cdef uint64_t expected_value
+    cdef uint64_t special_cursor = 0
+    cdef uint64_t region_cursor = 0
+    cdef uint64_t compact_cursor = 0
+    cdef uint64_t trace_cursor = 0
+    cdef uint64_t null2_cursor = 0
+    cdef uint64_t cert_begin
+    cdef uint64_t cert_end
+    cdef uint64_t exception_begin
+    cdef uint64_t exception_end
+    cdef uint64_t integrity
+
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    if not PyCapsule_IsValid(
+        capsule, PLAN7_CONTINUATION_JOURNAL_V3_CAPSULE_NAME
+    ):
+        raise TypeError("continuation journal v3 capsule is invalid or consumed")
+    journal = <plan7_continuation_journal_v3 *> PyCapsule_GetPointer(
+        capsule, PLAN7_CONTINUATION_JOURNAL_V3_CAPSULE_NAME
+    )
+    owner = <plan7_continuation_journal_v3_owner *> PyCapsule_GetContext(
+        capsule
+    )
+    if journal == NULL or owner == NULL:
+        raise TypeError("continuation journal v3 capsule has no storage owner")
+    if (
+        owner.source_seal_token != <uint64_t> id(sealed)
+        or journal.source_seal_token != owner.source_seal_token
+    ):
+        raise ValueError("continuation journal v3 source seal differs")
+    if (
+        journal.magic != PLAN7_CONTINUATION_JOURNAL_V3_MAGIC
+        or journal.version != PLAN7_CONTINUATION_JOURNAL_V3_VERSION
+        or journal.header_size != sizeof(plan7_continuation_journal_v3)
+        or journal.profile_size
+        != sizeof(plan7_continuation_journal_v3_profile)
+        or journal.certificate_size
+        != sizeof(plan7_continuation_journal_v3_certificate)
+        or journal.exception_size
+        != sizeof(plan7_continuation_journal_v3_exception)
+        or journal.region_size != sizeof(plan7_simple_region)
+        or journal.compact_result_size
+        != sizeof(plan7_domain_rescore_result)
+        or journal.compact_trace_step_size
+        != sizeof(plan7_domain_rescore_trace_step)
+        or journal.compact_null2_stride
+        != PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+        or journal.reserved0 != 0
+        or journal.total_bytes != owner.allocation_bytes
+        or journal.total_bytes < sizeof(plan7_continuation_journal_v3)
+        or journal.total_bytes > <uint64_t> (<size_t> -1)
+        or journal.total_bytes > <uint64_t> PY_SSIZE_T_MAX
+        or journal.profile_count != len(sealed._optimized_profiles)
+        or journal.target_count != sealed._sequences._length
+        or journal.total_residues
+        != sealed._residue_offsets[sealed._sequences._length]
+        or journal.compact_trace_offset_count
+        != journal.compact_result_count + 1
+        or journal.source_kind not in (
+            PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL,
+            PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL,
+        )
+    ):
+        raise ValueError("continuation journal v3 ABI header is invalid")
+    cursor = sizeof(plan7_continuation_journal_v3)
+    if not (
+        _journal_expected_segment(
+            &cursor, journal.profiles_offset, journal.profile_count,
+            sizeof(plan7_continuation_journal_v3_profile),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.certificates_offset, journal.certificate_count,
+            sizeof(plan7_continuation_journal_v3_certificate),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.exceptions_offset, journal.exception_count,
+            sizeof(plan7_continuation_journal_v3_exception),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.specials_offset, journal.special_count,
+            sizeof(float),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.regions_offset, journal.region_count,
+            sizeof(plan7_simple_region),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_results_offset,
+            journal.compact_result_count,
+            sizeof(plan7_domain_rescore_result),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_trace_offsets_offset,
+            journal.compact_trace_offset_count, sizeof(uint64_t),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_traces_offset,
+            journal.compact_trace_count,
+            sizeof(plan7_domain_rescore_trace_step),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.compact_null2_offset,
+            journal.compact_null2_count, sizeof(float),
+        )
+        and _journal_expected_segment(
+            &cursor, journal.background_fingerprint_offset,
+            journal.background_fingerprint_bytes, 1,
+        )
+        and cursor == <size_t> journal.total_bytes
+    ):
+        raise ValueError("continuation journal v3 storage layout is invalid")
+    integrity = plan7_continuation_journal_v3_integrity(journal)
+    if journal.integrity_tag == 0 or journal.integrity_tag != integrity:
+        raise ValueError("continuation journal v3 integrity check failed")
+    if (
+        journal.background_fingerprint_bytes
+        != sealed._background_fingerprint.shape[0]
+        or (
+            journal.background_fingerprint_bytes != 0
+            and memcmp(
+                <uint8_t *> journal + journal.background_fingerprint_offset,
+                &sealed._background_fingerprint[0],
+                journal.background_fingerprint_bytes,
+            ) != 0
+        )
+    ):
+        raise ValueError("continuation journal v3 background identity differs")
+    if bool(sealed._journal_storage.shape[0]) != (
+        journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
+    ):
+        raise ValueError("continuation journal v3 source provenance differs")
+
+    base = <uint8_t *> journal
+    profiles = <plan7_continuation_journal_v3_profile *> (
+        base + journal.profiles_offset
+    )
+    certificates = <plan7_continuation_journal_v3_certificate *> (
+        base + journal.certificates_offset
+    )
+    exceptions = <plan7_continuation_journal_v3_exception *> (
+        base + journal.exceptions_offset
+    )
+    cert_end = 0
+    exception_end = 0
+    for profile in range(<size_t> journal.profile_count):
+        profile_record = &profiles[profile]
+        if (
+            profile_record.profile_index != profile
+            or profile_record.profile_tag == 0
+            or profile_record.profile_tag
+            != plan7_continuation_journal_v3_profile_tag(profile_record)
+            or profile_record.target_count != journal.target_count
+            or profile_record.total_residues != journal.total_residues
+            or profile_record.certificate_begin != cert_end
+            or profile_record.exception_begin != exception_end
+            or profile_record.certificate_count
+            != profile_record.exception_count + 1
+            or profile_record.certificate_begin > journal.certificate_count
+            or profile_record.exception_begin > journal.exception_count
+            or profile_record.certificate_count
+            > journal.certificate_count - profile_record.certificate_begin
+            or profile_record.exception_count
+            > journal.exception_count - profile_record.exception_begin
+            or profile_record.source_postfilter_begin
+            != sealed._postfilter_offsets[profile]
+            or profile_record.source_postfilter_count
+            != sealed._postfilter_offsets[profile + 1]
+            - sealed._postfilter_offsets[profile]
+            or profile_record.source_forward_begin
+            != sealed._forward_offsets[profile]
+            or profile_record.source_forward_count
+            != sealed._forward_offsets[profile + 1]
+            - sealed._forward_offsets[profile]
+        ):
+            raise ValueError("continuation journal v3 profile certificate is invalid")
+        cert_begin = profile_record.certificate_begin
+        cert_end = cert_begin + profile_record.certificate_count
+        exception_begin = profile_record.exception_begin
+        exception_end = exception_begin + profile_record.exception_count
+        target_cursor = 0
+        for local_index in range(<size_t> profile_record.certificate_count):
+            certificate = &certificates[cert_begin + local_index]
+            if (
+                certificate.profile_index != profile
+                or certificate.segment_index != local_index
+                or certificate.segment_tag == 0
+                or certificate.segment_tag
+                != plan7_continuation_journal_v3_certificate_tag(certificate)
+                or certificate.target_begin != target_cursor
+                or certificate.target_begin > certificate.target_end
+                or certificate.target_end > journal.target_count
+                or certificate.target_delta
+                != certificate.target_end - certificate.target_begin
+                or certificate.residue_prefix_begin
+                != sealed._residue_offsets[certificate.target_begin]
+                or certificate.residue_prefix_end
+                != sealed._residue_offsets[certificate.target_end]
+                or certificate.residue_prefix_begin
+                > certificate.residue_prefix_end
+                or certificate.residue_delta
+                != certificate.residue_prefix_end
+                - certificate.residue_prefix_begin
+            ):
+                raise ValueError("continuation journal v3 segment is invalid")
+            stage_total = certificate.raw_f1_reject_count
+            if (
+                not _v3_checked_increment(
+                    &stage_total, certificate.bias_reject_count
+                )
+                or not _v3_checked_increment(
+                    &stage_total, certificate.f2_reject_count
+                )
+                or not _v3_checked_increment(
+                    &stage_total, certificate.f3_reject_count
+                )
+                or not _v3_checked_increment(
+                    &stage_total, certificate.no_region_count
+                )
+                or not _v3_checked_increment(
+                    &stage_total, certificate.before_f1_count
+                )
+                or stage_total != certificate.target_delta
+            ):
+                raise ValueError("continuation journal v3 stage accounting differs")
+            expected_value = certificate.bias_reject_count
+            if (
+                not _v3_checked_increment(
+                    &expected_value, certificate.f2_reject_count
+                )
+                or not _v3_checked_increment(
+                    &expected_value, certificate.f3_reject_count
+                )
+                or not _v3_checked_increment(
+                    &expected_value, certificate.no_region_count
+                )
+                or certificate.n_past_msv_delta != expected_value
+            ):
+                raise ValueError("continuation journal v3 MSV delta differs")
+            expected_value = certificate.f2_reject_count
+            if (
+                not _v3_checked_increment(
+                    &expected_value, certificate.f3_reject_count
+                )
+                or not _v3_checked_increment(
+                    &expected_value, certificate.no_region_count
+                )
+                or certificate.n_past_bias_delta != expected_value
+            ):
+                raise ValueError("continuation journal v3 bias delta differs")
+            if (
+                not plan7_continuation_journal_v3_checked_add(
+                    certificate.f3_reject_count,
+                    certificate.no_region_count,
+                    &expected_value,
+                )
+                or certificate.n_past_vit_delta != expected_value
+                or certificate.n_past_fwd_delta
+                != certificate.no_region_count
+            ):
+                raise ValueError("continuation journal v3 late-filter delta differs")
+
+            if local_index < profile_record.exception_count:
+                exception = &exceptions[exception_begin + local_index]
+                if (
+                    exception.profile_index != profile
+                    or exception.exception_index != local_index
+                    or exception.sequence_index != certificate.target_end
+                    or exception.sequence_index >= journal.target_count
+                    or exception.residue_prefix_begin
+                    != sealed._residue_offsets[exception.sequence_index]
+                    or exception.residue_prefix_end
+                    != sealed._residue_offsets[exception.sequence_index + 1]
+                    or exception.residue_prefix_begin
+                    > exception.residue_prefix_end
+                    or exception.residue_delta
+                    != exception.residue_prefix_end
+                    - exception.residue_prefix_begin
+                    or exception.route
+                    not in (
+                        PLAN7_CONTINUATION_V3_FULL_PIPELINE,
+                        PLAN7_CONTINUATION_V3_FILTER_SCORES,
+                        PLAN7_CONTINUATION_V3_FORWARD_SCORES,
+                        PLAN7_CONTINUATION_V3_SIMPLE_REGIONS,
+                        PLAN7_CONTINUATION_V3_COMPACT_DOMAINS,
+                    )
+                    or exception.exception_tag == 0
+                    or exception.exception_tag
+                    != plan7_continuation_journal_v3_exception_tag(exception)
+                    or exception.reserved != 0
+                    or exception.source_postfilter_index
+                    < profile_record.source_postfilter_begin
+                    or exception.source_postfilter_index
+                    >= profile_record.source_postfilter_begin
+                    + profile_record.source_postfilter_count
+                    or not (
+                        exception.payload_flags
+                        & PLAN7_CONTINUATION_V3_HAS_POSTFILTER
+                    )
+                ):
+                    raise ValueError("continuation journal v3 exception is invalid")
+                if exception.special_count:
+                    if exception.special_begin != special_cursor:
+                        raise ValueError("continuation journal v3 special span differs")
+                    special_cursor += exception.special_count
+                elif exception.special_begin != 0:
+                    raise ValueError("empty journal v3 special span has an offset")
+                if exception.region_count:
+                    if exception.region_begin != region_cursor:
+                        raise ValueError("continuation journal v3 region span differs")
+                    region_cursor += exception.region_count
+                elif exception.region_begin != 0:
+                    raise ValueError("empty journal v3 region span has an offset")
+                if exception.compact_result_count:
+                    if (
+                        exception.compact_result_begin != compact_cursor
+                        or exception.compact_trace_begin != trace_cursor
+                        or exception.compact_null2_begin != null2_cursor
+                    ):
+                        raise ValueError("continuation journal v3 compact span differs")
+                    compact_cursor += exception.compact_result_count
+                    trace_cursor += exception.compact_trace_count
+                    null2_cursor += exception.compact_null2_count
+                elif (
+                    exception.compact_result_begin != 0
+                    or exception.compact_trace_begin != 0
+                    or exception.compact_trace_count != 0
+                    or exception.compact_null2_begin != 0
+                    or exception.compact_null2_count != 0
+                ):
+                    raise ValueError("empty journal v3 compact span has an offset")
+                target_cursor = <uint64_t> exception.sequence_index + 1
+            else:
+                if certificate.target_end != journal.target_count:
+                    raise ValueError("journal v3 tail certificate is incomplete")
+                target_cursor = certificate.target_end
+        if target_cursor != journal.target_count:
+            raise ValueError("journal v3 profile partition is incomplete")
+    if (
+        cert_end != journal.certificate_count
+        or exception_end != journal.exception_count
+        or special_cursor != journal.special_count
+        or region_cursor != journal.region_count
+        or compact_cursor != journal.compact_result_count
+        or trace_cursor != journal.compact_trace_count
+        or null2_cursor != journal.compact_null2_count
+    ):
+        raise ValueError("continuation journal v3 payload partition differs")
+
+    # The source seal is still present in Phase 1A. Rebuilding the compact plan
+    # gives the validator an independent exact comparison of every certificate,
+    # route precondition, identity, and copied payload byte.
+    expected = _v3_allocate_from_seal(sealed)
+    try:
+        if (
+            expected.total_bytes != journal.total_bytes
+            or memcmp(journal, expected, <size_t> journal.total_bytes) != 0
+        ):
+            raise ValueError("continuation journal v3 differs from its dense source")
+    finally:
+        free(expected)
+    owner_out[0] = owner
+    return journal
+
+
+cdef dict _v3_debug_summary(
+    const plan7_continuation_journal_v3 *journal,
+    bint include_details,
+):
+    cdef const uint8_t *base = <const uint8_t *> journal
+    cdef const plan7_continuation_journal_v3_profile *profiles = (
+        <const plan7_continuation_journal_v3_profile *> (
+            base + journal.profiles_offset
+        )
+    )
+    cdef const plan7_continuation_journal_v3_certificate *certificates = (
+        <const plan7_continuation_journal_v3_certificate *> (
+            base + journal.certificates_offset
+        )
+    )
+    cdef const plan7_continuation_journal_v3_exception *exceptions = (
+        <const plan7_continuation_journal_v3_exception *> (
+            base + journal.exceptions_offset
+        )
+    )
+    cdef const plan7_continuation_journal_v3_profile *profile_record
+    cdef const plan7_continuation_journal_v3_certificate *certificate
+    cdef const plan7_continuation_journal_v3_exception *exception
+    cdef size_t profile
+    cdef size_t index
+    cdef uint64_t before_f1 = 0
+    cdef uint64_t raw_f1 = 0
+    cdef uint64_t bias_reject = 0
+    cdef uint64_t f2_reject = 0
+    cdef uint64_t f3_reject = 0
+    cdef uint64_t no_region = 0
+    cdef uint64_t past_msv = 0
+    cdef uint64_t past_bias = 0
+    cdef uint64_t past_vit = 0
+    cdef uint64_t past_fwd = 0
+    cdef uint64_t full_pipeline = 0
+    cdef uint64_t filter_scores = 0
+    cdef uint64_t forward_scores = 0
+    cdef uint64_t simple_regions = 0
+    cdef uint64_t compact_domains = 0
+    cdef list profile_details = []
+    cdef list certificate_details
+    cdef list exception_details
+
+    for index in range(<size_t> journal.certificate_count):
+        certificate = &certificates[index]
+        before_f1 += certificate.before_f1_count
+        raw_f1 += certificate.raw_f1_reject_count
+        bias_reject += certificate.bias_reject_count
+        f2_reject += certificate.f2_reject_count
+        f3_reject += certificate.f3_reject_count
+        no_region += certificate.no_region_count
+        past_msv += certificate.n_past_msv_delta
+        past_bias += certificate.n_past_bias_delta
+        past_vit += certificate.n_past_vit_delta
+        past_fwd += certificate.n_past_fwd_delta
+    for index in range(<size_t> journal.exception_count):
+        exception = &exceptions[index]
+        if exception.route == PLAN7_CONTINUATION_V3_FULL_PIPELINE:
+            full_pipeline += 1
+        elif exception.route == PLAN7_CONTINUATION_V3_FILTER_SCORES:
+            filter_scores += 1
+        elif exception.route == PLAN7_CONTINUATION_V3_FORWARD_SCORES:
+            forward_scores += 1
+        elif exception.route == PLAN7_CONTINUATION_V3_SIMPLE_REGIONS:
+            simple_regions += 1
+        elif exception.route == PLAN7_CONTINUATION_V3_COMPACT_DOMAINS:
+            compact_domains += 1
+
+    if include_details:
+        for profile in range(<size_t> journal.profile_count):
+            profile_record = &profiles[profile]
+            certificate_details = []
+            exception_details = []
+            for index in range(<size_t> profile_record.certificate_count):
+                certificate = &certificates[
+                    profile_record.certificate_begin + index
+                ]
+                certificate_details.append({
+                    "begin": certificate.target_begin,
+                    "end": certificate.target_end,
+                    "residue_prefix_begin": certificate.residue_prefix_begin,
+                    "residue_prefix_end": certificate.residue_prefix_end,
+                    "target_delta": certificate.target_delta,
+                    "residue_delta": certificate.residue_delta,
+                    "before_f1": certificate.before_f1_count,
+                    "raw_f1_reject": certificate.raw_f1_reject_count,
+                    "bias_reject": certificate.bias_reject_count,
+                    "f2_reject": certificate.f2_reject_count,
+                    "f3_reject": certificate.f3_reject_count,
+                    "no_region": certificate.no_region_count,
+                    "promotions": (
+                        certificate.n_past_msv_delta,
+                        certificate.n_past_bias_delta,
+                        certificate.n_past_vit_delta,
+                        certificate.n_past_fwd_delta,
+                    ),
+                })
+            for index in range(<size_t> profile_record.exception_count):
+                exception = &exceptions[
+                    profile_record.exception_begin + index
+                ]
+                exception_details.append({
+                    "sequence_index": exception.sequence_index,
+                    "source_stage": exception.source_stage,
+                    "route": exception.route,
+                    "payload_flags": exception.payload_flags,
+                    "preconditions": exception.preconditions,
+                    "residue_prefix_begin": exception.residue_prefix_begin,
+                    "residue_prefix_end": exception.residue_prefix_end,
+                    "source_postfilter_index": (
+                        exception.source_postfilter_index
+                    ),
+                    "source_forward_index": exception.source_forward_index,
+                    "source_domain_index": exception.source_domain_index,
+                    "special_count": exception.special_count,
+                    "region_count": exception.region_count,
+                    "compact_result_count": exception.compact_result_count,
+                    "compact_trace_count": exception.compact_trace_count,
+                    "compact_null2_count": exception.compact_null2_count,
+                })
+            profile_details.append({
+                "profile_index": profile,
+                "target_count": profile_record.target_count,
+                "total_residues": profile_record.total_residues,
+                "identity_token": profile_record.identity_token,
+                "flags": profile_record.flags,
+                "certificates": tuple(certificate_details),
+                "exceptions": tuple(exception_details),
+            })
+
+    return {
+        "schema_version": journal.version,
+        "source_kind": (
+            "v2_journal"
+            if journal.source_kind == PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL
+            else "host_seal"
+        ),
+        "profile_count": journal.profile_count,
+        "target_count": journal.target_count,
+        "total_residues": journal.total_residues,
+        "dense_postfilter_count": journal.source_postfilter_count,
+        "dense_forward_count": journal.source_forward_count,
+        "dense_domain_count": journal.source_domain_count,
+        "certificate_count": journal.certificate_count,
+        "exception_count": journal.exception_count,
+        "stage_counts": {
+            "before_f1": before_f1,
+            "raw_f1_reject": raw_f1,
+            "bias_reject": bias_reject,
+            "f2_reject": f2_reject,
+            "f3_reject": f3_reject,
+            "domain_no_regions": no_region,
+        },
+        "promotion_deltas": {
+            "n_past_msv": past_msv,
+            "n_past_bias": past_bias,
+            "n_past_vit": past_vit,
+            "n_past_fwd": past_fwd,
+        },
+        "exception_routes": {
+            "full_pipeline": full_pipeline,
+            "filter_scores": filter_scores,
+            "forward_scores": forward_scores,
+            "simple_regions": simple_regions,
+            "compact_domains": compact_domains,
+        },
+        "payload_counts": {
+            "specials": journal.special_count,
+            "regions": journal.region_count,
+            "compact_results": journal.compact_result_count,
+            "compact_traces": journal.compact_trace_count,
+            "compact_null2": journal.compact_null2_count,
+        },
+        "packet_bytes": journal.total_bytes,
+        "source_v2_bytes": journal.source_v2_total_bytes,
+        "header_size": journal.header_size,
+        "total_bytes_offset": (
+            <size_t> &journal.total_bytes - <size_t> journal
+        ),
+        "integrity_offset": (
+            <size_t> &journal.integrity_tag - <size_t> journal
+        ),
+        "profiles_offset": journal.profiles_offset,
+        "certificates_offset": journal.certificates_offset,
+        "exceptions_offset": journal.exceptions_offset,
+        "profile_record_size": journal.profile_size,
+        "certificate_record_size": journal.certificate_size,
+        "exception_record_size": journal.exception_size,
+        "profiles": tuple(profile_details) if include_details else None,
+    }
+
+
+cdef void _v3_retire_debug_capsule(
+    object capsule,
+    plan7_continuation_journal_v3 *journal,
+    plan7_continuation_journal_v3_owner *owner,
+) except *:
+    if PyCapsule_SetDestructor(
+        capsule, <PyCapsule_Destructor> NULL
+    ) != 0:
+        raise RuntimeError("cannot consume continuation journal v3 capsule")
+    if PyCapsule_SetPointer(capsule, &_consumed_journal_sentinel) != 0:
+        free(journal)
+        free(owner)
+        PyCapsule_SetName(
+            capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
+        )
+        raise RuntimeError("cannot retire continuation journal v3 capsule")
+    if PyCapsule_SetContext(capsule, NULL) != 0:
+        free(journal)
+        free(owner)
+        PyCapsule_SetName(
+            capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
+        )
+        raise RuntimeError("cannot clear continuation journal v3 owner")
+    if PyCapsule_SetName(
+        capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
+    ) != 0:
+        free(journal)
+        free(owner)
+        raise RuntimeError("cannot mark continuation journal v3 consumed")
+    free(journal)
+    free(owner)
+
+
+def _plan_continuation_journal_v3_bound(sealed_object):
+    """Compact one validated dense seal into an opaque journal-v3 packet.
+
+    This Phase-1A planner does not alter production consumption.  The dense
+    seal remains the audit source, while the new packet owns copies of only the
+    payloads required by ordered exception rows.
+    """
+    cdef _SealedPostfilterBatch sealed
+    cdef plan7_continuation_journal_v3 *journal = NULL
+    cdef plan7_continuation_journal_v3_owner *owner = NULL
+    cdef object capsule
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    journal = _v3_allocate_from_seal(sealed)
+    owner = <plan7_continuation_journal_v3_owner *> calloc(
+        1, sizeof(plan7_continuation_journal_v3_owner)
+    )
+    if owner == NULL:
+        free(journal)
+        raise MemoryError("journal v3 capsule owner allocation failed")
+    owner.allocation_bytes = journal.total_bytes
+    owner.source_seal_token = journal.source_seal_token
+    capsule = PyCapsule_New(
+        journal,
+        PLAN7_CONTINUATION_JOURNAL_V3_CAPSULE_NAME,
+        _v3_capsule_destroy,
+    )
+    if capsule is None:
+        free(journal)
+        free(owner)
+        raise MemoryError("journal v3 capsule allocation failed")
+    if PyCapsule_SetContext(capsule, owner) != 0:
+        PyCapsule_SetDestructor(capsule, <PyCapsule_Destructor> NULL)
+        free(journal)
+        free(owner)
+        raise RuntimeError("cannot attach continuation journal v3 owner")
+    return capsule
+
+
+def _validate_continuation_journal_v3_bound(
+    capsule,
+    sealed_object,
+    bint consume=False,
+    bint include_details=False,
+):
+    """Validate a v3 packet against its dense seal and return a debug summary.
+
+    ``consume=True`` is a one-shot debug sink used before the sparse consumer
+    exists.  Failed validation never retires the capsule or mutates any HMMER
+    pipeline state.
+    """
+    cdef _SealedPostfilterBatch sealed
+    cdef plan7_continuation_journal_v3 *journal
+    cdef plan7_continuation_journal_v3_owner *owner = NULL
+    cdef dict summary
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    journal = _v3_validate_capsule(capsule, sealed, &owner)
+    summary = _v3_debug_summary(journal, include_details)
+    if consume:
+        _v3_retire_debug_capsule(capsule, journal, owner)
+    return summary
 
 
 cdef tuple _consume_validate_continuation_journal(

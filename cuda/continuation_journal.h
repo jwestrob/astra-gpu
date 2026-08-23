@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "domain_rescore_cuda.h"
+#include "postfilter_cuda.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,6 +59,249 @@ typedef struct plan7_continuation_journal_row {
   uint8_t reserved2[3];
   uint32_t reserved3;
 } plan7_continuation_journal_row;
+
+/* Version 3 is an additive host-side sparse-accounting ABI.  Version 2 above
+ * remains the native producer/audit transport and is intentionally unchanged.
+ * Phase 1A constructs v3 only after a v2 batch has already survived the full
+ * existing seal, or from the older host-only sealed fixture path. */
+enum plan7_continuation_journal_v3_abi {
+  PLAN7_CONTINUATION_JOURNAL_V3_VERSION = 3,
+  PLAN7_CONTINUATION_JOURNAL_V3_MAGIC = 0x504a4e33,
+  PLAN7_CONTINUATION_JOURNAL_V3_SEQUENCE_FINGERPRINT_SIZE = 32,
+  PLAN7_CONTINUATION_JOURNAL_V3_BACKGROUND_ALIGNMENT = 8
+};
+
+#define PLAN7_CONTINUATION_JOURNAL_V3_CAPSULE_NAME \
+  "plan7_gpu._pipeline._continuation_journal_v3"
+#define PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME \
+  "plan7_gpu._pipeline._consumed_journal_v3"
+#define PLAN7_CONTINUATION_JOURNAL_V3_NO_SOURCE_INDEX UINT64_MAX
+
+enum plan7_continuation_journal_v3_source_kind {
+  PLAN7_CONTINUATION_V3_SOURCE_HOST_SEAL = 1,
+  PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL = 2
+};
+
+/* These are semantic source stages, not planner policy guesses.  Terminal
+ * stages are emitted only after replaying the same HMMER/Easel predicates (or
+ * consuming a producer action already authenticated by v2). */
+enum plan7_continuation_journal_v3_source_stage {
+  PLAN7_CONTINUATION_V3_BEFORE_F1 = 0,
+  PLAN7_CONTINUATION_V3_RAW_F1_REJECT = 1,
+  PLAN7_CONTINUATION_V3_BIAS_REJECT = 2,
+  PLAN7_CONTINUATION_V3_F2_REJECT = 3,
+  PLAN7_CONTINUATION_V3_F3_REJECT = 4,
+  PLAN7_CONTINUATION_V3_DOMAIN_NO_REGIONS = 5,
+  PLAN7_CONTINUATION_V3_CPU_REQUIRED = 6,
+  PLAN7_CONTINUATION_V3_F2_SURVIVOR = 7,
+  PLAN7_CONTINUATION_V3_F3_SURVIVOR = 8,
+  PLAN7_CONTINUATION_V3_DOMAIN_CPU_REQUIRED = 9,
+  PLAN7_CONTINUATION_V3_DOMAIN_SIMPLE = 10,
+  PLAN7_CONTINUATION_V3_DOMAIN_COMPACT = 11
+};
+
+enum plan7_continuation_journal_v3_exception_route {
+  PLAN7_CONTINUATION_V3_FULL_PIPELINE = 1,
+  PLAN7_CONTINUATION_V3_FILTER_SCORES = 2,
+  PLAN7_CONTINUATION_V3_FORWARD_SCORES = 3,
+  PLAN7_CONTINUATION_V3_SIMPLE_REGIONS = 4,
+  PLAN7_CONTINUATION_V3_COMPACT_DOMAINS = 5
+};
+
+enum plan7_continuation_journal_v3_payload {
+  PLAN7_CONTINUATION_V3_HAS_POSTFILTER = 0x01,
+  PLAN7_CONTINUATION_V3_HAS_FORWARD = 0x02,
+  PLAN7_CONTINUATION_V3_HAS_DOMAIN = 0x04,
+  PLAN7_CONTINUATION_V3_HAS_SPECIALS = 0x08,
+  PLAN7_CONTINUATION_V3_HAS_REGIONS = 0x10,
+  PLAN7_CONTINUATION_V3_HAS_COMPACT = 0x20
+};
+
+enum plan7_continuation_journal_v3_precondition {
+  PLAN7_CONTINUATION_V3_PRE_F2_SURVIVOR = 0x01,
+  PLAN7_CONTINUATION_V3_PRE_DIRECT_FORWARD = 0x02,
+  PLAN7_CONTINUATION_V3_PRE_F3_SURVIVOR = 0x04,
+  PLAN7_CONTINUATION_V3_PRE_DOMAIN_SAFE = 0x08,
+  PLAN7_CONTINUATION_V3_PRE_COMPACT_DEVICE = 0x10
+};
+
+enum plan7_continuation_journal_v3_profile_flag {
+  PLAN7_CONTINUATION_V3_PROFILE_HAS_V2_IDENTITY = 0x01,
+  PLAN7_CONTINUATION_V3_PROFILE_HAS_FINGERPRINT = 0x02
+};
+
+typedef struct plan7_continuation_journal_v3_options {
+  uint64_t f1_bits;
+  uint64_t f2_bits;
+  uint64_t f3_bits;
+  uint64_t E_bits;
+  uint64_t T_bits;
+  uint64_t domE_bits;
+  uint64_t domT_bits;
+  uint64_t incE_bits;
+  uint64_t incT_bits;
+  uint64_t incdomE_bits;
+  uint64_t incdomT_bits;
+  uint64_t Z_bits;
+  uint64_t domZ_bits;
+  uint32_t rt1_bits;
+  uint32_t rt2_bits;
+  uint32_t rt3_bits;
+  int32_t do_biasfilter;
+  int32_t do_null2;
+  int32_t do_alignment_score_calc;
+  int32_t by_E;
+  int32_t dom_by_E;
+  int32_t inc_by_E;
+  int32_t incdom_by_E;
+  int32_t use_bit_cutoffs;
+  int32_t Z_setby;
+  int32_t domZ_setby;
+  int32_t mode;
+  int32_t long_targets;
+  uint32_t complete;
+  uint32_t reserved;
+} plan7_continuation_journal_v3_options;
+
+typedef struct plan7_continuation_journal_v3_certificate {
+  uint64_t target_begin;
+  uint64_t target_end;
+  uint64_t residue_prefix_begin;
+  uint64_t residue_prefix_end;
+  uint64_t target_delta;
+  uint64_t residue_delta;
+  uint64_t before_f1_count;
+  uint64_t raw_f1_reject_count;
+  uint64_t bias_reject_count;
+  uint64_t f2_reject_count;
+  uint64_t f3_reject_count;
+  uint64_t no_region_count;
+  uint64_t n_past_msv_delta;
+  uint64_t n_past_bias_delta;
+  uint64_t n_past_vit_delta;
+  uint64_t n_past_fwd_delta;
+  uint32_t profile_index;
+  uint32_t segment_index;
+  uint64_t segment_tag;
+} plan7_continuation_journal_v3_certificate;
+
+typedef struct plan7_continuation_journal_v3_profile {
+  uint64_t certificate_begin;
+  uint64_t certificate_count;
+  uint64_t exception_begin;
+  uint64_t exception_count;
+  uint64_t target_count;
+  uint64_t total_residues;
+  uint64_t source_postfilter_begin;
+  uint64_t source_postfilter_count;
+  uint64_t source_forward_begin;
+  uint64_t source_forward_count;
+  uint64_t source_domain_begin;
+  uint64_t source_domain_count;
+  uint64_t identity_token;
+  uint32_t profile_index;
+  uint32_t flags;
+  uint8_t profile_fingerprint[
+      PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE];
+  uint64_t profile_tag;
+} plan7_continuation_journal_v3_profile;
+
+/* The three source records are copied byte-for-byte.  This keeps v3 additive:
+ * their original public ABIs remain owned by their stage headers, while the
+ * sparse packet has no pointers into the dense v2 allocation. */
+typedef struct plan7_continuation_journal_v3_exception {
+  uint64_t source_postfilter_index;
+  uint64_t source_forward_index;
+  uint64_t source_domain_index;
+  uint64_t residue_prefix_begin;
+  uint64_t residue_prefix_end;
+  uint64_t residue_delta;
+  uint64_t special_begin;
+  uint64_t special_count;
+  uint64_t region_begin;
+  uint64_t region_count;
+  uint64_t compact_result_begin;
+  uint64_t compact_result_count;
+  uint64_t compact_trace_begin;
+  uint64_t compact_trace_count;
+  uint64_t compact_null2_begin;
+  uint64_t compact_null2_count;
+  uint32_t profile_index;
+  uint32_t sequence_index;
+  uint32_t exception_index;
+  uint8_t source_stage;
+  uint8_t route;
+  uint8_t payload_flags;
+  uint8_t preconditions;
+  uint8_t postfilter_record[PLAN7_POSTFILTER_RECORD_SIZE];
+  uint8_t forward_record[PLAN7_FORWARD_RECORD_SIZE];
+  uint8_t domain_record[sizeof(plan7_continuation_journal_row)];
+  uint32_t reserved;
+  uint64_t exception_tag;
+} plan7_continuation_journal_v3_exception;
+
+typedef struct plan7_continuation_journal_v3 {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t header_size;
+  uint32_t profile_size;
+  uint32_t certificate_size;
+  uint32_t exception_size;
+  uint32_t region_size;
+  uint32_t compact_result_size;
+  uint32_t compact_trace_step_size;
+  uint32_t compact_null2_stride;
+  uint32_t source_kind;
+  uint32_t reserved0;
+  uint64_t total_bytes;
+  uint64_t source_seal_token;
+  uint64_t session_id;
+  uint64_t selection_id;
+  uint64_t batch_generation;
+  uint64_t profile_count;
+  uint64_t target_count;
+  uint64_t total_residues;
+  uint64_t source_postfilter_count;
+  uint64_t source_forward_count;
+  uint64_t source_domain_count;
+  uint64_t certificate_count;
+  uint64_t exception_count;
+  uint64_t special_count;
+  uint64_t region_count;
+  uint64_t compact_result_count;
+  uint64_t compact_trace_offset_count;
+  uint64_t compact_trace_count;
+  uint64_t compact_null2_count;
+  uint64_t source_v2_total_bytes;
+  uint64_t source_v2_integrity_tag;
+  uint64_t generation_tail_fingerprint;
+  uint64_t profiles_offset;
+  uint64_t certificates_offset;
+  uint64_t exceptions_offset;
+  uint64_t specials_offset;
+  uint64_t regions_offset;
+  uint64_t compact_results_offset;
+  uint64_t compact_trace_offsets_offset;
+  uint64_t compact_traces_offset;
+  uint64_t compact_null2_offset;
+  uint64_t background_fingerprint_offset;
+  uint64_t background_fingerprint_bytes;
+  uint8_t sequence_content_fingerprint[
+      PLAN7_CONTINUATION_JOURNAL_V3_SEQUENCE_FINGERPRINT_SIZE];
+  plan7_continuation_journal_v3_options options;
+  plan7_forward_provenance forward;
+  plan7_backward_domain_provenance backward;
+  plan7_domain_rescore_provenance rescore;
+  uint64_t integrity_tag;
+} plan7_continuation_journal_v3;
+
+/* Capsule context records the true allocation boundary.  Unlike trusting a
+ * mutable in-packet total_bytes field, this lets the validator reject damage
+ * before hashing outside the allocation. */
+typedef struct plan7_continuation_journal_v3_owner {
+  uint64_t allocation_bytes;
+  uint64_t source_seal_token;
+} plan7_continuation_journal_v3_owner;
 
 typedef struct plan7_continuation_journal {
   uint32_t magic;
@@ -138,6 +382,18 @@ static_assert(offsetof(plan7_continuation_journal, integrity_tag) == 776,
               "continuation journal integrity offset changed");
 static_assert(sizeof(plan7_continuation_journal) == 784,
               "continuation journal header ABI changed");
+static_assert(sizeof(plan7_continuation_journal_v3_options) == 176,
+              "continuation journal v3 option ABI changed");
+static_assert(sizeof(plan7_continuation_journal_v3_certificate) == 144,
+              "continuation journal v3 certificate ABI changed");
+static_assert(sizeof(plan7_continuation_journal_v3_profile) == 152,
+              "continuation journal v3 profile ABI changed");
+static_assert(sizeof(plan7_continuation_journal_v3_exception) == 248,
+              "continuation journal v3 exception ABI changed");
+static_assert(offsetof(plan7_continuation_journal_v3, integrity_tag) == 864,
+              "continuation journal v3 integrity offset changed");
+static_assert(sizeof(plan7_continuation_journal_v3) == 872,
+              "continuation journal v3 header ABI changed");
 #else
 _Static_assert(sizeof(plan7_continuation_journal_row) == 64,
                "continuation journal row ABI changed");
@@ -145,6 +401,18 @@ _Static_assert(offsetof(plan7_continuation_journal, integrity_tag) == 776,
                "continuation journal integrity offset changed");
 _Static_assert(sizeof(plan7_continuation_journal) == 784,
                "continuation journal header ABI changed");
+_Static_assert(sizeof(plan7_continuation_journal_v3_options) == 176,
+               "continuation journal v3 option ABI changed");
+_Static_assert(sizeof(plan7_continuation_journal_v3_certificate) == 144,
+               "continuation journal v3 certificate ABI changed");
+_Static_assert(sizeof(plan7_continuation_journal_v3_profile) == 152,
+               "continuation journal v3 profile ABI changed");
+_Static_assert(sizeof(plan7_continuation_journal_v3_exception) == 248,
+               "continuation journal v3 exception ABI changed");
+_Static_assert(offsetof(plan7_continuation_journal_v3, integrity_tag) == 864,
+               "continuation journal v3 integrity offset changed");
+_Static_assert(sizeof(plan7_continuation_journal_v3) == 872,
+               "continuation journal v3 header ABI changed");
 #endif
 
 static inline uint64_t plan7_continuation_journal_hash_bytes(
@@ -173,6 +441,53 @@ static inline uint64_t plan7_continuation_journal_hash_u64(
     hash *= UINT64_C(1099511628211);
   }
   return hash;
+}
+
+static inline int plan7_continuation_journal_v3_checked_add(
+    uint64_t left, uint64_t right, uint64_t *sum) {
+  if (sum == NULL || right > UINT64_MAX - left) return 0;
+  *sum = left + right;
+  return 1;
+}
+
+static inline int plan7_continuation_journal_v3_checked_multiply(
+    uint64_t left, uint64_t right, uint64_t *product) {
+  if (product == NULL || (left != 0 && right > UINT64_MAX / left)) return 0;
+  *product = left * right;
+  return 1;
+}
+
+static inline uint64_t plan7_continuation_journal_v3_certificate_tag(
+    const plan7_continuation_journal_v3_certificate *certificate) {
+  if (certificate == NULL) return 0;
+  uint64_t hash = UINT64_C(1469598103934665603);
+  hash = plan7_continuation_journal_hash_u64(
+      hash, UINT64_C(0x5633434552540001));
+  return plan7_continuation_journal_hash_bytes(
+      hash, certificate,
+      offsetof(plan7_continuation_journal_v3_certificate, segment_tag));
+}
+
+static inline uint64_t plan7_continuation_journal_v3_profile_tag(
+    const plan7_continuation_journal_v3_profile *profile) {
+  if (profile == NULL) return 0;
+  uint64_t hash = UINT64_C(1469598103934665603);
+  hash = plan7_continuation_journal_hash_u64(
+      hash, UINT64_C(0x563350524f460001));
+  return plan7_continuation_journal_hash_bytes(
+      hash, profile,
+      offsetof(plan7_continuation_journal_v3_profile, profile_tag));
+}
+
+static inline uint64_t plan7_continuation_journal_v3_exception_tag(
+    const plan7_continuation_journal_v3_exception *exception) {
+  if (exception == NULL) return 0;
+  uint64_t hash = UINT64_C(1469598103934665603);
+  hash = plan7_continuation_journal_hash_u64(
+      hash, UINT64_C(0x5633455843500001));
+  return plan7_continuation_journal_hash_bytes(
+      hash, exception,
+      offsetof(plan7_continuation_journal_v3_exception, exception_tag));
 }
 
 /* Recompute the three canonical hashes produced by domain_rescore_cuda.cu.
@@ -287,6 +602,19 @@ static inline uint64_t plan7_continuation_journal_integrity(
   uint64_t hash = UINT64_C(1469598103934665603);
   hash = plan7_continuation_journal_hash_bytes(
       hash, journal, offsetof(plan7_continuation_journal, integrity_tag));
+  return plan7_continuation_journal_hash_bytes(
+      hash, (const uint8_t *)journal + sizeof(*journal),
+      (size_t)(journal->total_bytes - sizeof(*journal)));
+}
+
+static inline uint64_t plan7_continuation_journal_v3_integrity(
+    const plan7_continuation_journal_v3 *journal) {
+  if (journal == NULL || journal->total_bytes < sizeof(*journal)) return 0;
+  uint64_t hash = UINT64_C(1469598103934665603);
+  hash = plan7_continuation_journal_hash_u64(
+      hash, UINT64_C(0x56334a4e4c000001));
+  hash = plan7_continuation_journal_hash_bytes(
+      hash, journal, offsetof(plan7_continuation_journal_v3, integrity_tag));
   return plan7_continuation_journal_hash_bytes(
       hash, (const uint8_t *)journal + sizeof(*journal),
       (size_t)(journal->total_bytes - sizeof(*journal)));

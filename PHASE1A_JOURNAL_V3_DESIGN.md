@@ -1,6 +1,7 @@
 # Phase 1A design: host-side sparse accounting journal v3
 
-Status: source-audited design; implementation has not started.
+Status: v3 planner/compactor implemented; sparse consumer and production
+selection have not started.
 
 This note fixes the semantic contract for the first sparse continuation
 experiment.  Phase 1A changes only the host representation and consumer.  It
@@ -255,3 +256,46 @@ Phase 1A is retained only if all semantic comparisons are exact and the sparse
 consumer materially reduces CPU continuation time on representative workloads.
 Otherwise the negative result and its measured cause are recorded here before
 any Phase 1B transport change.
+
+## Planner implementation checkpoint
+
+Hypothesis: the validated dense seal can be compiled into one ordered
+certificate before each exceptional target plus a tail certificate, while
+copying only payloads needed by the selected continuation route.
+
+Implementation: journal ABI v3 is additive; the v2 ABI and production consumer
+are unchanged.  The private host planner performs a two-pass scan over an
+already sealed batch.  It reuses the exact HMMER/Easel F2 predicate and the
+same binary32 operation order and `esl_exp_surv()` predicate used by native
+Forward classification.  Conservative source/action checks certify only
+before-F1, raw-F1, bias, exact F2, exact F3, and authenticated no-region
+terminal cases.  All other rows become ordered exceptions.  Route-specific
+Forward specials, simple regions, compact results, trace offsets/traces, and
+null2 payloads are copied into one pointer-free allocation.  Typed per-record
+tags, a packet integrity tag, redundant span/delta checks, complete source and
+option provenance, checked arithmetic, and a capsule-owned true allocation
+boundary protect validation.  A private debug validator rebuilds the packet
+from the immutable dense seal and compares every byte; optional retirement is
+one-shot.
+
+Correctness evidence: the exact d486 PyHMMER runtime passes the full
+CUDA-hidden masked-pipeline suite (50 tests, 3 expected seam-availability
+skips).  Deterministic v3 fixtures cover every initially certifiable terminal
+stage; full/filter/Forward exception routes and their payload spans; first,
+last, consecutive, and absent exceptions; a 4,098-target large prefix/tail;
+empty targets and an empty database; corrupt length/integrity fields; and
+one-shot ownership.  Existing v2 consumption and all exact output tests are
+unchanged and pass.
+
+Host microbenchmark (single warm process, no GPU): 32 profiles, 300,186
+targets/profile, and 262,144 dense records compacted in a median 6.15 ms when
+all rows were certifiable, reducing 4,194,304 record bytes to a 10,436-byte
+packet.  With 1,024 evenly spaced full-pipeline exceptions, median planning
+was 6.91 ms and the packet was 411,844 bytes.  These numbers measure only the
+host planner on a synthetic fixture; they are not a full-workload performance
+claim.
+
+Decision: retain the planner as the candidate ABI for the forthcoming sparse
+consumer/dual-execution proof.  Production remains on v2 until that proof and
+the representative/full workload benchmark establish exact state/output
+equivalence and a material CPU-continuation improvement.
