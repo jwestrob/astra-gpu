@@ -99,6 +99,81 @@ class MaskedPipelineTests(unittest.TestCase):
         return struct.pack("=IfBBH", index, fwdsc, status, action, reserved)
 
     @staticmethod
+    def continuation_row(
+        profile,
+        index,
+        *,
+        domain_status,
+        domain_route,
+        uncertain=0,
+        region_count=0,
+        multidomain=0,
+        compact_count=0,
+        compact_route=0,
+    ):
+        return struct.pack(
+            "=IIffffffIII8BIB3sI",
+            profile,
+            index,
+            -3.0,
+            0.0,
+            0.0,
+            -7.0,
+            0.0,
+            0.0,
+            uncertain,
+            region_count,
+            multidomain,
+            0,
+            2,
+            0,
+            2,
+            domain_status,
+            domain_route,
+            0,
+            0,
+            compact_count,
+            compact_route,
+            b"\0\0\0",
+            0,
+        )
+
+    @staticmethod
+    def compact_result(
+        row,
+        profile,
+        index,
+        begin,
+        end,
+        *,
+        status,
+        action,
+    ):
+        score = 0.0 if action == 1 else math.nan
+        return struct.pack(
+            "=9I5f4BI",
+            row,
+            profile,
+            index,
+            begin,
+            end,
+            begin,
+            end,
+            1,
+            1,
+            score,
+            score,
+            score,
+            score,
+            0.0,
+            status,
+            action,
+            0,
+            0,
+            0,
+        )
+
+    @staticmethod
     def double_bits(value):
         return struct.unpack("=Q", struct.pack("=d", value))[0]
 
@@ -733,6 +808,277 @@ print(json.dumps(after_repeat, sort_keys=True))
         exceptions = summary["profiles"][0]["exceptions"]
         self.assertEqual([item["sequence_index"] for item in exceptions], [1, 2, 3])
         self.assertEqual([item["special_count"] for item in exceptions], [0, 0, matrix_count])
+
+    def test_journal_v3_rejects_forward_rows_that_fail_exact_f2(self):
+        target = 2
+        records = self.postfilter_record(
+            target, 0.0, 0, 0, 2, -1.0e30
+        )
+        forward = self.forward_record(target, -7.0, 0, 1)
+        sealed = self.seal_v3_fixture(
+            self.sequences,
+            records,
+            f2=0.0,
+            f3=1.0,
+            forward_records=forward,
+            special_offsets=array("Q", [0, 0]),
+            specials=array("f"),
+        )
+        with self.assertRaisesRegex(ValueError, "exact F2 survivor"):
+            _pipeline._plan_continuation_journal_v3_bound(sealed)
+
+    def test_journal_v3_host_source_requires_bias_enabled_generation(self):
+        background = pyhmmer.plan7.Background(self.alphabet)
+        sealed = _pipeline._seal_postfilter_batch_bound(
+            (self.hmms[0],),
+            (self.optimized_profiles[0].copy(),),
+            self.sequences,
+            b"",
+            array("Q", [0, 0]),
+            self.residue_offsets(self.sequences),
+            1.0,
+            self.background_fingerprint(background),
+            generation_f2_bits=self.double_bits(1.0),
+            generation_f3_bits=self.double_bits(1.0),
+            generation_bias_filter=False,
+        )
+        with self.assertRaisesRegex(ValueError, "bias-enabled"):
+            _pipeline._plan_continuation_journal_v3_bound(sealed)
+
+    def test_journal_v3_serializes_validated_v2_domain_bundle(self):
+        if not _pipeline._simple_regions_seam_available():
+            self.skipTest("private simple-region seam is unavailable")
+        if not _pipeline._compact_domains_seam_available():
+            self.skipTest("private compact-domain seam is unavailable")
+
+        targets = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet,
+            [self.sequences[index % len(self.sequences)] for index in range(80)],
+        )
+        profile_sequences = ((0, 13, 31, 32, 33, 67), (1, 7))
+        postfilter = b"".join(
+            self.postfilter_record(index, 0.0, 0, 0, 2, 0.0)
+            for indexes in profile_sequences
+            for index in indexes
+        )
+        forward = b"".join(
+            self.forward_record(index, -7.0, 0, 2)
+            for indexes in profile_sequences
+            for index in indexes
+        )
+        row_offsets = array("Q", [0, 6, 8])
+        special_offsets = array("Q", [0])
+        specials = array("f")
+        for indexes in profile_sequences:
+            for index in indexes:
+                count = 6 * (len(targets[index]) + 1)
+                specials.extend([0.0] * count)
+                special_offsets.append(len(specials))
+
+        domain_rows = b"".join(
+            (
+                self.continuation_row(
+                    0, 0, domain_status=0, domain_route=1
+                ),
+                self.continuation_row(
+                    0,
+                    13,
+                    domain_status=0,
+                    domain_route=2,
+                    region_count=1,
+                    compact_count=1,
+                    compact_route=1,
+                ),
+                self.continuation_row(
+                    0, 31, domain_status=16, domain_route=0
+                ),
+                self.continuation_row(
+                    0,
+                    32,
+                    domain_status=0,
+                    domain_route=0,
+                    uncertain=1,
+                ),
+                self.continuation_row(
+                    0,
+                    33,
+                    domain_status=0,
+                    domain_route=0,
+                    multidomain=1,
+                ),
+                self.continuation_row(
+                    0,
+                    67,
+                    domain_status=0,
+                    domain_route=2,
+                    region_count=1,
+                    compact_count=1,
+                    compact_route=2,
+                ),
+                self.continuation_row(
+                    1, 1, domain_status=0, domain_route=1
+                ),
+                self.continuation_row(
+                    1,
+                    7,
+                    domain_status=0,
+                    domain_route=2,
+                    region_count=1,
+                    compact_count=1,
+                    compact_route=2,
+                ),
+            )
+        )
+        region_offsets = array("Q", [0, 0, 1, 1, 1, 1, 2, 2, 3])
+        regions = b"".join(
+            struct.pack("=II", begin, end)
+            for begin, end in ((1, 5), (2, 6), (3, 7))
+        )
+        compact_results = b"".join(
+            (
+                self.compact_result(
+                    1, 0, 13, 1, 5, status=75, action=0
+                ),
+                self.compact_result(
+                    5, 0, 67, 2, 6, status=0, action=1
+                ),
+                self.compact_result(
+                    7, 1, 7, 3, 7, status=0, action=1
+                ),
+            )
+        )
+        compact_trace_offsets = array("Q", [0, 0, 1, 2])
+        compact_traces = b"".join(
+            (
+                struct.pack("=IIfB3x", 2, 1, 1.0, 1),
+                struct.pack("=IIfB3x", 3, 1, 1.0, 1),
+            )
+        )
+        compact_null2 = array(
+            "f", [math.nan] * 29 + [1.0] * 29 + [1.0] * 29
+        )
+        pipeline = self.pipeline(F1=1.0, F2=1.0, F3=1.0)
+        profiles = tuple(
+            self.optimized_profiles[index].copy() for index in range(2)
+        )
+        sealed = _pipeline._seal_continuation_journal_v2_test_fixture_bound(
+            tuple(self.hmms[:2]),
+            profiles,
+            targets,
+            self.residue_offsets(targets),
+            1.0,
+            self.background_fingerprint(pipeline.background),
+            postfilter,
+            row_offsets,
+            forward,
+            row_offsets,
+            special_offsets,
+            specials,
+            row_offsets,
+            domain_rows,
+            region_offsets,
+            regions,
+            region_offsets,
+            compact_results,
+            compact_trace_offsets,
+            compact_traces,
+            compact_null2,
+            pipeline,
+            2.0e-4,
+        )
+        capsule = _pipeline._plan_continuation_journal_v3_bound(sealed)
+        summary = _pipeline._validate_continuation_journal_v3_bound(
+            capsule, sealed, include_details=True
+        )
+
+        self.assertEqual(summary["source_kind"], "v2_journal")
+        self.assertTrue(summary["options_complete"])
+        self.assertGreater(summary["source_v2_bytes"], 0)
+        self.assertGreater(summary["source_v2_integrity_tag"], 0)
+        self.assertGreater(summary["session_id"], 0)
+        self.assertGreater(summary["selection_id"], 0)
+        self.assertGreater(summary["batch_generation"], 0)
+        self.assertGreater(summary["generation_tail_fingerprint"], 0)
+        self.assertEqual(summary["dense_postfilter_count"], 8)
+        self.assertEqual(summary["dense_forward_count"], 8)
+        self.assertEqual(summary["dense_domain_count"], 8)
+        self.assertEqual(summary["stage_counts"]["domain_no_regions"], 2)
+        self.assertEqual(summary["exception_count"], 6)
+        self.assertEqual(
+            summary["exception_routes"],
+            {
+                "full_pipeline": 0,
+                "filter_scores": 0,
+                "forward_scores": 3,
+                "simple_regions": 1,
+                "compact_domains": 2,
+            },
+        )
+        self.assertEqual(summary["payload_counts"]["regions"], 3)
+        self.assertEqual(summary["payload_counts"]["compact_results"], 2)
+        self.assertEqual(summary["payload_counts"]["compact_traces"], 2)
+        self.assertEqual(summary["payload_counts"]["compact_null2"], 58)
+        self.assertEqual(summary["compact_trace_offsets"], (0, 1, 2))
+
+        first, second = summary["profiles"]
+        self.assertEqual((first["flags"], second["flags"]), (3, 3))
+        self.assertNotEqual(first["identity_token"], second["identity_token"])
+        self.assertEqual(
+            tuple(
+                sum(item["no_region"] for item in profile["certificates"])
+                for profile in (first, second)
+            ),
+            (1, 1),
+        )
+        self.assertEqual(first["source_postfilter_span"], (0, 6))
+        self.assertEqual(first["source_forward_span"], (0, 6))
+        self.assertEqual(first["source_domain_span"], (0, 6))
+        self.assertEqual(second["source_postfilter_span"], (6, 8))
+        self.assertEqual(second["source_forward_span"], (6, 8))
+        self.assertEqual(second["source_domain_span"], (6, 8))
+        self.assertEqual(
+            [item["sequence_index"] for item in first["exceptions"]],
+            [13, 31, 32, 33, 67],
+        )
+        self.assertEqual(
+            [item["sequence_index"] for item in second["exceptions"]], [7]
+        )
+        all_exceptions = first["exceptions"] + second["exceptions"]
+        self.assertTrue(
+            all(item["preconditions"] & 0x01 for item in all_exceptions)
+        )
+        by_sequence = {
+            (item["source_domain_index"], item["sequence_index"]): item
+            for item in all_exceptions
+        }
+        for source_row, sequence in ((2, 31), (3, 32), (4, 33)):
+            item = by_sequence[(source_row, sequence)]
+            self.assertEqual((item["source_stage"], item["route"]), (9, 3))
+            self.assertEqual(item["payload_flags"], 0x0F)
+        simple = by_sequence[(1, 13)]
+        self.assertEqual((simple["source_stage"], simple["route"]), (10, 4))
+        self.assertEqual(simple["payload_flags"], 0x17)
+        compact = [
+            item for item in all_exceptions if item["compact_result_count"]
+        ]
+        self.assertEqual(
+            [item["compact_result_begin"] for item in compact], [0, 1]
+        )
+        self.assertEqual(
+            [item["compact_trace_begin"] for item in compact], [0, 1]
+        )
+        self.assertEqual(
+            [item["compact_null2_begin"] for item in compact], [0, 29]
+        )
+        self.assertTrue(all(item["special_count"] > 0 for item in compact))
+        self.assertTrue(all(item["region_count"] == 1 for item in compact))
+        self.assertTrue(all(item["payload_flags"] == 0x3F for item in compact))
+        self.assertTrue(
+            all(item["compact_trace_count"] == 1 for item in compact)
+        )
+        self.assertTrue(
+            all(item["compact_null2_count"] == 29 for item in compact)
+        )
 
     def test_journal_v3_partitions_first_last_consecutive_and_large_gaps(self):
         def cpu(index):

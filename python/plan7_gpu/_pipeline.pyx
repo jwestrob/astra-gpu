@@ -3545,6 +3545,16 @@ cdef void _v3_capsule_destroy(object capsule) noexcept:
         free(owner)
 
 
+cdef void _v2_test_fixture_capsule_destroy(object capsule) noexcept:
+    """Own a synthetic v2 allocation until the production seal consumes it."""
+    cdef plan7_continuation_journal *journal
+    journal = <plan7_continuation_journal *> PyCapsule_GetPointer(
+        capsule, PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME
+    )
+    if journal != NULL:
+        free(journal)
+
+
 cdef void _v3_fill_options(
     plan7_continuation_journal_v3_options *destination,
     _SealedPostfilterBatch sealed,
@@ -3691,6 +3701,11 @@ cdef uint8_t _v3_decide_row(
         return <uint8_t> PLAN7_CONTINUATION_V3_BIAS_REJECT
 
     f2_decision = _hmmer_f2_decision(profile, postfilter, f2)
+    if has_forward and f2_decision != 1:
+        # A Forward row is authenticated only for an exact F2 survivor.  A
+        # contradictory host fixture must fail closed; sending it through the
+        # Forward-score seam would violate that seam's counter precondition.
+        return 0xff
     if not has_forward:
         if f2_decision == 0:
             return <uint8_t> PLAN7_CONTINUATION_V3_F2_REJECT
@@ -3863,6 +3878,11 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
         <size_t> sealed._journal_rows.shape[0]
         // sizeof(plan7_continuation_journal_row)
     )
+    has_source_v2 = sealed._journal_storage.shape[0] != 0
+    if not sealed._generation_bias_filter:
+        raise ValueError(
+            "journal v3 semantic planning requires bias-enabled generation"
+        )
     decision_bytes = postfilter_count
     if decision_bytes:
         decisions = <uint8_t *> malloc(decision_bytes)
@@ -3871,7 +3891,6 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
 
     f2_bits.bits = sealed._generation_f2_bits
     f3_bits.bits = sealed._generation_f3_bits
-    has_source_v2 = sealed._journal_storage.shape[0] != 0
     compact_available = (
         sealed._compact_domains_seam != NULL
         and sealed._generation_tail_fingerprint != 0
@@ -3963,6 +3982,10 @@ cdef plan7_continuation_journal_v3 *_v3_allocate_from_seal(
                     f2_bits.value,
                     f3_bits.value,
                 )
+                if decision == 0xff:
+                    raise ValueError(
+                        "journal v3 Forward source is not an exact F2 survivor"
+                    )
                 decisions[postfilter_cursor] = decision
                 route = <uint8_t> (decision >> 4)
                 if route != 0:
@@ -4915,6 +4938,20 @@ cdef plan7_continuation_journal_v3 *_v3_validate_capsule(
                         exception.payload_flags
                         & PLAN7_CONTINUATION_V3_HAS_POSTFILTER
                     )
+                    or bool(
+                        exception.payload_flags
+                        & PLAN7_CONTINUATION_V3_HAS_FORWARD
+                    )
+                    != (
+                        exception.source_forward_index != <uint64_t> -1
+                    )
+                    or (
+                        exception.source_forward_index != <uint64_t> -1
+                        and not (
+                            exception.preconditions
+                            & PLAN7_CONTINUATION_V3_PRE_F2_SURVIVOR
+                        )
+                    )
                 ):
                     raise ValueError("continuation journal v3 exception is invalid")
                 if exception.special_count:
@@ -5000,6 +5037,9 @@ cdef dict _v3_debug_summary(
         <const plan7_continuation_journal_v3_exception *> (
             base + journal.exceptions_offset
         )
+    )
+    cdef const uint64_t *compact_trace_offsets = <const uint64_t *> (
+        base + journal.compact_trace_offsets_offset
     )
     cdef const plan7_continuation_journal_v3_profile *profile_record
     cdef const plan7_continuation_journal_v3_certificate *certificate
@@ -5096,10 +5136,15 @@ cdef dict _v3_debug_summary(
                     ),
                     "source_forward_index": exception.source_forward_index,
                     "source_domain_index": exception.source_domain_index,
+                    "special_begin": exception.special_begin,
                     "special_count": exception.special_count,
+                    "region_begin": exception.region_begin,
                     "region_count": exception.region_count,
+                    "compact_result_begin": exception.compact_result_begin,
                     "compact_result_count": exception.compact_result_count,
+                    "compact_trace_begin": exception.compact_trace_begin,
                     "compact_trace_count": exception.compact_trace_count,
+                    "compact_null2_begin": exception.compact_null2_begin,
                     "compact_null2_count": exception.compact_null2_count,
                 })
             profile_details.append({
@@ -5108,6 +5153,21 @@ cdef dict _v3_debug_summary(
                 "total_residues": profile_record.total_residues,
                 "identity_token": profile_record.identity_token,
                 "flags": profile_record.flags,
+                "source_postfilter_span": (
+                    profile_record.source_postfilter_begin,
+                    profile_record.source_postfilter_begin
+                    + profile_record.source_postfilter_count,
+                ),
+                "source_forward_span": (
+                    profile_record.source_forward_begin,
+                    profile_record.source_forward_begin
+                    + profile_record.source_forward_count,
+                ),
+                "source_domain_span": (
+                    profile_record.source_domain_begin,
+                    profile_record.source_domain_begin
+                    + profile_record.source_domain_count,
+                ),
                 "certificates": tuple(certificate_details),
                 "exceptions": tuple(exception_details),
             })
@@ -5157,6 +5217,12 @@ cdef dict _v3_debug_summary(
         },
         "packet_bytes": journal.total_bytes,
         "source_v2_bytes": journal.source_v2_total_bytes,
+        "source_v2_integrity_tag": journal.source_v2_integrity_tag,
+        "session_id": journal.session_id,
+        "selection_id": journal.selection_id,
+        "batch_generation": journal.batch_generation,
+        "generation_tail_fingerprint": journal.generation_tail_fingerprint,
+        "options_complete": bool(journal.options.complete),
         "header_size": journal.header_size,
         "total_bytes_offset": (
             <size_t> &journal.total_bytes - <size_t> journal
@@ -5170,6 +5236,16 @@ cdef dict _v3_debug_summary(
         "profile_record_size": journal.profile_size,
         "certificate_record_size": journal.certificate_size,
         "exception_record_size": journal.exception_size,
+        "compact_trace_offsets": (
+            tuple(
+                compact_trace_offsets[index]
+                for index in range(
+                    <size_t> journal.compact_trace_offset_count
+                )
+            )
+            if include_details
+            else None
+        ),
         "profiles": tuple(profile_details) if include_details else None,
     }
 
@@ -5179,32 +5255,33 @@ cdef void _v3_retire_debug_capsule(
     plan7_continuation_journal_v3 *journal,
     plan7_continuation_journal_v3_owner *owner,
 ) except *:
-    if PyCapsule_SetDestructor(
-        capsule, <PyCapsule_Destructor> NULL
-    ) != 0:
-        raise RuntimeError("cannot consume continuation journal v3 capsule")
-    if PyCapsule_SetPointer(capsule, &_consumed_journal_sentinel) != 0:
-        free(journal)
-        free(owner)
-        PyCapsule_SetName(
-            capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
-        )
-        raise RuntimeError("cannot retire continuation journal v3 capsule")
-    if PyCapsule_SetContext(capsule, NULL) != 0:
-        free(journal)
-        free(owner)
-        PyCapsule_SetName(
-            capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
-        )
-        raise RuntimeError("cannot clear continuation journal v3 owner")
-    if PyCapsule_SetName(
-        capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
-    ) != 0:
-        free(journal)
-        free(owner)
-        raise RuntimeError("cannot mark continuation journal v3 consumed")
-    free(journal)
-    free(owner)
+    cdef bint ownership_transferred = False
+    try:
+        # Cython declares every PyCapsule setter ``except -1``.  Once the
+        # destructor is cleared, this frame owns both allocations on success
+        # and on every later exceptional edge.
+        PyCapsule_SetDestructor(capsule, <PyCapsule_Destructor> NULL)
+        ownership_transferred = True
+        try:
+            PyCapsule_SetPointer(capsule, &_consumed_journal_sentinel)
+            PyCapsule_SetContext(capsule, NULL)
+            PyCapsule_SetName(
+                capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
+            )
+        except:
+            # Make a partially retired capsule fail its public name check
+            # before the finally block releases its former storage.
+            try:
+                PyCapsule_SetName(
+                    capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
+                )
+            except:
+                pass
+            raise
+    finally:
+        if ownership_transferred:
+            free(journal)
+            free(owner)
 
 
 def _plan_continuation_journal_v3_bound(sealed_object):
@@ -5231,20 +5308,24 @@ def _plan_continuation_journal_v3_bound(sealed_object):
         raise MemoryError("journal v3 capsule owner allocation failed")
     owner.allocation_bytes = journal.total_bytes
     owner.source_seal_token = journal.source_seal_token
-    capsule = PyCapsule_New(
-        journal,
-        PLAN7_CONTINUATION_JOURNAL_V3_CAPSULE_NAME,
-        _v3_capsule_destroy,
-    )
-    if capsule is None:
+    try:
+        capsule = PyCapsule_New(
+            journal,
+            PLAN7_CONTINUATION_JOURNAL_V3_CAPSULE_NAME,
+            _v3_capsule_destroy,
+        )
+    except:
         free(journal)
         free(owner)
-        raise MemoryError("journal v3 capsule allocation failed")
-    if PyCapsule_SetContext(capsule, owner) != 0:
-        PyCapsule_SetDestructor(capsule, <PyCapsule_Destructor> NULL)
-        free(journal)
+        raise
+    try:
+        PyCapsule_SetContext(capsule, owner)
+    except:
+        # The capsule destructor still owns ``journal``.  Releasing only the
+        # unattached context avoids both the Cython auto-raise leak and a
+        # destructor double-free while the local capsule unwinds.
         free(owner)
-        raise RuntimeError("cannot attach continuation journal v3 owner")
+        raise
     return capsule
 
 
@@ -6961,6 +7042,538 @@ def _seal_profile_selection_continuation_bound(
     )
     sealed._ready = True
     return sealed
+
+
+def _seal_continuation_journal_v2_test_fixture_bound(
+    queries,
+    optimized_profiles,
+    DigitalSequenceBlock sequences,
+    const uint64_t[::1] residue_offsets,
+    double f1,
+    background_fingerprint,
+    const uint8_t[::1] postfilter_records,
+    const uint64_t[::1] postfilter_offsets,
+    const uint8_t[::1] forward_records,
+    const uint64_t[::1] forward_offsets,
+    const uint64_t[::1] special_offsets,
+    const float[::1] specials,
+    const uint64_t[::1] domain_profile_offsets,
+    const uint8_t[::1] domain_rows,
+    const uint64_t[::1] region_offsets,
+    const uint8_t[::1] regions,
+    const uint64_t[::1] compact_row_offsets,
+    const uint8_t[::1] compact_results,
+    const uint64_t[::1] compact_trace_offsets,
+    const uint8_t[::1] compact_traces,
+    const float[::1] compact_null2,
+    Pipeline pipeline,
+    double guard_band,
+):
+    """Mint and production-validate one synthetic binary v2 domain bundle.
+
+    This deliberately narrow underscore hook is absent from the adapter and
+    every public execution path.  CUDA-hidden tests use it to exercise the
+    real v2 parser/seal and v3 serializer with actual ABI records; it is not a
+    second Python classifier and is not reachable from production candidate
+    construction.
+    """
+    cdef tuple query_tuple = tuple(queries)
+    cdef tuple profile_tuple = tuple(optimized_profiles)
+    cdef size_t profile_count = len(profile_tuple)
+    cdef size_t postfilter_count
+    cdef size_t forward_count
+    cdef size_t row_count
+    cdef size_t region_count
+    cdef size_t compact_result_count
+    cdef size_t compact_trace_count
+    cdef size_t compact_null2_count = compact_null2.shape[0]
+    cdef size_t cursor
+    cdef size_t row_index
+    cdef size_t result_index
+    cdef size_t simple_row_count = 0
+    cdef size_t device_result_count = 0
+    cdef size_t cpu_required_count = 0
+    cdef uint64_t compact_output_bytes = 0
+    cdef uint64_t compact_output_component = 0
+    cdef uint64_t postfilter_offsets_offset = 0
+    cdef uint64_t postfilter_records_offset = 0
+    cdef uint64_t forward_offsets_offset = 0
+    cdef uint64_t forward_records_offset = 0
+    cdef uint64_t forward_special_offsets_offset = 0
+    cdef uint64_t profile_offsets_offset = 0
+    cdef uint64_t identity_tokens_offset = 0
+    cdef uint64_t profile_fingerprints_offset = 0
+    cdef uint64_t rows_offset = 0
+    cdef uint64_t special_offsets_offset = 0
+    cdef uint64_t specials_offset = 0
+    cdef uint64_t region_offsets_offset = 0
+    cdef uint64_t regions_offset = 0
+    cdef uint64_t compact_row_offsets_offset = 0
+    cdef uint64_t compact_results_offset = 0
+    cdef uint64_t compact_trace_offsets_offset = 0
+    cdef uint64_t compact_traces_offset = 0
+    cdef uint64_t compact_null2_offset = 0
+    cdef uint64_t generation_tail_fingerprint = 0
+    cdef uint64_t result_hash = 0
+    cdef uint64_t trace_hash = 0
+    cdef uint64_t null2_hash = 0
+    cdef plan7_continuation_journal *journal = NULL
+    cdef plan7_continuation_journal_row domain_row
+    cdef plan7_domain_rescore_result compact_result
+    cdef _pipeline_compact_tail_fingerprint_f tail_fingerprint = NULL
+    cdef _double_bits f1_bits
+    cdef _double_bits f2_bits
+    cdef _double_bits f3_bits
+    cdef _float_bits rt_bits
+    cdef _float_bits guard_bits
+    cdef object identity_owner
+    cdef object profile_fingerprint_owner
+    cdef object sequence_fingerprint_owner
+    cdef const uint64_t[::1] identity_view
+    cdef const uint8_t[::1] profile_fingerprint_view
+    cdef const uint8_t[::1] sequence_fingerprint_view
+    cdef object capsule
+    cdef uint8_t *base
+
+    if len(query_tuple) != profile_count:
+        raise ValueError("test v2 fixture HMM/profile count differs")
+    if postfilter_records.shape[0] % sizeof(_postfilter_result) != 0:
+        raise ValueError("test v2 post-filter storage has trailing bytes")
+    if forward_records.shape[0] % sizeof(_forward_result) != 0:
+        raise ValueError("test v2 Forward storage has trailing bytes")
+    if domain_rows.shape[0] % sizeof(plan7_continuation_journal_row) != 0:
+        raise ValueError("test v2 domain storage has trailing bytes")
+    if regions.shape[0] % sizeof(plan7_simple_region) != 0:
+        raise ValueError("test v2 region storage has trailing bytes")
+    if compact_results.shape[0] % sizeof(plan7_domain_rescore_result) != 0:
+        raise ValueError("test v2 compact-result storage has trailing bytes")
+    if compact_traces.shape[0] % sizeof(plan7_domain_rescore_trace_step) != 0:
+        raise ValueError("test v2 compact-trace storage has trailing bytes")
+
+    postfilter_count = postfilter_records.shape[0] // sizeof(_postfilter_result)
+    forward_count = forward_records.shape[0] // sizeof(_forward_result)
+    row_count = domain_rows.shape[0] // sizeof(plan7_continuation_journal_row)
+    region_count = regions.shape[0] // sizeof(plan7_simple_region)
+    compact_result_count = (
+        compact_results.shape[0] // sizeof(plan7_domain_rescore_result)
+    )
+    compact_trace_count = (
+        compact_traces.shape[0] // sizeof(plan7_domain_rescore_trace_step)
+    )
+    if compact_result_count > (<size_t> -1) // PLAN7_DOMAIN_RESCORE_NULL2_COUNT:
+        raise OverflowError("test v2 compact null2 count overflows")
+    if (
+        postfilter_offsets.shape[0] != profile_count + 1
+        or forward_offsets.shape[0] != profile_count + 1
+        or special_offsets.shape[0] != forward_count + 1
+        or domain_profile_offsets.shape[0] != profile_count + 1
+        or region_offsets.shape[0] != row_count + 1
+        or compact_row_offsets.shape[0] != row_count + 1
+        or compact_trace_offsets.shape[0] != compact_result_count + 1
+        or row_count != forward_count
+        or compact_null2_count
+        != compact_result_count * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+    ):
+        raise ValueError("test v2 fixture offset/count shape differs")
+
+    for row_index in range(row_count):
+        memcpy(
+            &domain_row,
+            &domain_rows[row_index * sizeof(plan7_continuation_journal_row)],
+            sizeof(plan7_continuation_journal_row),
+        )
+        if domain_row.domain_route == DOMAIN_SIMPLE:
+            simple_row_count += 1
+    for result_index in range(compact_result_count):
+        memcpy(
+            &compact_result,
+            &compact_results[
+                result_index * sizeof(plan7_domain_rescore_result)
+            ],
+            sizeof(plan7_domain_rescore_result),
+        )
+        if compact_result.action == PLAN7_DOMAIN_RESCORE_DEVICE_RESULT:
+            device_result_count += 1
+        elif compact_result.action == PLAN7_DOMAIN_RESCORE_CPU_REQUIRED:
+            cpu_required_count += 1
+        else:
+            raise ValueError("test v2 compact action is invalid")
+
+    if compact_result_count:
+        if (
+            _cached_compact_domains_seam() == NULL
+            or _compact_tail_fingerprint_cache == NULL
+        ):
+            raise RuntimeError("test v2 fixture requires the compact tail seam")
+        tail_fingerprint = _compact_tail_fingerprint_cache
+        with nogil:
+            generation_tail_fingerprint = tail_fingerprint(pipeline._pli)
+        if generation_tail_fingerprint == 0:
+            raise ValueError("test v2 compact tail fingerprint is zero")
+        if (
+            not plan7_continuation_journal_v3_checked_multiply(
+                compact_result_count,
+                sizeof(plan7_domain_rescore_result),
+                &compact_output_bytes,
+            )
+            or not plan7_continuation_journal_v3_checked_multiply(
+                compact_result_count + 1,
+                sizeof(uint64_t),
+                &compact_output_component,
+            )
+            or not _v3_checked_increment(
+                &compact_output_bytes, compact_output_component
+            )
+            or not plan7_continuation_journal_v3_checked_multiply(
+                compact_trace_count,
+                sizeof(plan7_domain_rescore_trace_step),
+                &compact_output_component,
+            )
+            or not _v3_checked_increment(
+                &compact_output_bytes, compact_output_component
+            )
+            or not plan7_continuation_journal_v3_checked_multiply(
+                compact_null2_count,
+                sizeof(float),
+                &compact_output_component,
+            )
+            or not _v3_checked_increment(
+                &compact_output_bytes, compact_output_component
+            )
+        ):
+            raise OverflowError("test v2 compact byte count overflows")
+        if compact_output_bytes > PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES:
+            raise OverflowError("test v2 compact payload exceeds ABI limit")
+        if not plan7_continuation_journal_rescore_hashes(
+            <const plan7_domain_rescore_result *> &compact_results[0],
+            compact_result_count,
+            &compact_trace_offsets[0],
+            (
+                <const plan7_domain_rescore_trace_step *> &compact_traces[0]
+                if compact_trace_count
+                else NULL
+            ),
+            compact_trace_count,
+            &compact_null2[0],
+            compact_null2_count,
+            &result_hash,
+            &trace_hash,
+            &null2_hash,
+        ):
+            raise ValueError("test v2 compact hashes cannot be computed")
+
+    identity_owner = _array(
+        "Q", (0x5632544553540001 + row for row in range(profile_count))
+    )
+    profile_fingerprint_owner = bytes(
+        ((profile * 37 + byte_index + 1) & 0xff)
+        for profile in range(profile_count)
+        for byte_index in range(PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE)
+    )
+    sequence_fingerprint_owner = bytes(
+        ((byte_index * 17 + 3) & 0xff)
+        for byte_index in range(PLAN7_CONTINUATION_JOURNAL_V3_SEQUENCE_FINGERPRINT_SIZE)
+    )
+    identity_view = identity_owner
+    profile_fingerprint_view = profile_fingerprint_owner
+    sequence_fingerprint_view = sequence_fingerprint_owner
+
+    cursor = sizeof(plan7_continuation_journal)
+    if not (
+        _v3_advance_segment(
+            &cursor, profile_count + 1, sizeof(uint64_t),
+            &postfilter_offsets_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, postfilter_count, sizeof(_postfilter_result),
+            &postfilter_records_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, profile_count + 1, sizeof(uint64_t),
+            &forward_offsets_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, forward_count, sizeof(_forward_result),
+            &forward_records_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, forward_count + 1, sizeof(uint64_t),
+            &forward_special_offsets_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, profile_count + 1, sizeof(uint64_t),
+            &profile_offsets_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, profile_count, sizeof(uint64_t),
+            &identity_tokens_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, profile_count,
+            PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+            &profile_fingerprints_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, row_count, sizeof(plan7_continuation_journal_row),
+            &rows_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, row_count + 1, sizeof(uint64_t),
+            &special_offsets_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, specials.shape[0], sizeof(float), &specials_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, row_count + 1, sizeof(uint64_t), &region_offsets_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, region_count, sizeof(plan7_simple_region), &regions_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, row_count + 1, sizeof(uint64_t),
+            &compact_row_offsets_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, compact_result_count,
+            sizeof(plan7_domain_rescore_result), &compact_results_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, compact_result_count + 1, sizeof(uint64_t),
+            &compact_trace_offsets_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, compact_trace_count,
+            sizeof(plan7_domain_rescore_trace_step), &compact_traces_offset,
+        )
+        and _v3_advance_segment(
+            &cursor, compact_null2_count, sizeof(float), &compact_null2_offset,
+        )
+        and cursor <= <size_t> PY_SSIZE_T_MAX
+    ):
+        raise OverflowError("test v2 fixture storage layout overflow")
+
+    journal = <plan7_continuation_journal *> calloc(1, cursor)
+    if journal == NULL:
+        raise MemoryError("test v2 fixture allocation failed")
+    journal.magic = PLAN7_CONTINUATION_JOURNAL_MAGIC
+    journal.version = PLAN7_CONTINUATION_JOURNAL_VERSION
+    journal.header_size = sizeof(plan7_continuation_journal)
+    journal.row_size = sizeof(plan7_continuation_journal_row)
+    journal.region_size = sizeof(plan7_simple_region)
+    journal.compact_result_size = sizeof(plan7_domain_rescore_result)
+    journal.compact_trace_step_size = sizeof(plan7_domain_rescore_trace_step)
+    journal.compact_null2_stride = PLAN7_DOMAIN_RESCORE_NULL2_COUNT
+    journal.total_bytes = cursor
+    journal.session_id = 0x5632544553540101
+    journal.selection_id = 0x5632544553540102
+    journal.profile_count = profile_count
+    journal.postfilter_count = postfilter_count
+    journal.forward_count = forward_count
+    journal.row_count = row_count
+    journal.special_count = specials.shape[0]
+    journal.region_count = region_count
+    journal.compact_result_count = compact_result_count
+    journal.compact_trace_offset_count = compact_result_count + 1
+    journal.compact_trace_count = compact_trace_count
+    journal.compact_null2_count = compact_null2_count
+    journal.generation_tail_fingerprint = generation_tail_fingerprint
+    journal.rescore_simple_row_count = simple_row_count
+    journal.rescore_device_result_count = device_result_count
+    journal.rescore_cpu_required_count = cpu_required_count
+    journal.rescore_cap_fallback_count = cpu_required_count
+    journal.rescore_compact_output_byte_limit = (
+        PLAN7_DOMAIN_RESCORE_MAX_COMPACT_BYTES if compact_result_count else 0
+    )
+    journal.rescore_compact_output_bytes = compact_output_bytes
+    f1_bits.value = f1
+    f2_bits.value = pipeline._pli.F2
+    f3_bits.value = pipeline._pli.F3
+    journal.generation_f1_bits = f1_bits.bits
+    journal.generation_f2_bits = f2_bits.bits
+    journal.generation_f3_bits = f3_bits.bits
+    rt_bits.value = <float> 0.25
+    journal.rt1_bits = rt_bits.bits
+    rt_bits.value = <float> 0.10
+    journal.rt2_bits = rt_bits.bits
+    rt_bits.value = <float> 0.20
+    journal.rt3_bits = rt_bits.bits
+    guard_bits.value = <float> guard_band
+    journal.guard_band_bits = guard_bits.bits
+    journal.generation_bias_filter = 1
+    journal.generation_compact_domains = <uint8_t> (compact_result_count != 0)
+    memcpy(
+        journal.sequence_content_fingerprint,
+        &sequence_fingerprint_view[0],
+        PLAN7_CONTINUATION_JOURNAL_V3_SEQUENCE_FINGERPRINT_SIZE,
+    )
+    journal.postfilter_offsets_offset = postfilter_offsets_offset
+    journal.postfilter_records_offset = postfilter_records_offset
+    journal.forward_offsets_offset = forward_offsets_offset
+    journal.forward_records_offset = forward_records_offset
+    journal.forward_special_offsets_offset = forward_special_offsets_offset
+    journal.profile_offsets_offset = profile_offsets_offset
+    journal.identity_tokens_offset = identity_tokens_offset
+    journal.profile_fingerprints_offset = profile_fingerprints_offset
+    journal.rows_offset = rows_offset
+    journal.special_offsets_offset = special_offsets_offset
+    journal.specials_offset = specials_offset
+    journal.region_offsets_offset = region_offsets_offset
+    journal.regions_offset = regions_offset
+    journal.compact_row_offsets_offset = compact_row_offsets_offset
+    journal.compact_results_offset = compact_results_offset
+    journal.compact_trace_offsets_offset = compact_trace_offsets_offset
+    journal.compact_traces_offset = compact_traces_offset
+    journal.compact_null2_offset = compact_null2_offset
+
+    journal.forward.database_generation = 0x5632544553540201
+    journal.forward.batch_generation = 0x5632544553540202
+    journal.forward.row_hash = 0x5632544553540203
+    journal.forward.special_hash = 0x5632544553540204
+    journal.forward.continuation_hash = 0x5632544553540205
+    journal.forward.pass_count = row_count
+    journal.forward.special_count = specials.shape[0]
+    journal.forward.generation_f3_bits = f3_bits.bits
+    journal.forward.integrity_tag = 0x5632544553540206
+    memcpy(
+        &journal.backward.forward,
+        &journal.forward,
+        sizeof(plan7_forward_provenance),
+    )
+    journal.backward.threshold_hash = 0x5632544553540301
+    journal.backward.result_hash = 0x5632544553540302
+    journal.backward.region_hash = 0x5632544553540303
+    journal.backward.candidate_count = row_count
+    journal.backward.region_count = region_count
+    if compact_result_count:
+        memcpy(
+            &journal.rescore.backward,
+            &journal.backward,
+            sizeof(plan7_backward_domain_provenance),
+        )
+        journal.rescore.result_hash = result_hash
+        journal.rescore.trace_hash = trace_hash
+        journal.rescore.null2_hash = null2_hash
+        journal.rescore.result_count = compact_result_count
+        journal.rescore.trace_count = compact_trace_count
+        journal.rescore.null2_count = compact_null2_count
+
+    base = <uint8_t *> journal
+    memcpy(
+        base + postfilter_offsets_offset, &postfilter_offsets[0],
+        (profile_count + 1) * sizeof(uint64_t),
+    )
+    if postfilter_count:
+        memcpy(
+            base + postfilter_records_offset, &postfilter_records[0],
+            postfilter_count * sizeof(_postfilter_result),
+        )
+    memcpy(
+        base + forward_offsets_offset, &forward_offsets[0],
+        (profile_count + 1) * sizeof(uint64_t),
+    )
+    if forward_count:
+        memcpy(
+            base + forward_records_offset, &forward_records[0],
+            forward_count * sizeof(_forward_result),
+        )
+    memcpy(
+        base + forward_special_offsets_offset, &special_offsets[0],
+        (forward_count + 1) * sizeof(uint64_t),
+    )
+    memcpy(
+        base + profile_offsets_offset, &domain_profile_offsets[0],
+        (profile_count + 1) * sizeof(uint64_t),
+    )
+    if profile_count:
+        memcpy(
+            base + identity_tokens_offset, &identity_view[0],
+            profile_count * sizeof(uint64_t),
+        )
+        memcpy(
+            base + profile_fingerprints_offset, &profile_fingerprint_view[0],
+            profile_count
+            * PLAN7_CONTINUATION_JOURNAL_PROFILE_FINGERPRINT_SIZE,
+        )
+    if row_count:
+        memcpy(
+            base + rows_offset, &domain_rows[0],
+            row_count * sizeof(plan7_continuation_journal_row),
+        )
+    memcpy(
+        base + special_offsets_offset, &special_offsets[0],
+        (row_count + 1) * sizeof(uint64_t),
+    )
+    if specials.shape[0]:
+        memcpy(
+            base + specials_offset, &specials[0],
+            specials.shape[0] * sizeof(float),
+        )
+    memcpy(
+        base + region_offsets_offset, &region_offsets[0],
+        (row_count + 1) * sizeof(uint64_t),
+    )
+    if region_count:
+        memcpy(
+            base + regions_offset, &regions[0],
+            region_count * sizeof(plan7_simple_region),
+        )
+    memcpy(
+        base + compact_row_offsets_offset, &compact_row_offsets[0],
+        (row_count + 1) * sizeof(uint64_t),
+    )
+    if compact_result_count:
+        memcpy(
+            base + compact_results_offset, &compact_results[0],
+            compact_result_count * sizeof(plan7_domain_rescore_result),
+        )
+    memcpy(
+        base + compact_trace_offsets_offset, &compact_trace_offsets[0],
+        (compact_result_count + 1) * sizeof(uint64_t),
+    )
+    if compact_trace_count:
+        memcpy(
+            base + compact_traces_offset, &compact_traces[0],
+            compact_trace_count * sizeof(plan7_domain_rescore_trace_step),
+        )
+    if compact_null2_count:
+        memcpy(
+            base + compact_null2_offset, &compact_null2[0],
+            compact_null2_count * sizeof(float),
+        )
+    journal.integrity_tag = plan7_continuation_journal_integrity(journal)
+    if journal.integrity_tag == 0:
+        free(journal)
+        raise ValueError("test v2 fixture integrity tag is zero")
+
+    try:
+        capsule = PyCapsule_New(
+            journal,
+            PLAN7_CONTINUATION_JOURNAL_CAPSULE_NAME,
+            _v2_test_fixture_capsule_destroy,
+        )
+    except:
+        free(journal)
+        raise
+    return _seal_profile_selection_continuation_bound(
+        query_tuple,
+        profile_tuple,
+        sequences,
+        residue_offsets,
+        f1,
+        background_fingerprint,
+        capsule,
+        (
+            0x5632544553540101,
+            0x5632544553540102,
+        ),
+        identity_owner,
+        profile_fingerprint_owner,
+        0x5632544553540202,
+        sequence_fingerprint_owner,
+        pipeline,
+        guard_band,
+    )
 
 
 cdef bint _sealed_background_matches(

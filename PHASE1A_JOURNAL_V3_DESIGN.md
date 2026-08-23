@@ -272,20 +272,32 @@ before-F1, raw-F1, bias, exact F2, exact F3, and authenticated no-region
 terminal cases.  All other rows become ordered exceptions.  Route-specific
 Forward specials, simple regions, compact results, trace offsets/traces, and
 null2 payloads are copied into one pointer-free allocation.  Typed per-record
-tags, a packet integrity tag, redundant span/delta checks, complete source and
-option provenance, checked arithmetic, and a capsule-owned true allocation
-boundary protect validation.  A private debug validator rebuilds the packet
-from the immutable dense seal and compares every byte; optional retirement is
-one-shot.
+tags, a packet integrity tag, redundant span/delta checks, complete v2 source
+and option provenance, checked arithmetic, and a capsule-owned true allocation
+boundary protect validation.  Host-only fixtures are explicitly marked as
+incomplete provenance and are accepted only with bias-enabled generation.  A
+Forward-bearing row that is not an exact F2 survivor is rejected rather than
+routed across a seam whose counter precondition it violates.  A private debug
+validator rebuilds the packet from the immutable dense seal and compares every
+byte; optional retirement is one-shot.
 
-Correctness evidence: the exact d486 PyHMMER runtime passes the full
-CUDA-hidden masked-pipeline suite (50 tests, 3 expected seam-availability
-skips).  Deterministic v3 fixtures cover every initially certifiable terminal
-stage; full/filter/Forward exception routes and their payload spans; first,
+Correctness evidence: the exact d486 PyHMMER runtime ran 53 tests in the
+CUDA-hidden masked-pipeline suite; the suite was OK with 3 expected
+environment-dependent skips.
+Deterministic host fixtures cover every
+initially certifiable pre-domain terminal stage; full/filter/Forward exception
+routes; contradictory Forward/F2 rejection; bias-disabled rejection; first,
 last, consecutive, and absent exceptions; a 4,098-target large prefix/tail;
 empty targets and an empty database; corrupt length/integrity fields; and
-one-shot ownership.  Existing v2 consumption and all exact output tests are
-unchanged and pass.
+one-shot ownership.  A test-only binary v2 minter then passes a two-profile
+domain bundle through the unchanged production v2 validator/seal before v3
+planning.  That fixture covers authenticated no-region certificates, ordinary,
+uncertain, and multidomain CPU domain routes, simple regions, compact device
+results and CPU fallback, specials, region/trace/null2 payloads, v2 provenance,
+and cross-profile source and destination cursors.  The v3 rebuild validator
+compares that packet byte-for-byte with a second plan from the immutable
+validated v2 seal.  This evidence is planner/serialization coverage, not yet a
+sparse-consumer semantic-equivalence result.
 
 Host microbenchmark (single warm process, no GPU): 32 profiles, 300,186
 targets/profile, and 262,144 dense records compacted in a median 6.15 ms when
