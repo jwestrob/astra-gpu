@@ -115,7 +115,10 @@ def require_environment() -> dict[str, object]:
 
 
 def audit_seal(
-    reference_sealed: object, candidates: object, alphabet: object
+    reference_sealed: object,
+    candidates: object,
+    alphabet: object,
+    direct_transport_delta: dict[str, int],
 ) -> dict[str, object]:
     direct_sealed = _candidate_state(candidates).sealed_postfilter
     if direct_sealed is None:
@@ -129,14 +132,34 @@ def audit_seal(
     if not _pipeline._sealed_sparse_journal_v3_enabled_bound(direct_sealed):
         raise AssertionError("direct generation did not retain sparse v3")
     direct_v3 = generation["sparse_journal_v3"]
+    reference_v3 = reference_generation["sparse_journal_v3"]
     resident = _pipeline._sealed_resident_memory_bound(direct_sealed)
     if (
         direct_v3["source_kind"] != "native_direct"
+        or direct_v3["planner_source_scan_count"] != 1
+        or direct_v3["separate_decision_scan_count"] != 0
         or generation["dense_v2_retained_bytes"] != 0
+        or generation["journal_bytes"] != 0
         or resident["dense_replay_retained_bytes"] != 0
         or resident["direct_v3_staging_retained_bytes"] != 0
     ):
         raise AssertionError("direct v3 retained dense replay or staging")
+    if any(
+        direct_transport_delta[key] != 0
+        for key in (
+            "build_count",
+            "payload_bytes",
+            "dense_v2_source_validation_ns",
+            "dense_v2_emit_ns",
+        )
+    ):
+        raise AssertionError("direct v3 allocated or emitted a dense v2 journal")
+    if (
+        reference_v3["enabled"]
+        or reference_generation["dense_v2_retained_bytes"] == 0
+        or reference_generation["journal_bytes"] == 0
+    ):
+        raise AssertionError("default non-sparse generation did not remain v2")
 
     # Keep the independent v2->v3 rebuild oracle on a separate dense seal.
     packet = _pipeline._plan_continuation_journal_v3_bound(reference_sealed)
@@ -192,6 +215,7 @@ def audit_seal(
         "generation": generation,
         "reference_generation": reference_generation,
         "direct_resident_memory": resident,
+        "direct_transport_delta": direct_transport_delta,
         "v3_summary": {
             key: summary[key]
             for key in (
@@ -237,6 +261,7 @@ def audit_fixture() -> dict[str, object]:
                 bias_filter=True,
                 pipeline=pipeline(alphabet),
             )
+            before_direct = _native._sealed_journal_transport_statistics()
             direct_production = batch._postfilter_forward_selection(
                 selection,
                 **OPTIONS,
@@ -244,6 +269,11 @@ def audit_fixture() -> dict[str, object]:
                 pipeline=pipeline(alphabet),
                 sparse_journal_v3=True,
             )
+            after_direct = _native._sealed_journal_transport_statistics()
+            production_direct_delta = {
+                key: after_direct[key] - before_direct[key]
+                for key in before_direct
+            }
             simple_fallback = batch._postfilter_forward_selection(
                 selection,
                 **OPTIONS,
@@ -251,6 +281,7 @@ def audit_fixture() -> dict[str, object]:
                 pipeline=pipeline(alphabet),
                 _rescore_compact_byte_budget=1,
             )
+            before_direct = _native._sealed_journal_transport_statistics()
             direct_simple_fallback = batch._postfilter_forward_selection(
                 selection,
                 **OPTIONS,
@@ -259,6 +290,11 @@ def audit_fixture() -> dict[str, object]:
                 _rescore_compact_byte_budget=1,
                 sparse_journal_v3=True,
             )
+            after_direct = _native._sealed_journal_transport_statistics()
+            simple_direct_delta = {
+                key: after_direct[key] - before_direct[key]
+                for key in before_direct
+            }
             production_seal = _candidate_state(production).sealed_postfilter
             simple_seal = _candidate_state(simple_fallback).sealed_postfilter
             if production_seal is None or simple_seal is None:
@@ -267,10 +303,16 @@ def audit_fixture() -> dict[str, object]:
 
         cases = {
             "production": audit_seal(
-                production_seal, direct_production, alphabet
+                production_seal,
+                direct_production,
+                alphabet,
+                production_direct_delta,
             ),
             "compact_cap_simple_fallback": audit_seal(
-                simple_seal, direct_simple_fallback, alphabet
+                simple_seal,
+                direct_simple_fallback,
+                alphabet,
+                simple_direct_delta,
             ),
         }
 
