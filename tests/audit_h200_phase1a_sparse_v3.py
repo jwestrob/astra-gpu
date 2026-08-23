@@ -115,17 +115,36 @@ def require_environment() -> dict[str, object]:
 
 
 def audit_seal(
-    sealed: object, candidates: object, alphabet: object
+    reference_sealed: object, candidates: object, alphabet: object
 ) -> dict[str, object]:
-    generation = _pipeline._sealed_continuation_statistics_bound(sealed)
-    if not _pipeline._sealed_sparse_journal_v3_enabled_bound(sealed):
-        raise AssertionError("fused generation did not retain sparse v3")
-    packet = _pipeline._plan_continuation_journal_v3_bound(sealed)
+    direct_sealed = _candidate_state(candidates).sealed_postfilter
+    if direct_sealed is None:
+        raise AssertionError("direct fused generation did not produce a seal")
+    reference_generation = _pipeline._sealed_continuation_statistics_bound(
+        reference_sealed
+    )
+    generation = _pipeline._sealed_continuation_statistics_bound(direct_sealed)
+    if _pipeline._sealed_sparse_journal_v3_enabled_bound(reference_sealed):
+        raise AssertionError("dense reference unexpectedly retained sparse v3")
+    if not _pipeline._sealed_sparse_journal_v3_enabled_bound(direct_sealed):
+        raise AssertionError("direct generation did not retain sparse v3")
+    direct_v3 = generation["sparse_journal_v3"]
+    resident = _pipeline._sealed_resident_memory_bound(direct_sealed)
+    if (
+        direct_v3["source_kind"] != "native_direct"
+        or generation["dense_v2_retained_bytes"] != 0
+        or resident["dense_replay_retained_bytes"] != 0
+        or resident["direct_v3_staging_retained_bytes"] != 0
+    ):
+        raise AssertionError("direct v3 retained dense replay or staging")
+
+    # Keep the independent v2->v3 rebuild oracle on a separate dense seal.
+    packet = _pipeline._plan_continuation_journal_v3_bound(reference_sealed)
     summary = _pipeline._validate_continuation_journal_v3_bound(
-        packet, sealed, include_details=True
+        packet, reference_sealed, include_details=True
     )
     audit = _pipeline._audit_continuation_journal_v3_bound(
-        packet, sealed, pipeline(alphabet), pipeline(alphabet)
+        packet, reference_sealed, pipeline(alphabet), pipeline(alphabet)
     )
     rows = audit["rows"]
     accepted = sum(row["dense"]["compact"]["accepted_count"] for row in rows)
@@ -171,6 +190,8 @@ def audit_seal(
         )
     return {
         "generation": generation,
+        "reference_generation": reference_generation,
+        "direct_resident_memory": resident,
         "v3_summary": {
             key: summary[key]
             for key in (
@@ -215,9 +236,22 @@ def audit_fixture() -> dict[str, object]:
                 **OPTIONS,
                 bias_filter=True,
                 pipeline=pipeline(alphabet),
+            )
+            direct_production = batch._postfilter_forward_selection(
+                selection,
+                **OPTIONS,
+                bias_filter=True,
+                pipeline=pipeline(alphabet),
                 sparse_journal_v3=True,
             )
             simple_fallback = batch._postfilter_forward_selection(
+                selection,
+                **OPTIONS,
+                bias_filter=True,
+                pipeline=pipeline(alphabet),
+                _rescore_compact_byte_budget=1,
+            )
+            direct_simple_fallback = batch._postfilter_forward_selection(
                 selection,
                 **OPTIONS,
                 bias_filter=True,
@@ -233,10 +267,10 @@ def audit_fixture() -> dict[str, object]:
 
         cases = {
             "production": audit_seal(
-                production_seal, production, alphabet
+                production_seal, direct_production, alphabet
             ),
             "compact_cap_simple_fallback": audit_seal(
-                simple_seal, simple_fallback, alphabet
+                simple_seal, direct_simple_fallback, alphabet
             ),
         }
 
