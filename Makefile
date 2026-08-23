@@ -206,10 +206,18 @@ $(PIPELINE_C): python/plan7_gpu/_pipeline.pyx python/plan7_gpu/_abi.py \
 		$(PYHMMER_ABI_STAMP) \
 		$(PYHMMER_PACKAGE_DIR)/plan7.pxd \
 		$(PYHMMER_PACKAGE_DIR)/easel.pxd \
+		$(PYHMMER_CYTHON_INCLUDE)/libeasel/alphabet.pxd \
+		$(PYHMMER_CYTHON_INCLUDE)/libeasel/hmm.pxd \
+		$(PYHMMER_CYTHON_INCLUDE)/libeasel/random.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libeasel/sq.pxd \
+		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/p7_alidisplay.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/p7_bg.pxd \
+		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/p7_domain.pxd \
+		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/p7_domaindef.pxd \
+		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/p7_hit.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/p7_pipeline.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/p7_tophits.pxd \
+		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/impl/p7_omx.pxd \
 		$(PYHMMER_CYTHON_INCLUDE)/libhmmer/impl/p7_oprofile.pxd
 	mkdir -p $(@D)
 	test "$$($(PYTHON) -c 'import pyhmmer; print(pyhmmer.__version__)')" = "$(PYHMMER_ABI_VERSION)" || \

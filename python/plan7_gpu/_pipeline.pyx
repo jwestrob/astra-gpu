@@ -10,10 +10,22 @@ loading it against an unsupported private ABI.
 
 from libc.stddef cimport size_t
 from libc.math cimport isfinite, isnan
-from libc.stdint cimport int16_t, int32_t, uint8_t, uint16_t, uint32_t, uint64_t
+from libc.stdint cimport (
+    int16_t,
+    int32_t,
+    int64_t,
+    uint8_t,
+    uint16_t,
+    uint32_t,
+    uint64_t,
+    uintptr_t,
+)
 from libc.stdlib cimport free, malloc
-from libc.string cimport memcmp, memcpy
-from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
+from libc.string cimport memcmp, memcpy, strlen
+from cpython.bytes cimport (
+    PyBytes_AS_STRING,
+    PyBytes_FromStringAndSize,
+)
 from cpython.buffer cimport Py_buffer, PyBuffer_FillInfo
 from cpython.pycapsule cimport (
     PyCapsule_Destructor,
@@ -33,6 +45,13 @@ from libeasel cimport (
     eslERANGE,
     eslOK,
 )
+from libeasel.alphabet cimport eslAMINO
+from libeasel.hmm cimport ESL_HMM
+from libeasel.random cimport (
+    ESL_RANDOMNESS,
+    eslRND_FAST,
+    eslRND_MERSENNE,
+)
 from libeasel.sq cimport ESL_SQ
 from libhmmer cimport p7_MLAMBDA, p7_MMU, p7_VLAMBDA, p7_VMU
 from libhmmer.impl.p7_oprofile cimport (
@@ -40,12 +59,17 @@ from libhmmer.impl.p7_oprofile cimport (
     p7_oprofile_Compare,
     p7_oprofile_ReconfigLength,
 )
+from libhmmer.impl.p7_omx cimport P7_OMX
 from libhmmer.p7_bg cimport (
     P7_BG,
     p7_bg_FilterScore,
     p7_bg_SetFilter,
     p7_bg_SetLength,
 )
+from libhmmer.p7_alidisplay cimport P7_ALIDISPLAY
+from libhmmer.p7_domain cimport P7_DOMAIN
+from libhmmer.p7_domaindef cimport P7_DOMAINDEF
+from libhmmer.p7_hit cimport P7_HIT
 from libhmmer.p7_pipeline cimport (
     P7_PIPELINE,
     p7_SEARCH_SEQS,
@@ -57,14 +81,22 @@ from libhmmer.p7_pipeline cimport (
 from libhmmer.p7_tophits cimport P7_TOPHITS
 
 from pyhmmer.easel cimport DigitalSequence, DigitalSequenceBlock
-from pyhmmer.plan7 cimport HMM, OptimizedProfile, Pipeline, TopHits
+from pyhmmer.plan7 cimport (
+    HMM,
+    OptimizedProfile,
+    Pipeline,
+    Profile,
+    TopHits,
+)
 
 import pyhmmer as _pyhmmer
 from pyhmmer.errors import AlphabetMismatch, UnexpectedError
 from array import array as _array
+import hashlib as _hashlib
 import importlib.util as _importlib_util
 import time as _time
 from pathlib import Path as _Path
+import struct as _struct
 from threading import Lock as _Lock
 
 # Keep the extension's established direct-file loading boundary usable by
@@ -83,6 +115,26 @@ cdef extern from "dlfcn.h" nogil:
     int dlclose(void* handle)
     void* dlopen(const char* filename, int flags)
     void* dlsym(void* handle, const char* symbol)
+
+
+cdef extern from * nogil:
+    """
+    #include <stdint.h>
+    #include <string.h>
+
+    static uint32_t
+    plan7_semantic_oprofile_xf_bits(const P7_OPROFILE *om, int x, int y)
+    {
+      uint32_t bits;
+      memcpy(&bits, &om->xf[x][y], sizeof(bits));
+      return bits;
+    }
+    """
+    uint32_t plan7_semantic_oprofile_xf_bits(
+        const P7_OPROFILE *om,
+        int x,
+        int y,
+    )
 
 
 cdef extern from "esl_gumbel.h" nogil:
@@ -5663,3 +5715,913 @@ def _search_hmm_postfilter_forward_bound(
         filter_scores_seam,
         forward_scores_seam,
     )
+
+
+# Phase 1A semantic-state oracle.  This deliberately lives in the private
+# extension: PyHMMER's public pickle state serializes dormant short-mode
+# fields, while the C structs contain pointers, capacity, padding, and
+# reusable workspaces that are not semantic state.
+SEMANTIC_STATE_SCHEMA_VERSION = 1
+
+cdef enum _semantic_field_tag:
+    _SEM_BOOL = 1
+    _SEM_I32 = 2
+    _SEM_I64 = 3
+    _SEM_U8 = 4
+    _SEM_U32 = 5
+    _SEM_U64 = 6
+    _SEM_F32_BITS = 7
+    _SEM_F64_BITS = 8
+    _SEM_BYTES = 9
+    _SEM_NULLABLE_BYTES = 10
+
+
+cdef inline uint32_t _semantic_float_bits(float value) noexcept:
+    cdef uint32_t bits
+    memcpy(&bits, &value, sizeof(bits))
+    return bits
+
+
+cdef inline uint64_t _semantic_double_bits(double value) noexcept:
+    cdef uint64_t bits
+    memcpy(&bits, &value, sizeof(bits))
+    return bits
+
+
+cdef void _semantic_field(
+    bytearray output,
+    bytes name,
+    uint8_t tag,
+    bytes payload,
+) except *:
+    if len(name) > 65535:
+        raise ValueError("semantic field name is too long")
+    output.extend(_struct.pack("<HBQ", len(name), tag, len(payload)))
+    output.extend(name)
+    output.extend(payload)
+
+
+cdef inline void _semantic_bool(
+    bytearray output,
+    bytes name,
+    int value,
+) except *:
+    if value != 0 and value != 1:
+        raise ValueError(f"{name.decode('ascii')} is not boolean")
+    _semantic_field(output, name, _SEM_BOOL, _struct.pack("<B", value))
+
+
+cdef inline void _semantic_i32(
+    bytearray output,
+    bytes name,
+    int value,
+) except *:
+    _semantic_field(output, name, _SEM_I32, _struct.pack("<i", value))
+
+
+cdef inline void _semantic_i64(
+    bytearray output,
+    bytes name,
+    int64_t value,
+) except *:
+    _semantic_field(output, name, _SEM_I64, _struct.pack("<q", value))
+
+
+cdef inline void _semantic_u8(
+    bytearray output,
+    bytes name,
+    uint8_t value,
+) except *:
+    _semantic_field(output, name, _SEM_U8, _struct.pack("<B", value))
+
+
+cdef inline void _semantic_u32(
+    bytearray output,
+    bytes name,
+    uint32_t value,
+) except *:
+    _semantic_field(output, name, _SEM_U32, _struct.pack("<I", value))
+
+
+cdef inline void _semantic_u64(
+    bytearray output,
+    bytes name,
+    uint64_t value,
+) except *:
+    _semantic_field(output, name, _SEM_U64, _struct.pack("<Q", value))
+
+
+cdef inline void _semantic_f32(
+    bytearray output,
+    bytes name,
+    float value,
+) except *:
+    _semantic_field(
+        output,
+        name,
+        _SEM_F32_BITS,
+        _struct.pack("<I", _semantic_float_bits(value)),
+    )
+
+
+cdef inline void _semantic_f64(
+    bytearray output,
+    bytes name,
+    double value,
+) except *:
+    _semantic_field(
+        output,
+        name,
+        _SEM_F64_BITS,
+        _struct.pack("<Q", _semantic_double_bits(value)),
+    )
+
+
+cdef inline void _semantic_bytes(
+    bytearray output,
+    bytes name,
+    bytes value,
+) except *:
+    _semantic_field(output, name, _SEM_BYTES, value)
+
+
+cdef inline void _semantic_nullable_bytes(
+    bytearray output,
+    bytes name,
+    object value,
+) except *:
+    cdef bytes data
+    if value is None:
+        _semantic_field(output, name, _SEM_NULLABLE_BYTES, b"\x00")
+        return
+    if not isinstance(value, bytes):
+        raise TypeError(f"{name.decode('ascii')} must be bytes or None")
+    data = value
+    _semantic_field(output, name, _SEM_NULLABLE_BYTES, b"\x01" + data)
+
+
+cdef inline object _semantic_cstring(const char *value):
+    if value == NULL:
+        return None
+    return PyBytes_FromStringAndSize(value, strlen(value))
+
+
+cdef inline object _semantic_fixed_string(const char *value, int length):
+    if value == NULL:
+        return None
+    if length < 0:
+        raise ValueError("negative semantic string length")
+    return PyBytes_FromStringAndSize(value, length)
+
+
+cdef void _semantic_encode_pipeline_scalars(
+    bytearray output,
+    const P7_PIPELINE *pli,
+    bytes prefix,
+) except *:
+    if pli == NULL:
+        raise ValueError("pipeline state is unavailable")
+    if pli.mode != p7_SEARCH_SEQS or pli.long_targets:
+        raise ValueError(
+            "semantic fingerprint requires a short protein sequence-search pipeline"
+        )
+
+    _semantic_bool(output, prefix + b".by_E", pli.by_E)
+    _semantic_f64(output, prefix + b".E", pli.E)
+    _semantic_f64(output, prefix + b".T", pli.T)
+    _semantic_bool(output, prefix + b".dom_by_E", pli.dom_by_E)
+    _semantic_f64(output, prefix + b".domE", pli.domE)
+    _semantic_f64(output, prefix + b".domT", pli.domT)
+    _semantic_i32(output, prefix + b".use_bit_cutoffs", pli.use_bit_cutoffs)
+    _semantic_bool(output, prefix + b".inc_by_E", pli.inc_by_E)
+    _semantic_f64(output, prefix + b".incE", pli.incE)
+    _semantic_f64(output, prefix + b".incT", pli.incT)
+    _semantic_bool(output, prefix + b".incdom_by_E", pli.incdom_by_E)
+    _semantic_f64(output, prefix + b".incdomE", pli.incdomE)
+    _semantic_f64(output, prefix + b".incdomT", pli.incdomT)
+
+    _semantic_f64(output, prefix + b".Z", pli.Z)
+    _semantic_f64(output, prefix + b".domZ", pli.domZ)
+    _semantic_i32(output, prefix + b".Z_setby", pli.Z_setby)
+    _semantic_i32(output, prefix + b".domZ_setby", pli.domZ_setby)
+
+    _semantic_bool(output, prefix + b".do_max", pli.do_max)
+    _semantic_f64(output, prefix + b".F1", pli.F1)
+    _semantic_f64(output, prefix + b".F2", pli.F2)
+    _semantic_f64(output, prefix + b".F3", pli.F3)
+    _semantic_i32(output, prefix + b".B1", pli.B1)
+    _semantic_i32(output, prefix + b".B2", pli.B2)
+    _semantic_i32(output, prefix + b".B3", pli.B3)
+    _semantic_bool(output, prefix + b".do_biasfilter", pli.do_biasfilter)
+    _semantic_bool(output, prefix + b".do_null2", pli.do_null2)
+    _semantic_bool(output, prefix + b".do_reseeding", pli.do_reseeding)
+    _semantic_bool(
+        output,
+        prefix + b".do_alignment_score_calc",
+        pli.do_alignment_score_calc,
+    )
+
+    _semantic_u64(output, prefix + b".nmodels", pli.nmodels)
+    _semantic_u64(output, prefix + b".nseqs", pli.nseqs)
+    _semantic_u64(output, prefix + b".nres", pli.nres)
+    _semantic_u64(output, prefix + b".nnodes", pli.nnodes)
+    _semantic_u64(output, prefix + b".n_past_msv", pli.n_past_msv)
+    _semantic_u64(output, prefix + b".n_past_bias", pli.n_past_bias)
+    _semantic_u64(output, prefix + b".n_past_vit", pli.n_past_vit)
+    _semantic_u64(output, prefix + b".n_past_fwd", pli.n_past_fwd)
+    _semantic_u64(output, prefix + b".pos_past_msv", pli.pos_past_msv)
+    _semantic_u64(output, prefix + b".pos_past_bias", pli.pos_past_bias)
+    _semantic_u64(output, prefix + b".pos_past_vit", pli.pos_past_vit)
+    _semantic_u64(output, prefix + b".pos_past_fwd", pli.pos_past_fwd)
+
+    _semantic_i32(output, prefix + b".mode", pli.mode)
+    _semantic_bool(output, prefix + b".long_targets", pli.long_targets)
+    # W is uninitialized in a newly allocated upstream P7_PIPELINE. NewModel
+    # defines it before any search and clear() defines it as zero. Before the
+    # first model it cannot affect execution because NewModel overwrites it.
+    _semantic_bool(output, prefix + b".W_present", pli.nmodels != 0)
+    if pli.nmodels != 0:
+        _semantic_i32(output, prefix + b".W", pli.W)
+    _semantic_bool(output, prefix + b".show_accessions", pli.show_accessions)
+    _semantic_bool(output, prefix + b".show_alignments", pli.show_alignments)
+
+    # Deliberately never read n_output, pos_output, strands, or block_length:
+    # upstream allocation leaves these dormant short-mode fields undefined.
+
+
+cdef void _semantic_encode_rng(
+    bytearray output,
+    const ESL_RANDOMNESS *rng,
+    bytes prefix,
+) except *:
+    cdef int i
+    if rng == NULL:
+        raise ValueError("pipeline RNG is unavailable")
+    _semantic_i32(output, prefix + b".type", rng.type)
+    _semantic_u32(output, prefix + b".seed", rng.seed)
+    if rng.type == eslRND_FAST:
+        # mt[] is uninitialized for the fast LCG and must never be read.
+        _semantic_u32(output, prefix + b".x", rng.x)
+    elif rng.type == eslRND_MERSENNE:
+        # x is irrelevant to MT state; mti and the initialized table are exact.
+        _semantic_i32(output, prefix + b".mti", rng.mti)
+        for i in range(624):
+            _semantic_u32(
+                output,
+                prefix + b".mt[" + str(i).encode("ascii") + b"]",
+                rng.mt[i],
+            )
+    else:
+        raise ValueError("pipeline RNG has an unsupported type")
+
+
+cdef void _semantic_encode_domaindef(
+    bytearray output,
+    const P7_DOMAINDEF *ddef,
+    const ESL_RANDOMNESS *rng,
+    bytes prefix,
+) except *:
+    if ddef == NULL:
+        raise ValueError("pipeline domain-definition state is unavailable")
+    if ddef.r != rng:
+        raise ValueError("pipeline and domain-definition RNG ownership differs")
+    if (
+        ddef.mocc == NULL
+        or ddef.btot == NULL
+        or ddef.etot == NULL
+        or ddef.n2sc == NULL
+        or ddef.sp == NULL
+        or ddef.tr == NULL
+        or ddef.gtr == NULL
+        or ddef.dcl == NULL
+    ):
+        raise ValueError("pipeline domain-definition workspace is incomplete")
+    if (
+        ddef.L != 0
+        or ddef.ndom != 0
+        or ddef.nexpected != 0.0
+        or ddef.nregions != 0
+        or ddef.nclustered != 0
+        or ddef.noverlaps != 0
+        or ddef.nenvelopes != 0
+    ):
+        raise ValueError(
+            "semantic fingerprint requires successful reusable domain state"
+        )
+
+    _semantic_f32(output, prefix + b".rt1", ddef.rt1)
+    _semantic_f32(output, prefix + b".rt2", ddef.rt2)
+    _semantic_f32(output, prefix + b".rt3", ddef.rt3)
+    _semantic_i32(output, prefix + b".nsamples", ddef.nsamples)
+    _semantic_f32(output, prefix + b".min_overlap", ddef.min_overlap)
+    _semantic_bool(output, prefix + b".of_smaller", ddef.of_smaller)
+    _semantic_i32(output, prefix + b".max_diagdiff", ddef.max_diagdiff)
+    _semantic_f32(output, prefix + b".min_posterior", ddef.min_posterior)
+    _semantic_f32(output, prefix + b".min_endpointp", ddef.min_endpointp)
+    _semantic_bool(output, prefix + b".do_reseeding", ddef.do_reseeding)
+    _semantic_i32(output, prefix + b".reusable.L", ddef.L)
+    _semantic_i32(output, prefix + b".reusable.ndom", ddef.ndom)
+    _semantic_f32(output, prefix + b".reusable.nexpected", ddef.nexpected)
+    _semantic_i32(output, prefix + b".reusable.nregions", ddef.nregions)
+    _semantic_i32(output, prefix + b".reusable.nclustered", ddef.nclustered)
+    _semantic_i32(output, prefix + b".reusable.noverlaps", ddef.noverlaps)
+    _semantic_i32(output, prefix + b".reusable.nenvelopes", ddef.nenvelopes)
+
+
+cdef void _semantic_encode_reusable_omx(
+    bytearray output,
+    const P7_OMX *matrix,
+    bytes prefix,
+) except *:
+    if matrix == NULL:
+        raise ValueError("pipeline DP workspace is unavailable")
+    if (
+        matrix.dpf == NULL
+        or matrix.dpw == NULL
+        or matrix.dpb == NULL
+        or matrix.dp_mem == NULL
+        or matrix.xmx == NULL
+        or matrix.x_mem == NULL
+    ):
+        raise ValueError("pipeline DP backing storage is incomplete")
+    if (
+        matrix.M != 0
+        or matrix.L != 0
+        or matrix.totscale != 0.0
+        or matrix.has_own_scales != 1
+    ):
+        raise ValueError("semantic fingerprint requires reusable DP state")
+    _semantic_i32(output, prefix + b".M", matrix.M)
+    _semantic_i32(output, prefix + b".L", matrix.L)
+    _semantic_f32(output, prefix + b".totscale", matrix.totscale)
+    _semantic_bool(
+        output,
+        prefix + b".has_own_scales",
+        matrix.has_own_scales,
+    )
+
+
+cdef void _semantic_encode_background(
+    bytearray output,
+    const P7_BG *bg,
+    bytes prefix,
+    bint include_filter_state,
+) except *:
+    cdef const ESL_HMM *fhmm
+    cdef int i
+    cdef int j
+    if bg == NULL or bg.abc == NULL or bg.f == NULL or bg.fhmm == NULL:
+        raise ValueError("pipeline background state is unavailable")
+    if bg.abc.type != eslAMINO:
+        raise ValueError("semantic fingerprint requires a protein alphabet")
+    fhmm = bg.fhmm
+    _semantic_i32(output, prefix + b".alphabet.type", bg.abc.type)
+    _semantic_i32(output, prefix + b".alphabet.K", bg.abc.K)
+    _semantic_i32(output, prefix + b".alphabet.Kp", bg.abc.Kp)
+    _semantic_f32(output, prefix + b".p1", bg.p1)
+    _semantic_f32(output, prefix + b".omega", bg.omega)
+    for i in range(bg.abc.K):
+        _semantic_f32(
+            output,
+            prefix + b".f[" + str(i).encode("ascii") + b"]",
+            bg.f[i],
+        )
+
+    # esl_hmm_Create() leaves its numeric buffers undefined. NewModel calls
+    # p7_bg_SetFilter() before they can be consumed. With no prior model the
+    # filter state is therefore both nonsemantic and unsafe to inspect.
+    _semantic_bool(output, prefix + b".fhmm.state_present", include_filter_state)
+    if not include_filter_state:
+        return
+    if (
+        fhmm.abc != bg.abc
+        or fhmm.M <= 0
+        or fhmm.K != bg.abc.K
+        or fhmm.pi == NULL
+        or fhmm.t == NULL
+        or fhmm.e == NULL
+        or fhmm.eo == NULL
+    ):
+        raise ValueError("background filter HMM is inconsistent")
+
+    _semantic_i32(output, prefix + b".fhmm.M", fhmm.M)
+    _semantic_i32(output, prefix + b".fhmm.K", fhmm.K)
+    # pi[M] is the implicit-end probability for an empty sequence. HMMER's
+    # protein pipeline skips empty targets, and p7_bg_SetFilter() initializes
+    # only pi[0..M-1], so the dormant pi[M] slot must not be inspected.
+    for i in range(fhmm.M):
+        _semantic_f32(
+            output,
+            prefix + b".fhmm.pi[" + str(i).encode("ascii") + b"]",
+            fhmm.pi[i],
+        )
+    for i in range(fhmm.M):
+        if fhmm.t[i] == NULL or fhmm.e[i] == NULL:
+            raise ValueError("background filter HMM row is unavailable")
+        for j in range(fhmm.M + 1):
+            _semantic_f32(
+                output,
+                prefix
+                + b".fhmm.t["
+                + str(i).encode("ascii")
+                + b"]["
+                + str(j).encode("ascii")
+                + b"]",
+                fhmm.t[i][j],
+            )
+        for j in range(fhmm.K):
+            _semantic_f32(
+                output,
+                prefix
+                + b".fhmm.e["
+                + str(i).encode("ascii")
+                + b"]["
+                + str(j).encode("ascii")
+                + b"]",
+                fhmm.e[i][j],
+            )
+    for i in range(bg.abc.Kp):
+        if fhmm.eo[i] == NULL:
+            raise ValueError("background filter HMM odds row is unavailable")
+        for j in range(fhmm.M):
+            _semantic_f32(
+                output,
+                prefix
+                + b".fhmm.eo["
+                + str(i).encode("ascii")
+                + b"]["
+                + str(j).encode("ascii")
+                + b"]",
+                fhmm.eo[i][j],
+            )
+
+
+cdef void _semantic_encode_oprofile(
+    bytearray output,
+    const P7_OPROFILE *om,
+    bytes prefix,
+) except *:
+    cdef int x
+    cdef int y
+    if om == NULL or om.abc == NULL:
+        raise ValueError("optimized-profile state is unavailable")
+    if om.abc.type != eslAMINO:
+        raise ValueError("semantic fingerprint requires a protein profile")
+
+    _semantic_i32(output, prefix + b".alphabet.type", om.abc.type)
+    _semantic_i32(output, prefix + b".alphabet.K", om.abc.K)
+    _semantic_i32(output, prefix + b".alphabet.Kp", om.abc.Kp)
+    _semantic_nullable_bytes(output, prefix + b".name", _semantic_cstring(om.name))
+    _semantic_nullable_bytes(output, prefix + b".acc", _semantic_cstring(om.acc))
+    _semantic_i32(output, prefix + b".M", om.M)
+    _semantic_i32(output, prefix + b".L", om.L)
+    _semantic_i32(output, prefix + b".max_length", om.max_length)
+    _semantic_i32(output, prefix + b".mode", om.mode)
+    _semantic_f32(output, prefix + b".nj", om.nj)
+
+    _semantic_u8(output, prefix + b".tbm_b", om.tbm_b)
+    _semantic_u8(output, prefix + b".tec_b", om.tec_b)
+    _semantic_u8(output, prefix + b".tjb_b", om.tjb_b)
+    _semantic_f32(output, prefix + b".scale_b", om.scale_b)
+    _semantic_u8(output, prefix + b".base_b", om.base_b)
+    _semantic_u8(output, prefix + b".bias_b", om.bias_b)
+    _semantic_f32(output, prefix + b".scale_w", om.scale_w)
+    _semantic_i32(output, prefix + b".base_w", om.base_w)
+    _semantic_i32(output, prefix + b".ddbound_w", om.ddbound_w)
+    _semantic_f32(output, prefix + b".ncj_roundoff", om.ncj_roundoff)
+    for x in range(4):
+        for y in range(2):
+            _semantic_i32(
+                output,
+                prefix
+                + b".xw["
+                + str(x).encode("ascii")
+                + b"]["
+                + str(y).encode("ascii")
+                + b"]",
+                om.xw[x][y],
+            )
+            _semantic_field(
+                output,
+                prefix
+                + b".xf["
+                + str(x).encode("ascii")
+                + b"]["
+                + str(y).encode("ascii")
+                + b"]",
+                _SEM_F32_BITS,
+                _struct.pack(
+                    "<I", plan7_semantic_oprofile_xf_bits(om, x, y)
+                ),
+            )
+
+
+cdef void _semantic_encode_query_identity(
+    bytearray output,
+    object query,
+    bytes prefix,
+) except *:
+    cdef bytes kind
+    cdef object name
+    cdef object accession
+    cdef int model_length
+    cdef HMM hmm
+    cdef Profile profile
+    cdef OptimizedProfile optimized
+    if isinstance(query, _pyhmmer.plan7.HMM):
+        kind = b"HMM"
+        hmm = query
+        name = _semantic_cstring(hmm._hmm.name)
+        accession = _semantic_cstring(hmm._hmm.acc)
+        model_length = hmm._hmm.M
+    elif isinstance(query, _pyhmmer.plan7.Profile):
+        kind = b"Profile"
+        profile = query
+        name = _semantic_cstring(profile._gm.name)
+        accession = _semantic_cstring(profile._gm.acc)
+        model_length = profile._gm.M
+    elif isinstance(query, _pyhmmer.plan7.OptimizedProfile):
+        kind = b"OptimizedProfile"
+        optimized = query
+        name = _semantic_cstring(optimized._om.name)
+        accession = _semantic_cstring(optimized._om.acc)
+        model_length = optimized._om.M
+    else:
+        raise TypeError(
+            "semantic TopHits fingerprint requires an HMM/profile query"
+        )
+    _semantic_bytes(output, prefix + b".kind", kind)
+    _semantic_nullable_bytes(output, prefix + b".name", name)
+    _semantic_nullable_bytes(output, prefix + b".accession", accession)
+    _semantic_i32(output, prefix + b".M", model_length)
+
+
+cdef void _semantic_encode_alidisplay(
+    bytearray output,
+    const P7_ALIDISPLAY *ad,
+    bytes prefix,
+) except *:
+    if ad == NULL:
+        _semantic_bool(output, prefix + b".present", False)
+        return
+    if ad.N < 0:
+        raise ValueError("alignment display has a negative length")
+    if ad.ntseq != NULL:
+        raise ValueError(
+            "short protein alignment display unexpectedly contains ntseq"
+        )
+    _semantic_bool(output, prefix + b".present", True)
+    _semantic_i32(output, prefix + b".N", ad.N)
+    _semantic_nullable_bytes(
+        output, prefix + b".rfline", _semantic_fixed_string(ad.rfline, ad.N)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".mmline", _semantic_fixed_string(ad.mmline, ad.N)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".csline", _semantic_fixed_string(ad.csline, ad.N)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".model", _semantic_fixed_string(ad.model, ad.N)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".mline", _semantic_fixed_string(ad.mline, ad.N)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".aseq", _semantic_fixed_string(ad.aseq, ad.N)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".ppline", _semantic_fixed_string(ad.ppline, ad.N)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".hmmname", _semantic_cstring(ad.hmmname)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".hmmacc", _semantic_cstring(ad.hmmacc)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".hmmdesc", _semantic_cstring(ad.hmmdesc)
+    )
+    _semantic_i32(output, prefix + b".hmmfrom", ad.hmmfrom)
+    _semantic_i32(output, prefix + b".hmmto", ad.hmmto)
+    _semantic_i32(output, prefix + b".M", ad.M)
+    _semantic_nullable_bytes(
+        output, prefix + b".sqname", _semantic_cstring(ad.sqname)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".sqacc", _semantic_cstring(ad.sqacc)
+    )
+    _semantic_nullable_bytes(
+        output, prefix + b".sqdesc", _semantic_cstring(ad.sqdesc)
+    )
+    _semantic_i64(output, prefix + b".sqfrom", ad.sqfrom)
+    _semantic_i64(output, prefix + b".sqto", ad.sqto)
+    _semantic_i64(output, prefix + b".L", ad.L)
+    # mem/memsize are allocation representation, not alignment semantics.
+
+
+cdef void _semantic_encode_domain(
+    bytearray output,
+    const P7_DOMAIN *domain,
+    bytes prefix,
+) except *:
+    cdef int i
+    if domain == NULL:
+        raise ValueError("domain state is unavailable")
+    _semantic_i64(output, prefix + b".ienv", domain.ienv)
+    _semantic_i64(output, prefix + b".jenv", domain.jenv)
+    _semantic_i64(output, prefix + b".iali", domain.iali)
+    _semantic_i64(output, prefix + b".jali", domain.jali)
+    # iorf/jorf are never initialized by the short protein-domain path.
+    _semantic_f32(output, prefix + b".envsc", domain.envsc)
+    _semantic_f32(output, prefix + b".domcorrection", domain.domcorrection)
+    _semantic_f32(output, prefix + b".dombias", domain.dombias)
+    _semantic_f32(output, prefix + b".oasc", domain.oasc)
+    _semantic_f32(output, prefix + b".bitscore", domain.bitscore)
+    _semantic_f64(output, prefix + b".lnP", domain.lnP)
+    _semantic_bool(output, prefix + b".is_reported", domain.is_reported)
+    _semantic_bool(output, prefix + b".is_included", domain.is_included)
+    _semantic_encode_alidisplay(output, domain.ad, prefix + b".ad")
+    _semantic_bool(
+        output,
+        prefix + b".scores_per_pos.present",
+        domain.scores_per_pos != NULL,
+    )
+    if domain.scores_per_pos != NULL:
+        if domain.ad == NULL:
+            raise ValueError("domain score vector has no alignment display")
+        for i in range(domain.ad.N):
+            _semantic_f32(
+                output,
+                prefix
+                + b".scores_per_pos["
+                + str(i).encode("ascii")
+                + b"]",
+                domain.scores_per_pos[i],
+            )
+
+
+cdef void _semantic_encode_hit(
+    bytearray output,
+    const P7_HIT *hit,
+    bytes prefix,
+) except *:
+    cdef int d
+    if hit == NULL:
+        raise ValueError("hit state is unavailable")
+    if hit.ndom < 0 or (hit.ndom != 0 and hit.dcl == NULL):
+        raise ValueError("hit domain storage is inconsistent")
+    _semantic_nullable_bytes(output, prefix + b".name", _semantic_cstring(hit.name))
+    _semantic_nullable_bytes(output, prefix + b".acc", _semantic_cstring(hit.acc))
+    _semantic_nullable_bytes(output, prefix + b".desc", _semantic_cstring(hit.desc))
+    # window_length, seqidx, and subseq_start are uninitialized in short mode.
+    _semantic_f64(output, prefix + b".sortkey", hit.sortkey)
+    _semantic_f32(output, prefix + b".score", hit.score)
+    _semantic_f32(output, prefix + b".pre_score", hit.pre_score)
+    _semantic_f32(output, prefix + b".sum_score", hit.sum_score)
+    _semantic_f64(output, prefix + b".lnP", hit.lnP)
+    _semantic_f64(output, prefix + b".pre_lnP", hit.pre_lnP)
+    _semantic_f64(output, prefix + b".sum_lnP", hit.sum_lnP)
+    _semantic_f32(output, prefix + b".nexpected", hit.nexpected)
+    _semantic_i32(output, prefix + b".nregions", hit.nregions)
+    _semantic_i32(output, prefix + b".nclustered", hit.nclustered)
+    _semantic_i32(output, prefix + b".noverlaps", hit.noverlaps)
+    _semantic_i32(output, prefix + b".nenvelopes", hit.nenvelopes)
+    _semantic_i32(output, prefix + b".ndom", hit.ndom)
+    _semantic_u32(output, prefix + b".flags", hit.flags)
+    _semantic_i32(output, prefix + b".nreported", hit.nreported)
+    _semantic_i32(output, prefix + b".nincluded", hit.nincluded)
+    _semantic_i32(output, prefix + b".best_domain", hit.best_domain)
+    _semantic_i64(output, prefix + b".offset", hit.offset)
+    for d in range(hit.ndom):
+        _semantic_encode_domain(
+            output,
+            &hit.dcl[d],
+            prefix + b".domain[" + str(d).encode("ascii") + b"]",
+        )
+
+
+cdef bytes _semantic_pipeline_state_encoding(
+    Pipeline pipeline,
+    OptimizedProfile optimized_profile,
+    bint include_optimized_profile,
+):
+    cdef bytearray output = bytearray(b"plan7-gpu-semantic-pipeline-v1\0")
+    cdef P7_PIPELINE *pli = pipeline._pli
+    cdef P7_BG *bg
+    if type(pipeline) is not _pyhmmer.plan7.Pipeline:
+        raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+    if pli == NULL:
+        raise ValueError("pipeline state is unavailable")
+    if (
+        pli.oxf == NULL
+        or pli.oxb == NULL
+        or pli.fwd == NULL
+        or pli.bck == NULL
+        or pli.r == NULL
+        or pli.ddef == NULL
+    ):
+        raise ValueError("pipeline reusable workspace is incomplete")
+    if pli.hfp != NULL:
+        raise ValueError("short protein search pipeline unexpectedly owns an HMM file")
+    if pli.errbuf[0] != 0:
+        raise ValueError("semantic fingerprint requires a successful clean pipeline")
+
+    _semantic_encode_pipeline_scalars(output, pli, b"pipeline")
+    _semantic_u32(output, b"pipeline.python_seed", pipeline._seed)
+    _semantic_encode_rng(output, pli.r, b"pipeline.rng")
+    _semantic_encode_domaindef(output, pli.ddef, pli.r, b"pipeline.ddef")
+    _semantic_encode_reusable_omx(output, pli.oxf, b"pipeline.oxf")
+    _semantic_encode_reusable_omx(output, pli.oxb, b"pipeline.oxb")
+    _semantic_encode_reusable_omx(output, pli.fwd, b"pipeline.fwd")
+    _semantic_encode_reusable_omx(output, pli.bck, b"pipeline.bck")
+
+    if pipeline.background is None:
+        raise ValueError("pipeline background is unavailable")
+    bg = pipeline.background._bg
+    _semantic_encode_background(
+        output,
+        bg,
+        b"background",
+        pli.nmodels != 0,
+    )
+    _semantic_bool(output, b"optimized_profile.present", include_optimized_profile)
+    if include_optimized_profile:
+        if (
+            optimized_profile._om.abc == NULL
+            or optimized_profile._om.abc.type != bg.abc.type
+            or optimized_profile._om.abc.K != bg.abc.K
+            or optimized_profile._om.abc.Kp != bg.abc.Kp
+        ):
+            raise ValueError("optimized profile and background alphabets differ")
+        _semantic_encode_oprofile(
+            output,
+            optimized_profile._om,
+            b"optimized_profile",
+        )
+    return bytes(output)
+
+
+def _semantic_pipeline_state_encoding_bound(
+    Pipeline pipeline,
+    optimized_profile=None,
+):
+    """Return canonical typed short-search state; private Phase 1A oracle."""
+    cdef OptimizedProfile profile
+    if optimized_profile is None:
+        profile = None
+        return _semantic_pipeline_state_encoding(pipeline, profile, False)
+    if type(optimized_profile) is not _pyhmmer.plan7.OptimizedProfile:
+        raise TypeError(
+            "optimized_profile must be exactly pyhmmer.plan7.OptimizedProfile"
+        )
+    profile = optimized_profile
+    return _semantic_pipeline_state_encoding(pipeline, profile, True)
+
+
+def _semantic_pipeline_state_fingerprint_bound(
+    Pipeline pipeline,
+    optimized_profile=None,
+):
+    """Return SHA-256 of the canonical Phase 1A pipeline-state encoding."""
+    return _hashlib.sha256(
+        _semantic_pipeline_state_encoding_bound(pipeline, optimized_profile)
+    ).digest()
+
+
+cdef bytes _semantic_tophits_encoding(TopHits hits):
+    cdef bytearray output = bytearray(b"plan7-gpu-semantic-tophits-v1\0")
+    cdef P7_TOPHITS *th = hits._th
+    cdef uintptr_t base
+    cdef uintptr_t limit
+    cdef uintptr_t pointer
+    cdef uintptr_t distance
+    cdef uint64_t i
+    cdef uint64_t order_index
+    cdef bytes prefix
+    if type(hits) is not _pyhmmer.plan7.TopHits:
+        raise TypeError("hits must be exactly pyhmmer.plan7.TopHits")
+    if th == NULL:
+        raise ValueError("TopHits state is unavailable")
+    if th.N > th.Nalloc:
+        raise ValueError("TopHits count exceeds capacity")
+    if th.N != 0 and (th.unsrt == NULL or th.hit == NULL):
+        raise ValueError("TopHits storage is unavailable")
+    _semantic_bool(output, b"tophits.empty", hits._empty)
+    _semantic_encode_query_identity(output, hits._query, b"tophits.query")
+    _semantic_u64(output, b"tophits.N", th.N)
+    _semantic_u64(output, b"tophits.nreported", th.nreported)
+    _semantic_u64(output, b"tophits.nincluded", th.nincluded)
+    _semantic_bool(
+        output,
+        b"tophits.is_sorted_by_sortkey",
+        th.is_sorted_by_sortkey,
+    )
+    _semantic_bool(
+        output,
+        b"tophits.is_sorted_by_seqidx",
+        th.is_sorted_by_seqidx,
+    )
+    _semantic_encode_pipeline_scalars(output, &hits._pli, b"tophits.pipeline")
+
+    if th.N != 0:
+        base = <uintptr_t> th.unsrt
+        limit = base + th.N * sizeof(P7_HIT)
+        if limit < base:
+            raise OverflowError("TopHits storage address overflow")
+        for i in range(th.N):
+            pointer = <uintptr_t> th.hit[i]
+            if pointer < base or pointer >= limit:
+                raise ValueError("TopHits order pointer is outside hit storage")
+            distance = pointer - base
+            if distance % sizeof(P7_HIT) != 0:
+                raise ValueError("TopHits order pointer is misaligned")
+            order_index = distance // sizeof(P7_HIT)
+            _semantic_u64(
+                output,
+                b"tophits.order[" + str(i).encode("ascii") + b"]",
+                order_index,
+            )
+        for i in range(th.N):
+            prefix = b"tophits.unsrt[" + str(i).encode("ascii") + b"]"
+            _semantic_encode_hit(output, &th.unsrt[i], prefix)
+    return bytes(output)
+
+
+def _semantic_tophits_encoding_bound(TopHits hits):
+    """Return canonical semantic TopHits bytes without raw serialization."""
+    return _semantic_tophits_encoding(hits)
+
+
+def _semantic_tophits_fingerprint_bound(TopHits hits):
+    """Return SHA-256 of canonical semantic TopHits state."""
+    return _hashlib.sha256(_semantic_tophits_encoding(hits)).digest()
+
+
+cdef object _semantic_first_difference(bytes left, bytes right):
+    cdef Py_ssize_t i
+    cdef Py_ssize_t common = min(len(left), len(right))
+    for i in range(common):
+        if left[i] != right[i]:
+            return i
+    if len(left) != len(right):
+        return common
+    return None
+
+
+def _semantic_dual_state_compare_bound(
+    Pipeline left_pipeline,
+    Pipeline right_pipeline,
+    left_hits=None,
+    right_hits=None,
+    left_optimized_profile=None,
+    right_optimized_profile=None,
+):
+    """Compare independently owned dense/sparse audit states without mutation."""
+    cdef bytes left_pipeline_encoding
+    cdef bytes right_pipeline_encoding
+    cdef bytes left_hits_encoding
+    cdef bytes right_hits_encoding
+    if (left_hits is None) != (right_hits is None):
+        raise ValueError("both TopHits values must be supplied together")
+    if (left_optimized_profile is None) != (right_optimized_profile is None):
+        raise ValueError("both optimized profiles must be supplied together")
+
+    left_pipeline_encoding = _semantic_pipeline_state_encoding_bound(
+        left_pipeline, left_optimized_profile
+    )
+    right_pipeline_encoding = _semantic_pipeline_state_encoding_bound(
+        right_pipeline, right_optimized_profile
+    )
+    result = {
+        "schema_version": SEMANTIC_STATE_SCHEMA_VERSION,
+        "pipeline": {
+            "equal": left_pipeline_encoding == right_pipeline_encoding,
+            "left_sha256": _hashlib.sha256(left_pipeline_encoding).hexdigest(),
+            "right_sha256": _hashlib.sha256(right_pipeline_encoding).hexdigest(),
+            "left_size": len(left_pipeline_encoding),
+            "right_size": len(right_pipeline_encoding),
+            "first_difference": _semantic_first_difference(
+                left_pipeline_encoding, right_pipeline_encoding
+            ),
+        },
+        "tophits": None,
+    }
+    if left_hits is not None:
+        if type(left_hits) is not _pyhmmer.plan7.TopHits:
+            raise TypeError("left_hits must be exactly pyhmmer.plan7.TopHits")
+        if type(right_hits) is not _pyhmmer.plan7.TopHits:
+            raise TypeError("right_hits must be exactly pyhmmer.plan7.TopHits")
+        left_hits_encoding = _semantic_tophits_encoding(left_hits)
+        right_hits_encoding = _semantic_tophits_encoding(right_hits)
+        result["tophits"] = {
+            "equal": left_hits_encoding == right_hits_encoding,
+            "left_sha256": _hashlib.sha256(left_hits_encoding).hexdigest(),
+            "right_sha256": _hashlib.sha256(right_hits_encoding).hexdigest(),
+            "left_size": len(left_hits_encoding),
+            "right_size": len(right_hits_encoding),
+            "first_difference": _semantic_first_difference(
+                left_hits_encoding, right_hits_encoding
+            ),
+        }
+    return result
