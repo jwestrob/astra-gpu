@@ -103,6 +103,7 @@ from pyhmmer.errors import AlphabetMismatch, UnexpectedError
 from array import array as _array
 import hashlib as _hashlib
 import importlib.util as _importlib_util
+import io as _io
 import time as _time
 from pathlib import Path as _Path
 import struct as _struct
@@ -128,8 +129,24 @@ cdef extern from "dlfcn.h" nogil:
 
 cdef extern from * nogil:
     """
+    #include <fenv.h>
     #include <stdint.h>
     #include <string.h>
+#if defined(__x86_64__) && defined(__GLIBC__)
+    #include <xmmintrin.h>
+#endif
+
+    static int
+    plan7_gpu_pipeline_host_environment_attested(void)
+    {
+#if defined(__x86_64__) && defined(__GLIBC__)
+      const unsigned int rounding_ftz_daz_mask = 0x0000e040u;
+      return fegetround() == FE_TONEAREST &&
+             (_mm_getcsr() & rounding_ftz_daz_mask) == 0;
+#else
+      return 0;
+#endif
+    }
 
     static uint32_t
     plan7_semantic_oprofile_xf_bits(const P7_OPROFILE *om, int x, int y)
@@ -144,6 +161,7 @@ cdef extern from * nogil:
         int x,
         int y,
     )
+    int plan7_gpu_pipeline_host_environment_attested()
 
 
 cdef extern from "esl_gumbel.h" nogil:
@@ -7215,7 +7233,6 @@ def _seal_continuation_journal_v2_test_fixture_bound(
         or region_offsets.shape[0] != row_count + 1
         or compact_row_offsets.shape[0] != row_count + 1
         or compact_trace_offsets.shape[0] != compact_result_count + 1
-        or row_count != forward_count
         or compact_null2_count
         != compact_result_count * PLAN7_DOMAIN_RESCORE_NULL2_COUNT
     ):
@@ -9565,6 +9582,1234 @@ def _semantic_dual_state_compare_bound(
             ),
         }
     return result
+
+
+cdef void _v3_zero_statistics(
+    _compact_consumption_statistics *statistics,
+) noexcept nogil:
+    memset(statistics, 0, sizeof(_compact_consumption_statistics))
+
+
+cdef void _v3_apply_certificate_accounting(
+    P7_PIPELINE *pli,
+    const plan7_continuation_journal_v3_certificate *certificate,
+) noexcept nogil:
+    """Apply one already validated omitted-row certificate exactly once."""
+    pli.nseqs += certificate.target_delta
+    if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
+        pli.Z = pli.nseqs
+    pli.nres += certificate.residue_delta
+    pli.n_past_msv += certificate.n_past_msv_delta
+    pli.n_past_bias += certificate.n_past_bias_delta
+    pli.n_past_vit += certificate.n_past_vit_delta
+    pli.n_past_fwd += certificate.n_past_fwd_delta
+
+
+cdef int _search_loop_continuation_journal_v3(
+    P7_PIPELINE *pli,
+    P7_OPROFILE *om,
+    P7_BG *bg,
+    const ESL_SQ **sq,
+    size_t n_targets,
+    const plan7_continuation_journal_v3 *journal,
+    const plan7_continuation_journal_v3_profile *profile_record,
+    P7_TOPHITS *th,
+    _pipeline_from_filter_scores_f filter_scores_seam,
+    _pipeline_from_filter_and_forward_scores_f forward_scores_seam,
+    _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam,
+    _pipeline_from_filter_forward_compact_domains_f compact_domains_seam,
+    uint64_t *compact_rebased_offsets,
+    _compact_consumption_statistics *statistics,
+) except 1 nogil:
+    """Consume one validated v3 profile partition without dense-row replay."""
+    cdef const uint8_t *base = <const uint8_t *> journal
+    cdef const plan7_continuation_journal_v3_certificate *certificates = (
+        <const plan7_continuation_journal_v3_certificate *> (
+            base + journal.certificates_offset
+        )
+    )
+    cdef const plan7_continuation_journal_v3_exception *exceptions = (
+        <const plan7_continuation_journal_v3_exception *> (
+            base + journal.exceptions_offset
+        )
+    )
+    cdef const float *specials = <const float *> (
+        base + journal.specials_offset
+    )
+    cdef const plan7_simple_region *all_regions = (
+        <const plan7_simple_region *> (base + journal.regions_offset)
+    )
+    cdef const plan7_domain_rescore_result *all_compact_results = (
+        <const plan7_domain_rescore_result *> (
+            base + journal.compact_results_offset
+        )
+    )
+    cdef const uint64_t *all_trace_offsets = <const uint64_t *> (
+        base + journal.compact_trace_offsets_offset
+    )
+    cdef const plan7_domain_rescore_trace_step *all_traces = (
+        <const plan7_domain_rescore_trace_step *> (
+            base + journal.compact_traces_offset
+        )
+    )
+    cdef const float *all_null2 = <const float *> (
+        base + journal.compact_null2_offset
+    )
+    cdef const plan7_continuation_journal_v3_certificate *certificate
+    cdef const plan7_continuation_journal_v3_exception *exception
+    cdef const plan7_simple_region *regions = NULL
+    cdef const plan7_domain_rescore_result *compact_results = NULL
+    cdef const plan7_domain_rescore_trace_step *compact_traces = NULL
+    cdef const float *compact_null2 = NULL
+    cdef const float *xmx = NULL
+    cdef _postfilter_result postfilter
+    cdef _forward_result forward
+    cdef plan7_continuation_journal_row domain
+    cdef uint64_t local_index
+    cdef uint64_t compact_index
+    cdef uint64_t trace_base
+    cdef uint64_t trace_stop
+    cdef uint64_t xmx_count
+    cdef uint64_t t
+    cdef float usc
+    cdef int status
+    cdef bint used_forward_seam
+    cdef bint used_simple_regions_seam
+    cdef bint used_compact_domains_seam
+
+    if statistics != NULL:
+        statistics.target_count = n_targets
+        statistics.postfilter_record_count = (
+            profile_record.source_postfilter_count
+        )
+        statistics.f1_reject_count = (
+            n_targets - profile_record.source_postfilter_count
+        )
+
+    status = p7_pli_NewModel(pli, om, bg)
+    if status == eslEINVAL:
+        Pipeline._missing_cutoffs(pli, om)
+    elif status != eslOK:
+        raise UnexpectedError(status, "p7_pli_NewModel")
+
+    for local_index in range(profile_record.exception_count):
+        certificate = &certificates[
+            profile_record.certificate_begin + local_index
+        ]
+        _v3_apply_certificate_accounting(pli, certificate)
+        if statistics != NULL:
+            statistics.definite_reject_count += (
+                certificate.raw_f1_reject_count
+            )
+
+        # The dense loop reuses once for an omitted prefix before its first
+        # retained row. Later gaps follow a reuse of the preceding exception.
+        if local_index == 0 and certificate.target_delta != 0:
+            p7_pipeline_Reuse(pli)
+
+        exception = &exceptions[
+            profile_record.exception_begin + local_index
+        ]
+        t = exception.sequence_index
+
+        # The exception target belongs to its seam. Only NewSeq accounting is
+        # applied here; none of its promotion counters are pre-accounted.
+        pli.nseqs += 1
+        if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
+            pli.Z = pli.nseqs
+        pli.nres += exception.residue_delta
+
+        status = p7_bg_SetLength(bg, sq[t].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_bg_SetLength")
+        status = p7_oprofile_ReconfigLength(om, sq[t].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+
+        memcpy(
+            &postfilter,
+            exception.postfilter_record,
+            sizeof(_postfilter_result),
+        )
+        used_forward_seam = False
+        used_simple_regions_seam = False
+        used_compact_domains_seam = False
+
+        if exception.route == PLAN7_CONTINUATION_V3_FULL_PIPELINE:
+            if statistics != NULL:
+                statistics.cpu_pipeline_count += 1
+            status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
+        else:
+            usc = <float> postfilter.msv_numerator
+            usc = usc / om.scale_b
+            usc = usc - <float> 3.0
+            if exception.route == PLAN7_CONTINUATION_V3_FILTER_SCORES:
+                if statistics != NULL:
+                    statistics.filter_continuation_count += 1
+                status = filter_scores_seam(
+                    pli,
+                    om,
+                    bg,
+                    sq[t],
+                    NULL,
+                    th,
+                    usc,
+                    postfilter.filtersc,
+                    P7_VIT_EXTERNAL,
+                    postfilter.vfsc,
+                )
+            elif exception.route == PLAN7_CONTINUATION_V3_FORWARD_SCORES:
+                if statistics != NULL:
+                    statistics.forward_continuation_count += 1
+                memcpy(
+                    &forward,
+                    exception.forward_record,
+                    sizeof(_forward_result),
+                )
+                xmx_count = exception.special_count
+                xmx = (
+                    specials + exception.special_begin
+                    if xmx_count != 0
+                    else NULL
+                )
+                status = forward_scores_seam(
+                    pli,
+                    om,
+                    bg,
+                    sq[t],
+                    NULL,
+                    th,
+                    usc,
+                    postfilter.filtersc,
+                    postfilter.vfsc,
+                    forward.fwdsc,
+                    xmx,
+                    xmx_count,
+                )
+                used_forward_seam = True
+            elif exception.route == PLAN7_CONTINUATION_V3_SIMPLE_REGIONS:
+                if statistics != NULL:
+                    statistics.simple_continuation_count += 1
+                memcpy(
+                    &domain,
+                    exception.domain_record,
+                    sizeof(plan7_continuation_journal_row),
+                )
+                regions = (
+                    all_regions + exception.region_begin
+                    if exception.region_count != 0
+                    else NULL
+                )
+                status = simple_regions_seam(
+                    pli,
+                    om,
+                    bg,
+                    sq[t],
+                    NULL,
+                    th,
+                    domain.usc,
+                    domain.filtersc,
+                    domain.vfsc,
+                    domain.fwdsc,
+                    journal.options.f1_bits,
+                    journal.options.f2_bits,
+                    journal.options.f3_bits,
+                    journal.options.do_biasfilter,
+                    domain.domain_route,
+                    domain.nexpected,
+                    regions,
+                    exception.region_count,
+                )
+                used_simple_regions_seam = True
+            else:
+                # Validation and preflight restrict the remaining route to the
+                # compact-domain seam, with enough scratch for every offset.
+                memcpy(
+                    &forward,
+                    exception.forward_record,
+                    sizeof(_forward_result),
+                )
+                memcpy(
+                    &domain,
+                    exception.domain_record,
+                    sizeof(plan7_continuation_journal_row),
+                )
+                trace_base = exception.compact_trace_begin
+                trace_stop = trace_base + exception.compact_trace_count
+                for compact_index in range(exception.compact_result_count + 1):
+                    compact_rebased_offsets[compact_index] = (
+                        all_trace_offsets[
+                            exception.compact_result_begin + compact_index
+                        ]
+                        - trace_base
+                    )
+                compact_results = (
+                    all_compact_results + exception.compact_result_begin
+                )
+                compact_traces = all_traces + trace_base
+                compact_null2 = all_null2 + exception.compact_null2_begin
+                if statistics != NULL:
+                    if statistics.attempt_count == 0:
+                        statistics.first_row_index = (
+                            exception.source_domain_index
+                        )
+                        statistics.first_profile_index = exception.profile_index
+                        statistics.first_sequence_index = exception.sequence_index
+                        statistics.first_domain_count = (
+                            exception.compact_result_count
+                        )
+                    statistics.attempt_count += 1
+                status = compact_domains_seam(
+                    pli,
+                    om,
+                    bg,
+                    sq[t],
+                    NULL,
+                    th,
+                    domain.usc,
+                    domain.filtersc,
+                    domain.vfsc,
+                    domain.fwdsc,
+                    journal.generation_tail_fingerprint,
+                    n_targets,
+                    <uint32_t> exception.source_domain_index,
+                    exception.profile_index,
+                    exception.sequence_index,
+                    domain.nexpected,
+                    compact_results,
+                    exception.compact_result_count,
+                    compact_rebased_offsets,
+                    exception.compact_result_count + 1,
+                    compact_traces,
+                    trace_stop - trace_base,
+                    compact_null2,
+                    exception.compact_null2_count,
+                )
+                used_compact_domains_seam = True
+                if status == eslEINACCURATE:
+                    if statistics != NULL:
+                        statistics.threshold_retry_count += 1
+                        statistics.cpu_pipeline_count += 1
+                    status = p7_Pipeline(pli, om, bg, sq[t], NULL, th)
+                    used_compact_domains_seam = False
+                elif status == eslEINVAL:
+                    if statistics != NULL:
+                        statistics.invalid_retry_count += 1
+                        statistics.forward_continuation_count += 1
+                    xmx_count = exception.special_count
+                    xmx = (
+                        specials + exception.special_begin
+                        if xmx_count != 0
+                        else NULL
+                    )
+                    status = forward_scores_seam(
+                        pli,
+                        om,
+                        bg,
+                        sq[t],
+                        NULL,
+                        th,
+                        usc,
+                        postfilter.filtersc,
+                        postfilter.vfsc,
+                        forward.fwdsc,
+                        xmx,
+                        xmx_count,
+                    )
+                    used_compact_domains_seam = False
+                    used_forward_seam = True
+                elif status == eslOK and statistics != NULL:
+                    statistics.accepted_count += 1
+
+        if status == eslEINVAL:
+            if used_simple_regions_seam:
+                raise UnexpectedError(
+                    status,
+                    "p7_PipelineFromFilterAndForwardSimpleRegions",
+                )
+            elif used_compact_domains_seam:
+                raise UnexpectedError(
+                    status,
+                    "p7_PipelineFromFilterForwardAndCompactDomainsV2",
+                )
+            elif used_forward_seam:
+                raise UnexpectedError(
+                    status,
+                    "p7_PipelineFromFilterAndForwardScores",
+                )
+            Pipeline._missing_cutoffs(pli, om)
+        elif status == eslERANGE:
+            raise OverflowError(
+                "numerical overflow in the optimized vector implementation"
+            )
+        elif status != eslOK:
+            raise UnexpectedError(status, "p7_Pipeline")
+        p7_pipeline_Reuse(pli)
+
+    certificate = &certificates[
+        profile_record.certificate_begin + profile_record.exception_count
+    ]
+    _v3_apply_certificate_accounting(pli, certificate)
+    if statistics != NULL:
+        statistics.definite_reject_count += certificate.raw_f1_reject_count
+
+    if (
+        n_targets != 0
+        and (
+            profile_record.exception_count == 0
+            or exceptions[
+                profile_record.exception_begin
+                + profile_record.exception_count - 1
+            ].sequence_index != n_targets - 1
+        )
+    ):
+        status = p7_bg_SetLength(bg, sq[n_targets - 1].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_bg_SetLength")
+        status = p7_oprofile_ReconfigLength(om, sq[n_targets - 1].n)
+        if status != eslOK:
+            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+        p7_pipeline_Reuse(pli)
+    return 0
+
+
+cdef void _v3_claim_capsule(
+    object capsule,
+    plan7_continuation_journal_v3 *journal,
+    plan7_continuation_journal_v3_owner *owner,
+    bint *claimed,
+) except *:
+    """Transfer one validated packet to the executor before any mutation."""
+    cdef bint transferred = False
+    claimed[0] = False
+    try:
+        PyCapsule_SetDestructor(capsule, <PyCapsule_Destructor> NULL)
+        transferred = True
+        PyCapsule_SetPointer(capsule, &_consumed_journal_sentinel)
+        PyCapsule_SetContext(capsule, NULL)
+        PyCapsule_SetName(
+            capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
+        )
+        claimed[0] = True
+    except:
+        if transferred:
+            try:
+                PyCapsule_SetName(
+                    capsule, PLAN7_CONTINUATION_JOURNAL_V3_CONSUMED_NAME
+                )
+            except:
+                pass
+            free(journal)
+            free(owner)
+        raise
+
+
+cdef void _v3_preflight_counter_capacity(
+    const plan7_continuation_journal_v3 *journal,
+    _SealedPostfilterBatch sealed,
+    Pipeline pipeline,
+) except *:
+    cdef const uint8_t *base = <const uint8_t *> journal
+    cdef const plan7_continuation_journal_v3_certificate *certificates = (
+        <const plan7_continuation_journal_v3_certificate *> (
+            base + journal.certificates_offset
+        )
+    )
+    cdef uint64_t nres_delta
+    cdef uint64_t nnodes_delta = 0
+    cdef uint64_t msv_delta = journal.exception_count
+    cdef uint64_t bias_delta = journal.exception_count
+    cdef uint64_t vit_delta = journal.exception_count
+    cdef uint64_t fwd_delta = journal.exception_count
+    cdef uint64_t scratch
+    cdef uint64_t index
+    cdef OptimizedProfile profile
+
+    if not plan7_continuation_journal_v3_checked_multiply(
+        journal.total_residues, journal.profile_count, &nres_delta
+    ):
+        raise OverflowError("journal v3 cumulative residue delta overflows")
+    for index in range(journal.profile_count):
+        profile = <OptimizedProfile> sealed._optimized_profiles[index]
+        if not _v3_checked_increment(&nnodes_delta, <uint64_t> profile._om.M):
+            raise OverflowError("journal v3 cumulative model nodes overflow")
+    for index in range(journal.certificate_count):
+        if (
+            not _v3_checked_increment(
+                &msv_delta, certificates[index].n_past_msv_delta
+            )
+            or not _v3_checked_increment(
+                &bias_delta, certificates[index].n_past_bias_delta
+            )
+            or not _v3_checked_increment(
+                &vit_delta, certificates[index].n_past_vit_delta
+            )
+            or not _v3_checked_increment(
+                &fwd_delta, certificates[index].n_past_fwd_delta
+            )
+        ):
+            raise OverflowError("journal v3 cumulative promotion delta overflows")
+    if (
+        not plan7_continuation_journal_v3_checked_add(
+            pipeline._pli.nmodels, journal.profile_count, &scratch
+        )
+        or not plan7_continuation_journal_v3_checked_add(
+            pipeline._pli.nnodes, nnodes_delta, &scratch
+        )
+        or not plan7_continuation_journal_v3_checked_add(
+            pipeline._pli.nres, nres_delta, &scratch
+        )
+        or not plan7_continuation_journal_v3_checked_add(
+            pipeline._pli.n_past_msv, msv_delta, &scratch
+        )
+        or not plan7_continuation_journal_v3_checked_add(
+            pipeline._pli.n_past_bias, bias_delta, &scratch
+        )
+        or not plan7_continuation_journal_v3_checked_add(
+            pipeline._pli.n_past_vit, vit_delta, &scratch
+        )
+        or not plan7_continuation_journal_v3_checked_add(
+            pipeline._pli.n_past_fwd, fwd_delta, &scratch
+        )
+    ):
+        raise OverflowError("journal v3 pipeline counter prestate overflows")
+
+
+cdef void _v3_preflight_live_pipeline(
+    const plan7_continuation_journal_v3 *journal,
+    _SealedPostfilterBatch sealed,
+    Pipeline pipeline,
+) except *:
+    cdef const uint8_t *base = <const uint8_t *> journal
+    cdef const plan7_continuation_journal_v3_exception *exceptions = (
+        <const plan7_continuation_journal_v3_exception *> (
+            base + journal.exceptions_offset
+        )
+    )
+    cdef uint64_t index
+    cdef uint64_t tail_fingerprint
+    cdef bint needs_filter = False
+    cdef bint needs_forward = False
+    cdef bint needs_simple = False
+    cdef bint needs_compact = False
+    cdef bint environment_attested
+    cdef size_t profile_index
+    cdef P7_OPROFILE *profile
+
+    with nogil:
+        environment_attested = (
+            plan7_gpu_pipeline_host_environment_attested() == 1
+        )
+    if not environment_attested:
+        raise RuntimeError("journal v3 host floating-point environment differs")
+
+    if type(pipeline) is not _pyhmmer.plan7.Pipeline:
+        raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+    if not pipeline.alphabet._eq(sealed._sequences.alphabet):
+        raise AlphabetMismatch(pipeline.alphabet, sealed._sequences.alphabet)
+    if not journal.options.complete:
+        raise ValueError("journal v3 execution requires complete options")
+    if journal.source_kind != PLAN7_CONTINUATION_V3_SOURCE_V2_JOURNAL:
+        raise ValueError("journal v3 execution requires a validated v2 source")
+    if not _pipeline_tail_options_match(&sealed._pipeline_options, pipeline):
+        raise ValueError("journal v3 pipeline options differ from generation")
+    if not _sealed_background_matches(sealed, pipeline):
+        raise ValueError("journal v3 pipeline background differs from generation")
+    if (
+        not isfinite(pipeline.background._bg.omega)
+        or pipeline.background._bg.omega <= 0.0
+        or pipeline.background._bg.omega >= 1.0
+    ):
+        raise ValueError("journal v3 background omega is invalid")
+    for profile_index in range(len(sealed._optimized_profiles)):
+        profile = (<OptimizedProfile> sealed._optimized_profiles[profile_index])._om
+        if (
+            profile == NULL
+            or not isfinite(profile.scale_b)
+            or profile.scale_b <= 0.0
+            or not isfinite(profile.evparam[<int> p7_MMU])
+            or not isfinite(profile.evparam[<int> p7_MLAMBDA])
+            or profile.evparam[<int> p7_MLAMBDA] <= 0.0
+            or not isfinite(profile.evparam[<int> p7_VMU])
+            or not isfinite(profile.evparam[<int> p7_VLAMBDA])
+            or profile.evparam[<int> p7_VLAMBDA] <= 0.0
+            or not isfinite(profile.evparam[<int> p7_FTAU])
+            or not isfinite(profile.evparam[<int> p7_FLAMBDA])
+            or profile.evparam[<int> p7_FLAMBDA] <= 0.0
+        ):
+            raise ValueError("journal v3 optimized-profile statistics are invalid")
+
+    for index in range(journal.exception_count):
+        if exceptions[index].route == PLAN7_CONTINUATION_V3_FILTER_SCORES:
+            needs_filter = True
+        elif exceptions[index].route == PLAN7_CONTINUATION_V3_FORWARD_SCORES:
+            needs_forward = True
+        elif exceptions[index].route == PLAN7_CONTINUATION_V3_SIMPLE_REGIONS:
+            needs_simple = True
+        elif exceptions[index].route == PLAN7_CONTINUATION_V3_COMPACT_DOMAINS:
+            needs_compact = True
+            needs_forward = True
+            if exceptions[index].source_domain_index > <uint64_t> 0xffffffff:
+                raise OverflowError("journal v3 compact source row exceeds uint32")
+    if needs_filter and sealed._filter_scores_seam == NULL:
+        raise RuntimeError("journal v3 requires the private filter-score seam")
+    if needs_forward and sealed._forward_scores_seam == NULL:
+        raise RuntimeError("journal v3 requires the private Forward seam")
+    if needs_simple and sealed._simple_regions_seam == NULL:
+        raise RuntimeError("journal v3 requires the private simple-region seam")
+    if needs_compact:
+        if (
+            sealed._compact_domains_seam == NULL
+            or sealed._compact_tail_fingerprint == NULL
+            or journal.generation_tail_fingerprint == 0
+        ):
+            raise RuntimeError("journal v3 requires the private compact-domain seam")
+        with nogil:
+            tail_fingerprint = sealed._compact_tail_fingerprint(pipeline._pli)
+        if tail_fingerprint != journal.generation_tail_fingerprint:
+            raise ValueError("journal v3 compact tail fingerprint differs")
+    _v3_preflight_counter_capacity(journal, sealed, pipeline)
+
+
+cdef TopHits _v3_sparse_profile_preallocated(
+    const plan7_continuation_journal_v3 *journal,
+    _SealedPostfilterBatch sealed,
+    size_t profile_index,
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    TopHits hits,
+    uint64_t *compact_rebased_offsets,
+    _compact_consumption_statistics *statistics,
+):
+    cdef const uint8_t *base = <const uint8_t *> journal
+    cdef const plan7_continuation_journal_v3_profile *profiles = (
+        <const plan7_continuation_journal_v3_profile *> (
+            base + journal.profiles_offset
+        )
+    )
+    with nogil:
+        pipeline._pli.mode = p7_SEARCH_SEQS
+        pipeline._pli.nseqs = 0
+        _search_loop_continuation_journal_v3(
+            pipeline._pli,
+            optimized_profile._om,
+            pipeline.background._bg,
+            <const ESL_SQ **> sealed._sequences._refs,
+            sealed._sequences._length,
+            journal,
+            &profiles[profile_index],
+            hits._th,
+            sealed._filter_scores_seam,
+            sealed._forward_scores_seam,
+            sealed._simple_regions_seam,
+            sealed._compact_domains_seam,
+            compact_rebased_offsets,
+            statistics,
+        )
+        hits._sort_by_key()
+        hits._threshold(pipeline)
+    hits._query = query
+    hits._empty = False
+    return hits
+
+
+cdef TopHits _v3_dense_reference_profile_preallocated(
+    _SealedPostfilterBatch sealed,
+    size_t row,
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    TopHits hits,
+    uint64_t *compact_rebased_offsets,
+    _compact_consumption_statistics *statistics,
+):
+    cdef size_t postfilter_start = <size_t> sealed._postfilter_offsets[row]
+    cdef size_t postfilter_stop = <size_t> sealed._postfilter_offsets[row + 1]
+    cdef size_t forward_start = <size_t> sealed._forward_offsets[row]
+    cdef size_t forward_stop = <size_t> sealed._forward_offsets[row + 1]
+    cdef size_t journal_start = <size_t> sealed._journal_profile_offsets[row]
+    cdef size_t journal_stop = <size_t> sealed._journal_profile_offsets[row + 1]
+    cdef const uint8_t *postfilter_ptr = NULL
+    cdef const uint8_t *forward_ptr = NULL
+    cdef const float *special_ptr = NULL
+    cdef const uint8_t *journal_ptr = NULL
+    cdef const uint8_t *region_ptr = NULL
+    cdef const uint8_t *compact_result_ptr = NULL
+    cdef const uint8_t *compact_trace_ptr = NULL
+    cdef const float *compact_null2_ptr = NULL
+    cdef _double_bits generation_f1
+
+    if postfilter_stop != postfilter_start:
+        postfilter_ptr = &sealed._postfilter_records[
+            postfilter_start * sizeof(_postfilter_result)
+        ]
+    if forward_stop != forward_start:
+        forward_ptr = &sealed._forward_records[
+            forward_start * sizeof(_forward_result)
+        ]
+    if sealed._specials.shape[0]:
+        special_ptr = &sealed._specials[0]
+    if journal_stop != journal_start:
+        journal_ptr = &sealed._journal_rows[
+            journal_start * sizeof(plan7_continuation_journal_row)
+        ]
+    if sealed._journal_regions.shape[0]:
+        region_ptr = &sealed._journal_regions[0]
+    if sealed._journal_compact_results.shape[0]:
+        compact_result_ptr = &sealed._journal_compact_results[0]
+    if sealed._journal_compact_traces.shape[0]:
+        compact_trace_ptr = &sealed._journal_compact_traces[0]
+    if sealed._journal_compact_null2.shape[0]:
+        compact_null2_ptr = &sealed._journal_compact_null2[0]
+    generation_f1.value = sealed._f1
+
+    with nogil:
+        pipeline._pli.mode = p7_SEARCH_SEQS
+        pipeline._pli.nseqs = 0
+        _search_loop_postfilter_forward(
+            pipeline._pli,
+            optimized_profile._om,
+            pipeline.background._bg,
+            <const ESL_SQ **> sealed._sequences._refs,
+            sealed._sequences._length,
+            postfilter_ptr,
+            postfilter_stop - postfilter_start,
+            forward_ptr,
+            forward_stop - forward_start,
+            &sealed._special_offsets[forward_start],
+            special_ptr,
+            &sealed._residue_offsets[0],
+            hits._th,
+            sealed._filter_scores_seam,
+            sealed._forward_scores_seam,
+            journal_ptr,
+            journal_stop - journal_start,
+            &sealed._journal_region_offsets[journal_start],
+            region_ptr,
+            generation_f1.bits,
+            sealed._generation_f2_bits,
+            sealed._generation_f3_bits,
+            sealed._generation_bias_filter,
+            sealed._simple_regions_seam,
+            &sealed._journal_compact_row_offsets[journal_start],
+            compact_result_ptr,
+            &sealed._journal_compact_trace_offsets[0],
+            compact_trace_ptr,
+            compact_null2_ptr,
+            journal_start,
+            sealed._generation_tail_fingerprint,
+            sealed._compact_tail_fingerprint,
+            sealed._compact_domains_seam,
+            compact_rebased_offsets,
+            statistics,
+        )
+        hits._sort_by_key()
+        hits._threshold(pipeline)
+    hits._query = query
+    hits._empty = False
+    return hits
+
+
+cdef tuple _v3_make_execution_objects(
+    _SealedPostfilterBatch sealed,
+):
+    cdef list queries = []
+    cdef list profiles = []
+    cdef list hits = []
+    cdef size_t index
+    cdef HMM query
+    cdef OptimizedProfile profile
+    cdef bytes expected_identity
+    cdef bytes copied_identity
+    for index in range(len(sealed._queries)):
+        query = (<HMM> sealed._queries[index]).copy()
+        profile = (<OptimizedProfile> sealed._optimized_profiles[index]).copy()
+        expected_identity = _semantic_checked_profile_identity_fingerprint(
+            <OptimizedProfile> sealed._optimized_profiles[index],
+            "sealed",
+        )
+        copied_identity = _semantic_checked_profile_identity_fingerprint(
+            profile,
+            "execution",
+        )
+        if copied_identity != expected_identity:
+            raise ValueError("journal v3 optimized-profile copy identity differs")
+        queries.append(query)
+        profiles.append(profile)
+        hits.append(TopHits(query))
+    return tuple(queries), tuple(profiles), tuple(hits)
+
+
+cdef dict _v3_statistics_evidence(
+    const _compact_consumption_statistics *statistics,
+):
+    return {
+        "target_count": statistics.target_count,
+        "postfilter_record_count": statistics.postfilter_record_count,
+        "f1_reject_count": statistics.f1_reject_count,
+        "cpu_pipeline_count": statistics.cpu_pipeline_count,
+        "definite_reject_count": statistics.definite_reject_count,
+        "filter_continuation_count": statistics.filter_continuation_count,
+        "forward_continuation_count": statistics.forward_continuation_count,
+        "simple_continuation_count": statistics.simple_continuation_count,
+        "compact": {
+            "attempt_count": statistics.attempt_count,
+            "accepted_count": statistics.accepted_count,
+            "invalid_retry_count": statistics.invalid_retry_count,
+            "threshold_retry_count": statistics.threshold_retry_count,
+            "first_attempt": (
+                None
+                if statistics.attempt_count == 0
+                else (
+                    statistics.first_row_index,
+                    statistics.first_profile_index,
+                    statistics.first_sequence_index,
+                    statistics.first_domain_count,
+                )
+            ),
+        },
+    }
+
+
+cdef dict _v3_profile_certificate_evidence(
+    const plan7_continuation_journal_v3 *journal,
+    size_t profile_index,
+):
+    cdef const uint8_t *base = <const uint8_t *> journal
+    cdef const plan7_continuation_journal_v3_profile *profiles = (
+        <const plan7_continuation_journal_v3_profile *> (
+            base + journal.profiles_offset
+        )
+    )
+    cdef const plan7_continuation_journal_v3_certificate *certificates = (
+        <const plan7_continuation_journal_v3_certificate *> (
+            base + journal.certificates_offset
+        )
+    )
+    cdef const plan7_continuation_journal_v3_exception *exceptions = (
+        <const plan7_continuation_journal_v3_exception *> (
+            base + journal.exceptions_offset
+        )
+    )
+    cdef const plan7_continuation_journal_v3_profile *profile = (
+        &profiles[profile_index]
+    )
+    cdef const plan7_continuation_journal_v3_certificate *certificate
+    cdef uint64_t target_delta = 0
+    cdef uint64_t residue_delta = 0
+    cdef uint64_t exception_residues = 0
+    cdef uint64_t before_f1 = 0
+    cdef uint64_t raw_f1 = 0
+    cdef uint64_t bias = 0
+    cdef uint64_t f2 = 0
+    cdef uint64_t f3 = 0
+    cdef uint64_t no_region = 0
+    cdef uint64_t past_msv = 0
+    cdef uint64_t past_bias = 0
+    cdef uint64_t past_vit = 0
+    cdef uint64_t past_fwd = 0
+    cdef uint64_t index
+
+    for index in range(profile.certificate_count):
+        certificate = &certificates[profile.certificate_begin + index]
+        target_delta += certificate.target_delta
+        residue_delta += certificate.residue_delta
+        before_f1 += certificate.before_f1_count
+        raw_f1 += certificate.raw_f1_reject_count
+        bias += certificate.bias_reject_count
+        f2 += certificate.f2_reject_count
+        f3 += certificate.f3_reject_count
+        no_region += certificate.no_region_count
+        past_msv += certificate.n_past_msv_delta
+        past_bias += certificate.n_past_bias_delta
+        past_vit += certificate.n_past_vit_delta
+        past_fwd += certificate.n_past_fwd_delta
+    for index in range(profile.exception_count):
+        exception_residues += exceptions[
+            profile.exception_begin + index
+        ].residue_delta
+    if (
+        target_delta + profile.exception_count != profile.target_count
+        or residue_delta + exception_residues != profile.total_residues
+        or before_f1 + raw_f1 + bias + f2 + f3 + no_region != target_delta
+    ):
+        raise AssertionError("journal v3 certificate partition does not reconcile")
+    return {
+        "omitted_targets": target_delta,
+        "omitted_residues": residue_delta,
+        "exception_count": profile.exception_count,
+        "exception_residues": exception_residues,
+        "stages": {
+            "before_f1": before_f1,
+            "raw_f1": raw_f1,
+            "bias": bias,
+            "f2": f2,
+            "f3": f3,
+            "no_region": no_region,
+        },
+        "promotions": {
+            "n_past_msv": past_msv,
+            "n_past_bias": past_bias,
+            "n_past_vit": past_vit,
+            "n_past_fwd": past_fwd,
+        },
+    }
+
+
+cdef dict _v3_reconcile_route_statistics(
+    const _compact_consumption_statistics *dense,
+    const _compact_consumption_statistics *sparse,
+    dict certificate,
+):
+    cdef dict stages = certificate["stages"]
+    cdef dict dense_evidence = _v3_statistics_evidence(dense)
+    cdef dict sparse_evidence = _v3_statistics_evidence(sparse)
+    cdef dict expected = {
+        "target_count": sparse.target_count,
+        "postfilter_record_count": sparse.postfilter_record_count,
+        "f1_reject_count": sparse.f1_reject_count,
+        "cpu_pipeline_count": sparse.cpu_pipeline_count,
+        "definite_reject_count": sparse.definite_reject_count,
+        "filter_continuation_count": (
+            sparse.filter_continuation_count
+            + stages["bias"] + stages["f2"]
+        ),
+        "forward_continuation_count": (
+            sparse.forward_continuation_count + stages["f3"]
+        ),
+        "simple_continuation_count": (
+            sparse.simple_continuation_count + stages["no_region"]
+        ),
+        "compact": sparse_evidence["compact"],
+    }
+    if dense_evidence != expected:
+        raise AssertionError("dense v2 and sparse v3 routes do not reconcile")
+    return {"equal": True, "dense": dense_evidence, "expected": expected}
+
+
+cdef bytes _v3_table_bytes(TopHits hits, str table_format):
+    cdef object stream = _io.BytesIO()
+    hits.write(stream, format=table_format, header=True)
+    return stream.getvalue()
+
+
+def _consume_continuation_journal_v3_bound(
+    capsule,
+    sealed_object,
+    Pipeline pipeline,
+):
+    """Consume one validated batch-wide v3 packet through the sparse path.
+
+    This is a private Phase-1A proof entry point. Production selection remains
+    on journal v2 until the dual oracle and representative benchmark pass.
+    """
+    cdef _SealedPostfilterBatch sealed
+    cdef plan7_continuation_journal_v3 *journal
+    cdef plan7_continuation_journal_v3_owner *owner = NULL
+    cdef uint64_t *compact_rebased_offsets = NULL
+    cdef tuple execution
+    cdef tuple queries
+    cdef tuple profiles
+    cdef tuple hits
+    cdef list evidence = []
+    cdef _compact_consumption_statistics statistics
+    cdef size_t profile_index
+    cdef uint64_t packet_bytes
+    cdef object start_ns
+    cdef bytes prestate
+    cdef dict row_statistics
+    cdef bint claimed = False
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    journal = _v3_validate_capsule(capsule, sealed, &owner)
+    _v3_preflight_live_pipeline(journal, sealed, pipeline)
+    execution = _v3_make_execution_objects(sealed)
+    queries, profiles, hits = execution
+    if journal.profile_count:
+        prestate = _semantic_pipeline_state_encoding(
+            pipeline, <OptimizedProfile> profiles[0], True
+        )
+    else:
+        prestate = _semantic_pipeline_state_encoding(pipeline, None, False)
+    start_ns = _time.perf_counter_ns()
+    if (
+        journal.compact_result_count
+        > <uint64_t> ((<size_t> -1) // sizeof(uint64_t)) - 1
+    ):
+        raise OverflowError("journal v3 compact scratch size overflows")
+    compact_rebased_offsets = <uint64_t *> malloc(
+        (<size_t> journal.compact_result_count + 1) * sizeof(uint64_t)
+    )
+    if compact_rebased_offsets == NULL:
+        raise MemoryError("journal v3 compact scratch allocation failed")
+    packet_bytes = journal.total_bytes
+    try:
+        _v3_claim_capsule(capsule, journal, owner, &claimed)
+        for profile_index in range(journal.profile_count):
+            _v3_zero_statistics(&statistics)
+            _v3_sparse_profile_preallocated(
+                journal,
+                sealed,
+                profile_index,
+                pipeline,
+                <HMM> queries[profile_index],
+                <OptimizedProfile> profiles[profile_index],
+                <TopHits> hits[profile_index],
+                compact_rebased_offsets,
+                &statistics,
+            )
+            row_statistics = _v3_statistics_evidence(&statistics)
+            row_statistics["certificate"] = (
+                _v3_profile_certificate_evidence(journal, profile_index)
+            )
+            evidence.append(row_statistics)
+        elapsed_ns = _time.perf_counter_ns() - start_ns
+        return {
+            "schema_version": PLAN7_CONTINUATION_JOURNAL_V3_VERSION,
+            "packet_bytes": packet_bytes,
+            "elapsed_ns": elapsed_ns,
+            "prestate_sha256": _hashlib.sha256(prestate).hexdigest(),
+            "hits": hits,
+            "profiles": profiles,
+            "rows": tuple(evidence),
+        }
+    finally:
+        free(compact_rebased_offsets)
+        if claimed:
+            free(journal)
+            free(owner)
+
+
+def _audit_continuation_journal_v3_bound(
+    capsule,
+    sealed_object,
+    Pipeline dense_pipeline,
+    Pipeline sparse_pipeline,
+):
+    """Run dense v2 and sparse v3 on independent state and assert equality."""
+    cdef _SealedPostfilterBatch sealed
+    cdef plan7_continuation_journal_v3 *journal
+    cdef plan7_continuation_journal_v3_owner *owner = NULL
+    cdef uint64_t *dense_scratch = NULL
+    cdef uint64_t *sparse_scratch = NULL
+    cdef tuple dense_execution
+    cdef tuple sparse_execution
+    cdef tuple dense_queries
+    cdef tuple dense_profiles
+    cdef tuple dense_hits
+    cdef tuple sparse_queries
+    cdef tuple sparse_profiles
+    cdef tuple sparse_hits
+    cdef _compact_consumption_statistics dense_statistics
+    cdef _compact_consumption_statistics sparse_statistics
+    cdef list row_evidence = []
+    cdef dict comparison
+    cdef dict dense_stats
+    cdef dict sparse_stats
+    cdef dict certificate
+    cdef dict route_reconciliation
+    cdef bytes dense_targets
+    cdef bytes sparse_targets
+    cdef bytes dense_domains
+    cdef bytes sparse_domains
+    cdef bytes left_prestate
+    cdef bytes right_prestate
+    cdef size_t profile_index
+    cdef uint64_t packet_bytes
+    cdef object start_ns
+    cdef bint claimed = False
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    if (
+        dense_pipeline is sparse_pipeline
+        or dense_pipeline._pli == sparse_pipeline._pli
+        or dense_pipeline.background is sparse_pipeline.background
+        or dense_pipeline.background._bg == sparse_pipeline.background._bg
+    ):
+        raise ValueError("dense and sparse audit pipelines must be independent")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    journal = _v3_validate_capsule(capsule, sealed, &owner)
+    _v3_preflight_live_pipeline(journal, sealed, dense_pipeline)
+    _v3_preflight_live_pipeline(journal, sealed, sparse_pipeline)
+
+    dense_execution = _v3_make_execution_objects(sealed)
+    sparse_execution = _v3_make_execution_objects(sealed)
+    dense_queries, dense_profiles, dense_hits = dense_execution
+    sparse_queries, sparse_profiles, sparse_hits = sparse_execution
+    if journal.profile_count:
+        left_prestate = _semantic_pipeline_state_encoding(
+            dense_pipeline, <OptimizedProfile> dense_profiles[0], True
+        )
+        right_prestate = _semantic_pipeline_state_encoding(
+            sparse_pipeline, <OptimizedProfile> sparse_profiles[0], True
+        )
+    else:
+        left_prestate = _semantic_pipeline_state_encoding(
+            dense_pipeline, None, False
+        )
+        right_prestate = _semantic_pipeline_state_encoding(
+            sparse_pipeline, None, False
+        )
+    if left_prestate != right_prestate:
+        raise ValueError("dense and sparse journal v3 prestates differ")
+    start_ns = _time.perf_counter_ns()
+    if (
+        journal.compact_result_count
+        > <uint64_t> ((<size_t> -1) // sizeof(uint64_t)) - 1
+    ):
+        raise OverflowError("journal v3 compact scratch size overflows")
+    dense_scratch = <uint64_t *> malloc(
+        (<size_t> journal.compact_result_count + 1) * sizeof(uint64_t)
+    )
+    sparse_scratch = <uint64_t *> malloc(
+        (<size_t> journal.compact_result_count + 1) * sizeof(uint64_t)
+    )
+    if dense_scratch == NULL or sparse_scratch == NULL:
+        free(dense_scratch)
+        free(sparse_scratch)
+        raise MemoryError("journal v3 dual compact scratch allocation failed")
+
+    packet_bytes = journal.total_bytes
+    try:
+        _v3_claim_capsule(capsule, journal, owner, &claimed)
+        for profile_index in range(journal.profile_count):
+            _v3_zero_statistics(&dense_statistics)
+            _v3_zero_statistics(&sparse_statistics)
+            _v3_dense_reference_profile_preallocated(
+                sealed,
+                profile_index,
+                dense_pipeline,
+                <HMM> dense_queries[profile_index],
+                <OptimizedProfile> dense_profiles[profile_index],
+                <TopHits> dense_hits[profile_index],
+                dense_scratch,
+                &dense_statistics,
+            )
+            _v3_sparse_profile_preallocated(
+                journal,
+                sealed,
+                profile_index,
+                sparse_pipeline,
+                <HMM> sparse_queries[profile_index],
+                <OptimizedProfile> sparse_profiles[profile_index],
+                <TopHits> sparse_hits[profile_index],
+                sparse_scratch,
+                &sparse_statistics,
+            )
+            comparison = _semantic_dual_state_compare_bound(
+                dense_pipeline,
+                sparse_pipeline,
+                dense_hits[profile_index],
+                sparse_hits[profile_index],
+                dense_profiles[profile_index],
+                sparse_profiles[profile_index],
+            )
+            dense_targets = _v3_table_bytes(
+                <TopHits> dense_hits[profile_index], "targets"
+            )
+            sparse_targets = _v3_table_bytes(
+                <TopHits> sparse_hits[profile_index], "targets"
+            )
+            dense_domains = _v3_table_bytes(
+                <TopHits> dense_hits[profile_index], "domains"
+            )
+            sparse_domains = _v3_table_bytes(
+                <TopHits> sparse_hits[profile_index], "domains"
+            )
+            dense_stats = _v3_statistics_evidence(&dense_statistics)
+            sparse_stats = _v3_statistics_evidence(&sparse_statistics)
+            certificate = _v3_profile_certificate_evidence(
+                journal, profile_index
+            )
+            route_reconciliation = _v3_reconcile_route_statistics(
+                &dense_statistics, &sparse_statistics, certificate
+            )
+            if (
+                not comparison["pipeline"]["equal"]
+                or not comparison["tophits"]["equal"]
+                or dense_targets != sparse_targets
+                or dense_domains != sparse_domains
+                or dense_stats["compact"] != sparse_stats["compact"]
+            ):
+                raise AssertionError(
+                    f"dense v2 and sparse v3 differ at profile {profile_index}"
+                )
+            row_evidence.append({
+                "profile_index": profile_index,
+                "semantic": comparison,
+                "targets_sha256": _hashlib.sha256(dense_targets).hexdigest(),
+                "domains_sha256": _hashlib.sha256(dense_domains).hexdigest(),
+                "targets_bytes": len(dense_targets),
+                "domains_bytes": len(dense_domains),
+                "dense": dense_stats,
+                "sparse": sparse_stats,
+                "certificate": certificate,
+                "route_reconciliation": route_reconciliation,
+            })
+        elapsed_ns = _time.perf_counter_ns() - start_ns
+        return {
+            "schema_version": PLAN7_CONTINUATION_JOURNAL_V3_VERSION,
+            "equal": True,
+            "packet_bytes": packet_bytes,
+            "elapsed_ns": elapsed_ns,
+            "prestate_sha256": _hashlib.sha256(left_prestate).hexdigest(),
+            "dense_hits": dense_hits,
+            "sparse_hits": sparse_hits,
+            "dense_profiles": dense_profiles,
+            "sparse_profiles": sparse_profiles,
+            "rows": tuple(row_evidence),
+        }
+    finally:
+        free(dense_scratch)
+        free(sparse_scratch)
+        if claimed:
+            free(journal)
+            free(owner)
+
+
+def _v3_test_set_pipeline_counter_bound(
+    Pipeline pipeline,
+    str field,
+    uint64_t value,
+):
+    """Set one accounting field for private overflow-preflight tests."""
+    cdef uint64_t previous
+    if field == "nmodels":
+        previous = pipeline._pli.nmodels
+        pipeline._pli.nmodels = value
+    elif field == "nres":
+        previous = pipeline._pli.nres
+        pipeline._pli.nres = value
+    elif field == "nnodes":
+        previous = pipeline._pli.nnodes
+        pipeline._pli.nnodes = value
+    elif field == "n_past_msv":
+        previous = pipeline._pli.n_past_msv
+        pipeline._pli.n_past_msv = value
+    elif field == "n_past_bias":
+        previous = pipeline._pli.n_past_bias
+        pipeline._pli.n_past_bias = value
+    elif field == "n_past_vit":
+        previous = pipeline._pli.n_past_vit
+        pipeline._pli.n_past_vit = value
+    elif field == "n_past_fwd":
+        previous = pipeline._pli.n_past_fwd
+        pipeline._pli.n_past_fwd = value
+    else:
+        raise ValueError("unknown journal v3 test counter")
+    return previous
+
+
+def _v3_host_float_environment_attested_bound():
+    """Expose the sparse-consumer host FP gate for private tests."""
+    cdef bint attested
+    with nogil:
+        attested = plan7_gpu_pipeline_host_environment_attested() == 1
+    return bool(attested)
 
 
 def _semantic_test_swapped_tophits_order_encoding_bound(TopHits hits):

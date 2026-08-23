@@ -110,15 +110,19 @@ class MaskedPipelineTests(unittest.TestCase):
         multidomain=0,
         compact_count=0,
         compact_route=0,
+        usc=-3.0,
+        filtersc=0.0,
+        vfsc=0.0,
+        fwdsc=-7.0,
     ):
         return struct.pack(
             "=IIffffffIII8BIB3sI",
             profile,
             index,
-            -3.0,
-            0.0,
-            0.0,
-            -7.0,
+            usc,
+            filtersc,
+            vfsc,
+            fwdsc,
             0.0,
             0.0,
             uncertain,
@@ -228,6 +232,76 @@ class MaskedPipelineTests(unittest.TestCase):
             f1,
             self.background_fingerprint(background),
             **options,
+        )
+
+    def seal_v2_terminal_fixture(
+        self,
+        sequences,
+        postfilter_records=b"",
+        *,
+        pipeline=None,
+        f1=0.02,
+    ):
+        """Mint a complete v2-backed seal with no Forward/domain rows."""
+        if pipeline is None:
+            pipeline = self.pipeline(F1=f1, F2=0.0, F3=0.0)
+        postfilter_count = len(postfilter_records) // 16
+        return _pipeline._seal_continuation_journal_v2_test_fixture_bound(
+            (self.hmms[0],),
+            (self.optimized_profiles[0].copy(),),
+            sequences,
+            self.residue_offsets(sequences),
+            f1,
+            self.background_fingerprint(pipeline.background),
+            postfilter_records,
+            array("Q", [0, postfilter_count]),
+            b"",
+            array("Q", [0, 0]),
+            array("Q", [0]),
+            array("f"),
+            array("Q", [0, 0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("f"),
+            pipeline,
+            2.0e-4,
+        )
+
+    def seal_v2_f3_reject_fixture(self, sequences, target, *, pipeline):
+        """Mint a v2-backed row whose exact Forward score rejects at F3."""
+        postfilter = self.postfilter_record(
+            target, 0.0, 0, 0, 2, math.inf
+        )
+        forward = self.forward_record(target, -1.0e30, 0, 1)
+        return _pipeline._seal_continuation_journal_v2_test_fixture_bound(
+            (self.hmms[0],),
+            (self.optimized_profiles[0].copy(),),
+            sequences,
+            self.residue_offsets(sequences),
+            1.0,
+            self.background_fingerprint(pipeline.background),
+            postfilter,
+            array("Q", [0, 1]),
+            forward,
+            array("Q", [0, 1]),
+            array("Q", [0, 0]),
+            array("f"),
+            array("Q", [0, 0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("f"),
+            pipeline,
+            2.0e-4,
         )
 
     @staticmethod
@@ -1196,6 +1270,354 @@ print(json.dumps(after_repeat, sort_keys=True))
         )
         with self.assertRaisesRegex(TypeError, "invalid or consumed"):
             _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
+
+    def test_journal_v3_sparse_dual_matches_dense_gap_and_tail_accounting(self):
+        terminal = b"".join(
+            (
+                self.postfilter_record(1, math.nan, -12, 0, 1, math.nan),
+                self.postfilter_record(2, 10.0, 0, 0, 1, 0.0),
+                self.postfilter_record(3, 0.0, 0, 0, 2, -1.0e30),
+            )
+        )
+        last = len(self.sequences) - 1
+        cpu = lambda index: self.postfilter_record(
+            index, math.nan, 0, 173, 0, math.nan
+        )
+        empty = pyhmmer.easel.TextSequence(
+            name=b"empty-final", sequence=""
+        ).digitize(self.alphabet)
+        final_empty = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [self.sequences[0], empty]
+        )
+        large = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [self.sequences[0]] * 4098
+        )
+        cases = (
+            ("no-exceptions", self.sequences, terminal),
+            ("first", self.sequences, cpu(0)),
+            ("last", self.sequences, cpu(last)),
+            ("consecutive", self.sequences, cpu(5) + cpu(6)),
+            ("first-last", self.sequences, cpu(0) + cpu(last)),
+            ("tail-config-empty-target", final_empty, cpu(0)),
+            ("large-prefix-tail", large, cpu(2048) + cpu(2049)),
+            (
+                "empty-database",
+                pyhmmer.easel.DigitalSequenceBlock(self.alphabet),
+                b"",
+            ),
+        )
+
+        for name, targets, records in cases:
+            with self.subTest(name=name):
+                generation = self.pipeline(F1=0.02, F2=0.0, F3=0.0)
+                sealed = self.seal_v2_terminal_fixture(
+                    targets, records, pipeline=generation
+                )
+                capsule = _pipeline._plan_continuation_journal_v3_bound(sealed)
+                dense = self.pipeline(F1=0.02, F2=0.0, F3=0.0)
+                sparse = self.pipeline(F1=0.02, F2=0.0, F3=0.0)
+                audit = _pipeline._audit_continuation_journal_v3_bound(
+                    capsule, sealed, dense, sparse
+                )
+                self.assertTrue(audit["equal"])
+                self.assertEqual(len(audit["rows"]), 1)
+                row = audit["rows"][0]
+                self.assertTrue(row["semantic"]["pipeline"]["equal"])
+                self.assertTrue(row["semantic"]["tophits"]["equal"])
+                self.assertEqual(len(row["targets_sha256"]), 64)
+                self.assertTrue(row["route_reconciliation"]["equal"])
+                self.assertEqual(
+                    row["certificate"]["omitted_targets"]
+                    + row["certificate"]["exception_count"],
+                    len(targets),
+                )
+                with self.assertRaisesRegex(TypeError, "invalid or consumed"):
+                    _pipeline._validate_continuation_journal_v3_bound(
+                        capsule, sealed
+                    )
+
+    def test_journal_v3_sparse_preflight_failures_do_not_mutate_or_claim(self):
+        generation = self.pipeline(F1=0.02, F2=0.0, F3=0.0)
+        sealed = self.seal_v2_terminal_fixture(
+            self.sequences, pipeline=generation
+        )
+
+        capsule = _pipeline._plan_continuation_journal_v3_bound(sealed)
+        mismatched = self.pipeline(F1=0.03, F2=0.0, F3=0.0)
+        before = _pipeline._semantic_pipeline_state_fingerprint_bound(mismatched)
+        with self.assertRaisesRegex(ValueError, "options differ"):
+            _pipeline._consume_continuation_journal_v3_bound(
+                capsule, sealed, mismatched
+            )
+        self.assertEqual(
+            _pipeline._semantic_pipeline_state_fingerprint_bound(mismatched),
+            before,
+        )
+        _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
+
+        capsule = _pipeline._plan_continuation_journal_v3_bound(sealed)
+        overflow = self.pipeline(F1=0.02, F2=0.0, F3=0.0)
+        previous = _pipeline._v3_test_set_pipeline_counter_bound(
+            overflow, "nres", (1 << 64) - 1
+        )
+        before = _pipeline._semantic_pipeline_state_fingerprint_bound(overflow)
+        with self.assertRaisesRegex(OverflowError, "counter prestate"):
+            _pipeline._consume_continuation_journal_v3_bound(
+                capsule, sealed, overflow
+            )
+        self.assertEqual(
+            _pipeline._semantic_pipeline_state_fingerprint_bound(overflow),
+            before,
+        )
+        _pipeline._v3_test_set_pipeline_counter_bound(
+            overflow, "nres", previous
+        )
+        _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
+
+        capsule = _pipeline._plan_continuation_journal_v3_bound(sealed)
+        shared = self.pipeline(F1=0.02, F2=0.0, F3=0.0)
+        before = _pipeline._semantic_pipeline_state_fingerprint_bound(shared)
+        with self.assertRaisesRegex(ValueError, "must be independent"):
+            _pipeline._audit_continuation_journal_v3_bound(
+                capsule, sealed, shared, shared
+            )
+        self.assertEqual(
+            _pipeline._semantic_pipeline_state_fingerprint_bound(shared),
+            before,
+        )
+        _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
+
+        capsule = _pipeline._plan_continuation_journal_v3_bound(sealed)
+        altered_rounding = self.pipeline(F1=0.02, F2=0.0, F3=0.0)
+        before = _pipeline._semantic_pipeline_state_fingerprint_bound(
+            altered_rounding
+        )
+        libc = ctypes.CDLL(None)
+        libc.fegetround.restype = ctypes.c_int
+        libc.fesetround.argtypes = [ctypes.c_int]
+        original_rounding = libc.fegetround()
+        try:
+            self.assertEqual(libc.fesetround(0x400), 0)
+            self.assertFalse(
+                _pipeline._v3_host_float_environment_attested_bound()
+            )
+            with self.assertRaisesRegex(RuntimeError, "floating-point"):
+                _pipeline._consume_continuation_journal_v3_bound(
+                    capsule, sealed, altered_rounding
+                )
+        finally:
+            self.assertEqual(libc.fesetround(original_rounding), 0)
+        self.assertTrue(_pipeline._v3_host_float_environment_attested_bound())
+        self.assertEqual(
+            _pipeline._semantic_pipeline_state_fingerprint_bound(
+                altered_rounding
+            ),
+            before,
+        )
+        _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
+
+    def test_journal_v3_sparse_direct_consumer_returns_exact_evidence(self):
+        records = b"".join(
+            (
+                self.postfilter_record(1, math.nan, -12, 0, 1, math.nan),
+                self.postfilter_record(5, math.nan, 0, 173, 0, math.nan),
+            )
+        )
+        options = {"F1": 0.02, "F2": 0.0, "F3": 0.0}
+        generation = self.pipeline(**options)
+        sealed = self.seal_v2_terminal_fixture(
+            self.sequences, records, pipeline=generation
+        )
+        expected = _pipeline._search_hmm_sealed_postfilter_bound(
+            sealed, 0, self.pipeline(**options)
+        )
+        sparse_pipeline = self.pipeline(**options)
+        capsule = _pipeline._plan_continuation_journal_v3_bound(sealed)
+        result = _pipeline._consume_continuation_journal_v3_bound(
+            capsule, sealed, sparse_pipeline
+        )
+
+        self.assertEqual(result["schema_version"], 3)
+        self.assertGreater(result["packet_bytes"], 0)
+        self.assertEqual(len(result["hits"]), 1)
+        self.assertEqual(len(result["profiles"]), 1)
+        self.assertEqual(len(result["rows"]), 1)
+        self.assert_exact_hits(expected, result["hits"][0])
+        row = result["rows"][0]
+        self.assertEqual(row["cpu_pipeline_count"], 1)
+        self.assertEqual(row["certificate"]["stages"]["raw_f1"], 1)
+        self.assertEqual(
+            row["certificate"]["omitted_targets"]
+            + row["certificate"]["exception_count"],
+            len(self.sequences),
+        )
+        with self.assertRaisesRegex(TypeError, "invalid or consumed"):
+            _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
+
+    def test_journal_v3_postclaim_failure_stays_consumed(self):
+        options = {
+            "F1": 0.02,
+            "F2": 0.0,
+            "F3": 0.0,
+            "bit_cutoffs": "gathering",
+        }
+        generation = self.pipeline(**options)
+        sealed = self.seal_v2_terminal_fixture(
+            self.sequences, pipeline=generation
+        )
+        capsule = _pipeline._plan_continuation_journal_v3_bound(sealed)
+        with self.assertRaises(MissingCutoffs):
+            _pipeline._consume_continuation_journal_v3_bound(
+                capsule, sealed, self.pipeline(**options)
+            )
+        with self.assertRaisesRegex(TypeError, "invalid or consumed"):
+            _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
+
+    def test_journal_v3_sparse_dual_certifies_exact_f3_reject(self):
+        generation = self.pipeline(F1=1.0, F2=1.0, F3=0.0)
+        sealed = self.seal_v2_f3_reject_fixture(
+            self.sequences, 3, pipeline=generation
+        )
+        audit = _pipeline._audit_continuation_journal_v3_bound(
+            _pipeline._plan_continuation_journal_v3_bound(sealed),
+            sealed,
+            self.pipeline(F1=1.0, F2=1.0, F3=0.0),
+            self.pipeline(F1=1.0, F2=1.0, F3=0.0),
+        )
+        row = audit["rows"][0]
+        self.assertTrue(audit["equal"])
+        self.assertEqual(row["certificate"]["stages"]["f3"], 1)
+        self.assertEqual(row["dense"]["forward_continuation_count"], 1)
+        self.assertEqual(row["sparse"]["forward_continuation_count"], 0)
+        self.assertTrue(row["route_reconciliation"]["equal"])
+
+    def test_journal_v3_sparse_dual_certifies_domain_no_region(self):
+        target = 3
+        row_offsets = array("Q", [0, 1])
+        special_count = 6 * (len(self.sequences[target]) + 1)
+        options = {"F1": 1.0, "F2": 1.0, "F3": 1.0}
+        generation = self.pipeline(**options)
+        sealed = _pipeline._seal_continuation_journal_v2_test_fixture_bound(
+            (self.hmms[0],),
+            (self.optimized_profiles[0].copy(),),
+            self.sequences,
+            self.residue_offsets(self.sequences),
+            1.0,
+            self.background_fingerprint(generation.background),
+            self.postfilter_record(target, 0.0, 0, 0, 2, 0.0),
+            row_offsets,
+            self.forward_record(target, -7.0, 0, 2),
+            row_offsets,
+            array("Q", [0, special_count]),
+            array("f", [0.0]) * special_count,
+            row_offsets,
+            self.continuation_row(
+                0, target, domain_status=0, domain_route=1
+            ),
+            array("Q", [0, 0]),
+            b"",
+            array("Q", [0, 0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("f"),
+            generation,
+            2.0e-4,
+        )
+        audit = _pipeline._audit_continuation_journal_v3_bound(
+            _pipeline._plan_continuation_journal_v3_bound(sealed),
+            sealed,
+            self.pipeline(**options),
+            self.pipeline(**options),
+        )
+        row = audit["rows"][0]
+        self.assertTrue(audit["equal"])
+        self.assertEqual(row["certificate"]["stages"]["no_region"], 1)
+        self.assertEqual(row["dense"]["simple_continuation_count"], 1)
+        self.assertEqual(row["sparse"]["simple_continuation_count"], 0)
+        self.assertTrue(row["route_reconciliation"]["equal"])
+
+    def test_journal_v3_sparse_dual_handles_multiple_profiles(self):
+        options = {"F1": 0.02, "F2": 0.0, "F3": 0.0}
+        generation = self.pipeline(**options)
+        row_offsets = array("Q", [0, 0, 0])
+        sealed = _pipeline._seal_continuation_journal_v2_test_fixture_bound(
+            tuple(self.hmms[:2]),
+            tuple(profile.copy() for profile in self.optimized_profiles[:2]),
+            self.sequences,
+            self.residue_offsets(self.sequences),
+            options["F1"],
+            self.background_fingerprint(generation.background),
+            b"",
+            row_offsets,
+            b"",
+            row_offsets,
+            array("Q", [0]),
+            array("f"),
+            row_offsets,
+            b"",
+            array("Q", [0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("Q", [0]),
+            b"",
+            array("f"),
+            generation,
+            2.0e-4,
+        )
+        audit = _pipeline._audit_continuation_journal_v3_bound(
+            _pipeline._plan_continuation_journal_v3_bound(sealed),
+            sealed,
+            self.pipeline(**options),
+            self.pipeline(**options),
+        )
+        self.assertTrue(audit["equal"])
+        self.assertEqual(len(audit["rows"]), 2)
+        self.assertTrue(all(row["semantic"]["pipeline"]["equal"] for row in audit["rows"]))
+        self.assertTrue(all(row["semantic"]["tophits"]["equal"] for row in audit["rows"]))
+
+    def test_journal_v3_sparse_preserves_fixed_spaces_and_cumulative_reuse(self):
+        options = {"F1": 0.02, "F2": 0.0, "F3": 0.0, "Z": 97, "domZ": 11}
+        generation = self.pipeline(**options)
+        sealed = self.seal_v2_terminal_fixture(
+            self.sequences, pipeline=generation
+        )
+        dense = self.pipeline(**options)
+        sparse = self.pipeline(**options)
+
+        first = _pipeline._audit_continuation_journal_v3_bound(
+            _pipeline._plan_continuation_journal_v3_bound(sealed),
+            sealed,
+            dense,
+            sparse,
+        )
+        self.assertTrue(first["equal"])
+        self.assertEqual(first["dense_hits"][0].Z, 97.0)
+        self.assertEqual(first["dense_hits"][0].domZ, 11.0)
+        self.assertEqual(first["dense_hits"][0].searched_models, 1)
+
+        second = _pipeline._audit_continuation_journal_v3_bound(
+            _pipeline._plan_continuation_journal_v3_bound(sealed),
+            sealed,
+            dense,
+            sparse,
+        )
+        self.assertTrue(second["equal"])
+        self.assertEqual(second["dense_hits"][0].Z, 97.0)
+        self.assertEqual(second["dense_hits"][0].domZ, 11.0)
+        self.assertEqual(second["dense_hits"][0].searched_models, 2)
+
+        dense.clear()
+        sparse.clear()
+        third = _pipeline._audit_continuation_journal_v3_bound(
+            _pipeline._plan_continuation_journal_v3_bound(sealed),
+            sealed,
+            dense,
+            sparse,
+        )
+        self.assertTrue(third["equal"])
+        self.assertEqual(third["dense_hits"][0].searched_models, 1)
 
     def test_forward_batch_validation_preserves_global_row_mapping(self):
         matrix_target = 3
