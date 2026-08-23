@@ -120,3 +120,18 @@ directory containing exactly six regular mode-`0444` files. Its SHA-256
 manifest (`ca90c552241ed5c0619a2cc3bc2f639c33c58f0f0108303ac452c6e3662ee527`)
 rehashes cleanly; the result JSON SHA-256 is
 `64e22431e855abbd8e5c816324350e414a8945d68a0c7fb321fa0e7e551fe2c4`.
+
+Full-corpus diagnostic job `1182355` then collected the complete reason census
+with byte-identical output. Of 826,453 Backward/domain rows, 552,390 (66.84%)
+routed to CPU. The dominant source facts were a conservative work cap on
+366,939 rows, multidomain evidence on 150,965 rows, and threshold uncertainty
+on 52,797 rows; these facts overlap. Numerical, host-environment, own-scale,
+unsupported-mode, workspace-cap, and catchall failures were all zero.
+
+Compact rescore routed 231,725 of 454,912 regions (50.94%) to CPU, entirely
+because of the matrix cap; numeric and global-budget fallbacks were zero.
+Postfilter CPU rows were only 0.229% of retained records, and Forward output-cap
+rows were 0.215% of F2 survivors. The continuation wall was broadly spread
+across profiles rather than dominated by a few models: the top 10 profiles
+accounted for 5.11%, while 700 profiles were needed to reach 50%. The full
+census is retained under `build/phase0-full-census-20260823/attempt-02`.
