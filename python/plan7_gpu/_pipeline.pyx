@@ -7957,12 +7957,12 @@ def _seal_profile_selection_continuation_bound(
     )
     sealed._journal_compact_traces = journal_compact_trace_view
     sealed._journal_compact_null2 = journal_compact_null2_view
-    sealed._source_identity_tokens = identity_view
-    sealed._source_profile_fingerprints = profile_fingerprint_view
-    sealed._source_sequence_fingerprint = sequence_fingerprint_view
     sealed._direct_v3_source = direct_v3_source
     sealed._source_consumer_validation_ns = source_validation_elapsed_ns
     if direct_v3_source:
+        sealed._source_identity_tokens = identity_view
+        sealed._source_profile_fingerprints = profile_fingerprint_view
+        sealed._source_sequence_fingerprint = sequence_fingerprint_view
         sealed._direct_v3_eliminated_v2_bytes = direct_source[25]
         sealed._direct_v3_staging_build_ns = direct_source[26]
         sealed._direct_v3_staging_bytes = direct_source[27]
@@ -11516,6 +11516,11 @@ cdef void _v3_complete_row_route_statistics(
         statistics.decision_compact_route_not_device += (
             certificate.no_region_count
         )
+        statistics.decision_compact_empty += certificate.no_region_count
+        if not compact_generation_matches:
+            statistics.decision_compact_tail_changed += (
+                certificate.no_region_count
+            )
 
     for exception_index in range(profile.exception_count):
         exception = &exceptions[profile.exception_begin + exception_index]
