@@ -114,43 +114,15 @@ def require_environment() -> dict[str, object]:
     return {"provenance": provenance, "seams": seams}
 
 
-def audit_fixture() -> dict[str, object]:
-    hmms, targets = fixture()
-    alphabet = hmms[0].alphabet
-    with tempfile.TemporaryDirectory(prefix="phase1a-h200-v3-") as temporary:
-        base = Path(temporary) / "models"
-        pyhmmer.hmmer.hmmpress(hmms, base)
-        pairs = load_pressed_profiles(base)
-        with (
-            ProfileSession(pairs, pack_workers=1) as session,
-            session.select(SELECTION) as selection,
-            SequenceBatch(targets) as batch,
-        ):
-            candidates = batch._postfilter_forward_selection(
-                selection,
-                **OPTIONS,
-                bias_filter=True,
-                pipeline=pipeline(alphabet),
-            )
-            sealed = _candidate_state(candidates).sealed_postfilter
-            if sealed is None:
-                raise AssertionError("fused CUDA generation did not produce a seal")
-            generation = _pipeline._sealed_continuation_statistics_bound(sealed)
-            workspace = dict(_sequence_state(batch).native.workspace_statistics)
-
-        packet = _pipeline._plan_continuation_journal_v3_bound(sealed)
-        summary = _pipeline._validate_continuation_journal_v3_bound(
-            packet, sealed, include_details=True
-        )
-        audit = _pipeline._audit_continuation_journal_v3_bound(
-            packet, sealed, pipeline(alphabet), pipeline(alphabet)
-        )
-
-    required_routes = ("forward_scores", "simple_regions", "compact_domains")
-    missing_routes = [
-        route for route in required_routes
-        if summary["exception_routes"][route] == 0
-    ]
+def audit_seal(sealed: object, alphabet: object) -> dict[str, object]:
+    generation = _pipeline._sealed_continuation_statistics_bound(sealed)
+    packet = _pipeline._plan_continuation_journal_v3_bound(sealed)
+    summary = _pipeline._validate_continuation_journal_v3_bound(
+        packet, sealed, include_details=True
+    )
+    audit = _pipeline._audit_continuation_journal_v3_bound(
+        packet, sealed, pipeline(alphabet), pipeline(alphabet)
+    )
     rows = audit["rows"]
     accepted = sum(row["dense"]["compact"]["accepted_count"] for row in rows)
     route_failures = [
@@ -164,23 +136,13 @@ def audit_fixture() -> dict[str, object]:
         if not row["semantic"]["pipeline"]["equal"]
         or not row["semantic"]["tophits"]["equal"]
     ]
-    if missing_routes:
-        raise AssertionError(f"fixture missed required v3 routes: {missing_routes}")
-    if accepted == 0:
-        raise AssertionError("fixture did not exercise compact acceptance")
     if route_failures or semantic_failures or audit["equal"] is not True:
         raise AssertionError(
             "dense-v2/sparse-v3 mismatch: "
             f"route={route_failures}, semantic={semantic_failures}"
         )
-    if workspace["forward_run_count"] <= 0 or workspace["postfilter_run_count"] <= 0:
-        raise AssertionError("audit did not execute real CUDA Forward/postfilter work")
-
     return {
-        "targets": len(targets),
-        "profiles": len(SELECTION),
         "generation": generation,
-        "workspace": workspace,
         "v3_summary": {
             key: summary[key]
             for key in (
@@ -204,6 +166,67 @@ def audit_fixture() -> dict[str, object]:
             "compact_accepted": accepted,
             "rows": audit["rows"],
         },
+    }
+
+
+def audit_fixture() -> dict[str, object]:
+    hmms, targets = fixture()
+    alphabet = hmms[0].alphabet
+    with tempfile.TemporaryDirectory(prefix="phase1a-h200-v3-") as temporary:
+        base = Path(temporary) / "models"
+        pyhmmer.hmmer.hmmpress(hmms, base)
+        pairs = load_pressed_profiles(base)
+        with (
+            ProfileSession(pairs, pack_workers=1) as session,
+            session.select(SELECTION) as selection,
+            SequenceBatch(targets) as batch,
+        ):
+            production = batch._postfilter_forward_selection(
+                selection,
+                **OPTIONS,
+                bias_filter=True,
+                pipeline=pipeline(alphabet),
+            )
+            simple_fallback = batch._postfilter_forward_selection(
+                selection,
+                **OPTIONS,
+                bias_filter=True,
+                pipeline=pipeline(alphabet),
+                _rescore_compact_byte_budget=1,
+            )
+            production_seal = _candidate_state(production).sealed_postfilter
+            simple_seal = _candidate_state(simple_fallback).sealed_postfilter
+            if production_seal is None or simple_seal is None:
+                raise AssertionError("fused CUDA generation did not produce a seal")
+            workspace = dict(_sequence_state(batch).native.workspace_statistics)
+
+        cases = {
+            "production": audit_seal(production_seal, alphabet),
+            "compact_cap_simple_fallback": audit_seal(simple_seal, alphabet),
+        }
+
+    routes = {
+        route: sum(
+            case["v3_summary"]["exception_routes"][route]
+            for case in cases.values()
+        )
+        for route in ("forward_scores", "simple_regions", "compact_domains")
+    }
+    missing_routes = [route for route, count in routes.items() if count == 0]
+    compact_accepted = cases["production"]["dual"]["compact_accepted"]
+    if missing_routes:
+        raise AssertionError(f"fixture missed required v3 routes: {missing_routes}")
+    if compact_accepted == 0:
+        raise AssertionError("fixture did not exercise compact acceptance")
+    if workspace["forward_run_count"] <= 0 or workspace["postfilter_run_count"] <= 0:
+        raise AssertionError("audit did not execute real CUDA Forward/postfilter work")
+
+    return {
+        "targets": len(targets),
+        "profiles": len(SELECTION),
+        "workspace": workspace,
+        "routes": routes,
+        "cases": cases,
     }
 
 
