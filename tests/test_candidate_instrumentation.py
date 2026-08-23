@@ -187,6 +187,49 @@ class CandidateResidentMemoryTests(unittest.TestCase):
 
 
 class PrivateTransportSourceCompatibilityTests(unittest.TestCase):
+    def test_f1_device_candidate_cache_fails_closed_before_overwrite(self):
+        source = (ROOT / "cuda/ssv_cuda.cu").read_text()
+        getter = source[
+            source.index("plan7_ssv_sequence_batch_get_f1_candidate_view") :
+            source.index("plan7_ssv_sequence_batch_bias_candidates_many")
+        ]
+        bias = source[
+            source.index("plan7_ssv_sequence_batch_bias_candidates_many") :
+            source.index("sequence_batch_postfilter_candidates_many_impl")
+        ]
+        postfilter = source[
+            source.index("sequence_batch_postfilter_candidates_many_impl") :
+            source.index("plan7_ssv_sequence_batch_postfilter_candidates_many(")
+        ]
+
+        self.assertEqual(source.count("invalidate_f1_cache(batch);"), 3)
+        self.assertIn(
+            "!batch->f1_cache_valid || !batch->f1_device_candidates_valid",
+            getter,
+        )
+        for implementation in (bias, postfilter):
+            invalidation = implementation.index(
+                "invalidate_f1_device_candidates(batch);"
+            )
+            self.assertLess(
+                invalidation,
+                implementation.index(
+                    "realloc(batch->host_bias_candidates, candidate_bytes)"
+                ),
+            )
+            self.assertLess(
+                invalidation,
+                implementation.index(
+                    "grow_device_buffer(&batch->device_bias_candidates"
+                ),
+            )
+            self.assertLess(
+                invalidation,
+                implementation.index(
+                    "cudaMemcpy(batch->device_bias_candidates"
+                ),
+            )
+
     def test_direct_v3_uses_fused_plan_and_one_emission_scan(self):
         native = (ROOT / "python/plan7_gpu/_native.pyx").read_text()
         pipeline = (ROOT / "python/plan7_gpu/_pipeline.pyx").read_text()

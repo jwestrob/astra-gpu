@@ -815,6 +815,20 @@ grow_device_buffer(T **buffer,
   return 0;
 }
 
+void
+invalidate_f1_device_candidates(plan7_ssv_sequence_batch *batch)
+{
+  batch->f1_device_candidates_valid = 0;
+  batch->cached_f1_candidate_count = 0;
+}
+
+void
+invalidate_f1_cache(plan7_ssv_sequence_batch *batch)
+{
+  batch->f1_cache_valid = 0;
+  invalidate_f1_device_candidates(batch);
+}
+
 bool
 validate_compact_profile(const plan7_ssv_profile *profile,
                          int alphabet_size,
@@ -1683,7 +1697,7 @@ plan7_ssv_sequence_batch_filter(plan7_ssv_sequence_batch *batch,
     return -1;
   }
   if (batch->sequence_count == 0) return 0;
-  batch->f1_cache_valid = 0;
+  invalidate_f1_cache(batch);
   if (!batch->host_float_environment_valid ||
       plan7_bias_host_environment_attested() != 1) {
     fill_cpu_required_results(results, batch->sequence_count);
@@ -1821,7 +1835,7 @@ plan7_ssv_sequence_batch_filter_many(
     return -1;
   }
   if (batch->sequence_count == 0) return 0;
-  batch->f1_cache_valid = 0;
+  invalidate_f1_cache(batch);
   if (!batch->host_float_environment_valid ||
       plan7_bias_host_environment_attested() != 1) {
     fill_cpu_required_results(profile_major_results, cell_count);
@@ -1955,9 +1969,7 @@ sequence_batch_f1_mask_many_impl(
     set_error(error, error_size, "sequence batch is null");
     return -1;
   }
-  batch->f1_cache_valid = 0;
-  batch->f1_device_candidates_valid = 0;
-  batch->cached_f1_candidate_count = 0;
+  invalidate_f1_cache(batch);
   status = cudaGetDevice(&current_device);
   if (status != cudaSuccess) {
     set_cuda_error(error, error_size, "cudaGetDevice", status);
@@ -2244,8 +2256,7 @@ plan7_ssv_sequence_batch_f1_compact_many(
     set_error(error, error_size, "sequence batch is null");
     return -1;
   }
-  batch->f1_device_candidates_valid = 0;
-  batch->cached_f1_candidate_count = 0;
+  invalidate_f1_device_candidates(batch);
   if (batch->sequence_count > SIZE_MAX - 31) {
     set_error(error, error_size, "fused F1 mask size overflow");
     return -1;
@@ -2423,7 +2434,7 @@ plan7_ssv_sequence_batch_get_f1_candidate_view(
     set_error(error, error_size, "invalid F1 candidate view request");
     return -1;
   }
-  if (!batch->f1_device_candidates_valid ||
+  if (!batch->f1_cache_valid || !batch->f1_device_candidates_valid ||
       batch->host_candidate_offsets == nullptr) {
     set_error(error, error_size, "device-compacted F1 candidates are unavailable");
     return -1;
@@ -2573,6 +2584,8 @@ plan7_ssv_sequence_batch_bias_candidates_many(
 
   if (candidate_bytes > batch->device_bias_candidate_capacity)
     use_cached_device_candidates = false;
+  if (!use_cached_device_candidates)
+    invalidate_f1_device_candidates(batch);
   if (!use_cached_device_candidates &&
       candidate_bytes > batch->host_bias_candidate_capacity) {
     void *replacement = realloc(batch->host_bias_candidates, candidate_bytes);
@@ -2671,7 +2684,6 @@ plan7_ssv_sequence_batch_bias_candidates_many(
                              batch->host_bias_candidates,
                              candidate_bytes,
                              cudaMemcpyHostToDevice));
-    batch->f1_device_candidates_valid = 0;
     ++batch->f1_candidate_upload_count;
   }
   if (!batch->bias_length_terms_device_valid) {
@@ -2876,6 +2888,8 @@ sequence_batch_postfilter_candidates_many_impl(
   }
   if (candidate_bytes > batch->device_bias_candidate_capacity)
     use_cached_device_candidates = false;
+  if (!use_cached_device_candidates)
+    invalidate_f1_device_candidates(batch);
   if (!use_cached_device_candidates &&
       candidate_bytes > batch->host_bias_candidate_capacity) {
     void *replacement = realloc(batch->host_bias_candidates, candidate_bytes);
@@ -2961,7 +2975,6 @@ sequence_batch_postfilter_candidates_many_impl(
     CUDA_TRY_POSTFILTER(cudaMemcpy(batch->device_bias_candidates,
                                    batch->host_bias_candidates,
                                    candidate_bytes, cudaMemcpyHostToDevice));
-    batch->f1_device_candidates_valid = 0;
     ++batch->f1_candidate_upload_count;
   }
   if (!batch->bias_length_terms_device_valid) {
