@@ -30,6 +30,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | HMMER 3.4, standard CPU node | 64 | 19,683.00 s (5:28:03) | 1,818,828 KB | H200 request was 36.0349x faster |
 | Stock Astra/PyHMMER, standard CPU node | 64 | 702.79 s (11:42.79) | 2,622,124 KB | baseline for the primary GPU comparison |
 | Astra GPU, H200, warm persistent request | 64 host workers | 546.220704615 s | see telemetry below | **1.286641085x faster than CPU64; 22.278% less wall time** |
+| Astra GPU, H200, one-pass sparse-v3 experiment | 64 host workers | 536.168411 s | 13,143,840 KiB | **1.31076x faster than CPU64; 23.71% less wall time** |
 
 Additional GPU timing layers:
 
@@ -40,6 +41,20 @@ Additional GPU timing layers:
 - The measured request was a cache hit in the same persistent GPU profile session: profile load and device build were both zero during the measured request. Target parsing and all per-request search/output work remained included.
 
 These are one-run, cross-node measurements. They establish the observed result but do not provide a sampling distribution or confidence interval.
+
+### Current optimization-stage result
+
+The original 546.221-second row remains the sealed architectural baseline.
+Phase 1A's host compaction was exact but 3.82% slower, because it built dense
+v2 and then spent 28.945 seconds planning and validating sparse v3.  Phase 1B
+eliminated dense-v2 allocation and fused the decision plan into generation.
+Full H200 job `1182391` was byte-identical and completed in 536.168 seconds:
+466.502 seconds generation, 399.591 seconds continuation/output, and 337.400
+seconds overlap.  It retained a 5,801,342,068-byte sparse packet instead of a
+counterfactual 9,890,721,120-byte dense journal, performed 83 source scans and
+zero separate decision scans, and improved the original request by 10.052
+seconds (1.84%).  The result is retained, while the next material performance
+target is device-side F1 compaction.
 
 ## GPU request-stage ledger
 

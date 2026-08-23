@@ -54,6 +54,27 @@ but the retained two-pass sparse planner and validator still cost 20.445 and
 8.559 seconds.  Removing dense-v2 construction recovered the Phase 1A
 regression, but did not produce the required material speedup.
 
+The retained follow-up fused decision planning into the existing generation
+walks.  Each chunk now performs one packet-emission source scan and zero
+separate decision scans.  Focused H200 job `1182389` matched dense pipeline
+state and TopHits across real Forward, simple, compact, and forced-fallback
+routes.  Full job `1182391` again produced the exact CPU64 output and measured:
+
+- request wall: 536.168 seconds;
+- generation: 466.502 seconds;
+- CPU continuation/output: 399.591 seconds;
+- overlap: 337.400 seconds;
+- sparse planning: 13.384 seconds, down 34.5% from the two-pass direct form;
+- 83 planner source scans and zero separate decision scans;
+- zero dense-v2 allocation/retention and zero retained staging bytes.
+
+This is 9.815 seconds (1.80%) faster than the first direct form and 10.052
+seconds (1.84%) faster than the original 546.221-second dense baseline.  It is
+1.311x faster than Astra CPU64, or 23.71% less request wall, but does not meet
+the internal 5% Phase-1B stretch target.  Worker and raw-validation SHA-256
+values are `ebc6972e6dc6d20600906882e7cca71c2d1fb9e432265838bd85b605daad2831`
+and `cad2a5107ca10f786ba7fc269315bfa30f02a7b76670e260539ba162dc103ddf`.
+
 Raw execution and validation records are rooted at
 `build/phase1b-benchmark-harness/build/h200-phase1b-direct-v3-20260823/attempt-01-full`.
 The immutable worker and raw-validation JSON SHA-256 values are respectively
@@ -62,8 +83,7 @@ and `2483c29ec65928088279168c704ed146591847017280c5543a7bd5aee3ac0be0`.
 
 ## Decision
 
-Retain behind explicit `sparse_journal_v3=True` as the exact sparse/audit path;
-do not switch the default.  The direct source is semantically accepted but its
-performance hypothesis is rejected.  The next retained experiment fuses the
-decision plan into the existing F2/Forward/domain generation walks so packet
-emission needs only one dense source scan and no separate decision scan.
+Retain the one-pass form behind explicit `sparse_journal_v3=True`; do not
+switch the default from dense v2 yet.  Phase 1B is complete: exact sparse
+generation is faster and materially smaller, but its gain is modest.  Proceed
+to device-side stable F1 compaction rather than further tuning the host packet.

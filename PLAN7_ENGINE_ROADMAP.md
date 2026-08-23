@@ -44,8 +44,8 @@ the complete oracle suite and representative end-to-end workloads.
 |---|---|---|---|---|
 | 0 | Per-profile/chunk work telemetry and real CPU-fallback taxonomy | complete | through `f9ef356` | jobs 1182345/1182355 PASS; work and matrix caps dominate CPU fallback |
 | 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | complete; production performance rejected | through `039c092` | exact full job 1182349 was 3.82% slower despite 41.35% fewer packet bytes |
-| 1B | Produce sparse certificate before dense host materialization | active; first direct form performance-neutral | through `5280513` | job 1182378 exact; dense v2 eliminated, but retained two-pass planning left wall tied with baseline; one-pass plan now under test |
-| 2 | Device-side stable F1 candidate compaction | blocked on 1B | pending | pending |
+| 1B | Produce sparse certificate before dense host materialization | complete; retained opt-in | through `87727cd` | jobs 1182389/1182391 exact; one-pass wall 536.168 s, 1.84% faster than dense, zero dense-v2 retention |
+| 2 | Device-side stable F1 candidate compaction | active | pending | isolated implementation/review complete; H200 oracle pending |
 | 3 | Device-resident Forward -> Backward/domain -> rescore chain | blocked on 2 | pending | pending |
 | 4 | Forward/Backward/rescore candidates-per-warp variants | blocked on 3 | pending | pending |
 | 5+ | Profile-axis SSV, cohorts, packed integer DP, certified F0/GA/index research | deferred | pending | pending |
