@@ -42,8 +42,8 @@ the complete oracle suite and representative end-to-end workloads.
 
 | Phase | Scope | State | Source commit | Evidence / decision |
 |---|---|---|---|---|
-| 0 | Per-profile/chunk work telemetry and real CPU-fallback taxonomy | implementation complete; H200 census pending | `d8a1e1a`, `d602d14`, `e3196b6`, `3e757a8`, `d3f6213` | opt-in host validation complete; source-fact H200 run pending |
-| 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | H200 oracle passed; production switch/benchmark pending | through `4649a91` | job 1182321 PASS; see `PHASE1A_SPARSE_CONSUMER.md` |
+| 0 | Per-profile/chunk work telemetry and real CPU-fallback taxonomy | complete | through `f9ef356` | source-fact H200 job 1182345 PASS; immutable NFS report exact |
+| 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | production opt-in H200 oracle passed; representative benchmark pending | through `9a078c2` | jobs 1182321 and 1182344 PASS; see Phase 1A notes |
 | 1B | Produce sparse certificate before dense host materialization | blocked on 1A | pending | pending |
 | 2 | Device-side stable F1 candidate compaction | blocked on 1B | pending | pending |
 | 3 | Device-resident Forward -> Backward/domain -> rescore chain | blocked on 2 | pending | pending |
@@ -128,6 +128,13 @@ v2 and sparse v3 had identical semantic fingerprints and target/domain table
 bytes in every profile. This closes the real-route correctness gate, but not
 the phase: journal v2 remains the production default until the sparse switch
 is implemented and its total wall time is measured honestly.
+
+The explicit production switch is now implemented at revision `9a078c2`.
+Focused H200 job 1182344 exercised the reusable seal-owned packet through real
+`CandidateBatch.search()` calls and again matched dense v2 exactly for every
+profile and all exercised Forward, simple, and compact routes. It remains
+opt-in until the representative first-1000 and full-workload benchmark proves
+the output and measures total wall time honestly.
 
 ## Later phase order
 

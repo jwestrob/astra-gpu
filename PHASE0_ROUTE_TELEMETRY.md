@@ -103,3 +103,20 @@ shape. The separate production Astra integration enables native telemetry
 only when a collector is supplied, passes exact original database ordinals for
 each chunk, and otherwise preserves its existing generation and consumption
 calls.
+
+## H200 evidence
+
+The focused source-fact oracle passed on an attested H200 in Slurm job
+`1182345` (exit 0) at source revision
+`9a078c22f5ba386fdaeb726a688ef16179bb277c`. It exercised real postfilter,
+Forward, Backward/domain, compact-rescore, and CPU-continuation work. The
+schema-2 report covered all three expected profiles with no missing generation
+or continuation rows and nonzero source-attributed rows, logical cells,
+journal matches, compact attempts, compact accepts, and continuation wall
+time.
+
+The report was published through the real NFS fallback as one mode-`0555`
+directory containing exactly six regular mode-`0444` files. Its SHA-256
+manifest (`ca90c552241ed5c0619a2cc3bc2f639c33c58f0f0108303ac452c6e3662ee527`)
+rehashes cleanly; the result JSON SHA-256 is
+`64e22431e855abbd8e5c816324350e414a8945d68a0c7fb321fa0e7e551fe2c4`.
