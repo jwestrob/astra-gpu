@@ -182,6 +182,65 @@ test helper may construct two fresh equivalent pipelines from explicit options,
 but the low-level dual validator treats equivalent caller-provided pipelines as
 the trust boundary.
 
+## Initial cert-only predicate
+
+The first host compactor is deliberately narrower than every row that might
+eventually be compressible.  It may omit a row only when the already validated
+version-2 inputs prove one of these exact terminal states:
+
+- a target absent from the postfilter stream, or an authenticated raw-F1 reject:
+  no promotion counters;
+- a finite postfilter row with `BIAS_DEFINITE_REJECT`: MSV only;
+- a finite `BIAS_DEFINITE_PASS` row with no Forward record, after replaying the
+  exact `esl_gumbel_surv` F2 predicates and proving a Viterbi/F2 reject: MSV and
+  bias;
+- an authenticated `FORWARD_DEFINITE_REJECT`: MSV, bias, and Viterbi; or
+- an authenticated Forward pass whose domain journal is exactly
+  `DOMAIN_NO_REGIONS`, with no own scales, uncertainty, multidomain state,
+  regions, or compact payload: all four promotions.
+
+The no-region seam temporarily assigns `ddef->L` and `ddef->nexpected`, but the
+existing unconditional `p7_pipeline_Reuse()` restores all meaningful reusable
+domain state to zero.  The certificate therefore reproduces its persistent
+semantic effect by adding the four promotion deltas only.
+
+Any malformed or unprovable F2 row remains a filter-score exception.  Every
+row that can construct a hit, requires CPU work, carries a simple/compact
+domain payload, or has an uncertain source-stage precondition remains an
+exception.  Widening this set requires a separate source proof and oracle.
+
+## Host-only testability contract
+
+Journal-v2 minting is currently fused to GPU generation, so Phase 1A needs a
+narrow private host hook.  The hook must exercise the production v3 planner,
+ABI validator, and one-shot owner; it must not duplicate the stage classifier
+in Python or substitute a dictionary for the binary journal.  It accepts an
+already validated sealed dense batch and exposes only a defensive debug summary
+of certificate spans/deltas and exception routes.  Production APIs and default
+search selection remain unchanged.
+
+The deterministic host matrix uses the existing masked-pipeline record helpers:
+
+| Terminal state | Dense fixture | Expected promotion delta |
+|---|---|---|
+| before F1 | no postfilter row | `(0,0,0,0)` |
+| raw F1 reject | `filtersc`/`vfsc` NaN, direct reject | `(0,0,0,0)` |
+| bias reject | `F1=.02`, numerator 0, `filtersc=10`, direct reject | `(1,0,0,0)` |
+| F2 reject | `F1=1`, `F2=0`, numerator 0, `filtersc=0`, `vfsc=-1e30` | `(1,1,0,0)` |
+| F3 reject | `F1=F2=1`, `F3=0`, `vfsc=+inf`, `fwdsc=-1e30` | `(1,1,1,0)` |
+
+Exception-shape tests use ordinary `BIAS_CPU_REQUIRED` records at the first and
+last target, consecutive exceptions, a 2,048-target prefix, a large tail, and
+no exceptions.  They also cover a final omitted target whose length differs
+from the preceding exception and an empty final target.  Real CUDA validation
+later uses the stable Thioesterase domain quartet: target 0 `NO_REGIONS`, 13
+`SIMPLE`, 31 clustered/CPU-required, and 67 `SIMPLE`.
+
+Private test seams are also required for a mutation-free compact `eslEINVAL`
+retry and checked counter prestates near `UINT64_MAX`.  These exist only to
+cover otherwise unreachable validator branches; they cannot be selected by
+the public search path.
+
 ## Required tests before production selection
 
 Fixtures cover reject-before-F1, F1, bias, F2, and F3 rejects; simple domain;
