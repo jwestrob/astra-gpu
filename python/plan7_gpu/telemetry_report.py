@@ -1,4 +1,4 @@
-"""Thread-safe collection and atomic export for opt-in Phase 0 telemetry."""
+"""Thread-safe collection and fail-closed export for Phase 0 telemetry."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 from threading import Lock
 from typing import Any, Iterable
@@ -28,7 +29,7 @@ _RENAME_NOREPLACE = 1
 
 
 class TelemetryReportCommittedError(RuntimeError):
-    """Report publication committed, but parent-directory fsync failed.
+    """Report publication committed, but final durability confirmation failed.
 
     ``target`` names the immutable report that now exists.  Callers must audit
     that target rather than retrying the no-replace publication.
@@ -38,7 +39,7 @@ class TelemetryReportCommittedError(RuntimeError):
         self.target = target
         self.os_error = error
         super().__init__(
-            f"telemetry report is committed at {target}, but parent fsync "
+            f"telemetry report is committed at {target}, but final fsync "
             f"failed: {error}"
         )
 
@@ -116,6 +117,156 @@ def _publish_directory_noreplace(stage: Path, target: Path) -> None:
         if error_number == errno.EEXIST:
             raise FileExistsError(error_number, os.strerror(error_number), target)
         raise OSError(error_number, os.strerror(error_number), target)
+
+
+_NOREPLACE_UNSUPPORTED = frozenset(
+    {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.EOPNOTSUPP,
+        getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+    }
+)
+
+
+def _discard_report_directory(path: Path) -> None:
+    """Remove one private, uncommitted report directory."""
+    path.chmod(0o700)
+    for child in path.iterdir():
+        child.chmod(0o600)
+    shutil.rmtree(path)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_sha256_at(directory_fd: int, name: str) -> str:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    digest = hashlib.sha256()
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _same_directory_identity(path: Path, descriptor: int) -> bool:
+    try:
+        observed = path.lstat()
+    except OSError:
+        return False
+    expected = os.fstat(descriptor)
+    return (
+        stat.S_ISDIR(observed.st_mode)
+        and observed.st_dev == expected.st_dev
+        and observed.st_ino == expected.st_ino
+    )
+
+
+def _publish_directory_portable(stage: Path, target: Path) -> None:
+    """Publish through an exclusive directory reservation.
+
+    ``mkdir`` provides the portable no-overwrite primitive, including on NFS.
+    The reserved target remains mode 0700 while its already-fsynced members
+    are copied.  Changing it to mode 0555 is the commit point.  Consequently a
+    process crash leaves either no target, a visibly incomplete 0700 target,
+    or the complete immutable report; every state continues to block an
+    accidental overwrite.  Live failures after reservation deliberately leave
+    the same 0700 evidence instead of deleting by pathname: a replacement
+    directory can never be mistaken for, and removed as, this publisher's
+    reservation.  Member creation and the commit chmod stay bound to one open
+    directory descriptor, with pathname identity checked on both sides of the
+    commit.  The portable protocol assumes cooperating publishers do not
+    rename an empty reservation during the single ``mkdir``-to-``open``
+    acquisition window; POSIX exposes no atomic mkdir-and-open operation.  A
+    nonempty substitution is rejected before any member or mode is changed,
+    and all substitutions after acquisition are identity-checked.
+    """
+    os.mkdir(target, 0o700)
+    target_fd = os.open(
+        target,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        if (
+            not _same_directory_identity(target, target_fd)
+            or os.listdir(target_fd)
+        ):
+            raise RuntimeError("portable report reservation identity changed")
+        os.fchmod(target_fd, 0o700)
+        members = sorted(
+            stage.iterdir(),
+            key=lambda path: (path.name == "artifact.sha256", path.name),
+        )
+        for source in members:
+            source_stat = source.lstat()
+            if source.is_symlink() or not stat.S_ISREG(source_stat.st_mode):
+                raise RuntimeError("staged report member is not a regular file")
+            destination_fd = os.open(
+                source.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=target_fd,
+            )
+            with source.open("rb") as input_stream, os.fdopen(
+                destination_fd, "wb"
+            ) as output:
+                shutil.copyfileobj(input_stream, output)
+                output.flush()
+                os.fchmod(output.fileno(), source_stat.st_mode & 0o777)
+                os.fsync(output.fileno())
+            destination_stat = os.stat(
+                source.name, dir_fd=target_fd, follow_symlinks=False
+            )
+            if (
+                destination_stat.st_size != source_stat.st_size
+                or _file_sha256_at(target_fd, source.name)
+                != _file_sha256(source)
+            ):
+                raise OSError(
+                    errno.EIO,
+                    "portable report publication changed staged content",
+                    target / source.name,
+                )
+        os.fsync(target_fd)
+        if not _same_directory_identity(target, target_fd):
+            raise RuntimeError("portable report reservation identity changed")
+        _discard_report_directory(stage)
+        os.fchmod(target_fd, 0o555)
+        try:
+            os.fsync(target_fd)
+        except OSError as error:
+            raise TelemetryReportCommittedError(target, error) from error
+        if not _same_directory_identity(target, target_fd):
+            raise RuntimeError("committed report reservation identity changed")
+    finally:
+        os.close(target_fd)
+
+
+def _publish_report_directory(stage: Path, target: Path) -> None:
+    """Use atomic no-replace when supported, otherwise the NFS-safe protocol."""
+    try:
+        _publish_directory_noreplace(stage, target)
+    except RuntimeError:
+        _publish_directory_portable(stage, target)
+    except OSError as error:
+        if error.errno not in _NOREPLACE_UNSUPPORTED:
+            raise
+        _publish_directory_portable(stage, target)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -455,7 +606,7 @@ class TelemetryCollector:
         }
 
     def export(self, directory: os.PathLike[str] | str) -> dict[str, Path]:
-        """Atomically publish one immutable, complete report directory."""
+        """No-replace publish one immutable, crash-detectable report."""
         snapshot = self.snapshot(require_complete=True)
         target = Path(directory)
         if not target.name:
@@ -489,17 +640,14 @@ class TelemetryCollector:
             manifest_path.chmod(0o444)
             _fsync_directory(stage)
             stage.chmod(0o555)
-            _publish_directory_noreplace(stage, target)
+            _publish_report_directory(stage, target)
             try:
                 _fsync_directory(parent)
             except OSError as error:
                 raise TelemetryReportCommittedError(target, error) from error
         except BaseException:
             if stage.exists():
-                stage.chmod(0o700)
-                for child in stage.iterdir():
-                    child.chmod(0o600)
-                shutil.rmtree(stage)
+                _discard_report_directory(stage)
             raise
         return {
             name: target / name

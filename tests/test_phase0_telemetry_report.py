@@ -1,5 +1,6 @@
 import copy
 from array import array
+import errno
 import hashlib
 import json
 import os
@@ -426,6 +427,264 @@ class TelemetryCollectorTests(unittest.TestCase):
             self.assertTrue(target.is_dir())
             self.assertTrue((target / "artifact.sha256").is_file())
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o555)
+            os.chmod(target, 0o700)
+
+    def test_unsupported_noreplace_uses_portable_immutable_commit(self):
+        collector = self.collector()
+        collector.record_continuation(10, continuation_statistics(0, 100))
+        collector.record_continuation(20, continuation_statistics(1, 300))
+        unsupported = OSError(errno.EINVAL, "unsupported RENAME_NOREPLACE")
+        with tempfile.TemporaryDirectory(prefix="phase0-report-nfs-") as root:
+            target = Path(root) / "report"
+            with mock.patch(
+                "plan7_gpu.telemetry_report._publish_directory_noreplace",
+                side_effect=unsupported,
+            ):
+                paths = collector.export(target)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o555)
+            self.assertTrue(all(path.is_file() for path in paths.values()))
+            self.assertFalse(any(Path(root).glob(".report.tmp-*")))
+            os.chmod(target, 0o700)
+
+    def test_portable_reservation_collision_never_overwrites(self):
+        collector = self.collector()
+        collector.record_continuation(10, continuation_statistics(0, 100))
+        collector.record_continuation(20, continuation_statistics(1, 300))
+        with tempfile.TemporaryDirectory(prefix="phase0-report-collision-") as root:
+            parent = Path(root)
+            target = parent / "report"
+            marker = target / "preexisting"
+
+            def collide(_stage, destination):
+                destination.mkdir()
+                marker.write_text("do not replace")
+                raise OSError(errno.EINVAL, "unsupported RENAME_NOREPLACE")
+
+            with mock.patch(
+                "plan7_gpu.telemetry_report._publish_directory_noreplace",
+                side_effect=collide,
+            ):
+                with self.assertRaises(FileExistsError):
+                    collector.export(target)
+            self.assertEqual(marker.read_text(), "do not replace")
+            self.assertEqual(set(target.iterdir()), {marker})
+            self.assertFalse(any(parent.glob(".report.tmp-*")))
+
+    def test_portable_copy_failure_preserves_detectable_reservation(self):
+        collector = self.collector()
+        collector.record_continuation(10, continuation_statistics(0, 100))
+        collector.record_continuation(20, continuation_statistics(1, 300))
+        unsupported = OSError(errno.EINVAL, "unsupported RENAME_NOREPLACE")
+        with tempfile.TemporaryDirectory(prefix="phase0-report-copy-fail-") as root:
+            parent = Path(root)
+            target = parent / "report"
+            with (
+                mock.patch(
+                    "plan7_gpu.telemetry_report._publish_directory_noreplace",
+                    side_effect=unsupported,
+                ),
+                mock.patch(
+                    "plan7_gpu.telemetry_report.shutil.copyfileobj",
+                    side_effect=OSError("injected copy failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "injected copy failure"):
+                    collector.export(target)
+            self.assertTrue(target.is_dir())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+            self.assertFalse(any(parent.glob(".report.tmp-*")))
+            with self.assertRaises(FileExistsError):
+                collector.export(target)
+
+    def test_portable_failure_never_deletes_replacement_target(self):
+        collector = self.collector()
+        collector.record_continuation(10, continuation_statistics(0, 100))
+        collector.record_continuation(20, continuation_statistics(1, 300))
+        unsupported = OSError(errno.EINVAL, "unsupported RENAME_NOREPLACE")
+        with tempfile.TemporaryDirectory(prefix="phase0-report-replaced-") as root:
+            parent = Path(root)
+            target = parent / "report"
+            displaced = parent / "displaced-reservation"
+            marker = target / "replacement"
+
+            def replace_then_fail(_input, _output):
+                target.rename(displaced)
+                target.mkdir()
+                marker.write_text("other publisher")
+                raise OSError("injected copy failure after replacement")
+
+            with (
+                mock.patch(
+                    "plan7_gpu.telemetry_report._publish_directory_noreplace",
+                    side_effect=unsupported,
+                ),
+                mock.patch(
+                    "plan7_gpu.telemetry_report.shutil.copyfileobj",
+                    side_effect=replace_then_fail,
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "after replacement"):
+                    collector.export(target)
+            self.assertEqual(marker.read_text(), "other publisher")
+            self.assertTrue(displaced.is_dir())
+            self.assertFalse(any(parent.glob(".report.tmp-*")))
+
+    def test_portable_ambiguous_commit_never_deletes_immutable_target(self):
+        collector = self.collector()
+        collector.record_continuation(10, continuation_statistics(0, 100))
+        collector.record_continuation(20, continuation_statistics(1, 300))
+        unsupported = OSError(errno.EINVAL, "unsupported RENAME_NOREPLACE")
+        with tempfile.TemporaryDirectory(prefix="phase0-report-commit-race-") as root:
+            parent = Path(root)
+            target = parent / "report"
+            original_fchmod = os.fchmod
+
+            def interrupt_after_chmod(descriptor, mode):
+                result = original_fchmod(descriptor, mode)
+                if mode == 0o555:
+                    raise KeyboardInterrupt("injected post-commit interruption")
+                return result
+
+            with (
+                mock.patch(
+                    "plan7_gpu.telemetry_report._publish_directory_noreplace",
+                    side_effect=unsupported,
+                ),
+                mock.patch(
+                    "plan7_gpu.telemetry_report.os.fchmod",
+                    side_effect=interrupt_after_chmod,
+                ),
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "post-commit"):
+                    collector.export(target)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o555)
+            self.assertTrue((target / "artifact.sha256").is_file())
+            self.assertFalse(any(parent.glob(".report.tmp-*")))
+            os.chmod(target, 0o700)
+
+    def test_portable_replacement_cannot_be_populated_or_committed(self):
+        collector = self.collector()
+        collector.record_continuation(10, continuation_statistics(0, 100))
+        collector.record_continuation(20, continuation_statistics(1, 300))
+        unsupported = OSError(errno.EINVAL, "unsupported RENAME_NOREPLACE")
+        with tempfile.TemporaryDirectory(prefix="phase0-report-identity-") as root:
+            parent = Path(root)
+            target = parent / "report"
+            displaced = parent / "displaced-reservation"
+            marker = target / "replacement"
+            original_copy = __import__("shutil").copyfileobj
+            replaced = False
+
+            def replace_then_continue(input_stream, output_stream):
+                nonlocal replaced
+                if not replaced:
+                    target.rename(displaced)
+                    target.mkdir()
+                    marker.write_text("other publisher")
+                    replaced = True
+                return original_copy(input_stream, output_stream)
+
+            with (
+                mock.patch(
+                    "plan7_gpu.telemetry_report._publish_directory_noreplace",
+                    side_effect=unsupported,
+                ),
+                mock.patch(
+                    "plan7_gpu.telemetry_report.shutil.copyfileobj",
+                    side_effect=replace_then_continue,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                    collector.export(target)
+            self.assertEqual(set(target.iterdir()), {marker})
+            self.assertEqual(marker.read_text(), "other publisher")
+            self.assertEqual(stat.S_IMODE(displaced.stat().st_mode), 0o700)
+            self.assertTrue((displaced / "artifact.sha256").is_file())
+            self.assertFalse(any(parent.glob(".report.tmp-*")))
+
+    def test_portable_nonempty_preopen_substitution_fails_before_mutation(self):
+        collector = self.collector()
+        collector.record_continuation(10, continuation_statistics(0, 100))
+        collector.record_continuation(20, continuation_statistics(1, 300))
+        unsupported = OSError(errno.EINVAL, "unsupported RENAME_NOREPLACE")
+        with tempfile.TemporaryDirectory(prefix="phase0-report-acquire-") as root:
+            parent = Path(root)
+            target = parent / "report"
+            displaced = parent / "displaced-reservation"
+            marker = target / "replacement"
+            original_open = os.open
+            replaced = False
+
+            def replace_before_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal replaced
+                if (
+                    not replaced
+                    and Path(path) == target
+                    and flags & os.O_DIRECTORY
+                    and dir_fd is None
+                ):
+                    target.rename(displaced)
+                    target.mkdir()
+                    marker.write_text("other publisher")
+                    replaced = True
+                if dir_fd is None:
+                    return original_open(path, flags, mode)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch(
+                    "plan7_gpu.telemetry_report._publish_directory_noreplace",
+                    side_effect=unsupported,
+                ),
+                mock.patch(
+                    "plan7_gpu.telemetry_report.os.open",
+                    side_effect=replace_before_open,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                    collector.export(target)
+            self.assertEqual(set(target.iterdir()), {marker})
+            self.assertEqual(marker.read_text(), "other publisher")
+            self.assertNotEqual(stat.S_IMODE(target.stat().st_mode), 0o555)
+            self.assertEqual(stat.S_IMODE(displaced.stat().st_mode), 0o700)
+            self.assertEqual(tuple(displaced.iterdir()), ())
+            self.assertFalse(any(parent.glob(".report.tmp-*")))
+
+    def test_portable_parent_fsync_failure_is_committed_not_retried(self):
+        collector = self.collector()
+        collector.record_continuation(10, continuation_statistics(0, 100))
+        collector.record_continuation(20, continuation_statistics(1, 300))
+        unsupported = OSError(errno.EINVAL, "unsupported RENAME_NOREPLACE")
+        with tempfile.TemporaryDirectory(prefix="phase0-report-nfs-fsync-") as root:
+            parent = Path(root)
+            target = parent / "report"
+            original = __import__(
+                "plan7_gpu.telemetry_report", fromlist=["_fsync_directory"]
+            )._fsync_directory
+
+            def fail_parent(path):
+                if Path(path) == parent:
+                    raise OSError("injected parent fsync failure")
+                return original(path)
+
+            with (
+                mock.patch(
+                    "plan7_gpu.telemetry_report._publish_directory_noreplace",
+                    side_effect=unsupported,
+                ),
+                mock.patch(
+                    "plan7_gpu.telemetry_report._fsync_directory",
+                    side_effect=fail_parent,
+                ),
+            ):
+                with self.assertRaises(TelemetryReportCommittedError) as caught:
+                    collector.export(target)
+            self.assertEqual(caught.exception.target, target)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o555)
+            self.assertTrue((target / "artifact.sha256").is_file())
+            self.assertFalse(any(parent.glob(".report.tmp-*")))
+            with self.assertRaises(FileExistsError):
+                collector.export(target)
             os.chmod(target, 0o700)
 
 

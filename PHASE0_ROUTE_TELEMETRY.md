@@ -73,14 +73,26 @@ reason-by-row and reason-by-logical-cell tables, per-profile continuation CPU
 wall nanoseconds, and a stable cumulative CPU-wall Pareto ordered by
 `(-wall_ns, global_ordinal)`.
 
-`TelemetryCollector.export(path)` requires a new path and publishes the whole
-report as one same-parent atomic directory rename. It writes canonical JSON,
-profile/reason/summary/Pareto TSV files, and a SHA-256 manifest, fsyncs their
-contents and directory metadata, and seals the resulting files `0444` and
-directory `0555`.
-If the atomic rename succeeds but fsync of the parent directory fails,
-`TelemetryReportCommittedError` reports the exact already-committed target;
-callers must audit that target and must not retry publication blindly.
+`TelemetryCollector.export(path)` requires a new path. It stages canonical
+JSON, profile/reason/summary/Pareto TSV files, and a SHA-256 manifest, fsyncs
+their contents and directory metadata, and seals the files `0444`. Filesystems
+that support `renameat2(RENAME_NOREPLACE)` publish that stage with one atomic
+same-parent rename. On filesystems such as NFSv3 that reject the flag, export
+instead reserves the target with exclusive `mkdir` at mode `0700`, copies and
+rehashes every staged member through one bound directory descriptor, fsyncs
+the directory, then changes its mode to `0555` as the commit point. The
+manifest is copied last; pathname identity is checked before and after commit.
+
+A visible mode-`0700` target is deliberately incomplete: a crash or live
+failure after reservation leaves it in place, blocks reuse of the name, and
+requires audit plus explicit cleanup or a new attempt path. The portable
+fallback assumes cooperating publishers do not rename an empty reservation in
+the POSIX `mkdir`-to-`open` acquisition window; nonempty substitution is
+rejected before mutation and later substitution cannot redirect descriptor-
+bound writes or the commit chmod. Once the target reaches `0555`, failure of
+its final fsync or the parent-directory fsync raises
+`TelemetryReportCommittedError`; callers must audit that exact target and must
+not retry publication blindly.
 
 The local Astra bridge does not attempt to synthesize generation telemetry.
 `telemetry=True` or an explicit collector accepts only a precomputed sealed
