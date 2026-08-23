@@ -952,3 +952,142 @@ def build_continuation_statistics(
             "journal_row_stop": identity_values[2],
         },
     }
+
+
+def validate_continuation_statistics(value: Any) -> dict[str, Any]:
+    """Fail closed on stored continuation evidence and rebuild it exactly."""
+    required = {
+        "schema_version",
+        "scope",
+        "path",
+        "wall_ns",
+        "target_count",
+        "postfilter_record_count",
+        "routes",
+        "journal",
+        "compact",
+        "source_routes",
+        "decision_facts",
+        "identity",
+    }
+    if type(value) is not dict or set(value) != required:
+        raise ValueError("continuation statistics fields changed")
+    if value.get("scope") != "continuation":
+        raise ValueError("continuation statistics scope changed")
+
+    routes = value.get("routes")
+    route_names = (
+        "f1_reject_count",
+        "cpu_pipeline_count",
+        "definite_reject_count",
+        "filter_continuation_count",
+        "forward_continuation_count",
+        "simple_continuation_count",
+        "compact_accepted_count",
+    )
+    journal = value.get("journal")
+    journal_names = (
+        "match_count",
+        "cpu_required_count",
+        "no_region_count",
+        "simple_count",
+    )
+    compact = value.get("compact")
+    compact_names = (
+        "attempt_count",
+        "accepted_count",
+        "invalid_retry_count",
+        "threshold_retry_count",
+        "first_attempt",
+    )
+    source = value.get("source_routes")
+    source_names = (
+        "postfilter_cpu_count",
+        "definite_reject_count",
+        "filter_count",
+        "forward_count",
+        "journal_eligible_count",
+        "simple_bypass_count",
+    )
+    if type(routes) is not dict or set(routes) != set(route_names):
+        raise ValueError("continuation route fields changed")
+    if type(journal) is not dict or set(journal) != set(journal_names):
+        raise ValueError("continuation journal fields changed")
+    if type(compact) is not dict or set(compact) != set(compact_names):
+        raise ValueError("continuation compact fields changed")
+    if type(source) is not dict or set(source) != set(source_names):
+        raise ValueError("continuation source-route fields changed")
+
+    first_attempt = compact["first_attempt"]
+    if first_attempt is None:
+        first_attempt_values = (0, 0, 0, 0)
+    elif type(first_attempt) is tuple and len(first_attempt) == 4:
+        first_attempt_values = first_attempt
+    else:
+        raise ValueError("continuation compact first attempt changed")
+
+    decisions = value.get("decision_facts")
+    decision_names = {
+        "forward": (
+            "row_external_unavailable",
+            "seam_unavailable",
+            "f2_changed",
+            "f3_changed",
+            "bias_filter_changed",
+        ),
+        "journal": (
+            "storage_unavailable",
+            "simple_regions_seam_unavailable",
+            "tail_options_changed",
+        ),
+        "compact": (
+            "route_not_device",
+            "empty",
+            "tail_options_changed",
+            "rebase_unavailable",
+        ),
+    }
+    if type(decisions) is not dict or set(decisions) != set(decision_names):
+        raise ValueError("continuation decision fields changed")
+    decision_values: list[int] = []
+    for stage, names in decision_names.items():
+        stage_values = decisions.get(stage)
+        if type(stage_values) is not dict or set(stage_values) != set(names):
+            raise ValueError(f"continuation {stage} decision fields changed")
+        decision_values.extend(stage_values[name] for name in names)
+
+    identity = value.get("identity")
+    identity_names = (
+        "profile_index",
+        "journal_row_start",
+        "journal_row_stop",
+    )
+    if type(identity) is not dict or set(identity) != set(identity_names):
+        raise ValueError("continuation identity fields changed")
+
+    rebuilt = build_continuation_statistics(
+        value.get("schema_version"),
+        value.get("path"),
+        value.get("wall_ns"),
+        value.get("target_count"),
+        value.get("postfilter_record_count"),
+        tuple(routes[name] for name in route_names),
+        tuple(journal[name] for name in journal_names),
+        (
+            *(compact[name] for name in compact_names[:-1]),
+            *first_attempt_values,
+        ),
+        tuple(source[name] for name in source_names),
+        tuple(decision_values),
+        tuple(identity[name] for name in identity_names),
+    )
+    if rebuilt != value:
+        raise ValueError("continuation telemetry reconciliation changed")
+    return rebuilt
+
+
+def defensive_continuation_statistics(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and return a private copy of continuation evidence."""
+    return copy.deepcopy(validate_continuation_statistics(value))

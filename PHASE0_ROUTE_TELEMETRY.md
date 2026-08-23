@@ -51,3 +51,34 @@ The defensive Python dictionaries and tuples used to expose telemetry are
 ordinary object overhead and are intentionally outside `CandidateBatch`'s
 `resident_bytes` contract, which measures exact retained backing-buffer
 payload rather than Python-object RSS.
+
+## Collection and export
+
+`plan7_gpu.telemetry_report.TelemetryCollector` is an explicit-only,
+thread-safe join between generation chunks and CPU continuation rows. The
+caller supplies immutable global profile ordinals for each chunk; the
+collector rejects duplicates, missing continuation rows, and any mismatch
+between a continuation's local profile identity and its generation row.
+Before work, `bind_expected_profiles(...)` seals the full intended ordinal
+universe; complete snapshots and exports fail if any generation chunk or CPU
+continuation row is absent.
+Snapshots contain raw per-profile generation and continuation evidence, exact
+reason-by-row and reason-by-logical-cell tables, per-profile continuation CPU
+wall nanoseconds, and a stable cumulative CPU-wall Pareto ordered by
+`(-wall_ns, global_ordinal)`.
+
+`TelemetryCollector.export(path)` requires a new path and publishes the whole
+report as one same-parent atomic directory rename. It writes canonical JSON,
+profile/reason/summary/Pareto TSV files, and a SHA-256 manifest, fsyncs their
+contents and directory metadata, and seals the resulting files `0444` and
+directory `0555`.
+
+The local Astra bridge does not attempt to synthesize generation telemetry.
+`telemetry=True` or an explicit collector accepts only a precomputed sealed
+fused `CandidateBatch` that already carries generation evidence; a
+`SequenceBatch` or legacy batch fails synchronously before filtering/search
+work. With a collector alone, search results retain the ordinary `TopHits`
+shape. The separate production Astra integration enables native telemetry
+only when a collector is supplied, passes exact original database ordinals for
+each chunk, and otherwise preserves its existing generation and consumption
+calls.

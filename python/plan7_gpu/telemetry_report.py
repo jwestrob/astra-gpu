@@ -1,0 +1,548 @@
+"""Thread-safe collection and atomic export for opt-in Phase 0 telemetry."""
+
+from __future__ import annotations
+
+import copy
+import ctypes
+import csv
+import errno
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+from threading import Lock
+from typing import Any, Iterable
+
+from ._telemetry import (
+    defensive_continuation_statistics,
+    validate_generation_statistics,
+)
+
+
+REPORT_SCHEMA_VERSION = 1
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+def _exact_nonnegative_int(value: Any, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be an exact nonnegative integer")
+    return value
+
+
+def _profile_ordinals(values: Iterable[int], expected: int) -> tuple[int, ...]:
+    try:
+        ordinals = tuple(values)
+    except TypeError as error:
+        raise TypeError("profile_ordinals must be iterable") from error
+    if len(ordinals) != expected:
+        raise ValueError("profile ordinal count differs from generation rows")
+    for index, ordinal in enumerate(ordinals):
+        _exact_nonnegative_int(ordinal, f"profile_ordinals[{index}]")
+    if len(set(ordinals)) != len(ordinals):
+        raise ValueError("profile ordinals are not unique within the chunk")
+    return ordinals
+
+
+def _expected_profile_ordinals(values: Iterable[int]) -> tuple[int, ...]:
+    try:
+        ordinals = tuple(values)
+    except TypeError as error:
+        raise TypeError("expected profile ordinals must be iterable") from error
+    for index, ordinal in enumerate(ordinals):
+        _exact_nonnegative_int(ordinal, f"expected_profile_ordinals[{index}]")
+    if len(set(ordinals)) != len(ordinals):
+        raise ValueError("expected profile ordinals are not unique")
+    return ordinals
+
+
+def _profile_keys(
+    values: Iterable[str | None] | None, expected: int
+) -> tuple[str | None, ...]:
+    if values is None:
+        return (None,) * expected
+    try:
+        keys = tuple(values)
+    except TypeError as error:
+        raise TypeError("profile_keys must be iterable") from error
+    if len(keys) != expected:
+        raise ValueError("profile key count differs from generation rows")
+    if any(key is not None and type(key) is not str for key in keys):
+        raise TypeError("profile keys must be exact strings or None")
+    return keys
+
+
+def _publish_directory_noreplace(stage: Path, target: Path) -> None:
+    """Linux-atomically publish a directory without replacing any target."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace report publication is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        _AT_FDCWD,
+        os.fsencode(stage),
+        _AT_FDCWD,
+        os.fsencode(target),
+        _RENAME_NOREPLACE,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), target)
+        raise OSError(error_number, os.strerror(error_number), target)
+
+
+def _reason_rows(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    reason_bits = profile["_reason_fact_bits"]
+    reason_counts = profile["generation"]["reason_counts"]
+    reason_cells = profile["generation"]["reason_logical_cells"]
+    for stage, facts in reason_bits.items():
+        counts = dict(reason_counts[stage])
+        cells = dict(reason_cells[stage])
+        for reason, _bit in facts:
+            rows.append(
+                {
+                    "profile_ordinal": profile["profile_ordinal"],
+                    "profile_key": profile["profile_key"],
+                    "stage": stage,
+                    "reason": reason,
+                    "rows": counts.get(reason, 0),
+                    "logical_cells": cells.get(reason, 0),
+                }
+            )
+    return rows
+
+
+class TelemetryCollector:
+    """Join generation and continuation sidecars by exact global ordinal.
+
+    The collector is inert until passed explicitly to an integration boundary.
+    Generation rows may arrive in multiple chunks and continuation records may
+    arrive concurrently or out of order. Duplicate ordinals, missing rows, and
+    local/global identity drift fail closed before an export is created.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._chunks: list[dict[str, Any]] = []
+        self._profiles: dict[int, dict[str, Any]] = {}
+        self._expected_profile_ordinals: tuple[int, ...] | None = None
+
+    def bind_expected_profiles(self, profile_ordinals: Iterable[int]) -> None:
+        """Bind the complete intended report universe before search work."""
+        ordinals = _expected_profile_ordinals(profile_ordinals)
+        expected = frozenset(ordinals)
+        with self._lock:
+            if self._expected_profile_ordinals is not None:
+                if self._expected_profile_ordinals != ordinals:
+                    raise ValueError("expected profile ordinals changed")
+                return
+            extras = sorted(set(self._profiles) - expected)
+            if extras:
+                raise ValueError(
+                    "recorded profile ordinals are outside the expected universe"
+                )
+            self._expected_profile_ordinals = ordinals
+
+    def record_generation(
+        self,
+        generation_statistics: dict[str, Any],
+        profile_ordinals: Iterable[int],
+        *,
+        profile_keys: Iterable[str | None] | None = None,
+    ) -> int:
+        """Record one instrumented generation chunk and its global mapping."""
+        generation = validate_generation_statistics(generation_statistics)
+        count = generation["profile_count"]
+        ordinals = _profile_ordinals(profile_ordinals, count)
+        keys = _profile_keys(profile_keys, count)
+        with self._lock:
+            if self._expected_profile_ordinals is None:
+                raise RuntimeError(
+                    "expected profile universe must be bound before generation"
+                )
+            expected = frozenset(self._expected_profile_ordinals)
+            extras = sorted(set(ordinals) - expected)
+            if extras:
+                raise ValueError(
+                    "generation profile ordinals are outside the expected universe"
+                )
+            duplicate = next(
+                (ordinal for ordinal in ordinals if ordinal in self._profiles),
+                None,
+            )
+            if duplicate is not None:
+                raise ValueError(f"profile ordinal {duplicate} was already recorded")
+            chunk_index = len(self._chunks)
+            shared = {
+                name: copy.deepcopy(value)
+                for name, value in generation.items()
+                if name != "profiles"
+            }
+            self._chunks.append(
+                {
+                    "chunk_index": chunk_index,
+                    "profile_ordinals": ordinals,
+                    "profile_keys": keys,
+                    "generation": shared,
+                }
+            )
+            reason_fact_bits = generation["reason_fact_bits"]
+            for local_index, (ordinal, key, row) in enumerate(
+                zip(ordinals, keys, generation["profiles"], strict=True)
+            ):
+                self._profiles[ordinal] = {
+                    "profile_ordinal": ordinal,
+                    "profile_key": key,
+                    "chunk_index": chunk_index,
+                    "chunk_profile_index": local_index,
+                    "target_count": generation["target_count"],
+                    "target_residues": generation["total_target_residues"],
+                    "generation": copy.deepcopy(row),
+                    "continuation": None,
+                    "_reason_fact_bits": copy.deepcopy(reason_fact_bits),
+                }
+            return chunk_index
+
+    def record_continuation(
+        self,
+        profile_ordinal: int,
+        continuation_statistics: dict[str, Any],
+    ) -> None:
+        """Bind one validated CPU-continuation record to its generation row."""
+        ordinal = _exact_nonnegative_int(profile_ordinal, "profile_ordinal")
+        continuation = defensive_continuation_statistics(
+            continuation_statistics
+        )
+        with self._lock:
+            profile = self._profiles.get(ordinal)
+            if profile is None:
+                raise ValueError(
+                    f"profile ordinal {ordinal} has no generation record"
+                )
+            if profile["continuation"] is not None:
+                raise ValueError(
+                    f"profile ordinal {ordinal} continuation was already recorded"
+                )
+            if (
+                continuation["identity"]["profile_index"]
+                != profile["chunk_profile_index"]
+            ):
+                raise ValueError(
+                    "continuation local profile identity differs from generation"
+                )
+            profile["continuation"] = continuation
+
+    def snapshot(self, *, require_complete: bool = True) -> dict[str, Any]:
+        """Return canonical raw records, reason totals, and a CPU-wall Pareto."""
+        if type(require_complete) is not bool:
+            raise TypeError("require_complete must be bool")
+        with self._lock:
+            chunks = copy.deepcopy(self._chunks)
+            stored_profiles = copy.deepcopy(self._profiles)
+            expected_ordinals = self._expected_profile_ordinals
+
+        missing_continuation = sorted(
+            ordinal
+            for ordinal, profile in stored_profiles.items()
+            if profile["continuation"] is None
+        )
+        missing_generation = (
+            ()
+            if expected_ordinals is None
+            else tuple(
+                ordinal
+                for ordinal in expected_ordinals
+                if ordinal not in stored_profiles
+            )
+        )
+        if require_complete and expected_ordinals is None:
+            raise RuntimeError("expected profile universe is not bound")
+        if require_complete and (missing_generation or missing_continuation):
+            raise RuntimeError(
+                "Phase 0 telemetry is incomplete: missing generation="
+                + ",".join(str(value) for value in missing_generation[:16])
+                + "; missing continuation="
+                + ",".join(str(value) for value in missing_continuation[:16])
+            )
+
+        profiles = []
+        reason_rows = []
+        for ordinal in sorted(stored_profiles):
+            profile = stored_profiles[ordinal]
+            reason_rows.extend(_reason_rows(profile))
+            profile.pop("_reason_fact_bits")
+            continuation = profile["continuation"]
+            profile["continuation_cpu_wall_ns"] = (
+                None if continuation is None else continuation["wall_ns"]
+            )
+            profiles.append(profile)
+
+        reason_summary: dict[tuple[str, str], list[int]] = {}
+        for row in reason_rows:
+            key = (row["stage"], row["reason"])
+            totals = reason_summary.setdefault(key, [0, 0])
+            totals[0] += row["rows"]
+            totals[1] += row["logical_cells"]
+        reason_totals = [
+            {
+                "stage": stage,
+                "reason": reason,
+                "rows": totals[0],
+                "logical_cells": totals[1],
+            }
+            for (stage, reason), totals in reason_summary.items()
+        ]
+
+        complete_profiles = [
+            profile
+            for profile in profiles
+            if profile["continuation_cpu_wall_ns"] is not None
+        ]
+        ranked = sorted(
+            complete_profiles,
+            key=lambda profile: (
+                -profile["continuation_cpu_wall_ns"],
+                profile["profile_ordinal"],
+            ),
+        )
+        total_wall_ns = sum(
+            profile["continuation_cpu_wall_ns"] for profile in ranked
+        )
+        cumulative = 0
+        pareto = []
+        for rank, profile in enumerate(ranked, 1):
+            cumulative += profile["continuation_cpu_wall_ns"]
+            pareto.append(
+                {
+                    "rank": rank,
+                    "profile_ordinal": profile["profile_ordinal"],
+                    "profile_key": profile["profile_key"],
+                    "continuation_cpu_wall_ns": (
+                        profile["continuation_cpu_wall_ns"]
+                    ),
+                    "cumulative_cpu_wall_ns": cumulative,
+                    "total_cpu_wall_ns": total_wall_ns,
+                    "cumulative_fraction_numerator": cumulative,
+                    "cumulative_fraction_denominator": total_wall_ns,
+                }
+            )
+
+        complete = (
+            expected_ordinals is not None
+            and not missing_generation
+            and not missing_continuation
+        )
+        return {
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "scope": "phase0_route_telemetry_report",
+            "complete": complete,
+            "expected_profile_ordinals": expected_ordinals,
+            "missing_generation_profile_ordinals": tuple(missing_generation),
+            "missing_continuation_profile_ordinals": tuple(
+                missing_continuation
+            ),
+            "chunk_count": len(chunks),
+            "expected_profile_count": (
+                None if expected_ordinals is None else len(expected_ordinals)
+            ),
+            "profile_count": len(profiles),
+            "continuation_cpu_wall_ns": total_wall_ns,
+            "chunks": tuple(chunks),
+            "profiles": tuple(profiles),
+            "reason_rows": tuple(reason_rows),
+            "reason_totals": tuple(reason_totals),
+            "pareto": tuple(pareto),
+        }
+
+    def export(self, directory: os.PathLike[str] | str) -> dict[str, Path]:
+        """Atomically publish one immutable, complete report directory."""
+        snapshot = self.snapshot(require_complete=True)
+        target = Path(directory)
+        if not target.name:
+            raise ValueError("report directory must have a final path component")
+        parent = target.parent
+        if not parent.is_dir() or parent.is_symlink():
+            raise ValueError("report parent must be an existing real directory")
+        if os.path.lexists(target):
+            raise FileExistsError(target)
+
+        stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=parent))
+        try:
+            payloads = self._render(snapshot)
+            hashes = []
+            for name, payload in payloads.items():
+                path = stage / name
+                with path.open("xb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                path.chmod(0o444)
+                hashes.append((name, hashlib.sha256(payload).hexdigest()))
+            manifest = "".join(
+                f"{digest}  {name}\n" for name, digest in sorted(hashes)
+            ).encode("ascii")
+            manifest_path = stage / "artifact.sha256"
+            with manifest_path.open("xb") as stream:
+                stream.write(manifest)
+                stream.flush()
+                os.fsync(stream.fileno())
+            manifest_path.chmod(0o444)
+            directory_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            stage.chmod(0o555)
+            _publish_directory_noreplace(stage, target)
+            parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except BaseException:
+            if stage.exists():
+                stage.chmod(0o700)
+                for child in stage.iterdir():
+                    child.chmod(0o600)
+                shutil.rmtree(stage)
+            raise
+        return {
+            name: target / name
+            for name in (*self._render_names(), "artifact.sha256")
+        }
+
+    @staticmethod
+    def _render_names() -> tuple[str, ...]:
+        return (
+            "phase0-raw.json",
+            "phase0-profiles.tsv",
+            "phase0-reasons.tsv",
+            "phase0-reason-summary.tsv",
+            "phase0-pareto.tsv",
+        )
+
+    @staticmethod
+    def _render(snapshot: dict[str, Any]) -> dict[str, bytes]:
+        raw = (
+            json.dumps(
+                snapshot,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+
+        profiles = snapshot["profiles"]
+        count_names = tuple(profiles[0]["generation"]["counts"]) if profiles else ()
+        cell_names = (
+            tuple(profiles[0]["generation"]["logical_cells"])
+            if profiles
+            else ()
+        )
+        route_names = (
+            tuple(profiles[0]["continuation"]["routes"])
+            if profiles
+            else ()
+        )
+        profile_header = (
+            "profile_ordinal",
+            "profile_key",
+            "chunk_index",
+            "chunk_profile_index",
+            "model_length",
+            "target_count",
+            "target_residues",
+            *(f"generation.{name}" for name in count_names),
+            *(f"generation.{name}" for name in cell_names),
+            "generation.journal_row_count",
+            "generation.journal_region_count",
+            "continuation_cpu_wall_ns",
+            "continuation.path",
+            *(f"continuation.{name}" for name in route_names),
+        )
+        profile_rows = []
+        for profile in profiles:
+            generation = profile["generation"]
+            continuation = profile["continuation"]
+            profile_rows.append(
+                (
+                    profile["profile_ordinal"],
+                    profile["profile_key"] or "",
+                    profile["chunk_index"],
+                    profile["chunk_profile_index"],
+                    generation["model_length"],
+                    profile["target_count"],
+                    profile["target_residues"],
+                    *(generation["counts"][name] for name in count_names),
+                    *(generation["logical_cells"][name] for name in cell_names),
+                    generation["journal"]["row_count"],
+                    generation["journal"]["region_count"],
+                    profile["continuation_cpu_wall_ns"],
+                    continuation["path"],
+                    *(continuation["routes"][name] for name in route_names),
+                )
+            )
+
+        reason_header = (
+            "profile_ordinal",
+            "profile_key",
+            "stage",
+            "reason",
+            "rows",
+            "logical_cells",
+        )
+        reason_rows = [
+            tuple(row[name] for name in reason_header)
+            for row in snapshot["reason_rows"]
+        ]
+        summary_header = ("stage", "reason", "rows", "logical_cells")
+        summary_rows = [
+            tuple(row[name] for name in summary_header)
+            for row in snapshot["reason_totals"]
+        ]
+        pareto_header = (
+            "rank",
+            "profile_ordinal",
+            "profile_key",
+            "continuation_cpu_wall_ns",
+            "cumulative_cpu_wall_ns",
+            "total_cpu_wall_ns",
+            "cumulative_fraction_numerator",
+            "cumulative_fraction_denominator",
+        )
+        pareto_rows = [
+            tuple(row[name] if row[name] is not None else "" for name in pareto_header)
+            for row in snapshot["pareto"]
+        ]
+
+        def tsv(header: tuple[str, ...], rows: list[tuple[Any, ...]]) -> bytes:
+            output = io.StringIO(newline="")
+            writer = csv.writer(output, delimiter="\t", lineterminator="\n")
+            writer.writerow(header)
+            writer.writerows(rows)
+            return output.getvalue().encode("utf-8")
+
+        return {
+            "phase0-raw.json": raw,
+            "phase0-profiles.tsv": tsv(profile_header, profile_rows),
+            "phase0-reasons.tsv": tsv(reason_header, reason_rows),
+            "phase0-reason-summary.tsv": tsv(summary_header, summary_rows),
+            "phase0-pareto.tsv": tsv(pareto_header, pareto_rows),
+        }
+
+
+__all__ = ["REPORT_SCHEMA_VERSION", "TelemetryCollector"]

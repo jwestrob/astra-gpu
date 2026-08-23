@@ -24,7 +24,7 @@ from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 import operator
 from threading import local
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import pyhmmer
 
@@ -34,6 +34,9 @@ from .adapter import (
     SequenceBatch,
     _candidate_state,
 )
+
+if TYPE_CHECKING:
+    from .telemetry_report import TelemetryCollector
 
 
 _MAX_ROWS_PER_TASK = 8
@@ -172,11 +175,25 @@ def _search_row(
     row: int,
     pipeline: Any,
     telemetry: bool,
+    collector: TelemetryCollector | None = None,
+    profile_ordinal: int | None = None,
 ) -> Any:
     try:
-        hits = candidates.search(
-            row, pipeline, return_telemetry=telemetry
-        )
+        if collector is None:
+            result = candidates.search(
+                row, pipeline, return_telemetry=telemetry
+            )
+        else:
+            result = candidates.search(
+                row, pipeline, return_telemetry=True
+            )
+            if type(result) is not tuple or len(result) != 2:
+                raise RuntimeError("instrumented candidate search shape changed")
+            if profile_ordinal is None:
+                raise RuntimeError("collector search lacks a profile ordinal")
+            hits, continuation = result
+            collector.record_continuation(profile_ordinal, continuation)
+            result = result if telemetry else hits
     except BaseException:
         # Match PyHMMER's worker lifecycle and leave no dirty pipeline queued
         # for another row if the failure happened after pipeline mutation.
@@ -186,17 +203,31 @@ def _search_row(
             pass
         raise
     pipeline.clear()
-    return hits
+    return result
 
 
 def _serial_hmmsearch(
     candidates: CandidateBatch,
     pipeline_options: dict[str, Any],
     telemetry: bool,
+    collector: TelemetryCollector | None = None,
+    profile_ordinals: tuple[int, ...] | None = None,
 ) -> Iterator[Any]:
+    if collector is not None and profile_ordinals is None:
+        raise RuntimeError("collector search lacks profile ordinals")
     pipeline = pyhmmer.plan7.Pipeline(**pipeline_options)
     for row in range(len(candidates)):
-        yield _search_row(candidates, row, pipeline, telemetry)
+        if collector is None:
+            yield _search_row(candidates, row, pipeline, telemetry)
+        else:
+            yield _search_row(
+                candidates,
+                row,
+                pipeline,
+                telemetry,
+                collector,
+                profile_ordinals[row],
+            )
 
 
 def _threaded_hmmsearch(
@@ -204,7 +235,11 @@ def _threaded_hmmsearch(
     cpus: int,
     pipeline_options: dict[str, Any],
     telemetry: bool,
+    collector: TelemetryCollector | None = None,
+    profile_ordinals: tuple[int, ...] | None = None,
 ) -> Iterator[Any]:
+    if collector is not None and profile_ordinals is None:
+        raise RuntimeError("collector search lacks profile ordinals")
     worker_count = min(cpus, len(candidates))
     worker_state = local()
 
@@ -231,9 +266,21 @@ def _threaded_hmmsearch(
         hits = []
         for row in range(start, stop):
             try:
-                hits.append(
-                    _search_row(candidates, row, pipeline, telemetry)
-                )
+                if collector is None:
+                    hits.append(
+                        _search_row(candidates, row, pipeline, telemetry)
+                    )
+                else:
+                    hits.append(
+                        _search_row(
+                            candidates,
+                            row,
+                            pipeline,
+                            telemetry,
+                            collector,
+                            profile_ordinals[row],
+                        )
+                    )
             except BaseException as error:
                 # A task must preserve row-wise failure order: successful rows
                 # before the failing row are yielded before this exact error.
@@ -291,6 +338,9 @@ def hmmsearch(
     cpus: int = 1,
     postfilter: bool = False,
     telemetry: bool = False,
+    telemetry_collector: TelemetryCollector | None = None,
+    profile_ordinals: Iterable[int] | None = None,
+    profile_keys: Iterable[str | None] | None = None,
     **pipeline_options: Any,
 ) -> Iterator[Any]:
     """Yield candidate-aware HMM searches in supplied query order.
@@ -309,12 +359,46 @@ def hmmsearch(
     chunks of at most eight rows each, bounding both the reorder buffer and
     queued work.  The returned iterator owns all pipelines and worker threads
     until it is exhausted or closed.
+
+    Telemetry is deliberately narrower than ordinary candidate generation.
+    ``telemetry=True`` or an explicit ``telemetry_collector`` requires a
+    precomputed sealed fused :class:`CandidateBatch` whose generation sidecar
+    is already present; unsupported ``SequenceBatch`` or legacy batches are
+    rejected synchronously before filtering or searching begins. A collector
+    records validated continuation evidence while preserving ordinary
+    ``TopHits`` output unless ``telemetry=True`` also requests the historical
+    ``(TopHits, evidence)`` opt-in shape.
     """
     worker_count = _positive_cpus(cpus)
     if type(postfilter) is not bool:
         raise TypeError("postfilter must be bool")
     if type(telemetry) is not bool:
         raise TypeError("telemetry must be bool")
+    if telemetry_collector is not None:
+        from .telemetry_report import TelemetryCollector
+
+        if type(telemetry_collector) is not TelemetryCollector:
+            raise TypeError(
+                "telemetry_collector must be exactly TelemetryCollector"
+            )
+    if telemetry_collector is None and (
+        profile_ordinals is not None or profile_keys is not None
+    ):
+        raise ValueError(
+            "profile ordinals and keys require an explicit telemetry collector"
+        )
+    telemetry_requested = telemetry or telemetry_collector is not None
+    if telemetry_requested:
+        if type(batch) is not CandidateBatch:
+            raise ValueError(
+                "telemetry requires a precomputed sealed fused CandidateBatch; "
+                "SequenceBatch generation is not instrumented by this bridge"
+            )
+        if batch.generation_statistics is None:
+            raise ValueError(
+                "telemetry requires a precomputed CandidateBatch generated "
+                "with telemetry=True"
+            )
     pairs = _pressed_pairs(profile_pairs)
     options = dict(pipeline_options)
     candidates = _prepare_candidates(pairs, batch, options, postfilter)
@@ -323,12 +407,45 @@ def hmmsearch(
         # This should be guaranteed by CandidateBatch construction, but keep
         # the bridge's row/query contract explicit at its trust boundary.
         raise ValueError("candidate row count does not match profile pair count")
+    ordinal_values: tuple[int, ...] | None = None
+    if telemetry_collector is not None:
+        ordinal_values = (
+            tuple(pair.ordinal for pair in pairs)
+            if profile_ordinals is None
+            else tuple(profile_ordinals)
+        )
+        key_values = None if profile_keys is None else tuple(profile_keys)
+        generation_statistics = candidates.generation_statistics
+        if generation_statistics is None:
+            raise RuntimeError("instrumented generation statistics disappeared")
+        telemetry_collector.record_generation(
+            generation_statistics,
+            ordinal_values,
+            profile_keys=key_values,
+        )
     if not pairs:
         return iter(())
     if worker_count == 1:
-        return _serial_hmmsearch(candidates, options, telemetry)
+        if telemetry_collector is None:
+            return _serial_hmmsearch(candidates, options, telemetry)
+        return _serial_hmmsearch(
+            candidates,
+            options,
+            telemetry,
+            telemetry_collector,
+            ordinal_values,
+        )
+    if telemetry_collector is None:
+        return _threaded_hmmsearch(
+            candidates, worker_count, options, telemetry
+        )
     return _threaded_hmmsearch(
-        candidates, worker_count, options, telemetry
+        candidates,
+        worker_count,
+        options,
+        telemetry,
+        telemetry_collector,
+        ordinal_values,
     )
 
 
