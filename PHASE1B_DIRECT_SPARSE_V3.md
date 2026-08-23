@@ -36,12 +36,34 @@ time plus certificate/exception visits.
 
 ## Benchmark result
 
-Pending the visible-GPU gates. This change removes dense-v2 construction and
-retention, but deliberately retains the Phase 1A two-pass sparse planner. Its
-measured planning cost therefore remains a separate optimization target.
+The visible-GPU gate passed on an attested H200, including real Forward,
+simple-region, and compact-domain routes.  Full job `1182378` then reproduced
+the CPU64 output exactly (SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
+39,010,327 bytes, 383,235 lines).
+
+Direct generation allocated and retained zero dense-v2 bytes and dropped all
+transient staging ownership.  It eliminated a counterfactual 9,890,721,120
+dense-v2 bytes while retaining the 5,801,342,068-byte sparse packet.  Request
+wall was 545.983 seconds versus 546.221 seconds for sealed dense v2: a
+0.043% difference, effectively a tie.  Generation was 478.207 seconds, CPU
+continuation/output 399.914 seconds, and overlap 339.643 seconds.
+
+The reason is explicit in the counters: direct staging cost 3.310 seconds,
+but the retained two-pass sparse planner and validator still cost 20.445 and
+8.559 seconds.  Removing dense-v2 construction recovered the Phase 1A
+regression, but did not produce the required material speedup.
+
+Raw execution and validation records are rooted at
+`build/phase1b-benchmark-harness/build/h200-phase1b-direct-v3-20260823/attempt-01-full`.
+The immutable worker and raw-validation JSON SHA-256 values are respectively
+`b34a78e71c2be8567be4cd4bd004e1eb896ccde0d7497866886d7da7e08ea338`
+and `2483c29ec65928088279168c704ed146591847017280c5543a7bd5aee3ac0be0`.
 
 ## Decision
 
-Retain provisionally behind explicit `sparse_journal_v3=True`. Do not switch
-the default or remove v2 until the first-1000 and full-workload equivalence and
-performance gates pass.
+Retain behind explicit `sparse_journal_v3=True` as the exact sparse/audit path;
+do not switch the default.  The direct source is semantically accepted but its
+performance hypothesis is rejected.  The next retained experiment fuses the
+decision plan into the existing F2/Forward/domain generation walks so packet
+emission needs only one dense source scan and no separate decision scan.
