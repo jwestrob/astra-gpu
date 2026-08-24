@@ -51,8 +51,8 @@ the complete oracle suite and representative end-to-end workloads.
 | 5 | Profile-axis packed SSV | complete; retained | through `9730f39` | exact job 1182734: 455.026 s, 14.98% faster than retained Phase 3 |
 | 6 | Length-cohort decision metadata | complete; retained | through `cfd756c` | exact job 1182743: 454.247 s; transition H2D reduced 24.92 MB -> 0.12 MB |
 | 7 | Packed integer MSV/Viterbi | MSV retained; Viterbi rejected | through `f5ac24a` | packed MSV exact/flat at 454.007 s; packed Viterbi exact but slower and larger, so excluded from `main` |
-| 8 | Certified reduced-alphabet F0 | active; evaluator only | pending | prove zero false negatives and measure selectivity/cost before any production integration |
-| 9 | GA-specialized certified pruning | pending research | pending | source proof and reject census required before implementation |
+| 8 | Certified reduced-alphabet F0 | complete; production rejected | through `913be5d` | exact job 1182800: best codebook certified only 0.145% of cells while F0 cost about 1.9x exact packed F1 |
+| 9 | GA-specialized certified pruning | active research | pending | source proof and reject census required before implementation |
 | 10 | Mandatory-seed/global-profile index | pending research | pending | optional/cached only; formal sensitivity proof required |
 | 11 | Internal GPU execution policy | pending | pending | deterministic policy only after multiple retained GPU algorithms exist |
 
@@ -279,14 +279,11 @@ The immutable run evidence is under
 
 ## Remaining implementation order
 
-1. Phase 8: evaluate certified reduced-alphabet F0 offline. Integrate only if
-   the proof is exact, false negatives are zero, and saved SSV work clearly
-   exceeds added runtime and memory.
-2. Phase 9: census GA-specialized early rejects only after proving a valid
+1. Phase 9: census GA-specialized early rejects only after proving a valid
    upper bound from exact HMMER scoring semantics.
-3. Phase 10: keep mandatory-seed/global-profile indexing as an optional
+2. Phase 10: keep mandatory-seed/global-profile indexing as an optional
    research path with a formal sensitivity proof and no small-workload tax.
-4. Phase 11: add a deterministic internal GPU policy only for validated GPU
+3. Phase 11: add a deterministic internal GPU policy only for validated GPU
    algorithms; retain force-policy controls and the simple path.
 
 Every retained full-workload result will continue to report exact output

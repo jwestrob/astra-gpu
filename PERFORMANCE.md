@@ -137,6 +137,16 @@ and the execution permutation added 814,684,436 bytes of H2D traffic. The
 implementation is rejected and excluded from `main`; its isolated commit
 `61c3545` and immutable evidence remain available for inspection.
 
+Phase 8 H200 job `1182800` evaluated certified reduced-alphabet F0 across all
+27,481 Pfam profiles and the immutable first 1,000 targets. All fixed and
+codebook partitions had zero false rejects, and a singleton 29-class partition
+exactly reproduced the 879,857-candidate F1 mask. The best fixed eight-class
+bound certified only 0.1412% of logical SSV cells; a 32-partition per-profile
+codebook improved that to only 0.1450%. Meanwhile the F0 kernel took 1.297
+seconds versus 0.678 seconds for exact packed F1 and added 36.7 MiB of
+temporary HBM. Production F0 is rejected; the offline evaluator and negative
+evidence are retained.
+
 ## GPU request-stage ledger
 
 The measured 546.220704615 s request decomposed as follows:
@@ -212,6 +222,7 @@ These paths exist in the development workspace and are excluded from Git because
 - Phase 7 full-MSV compaction full run: `build/h200-phase7-msv-compaction-20260824/attempt-01-full/runs/h200-full`; worker SHA-256 `856819b4f605c2a0ac91c2c1d34839ba3bd765fb90fffc615e7f5ab0cb8c3f8e`, raw-validation SHA-256 `2a6bf3e53c3a55e919de3a3122fa5130b5192bb2f8d9e98af180067d57b94935`.
 - Phase 7 packed full-MSV full run: `build/h200-phase7-packed-msv-20260824/attempt-01-full/runs/h200-full`; worker SHA-256 `53f958666c3eaeee3dcd9b19ace58e831b5dc235a2f0b57e8721a0295f5218e9`, raw-validation SHA-256 `1615f9180674b669aae26ec1536bef9e197ba01cc522fe13f7fbd23df5b00c4d`.
 - Rejected packed-Viterbi full run: `build/h200-phase7-packed-viterbi-20260824/attempt-03-full/runs/h200-full`; worker SHA-256 `3f47ae09605d23dce158e5a0d6ebe7606221ee2ab7c08e9840aa6c5c94daf10d`, raw-validation SHA-256 `2192571756e5dda6daef9c4b42bc310ef05cfac961d86c9aa6ebdd25489e13c6`.
+- Phase 8 reduced-alphabet F0 census: `build/phase8-f0-evaluator-h200-20260824/attempt-02/result.json`, SHA-256 `071822c93880ad98a190e0fdd2593c14c514acb786c1968b41a5b1dd7afc960d`.
 - CPU48 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu48/artifact.sha256`, manifest SHA-256 `9e6d4d96073c565a9b61fac5b804f98dd5f7ec57dd67af07c5a289b198dadd42`.
 - CPU64 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu64/artifact.sha256`, manifest SHA-256 `e3a2e4cd5674addfe347aa8c4604571a5bdc38f14b8e9fdade60f71cf5f35b46`.
 - CPU semantic normalization report: `build/astra-full-plm-pfam-cpu-comparison-20260817/runs/validation-01/comparison.json`, SHA-256 `78bee4fd2d03c2658d0779345893f89e6dc3777f1a380123a85c25c9a9b2525`.

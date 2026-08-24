@@ -26,6 +26,7 @@ hashes live in `PERFORMANCE.md`.
 | 5 | `9730f39` | Length-compatible profile-packed SSV retained; full request fell to 455.026 s. |
 | 6 | `cfd756c` | Target-length metadata retained; transition H2D fell from 24.92 MB to 0.12 MB. |
 | 7 | `f5ac24a` | Full-MSV compaction and exact packed full MSV retained; request 454.007 s. |
+| 8 | `913be5d` | Certified F0 evaluator retained as evidence; production F0 rejected after exact H200 census. |
 
 ## Rejected or non-production experiments
 
@@ -37,14 +38,17 @@ hashes live in `PERFORMANCE.md`.
 - Packed Viterbi at isolated commit `61c3545`: exact, but 0.211% slower than
   packed full MSV, with 94,836 KiB more RSS and 814,684,436 bytes of added
   execution-index H2D. It is not merged into `main`.
+- Reduced-alphabet F0: zero false rejects, but the best 32-partition codebook
+  certified only 0.145% of SSV cells while F0 itself cost about 1.9x exact
+  packed F1. The offline evaluator remains; production integration is rejected.
 
 ## Work now in progress
 
-Phase 8 is an offline certified reduced-alphabet F0 evaluator. No unfinished
-Phase 8 source is part of this `main` history record. It must prove an upper
-bound with zero false negatives and demonstrate a runtime or memory benefit
-before production integration. Phases 9-11 remain ordered research and policy
-work as listed in `PLAN7_ENGINE_ROADMAP.md`.
+Phase 9 now investigates GA-specialized certified pruning. It must first prove
+an exact upper bound from HMMER's source formulas and measure the possible
+reject census; no hot-path code is justified before both are positive. Phases
+10-11 remain ordered research and policy work as listed in
+`PLAN7_ENGINE_ROADMAP.md`.
 
 For the complete commit-by-commit history, run:
 
