@@ -197,3 +197,24 @@ request wall took 539.052 seconds versus 535.213 seconds (+0.72%). The policy
 is rejected and production is restored to width 1. Wider Forward and Backward
 variants remain private diagnostics only; Phase 5 proceeds from the stable
 width-1 production path.
+
+## Phase 5 profile-axis packed SSV result
+
+The standalone H200 experiment proved exact four-profile signed-byte SSV and
+measured 1.45--1.49x kernel speedups for equal or length-sorted profiles, while
+also showing that deliberately divergent quartets are harmful. Production
+therefore packs only stable length-compatible quartets, retains original
+profile ordinals, and sends small selections, unsuitable quartets, and
+leftovers through the unchanged scalar kernel.
+
+Focused production job `1182733` proved forced-scalar versus packed equality
+for complete postfilter records and final HMMER output. Full job `1182734`
+then reproduced the established 39,010,327-byte output exactly over all
+8,249,411,466 logical comparisons. It completed in 455.026 seconds versus
+535.213 seconds for retained Phase 3, a 14.982% request-wall improvement.
+Generation fell 25.520%, from 463.471 to 345.195 seconds. The packed path
+covered 27,160 of 27,481 profiles across all 83 chunks, with only 321 scalar
+fallback profiles and 3,372 MiB peak sampled H200 memory.
+
+Phase 5 is retained. Phase 6 proceeds from this path and targets exact
+length-dependent execution metadata without changing logical sequence order.
