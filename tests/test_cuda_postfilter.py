@@ -1,10 +1,12 @@
 import ctypes
 import math
+import os
 import platform
 import struct
 import sys
 import threading
 import unittest
+from unittest import mock
 from array import array
 from pathlib import Path
 
@@ -221,6 +223,80 @@ class CudaPostfilterTests(unittest.TestCase):
         self.assertTrue(batch.closed)
         with self.assertRaisesRegex(RuntimeError, "closed"):
             _ = batch.workspace_statistics
+
+    def test_compact_full_msv_matches_legacy_rows_exactly(self):
+        with pyhmmer.plan7.HMMFile(HMM_20AA) as hmm_file:
+            range_hmm = hmm_file.read()
+        with pyhmmer.plan7.HMMFile(DATA / "hmms" / "txt" / "Thioesterase.hmm") as hmm_file:
+            ordinary_hmm = hmm_file.read()
+        background = pyhmmer.plan7.Background(range_hmm.alphabet)
+        profiles = [
+            range_hmm.to_profile(background, L=100).to_optimized(),
+            ordinary_hmm.to_profile(background, L=100).to_optimized(),
+        ]
+        sequences = digitize(
+            profiles[0],
+            [
+                "ACDEX",
+                "ACDEX" * 3,
+                "ACDEFGHIKLMNPQRSTVWY",
+                "A" * 100,
+                "G" * 100,
+                "MKTIIALSYIFCLVFADYKDDDDK",
+                "RSTVWYACDEFGHIKLMNPQ",
+                "VVVVVVVVVVVVVVVVVVVV",
+            ],
+        )
+        packed = _pack_profiles(profiles)
+        packed_bias, mu, lambda_ = bias_inputs(background, profiles, 1.0)
+
+        def run(policy):
+            with mock.patch.dict(
+                os.environ, {"PLAN7_GPU_FULL_MSV_POLICY": policy}
+            ):
+                with _native.ViterbiProfiles(profiles) as resident:
+                    with native_batch(sequences) as batch:
+                        records, offsets = (
+                            batch.postfilter_candidates_many_csr_raw(
+                                *packed,
+                                mu,
+                                lambda_,
+                                1.0,
+                                packed_bias,
+                                profiles,
+                                resident,
+                            )
+                        )
+                        statistics = dict(batch.workspace_statistics)
+            return bytes(records), list(offsets), statistics
+
+        legacy_records, legacy_offsets, legacy = run("legacy")
+        compact_records, compact_offsets, compact = run("compact")
+        self.assertEqual(compact_offsets, legacy_offsets)
+        self.assertEqual(compact_records, legacy_records)
+        candidate_count = len(compact_records) // struct.calcsize(POSTFILTER_FORMAT)
+        self.assertEqual(legacy["full_msv_legacy_run_count"], 1)
+        self.assertEqual(legacy["full_msv_compaction_run_count"], 0)
+        self.assertEqual(legacy["full_msv_launch_candidate_count"], candidate_count)
+        self.assertEqual(compact["full_msv_compaction_run_count"], 1)
+        self.assertEqual(compact["full_msv_legacy_run_count"], 0)
+        self.assertEqual(compact["full_msv_compaction_source_count"], candidate_count)
+        self.assertGreater(compact["full_msv_compaction_selected_count"], 0)
+        self.assertLess(
+            compact["full_msv_compaction_selected_count"], candidate_count
+        )
+        self.assertEqual(
+            compact["full_msv_launch_candidate_count"],
+            compact["full_msv_compaction_selected_count"],
+        )
+        self.assertEqual(
+            compact["full_msv_launch_candidate_avoided_count"],
+            candidate_count - compact["full_msv_compaction_selected_count"],
+        )
+        self.assertEqual(
+            compact["full_msv_index_d2h_bytes"],
+            4 * compact["full_msv_compaction_selected_count"],
+        )
 
     def test_versioned_abi_and_direct_prefix(self):
         self.assertEqual(_native.POSTFILTER_RECORD_VERSION, 1)

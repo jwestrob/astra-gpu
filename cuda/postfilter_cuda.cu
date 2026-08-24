@@ -2,6 +2,8 @@
 #include "forward_cuda.h"
 
 #include <cuda_runtime.h>
+#include <cub/device/device_select.cuh>
+#include <cub/iterator/counting_input_iterator.cuh>
 
 extern "C" {
 #include <easel.h>
@@ -15,6 +17,7 @@ extern "C" {
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -45,6 +48,7 @@ constexpr int kWarpsPerBlock = 8;
 constexpr int kThreads = kWarpSize * kWarpsPerBlock;
 constexpr int kNegInf = -32768;
 constexpr uint64_t kDpByteLimit = UINT64_C(256) << 20;
+constexpr size_t kFullMsvCompactSourceChunk = UINT64_C(4) << 20;
 constexpr double kLog2 = 0.69314718055994529;
 
 enum CandidateState : uint8_t {
@@ -133,6 +137,10 @@ bool checked_bytes(size_t count, size_t size, size_t *bytes) {
   if (size != 0 && count > SIZE_MAX / size) return false;
   *bytes = count * size;
   return true;
+}
+
+void saturating_counter_add(uint64_t value, uint64_t *counter) {
+  *counter = value > UINT64_MAX - *counter ? UINT64_MAX : *counter + value;
 }
 
 bool aligned_vector_address(const void *allocation, uintptr_t *address) {
@@ -329,7 +337,8 @@ __global__ void full_msv_kernel(
     const uint8_t *compact_scores, const uint8_t *exact_rbv,
     const plan7_ssv_f1_profile *msv_profiles,
     const VitProfile *vit_profiles, const uint8_t *tjb,
-    const plan7_bias_candidate *candidates, const uint64_t *dp_offsets,
+    const plan7_bias_candidate *candidates,
+    const uint32_t *candidate_indices, const uint64_t *dp_offsets,
     size_t candidate_begin, size_t tile_count, uint64_t tile_dp_begin,
     uint8_t *dp_storage, plan7_bias_ssv_input *msv_results) {
   const int warp_in_block = threadIdx.x / kWarpSize;
@@ -337,7 +346,10 @@ __global__ void full_msv_kernel(
   const size_t tile_candidate =
       static_cast<size_t>(blockIdx.x) * kWarpsPerBlock + warp_in_block;
   if (tile_candidate >= tile_count) return;
-  const size_t candidate = candidate_begin + tile_candidate;
+  const size_t candidate_position = candidate_begin + tile_candidate;
+  const size_t candidate = candidate_indices == nullptr
+      ? candidate_position
+      : static_cast<size_t>(candidate_indices[candidate_position]);
   if (msv_results[candidate].status != PLAN7_SSV_ENORESULT) return;
 
   const plan7_bias_candidate mapping = candidates[candidate];
@@ -350,7 +362,8 @@ __global__ void full_msv_kernel(
       sequence_offsets[mapping.sequence_index + 1] - sequence_start);
   const unsigned candidate_tjb =
       tjb[profile.tjb_offset + mapping.sequence_index];
-  uint8_t *dp = dp_storage + dp_offsets[candidate] - tile_dp_begin;
+  uint8_t *dp =
+      dp_storage + dp_offsets[candidate_position] - tile_dp_begin;
   for (int q = 0; q < q_count; ++q)
     dp[q * kWarpSize + lane] = 0;
 
@@ -420,6 +433,14 @@ __global__ void full_msv_kernel(
     };
   }
 }
+
+struct FullMsvCandidatePredicate {
+  const plan7_bias_ssv_input *results;
+
+  __host__ __device__ bool operator()(const uint32_t candidate) const {
+    return results[candidate].status == PLAN7_SSV_ENORESULT;
+  }
+};
 
 __global__ void postfilter_full_msv_execution_facts_kernel(
     const plan7_bias_ssv_input *msv_results, size_t candidate_count,
@@ -1305,6 +1326,7 @@ struct plan7_profile_selection {
 struct plan7_postfilter_workspace {
   int device_ordinal;
   std::vector<uint64_t> host_msv_offsets;
+  std::vector<uint32_t> host_msv_candidate_indices;
   std::vector<uint64_t> host_vit_offsets;
   std::vector<VitLengthTransitions> host_moves;
   std::vector<size_t> msv_tiles;
@@ -1329,6 +1351,14 @@ struct plan7_postfilter_workspace {
   size_t results_capacity;
   uint64_t growth_count;
   uint64_t run_count;
+  uint64_t full_msv_compaction_run_count;
+  uint64_t full_msv_compaction_chunk_count;
+  uint64_t full_msv_compaction_source_count;
+  uint64_t full_msv_compaction_selected_count;
+  uint64_t full_msv_legacy_run_count;
+  uint64_t full_msv_launch_candidate_count;
+  uint64_t full_msv_launch_candidate_avoided_count;
+  uint64_t full_msv_index_d2h_bytes;
 };
 
 namespace {
@@ -2222,6 +2252,22 @@ extern "C" int plan7_postfilter_workspace_get_statistics(
       static_cast<uint64_t>(workspace->dp_capacity);
   statistics->growth_count = workspace->growth_count;
   statistics->run_count = workspace->run_count;
+  statistics->full_msv_compaction_run_count =
+      workspace->full_msv_compaction_run_count;
+  statistics->full_msv_compaction_chunk_count =
+      workspace->full_msv_compaction_chunk_count;
+  statistics->full_msv_compaction_source_count =
+      workspace->full_msv_compaction_source_count;
+  statistics->full_msv_compaction_selected_count =
+      workspace->full_msv_compaction_selected_count;
+  statistics->full_msv_legacy_run_count =
+      workspace->full_msv_legacy_run_count;
+  statistics->full_msv_launch_candidate_count =
+      workspace->full_msv_launch_candidate_count;
+  statistics->full_msv_launch_candidate_avoided_count =
+      workspace->full_msv_launch_candidate_avoided_count;
+  statistics->full_msv_index_d2h_bytes =
+      workspace->full_msv_index_d2h_bytes;
   const size_t capacities[PLAN7_POSTFILTER_CAPACITY_COUNT] = {
       workspace->states_capacity,
       workspace->bias_inputs_capacity,
@@ -2346,7 +2392,24 @@ int postfilter_candidates_device_with_workspace_impl(
     set_error(error, error_size, "post-filter candidate count overflow");
     return -1;
   }
+  const char *full_msv_policy = std::getenv("PLAN7_GPU_FULL_MSV_POLICY");
+  const bool force_legacy_full_msv =
+      full_msv_policy != nullptr &&
+      std::strcmp(full_msv_policy, "legacy") == 0;
+  const bool force_compact_full_msv =
+      full_msv_policy != nullptr &&
+      std::strcmp(full_msv_policy, "compact") == 0;
+  if (force_compact_full_msv && candidate_count > UINT32_MAX) {
+    set_error(error, error_size,
+              "compact full-MSV candidate count exceeds uint32 range");
+    return -1;
+  }
+  const bool compact_full_msv =
+      !force_legacy_full_msv && candidate_count <= UINT32_MAX &&
+      (force_compact_full_msv || candidate_count >= 65536);
   std::vector<uint64_t> &host_msv_offsets = workspace->host_msv_offsets;
+  std::vector<uint32_t> &host_msv_candidate_indices =
+      workspace->host_msv_candidate_indices;
   std::vector<uint64_t> &host_vit_offsets = workspace->host_vit_offsets;
   std::vector<VitLengthTransitions> &host_moves = workspace->host_moves;
   std::vector<size_t> &msv_tiles = workspace->msv_tiles;
@@ -2355,7 +2418,12 @@ int postfilter_candidates_device_with_workspace_impl(
   uint64_t maximum_vit_cells = 0;
   constexpr uint64_t kVitCellLimit = kDpByteLimit / sizeof(int16_t);
   try {
-    host_msv_offsets.assign(candidate_count + 1, 0);
+    if (compact_full_msv) {
+      host_msv_offsets.clear();
+      host_msv_candidate_indices.clear();
+    } else {
+      host_msv_offsets.assign(candidate_count + 1, 0);
+    }
     host_vit_offsets.assign(candidate_count + 1, 0);
     host_moves.resize(candidate_count);
     msv_tiles.clear();
@@ -2378,25 +2446,28 @@ int postfilter_candidates_device_with_workspace_impl(
       const uint64_t msv_cells =
           static_cast<uint64_t>(profile.q) * kWarpSize;
       const uint64_t vit_cells = msv_cells * 3;
-      if (!checked_add(host_msv_offsets[c], msv_cells,
-                       &host_msv_offsets[c + 1]) ||
+      if ((!compact_full_msv &&
+           !checked_add(host_msv_offsets[c], msv_cells,
+                        &host_msv_offsets[c + 1])) ||
           !checked_add(host_vit_offsets[c], vit_cells,
                        &host_vit_offsets[c + 1])) {
         set_error(error, error_size, "post-filter DP offset overflow");
         return -1;
       }
     }
-    for (size_t begin = 0; begin < candidate_count;) {
-      size_t end = begin + 1;
-      while (end < candidate_count &&
-             host_msv_offsets[end + 1] - host_msv_offsets[begin] <=
-                 kDpByteLimit)
-        ++end;
-      maximum_msv_bytes = std::max(
-          maximum_msv_bytes,
-          host_msv_offsets[end] - host_msv_offsets[begin]);
-      msv_tiles.push_back(end);
-      begin = end;
+    if (!compact_full_msv) {
+      for (size_t begin = 0; begin < candidate_count;) {
+        size_t end = begin + 1;
+        while (end < candidate_count &&
+               host_msv_offsets[end + 1] - host_msv_offsets[begin] <=
+                   kDpByteLimit)
+          ++end;
+        maximum_msv_bytes = std::max(
+            maximum_msv_bytes,
+            host_msv_offsets[end] - host_msv_offsets[begin]);
+        msv_tiles.push_back(end);
+        begin = end;
+      }
     }
     for (size_t begin = 0; begin < candidate_count;) {
       size_t end = begin + 1;
@@ -2414,22 +2485,24 @@ int postfilter_candidates_device_with_workspace_impl(
     set_error(error, error_size, "post-filter host workspace allocation failed");
     return -1;
   }
-  const uint64_t dp_bytes_u64 = std::max(
-      maximum_msv_bytes, maximum_vit_cells * sizeof(int16_t));
-  if (dp_bytes_u64 > kDpByteLimit || dp_bytes_u64 > SIZE_MAX) {
+  const uint64_t maximum_vit_bytes = maximum_vit_cells * sizeof(int16_t);
+  if (maximum_msv_bytes > kDpByteLimit ||
+      maximum_vit_bytes > kDpByteLimit ||
+      maximum_msv_bytes > SIZE_MAX || maximum_vit_bytes > SIZE_MAX) {
     set_error(error, error_size, "post-filter DP tile exceeds 256 MiB");
     return -1;
   }
 
   size_t candidate_bytes;
-  size_t offset_bytes;
+  size_t vit_offset_bytes;
   size_t move_bytes;
   size_t bias_input_bytes;
   size_t bias_result_bytes;
   size_t vit_result_bytes;
   size_t post_result_bytes;
   size_t reason_fact_bytes = 0;
-  if (!checked_bytes(candidate_count + 1, sizeof(uint64_t), &offset_bytes) ||
+  if (!checked_bytes(candidate_count + 1, sizeof(uint64_t),
+                     &vit_offset_bytes) ||
       !checked_bytes(candidate_count, sizeof(VitLengthTransitions),
                      &move_bytes) ||
       !checked_bytes(candidate_count, sizeof(plan7_bias_ssv_input),
@@ -2484,20 +2557,11 @@ int postfilter_candidates_device_with_workspace_impl(
                             &workspace->growth_count,
                             "cudaMalloc(post-filter length transitions)", error,
                             error_size) != 0 ||
-      grow_workspace_buffer(&workspace->device_msv_offsets,
-                            &workspace->msv_offsets_capacity, offset_bytes,
-                            &workspace->growth_count,
-                            "cudaMalloc(post-filter MSV offsets)", error,
-                            error_size) != 0 ||
       grow_workspace_buffer(&workspace->device_vit_offsets,
-                            &workspace->vit_offsets_capacity, offset_bytes,
+                            &workspace->vit_offsets_capacity,
+                            vit_offset_bytes,
                             &workspace->growth_count,
                             "cudaMalloc(post-filter Viterbi offsets)", error,
-                            error_size) != 0 ||
-      grow_workspace_buffer(&workspace->device_dp, &workspace->dp_capacity,
-                            static_cast<size_t>(dp_bytes_u64),
-                            &workspace->growth_count,
-                            "cudaMalloc(post-filter DP workspace)", error,
                             error_size) != 0 ||
       grow_workspace_buffer(&workspace->device_results,
                             &workspace->results_capacity, post_result_bytes,
@@ -2514,26 +2578,235 @@ int postfilter_candidates_device_with_workspace_impl(
   }
   CUDA_RUN(cudaMemcpy(workspace->device_moves, host_moves.data(), move_bytes,
                       cudaMemcpyHostToDevice));
-  CUDA_RUN(cudaMemcpy(workspace->device_msv_offsets, host_msv_offsets.data(),
-                      offset_bytes, cudaMemcpyHostToDevice));
   CUDA_RUN(cudaMemcpy(workspace->device_vit_offsets, host_vit_offsets.data(),
-                      offset_bytes, cudaMemcpyHostToDevice));
+                      vit_offset_bytes, cudaMemcpyHostToDevice));
   CUDA_RUN(cudaMemset(workspace->device_vit_results, 0xff, vit_result_bytes));
 
-  for (size_t tile = 0; tile + 1 < msv_tiles.size(); ++tile) {
-    const size_t tile_begin = msv_tiles[tile];
-    const size_t tile_count = msv_tiles[tile + 1] - tile_begin;
-    full_msv_kernel<<<
-        static_cast<unsigned>((tile_count - 1) / kWarpsPerBlock + 1),
-        kThreads>>>(
-        device_residues, device_sequence_offsets, device_compact_scores,
-        database->device_exact_rbv, device_f1_profiles,
-        database->device_profiles, device_tjb,
-        device_candidates, workspace->device_msv_offsets, tile_begin, tile_count,
-        host_msv_offsets[tile_begin],
-        static_cast<uint8_t *>(workspace->device_dp),
-        device_msv_inputs);
-    CUDA_RUN(cudaGetLastError());
+  if (!compact_full_msv) {
+    size_t msv_offset_bytes;
+    const uint64_t dp_bytes_u64 =
+        std::max(maximum_msv_bytes, maximum_vit_bytes);
+    if (!checked_bytes(candidate_count + 1, sizeof(uint64_t),
+                       &msv_offset_bytes) ||
+        grow_workspace_buffer(&workspace->device_msv_offsets,
+                              &workspace->msv_offsets_capacity,
+                              msv_offset_bytes, &workspace->growth_count,
+                              "cudaMalloc(post-filter MSV offsets)", error,
+                              error_size) != 0 ||
+        grow_workspace_buffer(&workspace->device_dp,
+                              &workspace->dp_capacity,
+                              static_cast<size_t>(dp_bytes_u64),
+                              &workspace->growth_count,
+                              "cudaMalloc(post-filter DP workspace)", error,
+                              error_size) != 0)
+      return -1;
+    CUDA_RUN(cudaMemcpy(workspace->device_msv_offsets,
+                        host_msv_offsets.data(), msv_offset_bytes,
+                        cudaMemcpyHostToDevice));
+    ++workspace->full_msv_legacy_run_count;
+    saturating_counter_add(candidate_count,
+                           &workspace->full_msv_launch_candidate_count);
+    for (size_t tile = 0; tile + 1 < msv_tiles.size(); ++tile) {
+      const size_t tile_begin = msv_tiles[tile];
+      const size_t tile_count = msv_tiles[tile + 1] - tile_begin;
+      full_msv_kernel<<<
+          static_cast<unsigned>((tile_count - 1) / kWarpsPerBlock + 1),
+          kThreads>>>(
+          device_residues, device_sequence_offsets, device_compact_scores,
+          database->device_exact_rbv, device_f1_profiles,
+          database->device_profiles, device_tjb, device_candidates, nullptr,
+          workspace->device_msv_offsets, tile_begin, tile_count,
+          host_msv_offsets[tile_begin],
+          static_cast<uint8_t *>(workspace->device_dp), device_msv_inputs);
+      CUDA_RUN(cudaGetLastError());
+    }
+  } else {
+    ++workspace->full_msv_compaction_run_count;
+    saturating_counter_add(candidate_count,
+                           &workspace->full_msv_compaction_source_count);
+    for (size_t source_begin = 0; source_begin < candidate_count;) {
+      const size_t source_count = std::min(
+          kFullMsvCompactSourceChunk, candidate_count - source_begin);
+      size_t index_capacity_bytes;
+      size_t offset_capacity_bytes;
+      if (!checked_bytes(source_count, sizeof(uint32_t),
+                         &index_capacity_bytes) ||
+          !checked_bytes(source_count + 1, sizeof(uint64_t),
+                         &offset_capacity_bytes) ||
+          index_capacity_bytes > SIZE_MAX - 7) {
+        set_error(error, error_size,
+                  "compact full-MSV workspace size overflow");
+        return -1;
+      }
+      const size_t offset_start = (index_capacity_bytes + 7) & ~size_t{7};
+      if (offset_capacity_bytes > SIZE_MAX - offset_start) {
+        set_error(error, error_size,
+                  "compact full-MSV workspace size overflow");
+        return -1;
+      }
+      const size_t msv_storage_bytes =
+          offset_start + offset_capacity_bytes;
+      if (grow_workspace_buffer(&workspace->device_msv_offsets,
+                                &workspace->msv_offsets_capacity,
+                                msv_storage_bytes,
+                                &workspace->growth_count,
+                                "cudaMalloc(compact full-MSV storage)", error,
+                                error_size) != 0)
+        return -1;
+      auto *msv_storage = reinterpret_cast<uint8_t *>(
+          workspace->device_msv_offsets);
+      auto *device_selected = reinterpret_cast<uint32_t *>(msv_storage);
+      auto *device_selected_count = reinterpret_cast<uint32_t *>(
+          msv_storage + offset_start);
+      const cub::CountingInputIterator<uint32_t> source_indices(
+          static_cast<uint32_t>(source_begin));
+      const FullMsvCandidatePredicate select_full_msv{device_msv_inputs};
+      size_t select_workspace_bytes = 0;
+      CUDA_RUN(cub::DeviceSelect::If(
+          nullptr, select_workspace_bytes, source_indices, device_selected,
+          device_selected_count, static_cast<int>(source_count),
+          select_full_msv));
+      if (grow_workspace_buffer(&workspace->device_dp,
+                                &workspace->dp_capacity,
+                                select_workspace_bytes,
+                                &workspace->growth_count,
+                                "cudaMalloc(full-MSV selection workspace)",
+                                error, error_size) != 0)
+        return -1;
+      CUDA_RUN(cub::DeviceSelect::If(
+          workspace->device_dp, select_workspace_bytes, source_indices,
+          device_selected, device_selected_count,
+          static_cast<int>(source_count), select_full_msv));
+      uint32_t selected_count_u32 = 0;
+      CUDA_RUN(cudaMemcpy(&selected_count_u32, device_selected_count,
+                          sizeof(selected_count_u32),
+                          cudaMemcpyDeviceToHost));
+      const size_t selected_count =
+          static_cast<size_t>(selected_count_u32);
+      if (selected_count > source_count) {
+        set_error(error, error_size,
+                  "compact full-MSV selected count is invalid");
+        return -1;
+      }
+      ++workspace->full_msv_compaction_chunk_count;
+      saturating_counter_add(selected_count,
+          &workspace->full_msv_compaction_selected_count);
+      saturating_counter_add(selected_count,
+          &workspace->full_msv_launch_candidate_count);
+      saturating_counter_add(source_count - selected_count,
+          &workspace->full_msv_launch_candidate_avoided_count);
+      source_begin += source_count;
+      if (selected_count == 0) continue;
+
+      size_t selected_index_bytes;
+      if (!checked_bytes(selected_count, sizeof(uint32_t),
+                         &selected_index_bytes)) {
+        set_error(error, error_size,
+                  "compact full-MSV selected-index size overflow");
+        return -1;
+      }
+      try {
+        host_msv_candidate_indices.resize(selected_count);
+      } catch (...) {
+        set_error(error, error_size,
+                  "compact full-MSV host index allocation failed");
+        return -1;
+      }
+      CUDA_RUN(cudaMemcpy(host_msv_candidate_indices.data(), device_selected,
+                          selected_index_bytes, cudaMemcpyDeviceToHost));
+      saturating_counter_add(selected_index_bytes,
+                             &workspace->full_msv_index_d2h_bytes);
+      for (size_t selected = 0; selected < selected_count; ++selected) {
+        const size_t candidate = host_msv_candidate_indices[selected];
+        const size_t source_chunk_begin = source_begin - source_count;
+        if (candidate < source_chunk_begin || candidate >= source_begin ||
+            (selected != 0 &&
+             candidate <= host_msv_candidate_indices[selected - 1])) {
+          set_error(error, error_size,
+                    "compact full-MSV index order is invalid");
+          return -1;
+        }
+      }
+
+      uint64_t chunk_maximum_msv_bytes = 0;
+      try {
+        host_msv_offsets.assign(selected_count + 1, 0);
+        msv_tiles.clear();
+        msv_tiles.push_back(0);
+        const auto &profiles = database_host_profiles(database);
+        for (size_t selected = 0; selected < selected_count; ++selected) {
+          const size_t candidate = host_msv_candidate_indices[selected];
+          const plan7_bias_candidate mapping = host_candidates[candidate];
+          const uint64_t msv_cells =
+              static_cast<uint64_t>(profiles[mapping.profile_index].q) *
+              kWarpSize;
+          if (!checked_add(host_msv_offsets[selected], msv_cells,
+                           &host_msv_offsets[selected + 1])) {
+            set_error(error, error_size,
+                      "compact full-MSV DP offset overflow");
+            return -1;
+          }
+        }
+        for (size_t begin = 0; begin < selected_count;) {
+          size_t end = begin + 1;
+          while (end < selected_count &&
+                 host_msv_offsets[end + 1] - host_msv_offsets[begin] <=
+                     kDpByteLimit)
+            ++end;
+          chunk_maximum_msv_bytes = std::max(
+              chunk_maximum_msv_bytes,
+              host_msv_offsets[end] - host_msv_offsets[begin]);
+          msv_tiles.push_back(end);
+          begin = end;
+        }
+      } catch (...) {
+        set_error(error, error_size,
+                  "compact full-MSV execution plan allocation failed");
+        return -1;
+      }
+      size_t selected_offset_bytes;
+      if (chunk_maximum_msv_bytes > kDpByteLimit ||
+          chunk_maximum_msv_bytes > SIZE_MAX ||
+          !checked_bytes(selected_count + 1, sizeof(uint64_t),
+                         &selected_offset_bytes) ||
+          selected_offset_bytes > offset_capacity_bytes) {
+        set_error(error, error_size,
+                  "compact full-MSV DP workspace size overflow");
+        return -1;
+      }
+      if (grow_workspace_buffer(&workspace->device_dp,
+                                &workspace->dp_capacity,
+                                static_cast<size_t>(chunk_maximum_msv_bytes),
+                                &workspace->growth_count,
+                                "cudaMalloc(compact full-MSV DP workspace)",
+                                error, error_size) != 0)
+        return -1;
+      auto *device_selected_offsets = reinterpret_cast<uint64_t *>(
+          msv_storage + offset_start);
+      CUDA_RUN(cudaMemcpy(device_selected_offsets, host_msv_offsets.data(),
+                          selected_offset_bytes, cudaMemcpyHostToDevice));
+      for (size_t tile = 0; tile + 1 < msv_tiles.size(); ++tile) {
+        const size_t tile_begin = msv_tiles[tile];
+        const size_t tile_count = msv_tiles[tile + 1] - tile_begin;
+        full_msv_kernel<<<
+            static_cast<unsigned>((tile_count - 1) / kWarpsPerBlock + 1),
+            kThreads>>>(
+            device_residues, device_sequence_offsets, device_compact_scores,
+            database->device_exact_rbv, device_f1_profiles,
+            database->device_profiles, device_tjb, device_candidates,
+            device_selected, device_selected_offsets, tile_begin, tile_count,
+            host_msv_offsets[tile_begin],
+            static_cast<uint8_t *>(workspace->device_dp), device_msv_inputs);
+        CUDA_RUN(cudaGetLastError());
+      }
+    }
+    if (grow_workspace_buffer(&workspace->device_dp,
+                              &workspace->dp_capacity,
+                              static_cast<size_t>(maximum_vit_bytes),
+                              &workspace->growth_count,
+                              "cudaMalloc(post-filter Viterbi DP workspace)",
+                              error, error_size) != 0)
+      return -1;
   }
   prepare_bias_inputs_kernel<<<blocks, kThreads>>>(
       device_null_scores, device_f1_profiles, device_candidates,

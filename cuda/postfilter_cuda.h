@@ -138,6 +138,14 @@ typedef struct plan7_postfilter_workspace_statistics {
   uint64_t dp_capacity_bytes;
   uint64_t growth_count;
   uint64_t run_count;
+  uint64_t full_msv_compaction_run_count;
+  uint64_t full_msv_compaction_chunk_count;
+  uint64_t full_msv_compaction_source_count;
+  uint64_t full_msv_compaction_selected_count;
+  uint64_t full_msv_legacy_run_count;
+  uint64_t full_msv_launch_candidate_count;
+  uint64_t full_msv_launch_candidate_avoided_count;
+  uint64_t full_msv_index_d2h_bytes;
   uint64_t capacity_bytes[PLAN7_POSTFILTER_CAPACITY_COUNT];
 } plan7_postfilter_workspace_statistics;
 

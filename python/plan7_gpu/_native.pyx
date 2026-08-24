@@ -399,6 +399,14 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t postfilter_dp_capacity_bytes
         uint64_t postfilter_growth_count
         uint64_t postfilter_run_count
+        uint64_t full_msv_compaction_run_count
+        uint64_t full_msv_compaction_chunk_count
+        uint64_t full_msv_compaction_source_count
+        uint64_t full_msv_compaction_selected_count
+        uint64_t full_msv_legacy_run_count
+        uint64_t full_msv_launch_candidate_count
+        uint64_t full_msv_launch_candidate_avoided_count
+        uint64_t full_msv_index_d2h_bytes
         uint64_t forward_device_bytes
         uint64_t forward_dp_capacity_bytes
         uint64_t forward_xmx_capacity_bytes
@@ -5510,6 +5518,26 @@ cdef class SequenceBatch:
             ),
             "postfilter_growth_count": statistics.postfilter_growth_count,
             "postfilter_run_count": statistics.postfilter_run_count,
+            "full_msv_compaction_run_count": (
+                statistics.full_msv_compaction_run_count
+            ),
+            "full_msv_compaction_chunk_count": (
+                statistics.full_msv_compaction_chunk_count
+            ),
+            "full_msv_compaction_source_count": (
+                statistics.full_msv_compaction_source_count
+            ),
+            "full_msv_compaction_selected_count": (
+                statistics.full_msv_compaction_selected_count
+            ),
+            "full_msv_legacy_run_count": statistics.full_msv_legacy_run_count,
+            "full_msv_launch_candidate_count": (
+                statistics.full_msv_launch_candidate_count
+            ),
+            "full_msv_launch_candidate_avoided_count": (
+                statistics.full_msv_launch_candidate_avoided_count
+            ),
+            "full_msv_index_d2h_bytes": statistics.full_msv_index_d2h_bytes,
             "forward_device_bytes": statistics.forward_device_bytes,
             "forward_dp_capacity_bytes": statistics.forward_dp_capacity_bytes,
             "forward_xmx_capacity_bytes": statistics.forward_xmx_capacity_bytes,

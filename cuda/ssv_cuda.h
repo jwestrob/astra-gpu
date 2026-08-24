@@ -82,6 +82,14 @@ typedef struct plan7_ssv_workspace_statistics {
   uint64_t postfilter_dp_capacity_bytes;
   uint64_t postfilter_growth_count;
   uint64_t postfilter_run_count;
+  uint64_t full_msv_compaction_run_count;
+  uint64_t full_msv_compaction_chunk_count;
+  uint64_t full_msv_compaction_source_count;
+  uint64_t full_msv_compaction_selected_count;
+  uint64_t full_msv_legacy_run_count;
+  uint64_t full_msv_launch_candidate_count;
+  uint64_t full_msv_launch_candidate_avoided_count;
+  uint64_t full_msv_index_d2h_bytes;
   uint64_t forward_device_bytes;
   uint64_t forward_dp_capacity_bytes;
   uint64_t forward_xmx_capacity_bytes;
