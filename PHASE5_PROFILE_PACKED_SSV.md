@@ -28,4 +28,33 @@ intrinsics map to a single Hopper instruction.
 
 ## Result
 
-Pending the focused H200 run. Production remains on the existing SSV path.
+Focused H200 job `1182723` completed successfully on an NVIDIA H200 (compute
+capability 9.0). All 65,536 primitive byte pairs passed. Every scalar and
+packed result record was byte-identical, including the partial-quartet,
+empty-target, boundary-length, and hostile-padding oracle.
+
+Median kernel timings were:
+
+| Case | Scalar | Packed four-profile | Speedup |
+|---|---:|---:|---:|
+| 1,024 equal-length profiles, M=96, L=96, 64 targets | 0.6282 ms | 0.4212 ms | 1.491x |
+| 1,024 length-sorted profiles, M=32..383, L=256, 64 targets | 2.7744 ms | 1.9165 ms | 1.448x |
+| 512 deliberately divergent quartets, M=32/64/128/384, L=512, 32 targets | 1.0193 ms | 1.7131 ms | 0.595x |
+
+The sm90 packed kernel uses 40 registers/thread versus 32 for the scalar
+kernel. Inspection of generated SASS shows a mixture of integer,
+permutation/logic, `VIMNMX`, and `VIADDMNMX` instructions rather than a single
+four-byte subtract/max instruction pair. The net result is nevertheless a
+clear win when model lengths are compatible and a severe loss when they are
+not.
+
+Decision: retain the experiment and proceed to an optional, lazily built
+length-compatible quartet execution view. Never pack arbitrarily divergent
+profiles, and preserve the scalar path for one/few profiles and unsuitable
+quartets. This microbenchmark is not an end-to-end performance claim.
+
+Evidence:
+
+- result: `build/phase5-h200-20260824/result.json`
+- result SHA-256: `4abfef6f197c376f6a4363c4de0f12c412e0f477f5d9cb51fa576a3cd63eda76`
+- Slurm job: `1182723`, `COMPLETED`, exit `0:0`
