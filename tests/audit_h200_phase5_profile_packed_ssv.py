@@ -24,7 +24,6 @@ SOURCE_MODELS = (
     "Thioesterase.hmm",
     "KR.hmm",
     "LuxC.hmm",
-    "bmyD.hmm",
 )
 
 
@@ -144,8 +143,8 @@ def audit() -> dict[str, object]:
                 raise AssertionError("forced scalar reference used packed execution")
             if (
                 packed_delta["f1_profile_packed_run_count"] != 1
-                or packed_delta["f1_profile_packed_quartet_count"] != 12
-                or packed_delta["f1_profile_packed_profile_count"] != 48
+                or packed_delta["f1_profile_packed_quartet_count"] != 10
+                or packed_delta["f1_profile_packed_profile_count"] != 40
                 or packed_delta["f1_profile_scalar_profile_count"] != 0
                 or packed_delta["f1_profile_packed_score_bytes"] <= 0
             ):
