@@ -20,11 +20,11 @@ from plan7_gpu.adapter import _candidate_state, _sequence_state
 F1 = 0.99
 SOURCE_MODELS = (
     "RREFam.hmm",
-    "RF00001.hmm",
     "PF02826.hmm",
     "Thioesterase.hmm",
     "KR.hmm",
     "LuxC.hmm",
+    "bmyD.hmm",
 )
 
 
