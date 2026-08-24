@@ -96,6 +96,26 @@ cdef uint64_t _f3_device_compaction_run_count = 0
 cdef uint64_t _f3_device_compaction_candidate_count = 0
 cdef uint64_t _f3_device_compacted_survivor_count = 0
 cdef uint64_t _f3_survivor_upload_avoided_bytes = 0
+cdef uint64_t _subwarp_call_count = 0
+cdef uint64_t _subwarp_auto_call_count = 0
+cdef uint64_t _subwarp_width1_call_count = 0
+cdef uint64_t _subwarp_width2_call_count = 0
+cdef uint64_t _subwarp_width4_call_count = 0
+cdef uint64_t _subwarp_width8_call_count = 0
+cdef uint64_t _subwarp_no_kernel_count = 0
+cdef uint64_t _subwarp_forced_count = 0
+cdef uint64_t _subwarp_sparse_width1_count = 0
+cdef uint64_t _subwarp_short_width4_count = 0
+cdef uint64_t _subwarp_short_width2_count = 0
+cdef uint64_t _subwarp_long_width4_count = 0
+cdef uint64_t _subwarp_long_width2_count = 0
+cdef uint64_t _subwarp_long_saturated_width1_count = 0
+cdef uint64_t _subwarp_divergent_width1_count = 0
+cdef uint64_t _subwarp_kernel_launch_count = 0
+cdef uint64_t _subwarp_scheduled_warp_count = 0
+cdef uint64_t _subwarp_candidate_count = 0
+cdef uint64_t _subwarp_active_lane_slots = 0
+cdef uint64_t _subwarp_issued_lane_slots = 0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 GENERATION_TELEMETRY_SCHEMA_VERSION = 2
 DIRECT_V3_STAGING_SCHEMA_VERSION = 2
@@ -3740,6 +3760,95 @@ def _forward_f3_device_statistics():
         "f3_survivor_upload_avoided_bytes": (
             _f3_survivor_upload_avoided_bytes
         ),
+    }
+
+
+cdef void _accumulate_forward_subwarp_statistics(
+    const plan7_forward_subwarp_statistics *statistics,
+) noexcept:
+    global _subwarp_call_count
+    global _subwarp_auto_call_count
+    global _subwarp_width1_call_count
+    global _subwarp_width2_call_count
+    global _subwarp_width4_call_count
+    global _subwarp_width8_call_count
+    global _subwarp_no_kernel_count
+    global _subwarp_forced_count
+    global _subwarp_sparse_width1_count
+    global _subwarp_short_width4_count
+    global _subwarp_short_width2_count
+    global _subwarp_long_width4_count
+    global _subwarp_long_width2_count
+    global _subwarp_long_saturated_width1_count
+    global _subwarp_divergent_width1_count
+    global _subwarp_kernel_launch_count
+    global _subwarp_scheduled_warp_count
+    global _subwarp_candidate_count
+    global _subwarp_active_lane_slots
+    global _subwarp_issued_lane_slots
+    if statistics == NULL:
+        return
+    _subwarp_call_count += 1
+    if statistics.requested_candidates_per_warp == 0:
+        _subwarp_auto_call_count += 1
+    if statistics.candidates_per_warp == 1:
+        _subwarp_width1_call_count += 1
+    elif statistics.candidates_per_warp == 2:
+        _subwarp_width2_call_count += 1
+    elif statistics.candidates_per_warp == 4:
+        _subwarp_width4_call_count += 1
+    elif statistics.candidates_per_warp == 8:
+        _subwarp_width8_call_count += 1
+    if statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_NO_KERNEL:
+        _subwarp_no_kernel_count += 1
+    elif statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_FORCED:
+        _subwarp_forced_count += 1
+    elif statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_SPARSE_WIDTH1:
+        _subwarp_sparse_width1_count += 1
+    elif statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH4:
+        _subwarp_short_width4_count += 1
+    elif statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH2:
+        _subwarp_short_width2_count += 1
+    elif statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH4:
+        _subwarp_long_width4_count += 1
+    elif statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH2:
+        _subwarp_long_width2_count += 1
+    elif statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_LONG_SATURATED_WIDTH1:
+        _subwarp_long_saturated_width1_count += 1
+    elif statistics.policy_reason == PLAN7_FORWARD_SUBWARP_POLICY_DIVERGENT_WIDTH1:
+        _subwarp_divergent_width1_count += 1
+    _subwarp_kernel_launch_count += statistics.kernel_launch_count
+    _subwarp_scheduled_warp_count += statistics.scheduled_warp_count
+    _subwarp_candidate_count += statistics.candidate_subwarp_count
+    _subwarp_active_lane_slots += statistics.active_lane_slots
+    _subwarp_issued_lane_slots += statistics.issued_lane_slots
+
+
+def _forward_subwarp_statistics():
+    """Return cumulative production Forward subwarp policy counters."""
+    return {
+        "call_count": _subwarp_call_count,
+        "auto_call_count": _subwarp_auto_call_count,
+        "width1_call_count": _subwarp_width1_call_count,
+        "width2_call_count": _subwarp_width2_call_count,
+        "width4_call_count": _subwarp_width4_call_count,
+        "width8_call_count": _subwarp_width8_call_count,
+        "no_kernel_count": _subwarp_no_kernel_count,
+        "forced_count": _subwarp_forced_count,
+        "sparse_width1_count": _subwarp_sparse_width1_count,
+        "short_width4_count": _subwarp_short_width4_count,
+        "short_width2_count": _subwarp_short_width2_count,
+        "long_width4_count": _subwarp_long_width4_count,
+        "long_width2_count": _subwarp_long_width2_count,
+        "long_saturated_width1_count": (
+            _subwarp_long_saturated_width1_count
+        ),
+        "divergent_width1_count": _subwarp_divergent_width1_count,
+        "kernel_launch_count": _subwarp_kernel_launch_count,
+        "scheduled_warp_count": _subwarp_scheduled_warp_count,
+        "candidate_count": _subwarp_candidate_count,
+        "active_lane_slots": _subwarp_active_lane_slots,
+        "issued_lane_slots": _subwarp_issued_lane_slots,
     }
 
 
@@ -8392,6 +8501,9 @@ cdef class SequenceBatch:
                 )
                 _accumulate_forward_f3_device_statistics(
                     plan7_forward_output_f3_device_statistics(output)
+                )
+                _accumulate_forward_subwarp_statistics(
+                    plan7_forward_output_subwarp_statistics(output)
                 )
                 sealed_stage_timings = (
                     SEALED_STAGE_TIMING_SCHEMA_VERSION,
