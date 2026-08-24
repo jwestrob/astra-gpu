@@ -9,7 +9,7 @@ loading it against an unsupported private ABI.
 """
 
 from libc.stddef cimport size_t
-from libc.math cimport isfinite, isnan
+from libc.math cimport isfinite, isnan, log
 from libc.stdint cimport (
     int16_t,
     int32_t,
@@ -56,13 +56,17 @@ from libeasel.random cimport (
 )
 from libeasel.sq cimport ESL_SQ
 from libhmmer cimport (
+    p7_CUTOFF_UNSET,
     p7_FLAMBDA,
     p7_FTAU,
+    p7_GA1,
+    p7_GA2,
     p7_MLAMBDA,
     p7_MMU,
     p7_VLAMBDA,
     p7_VMU,
 )
+from libhmmer.p7_hmm cimport p7H_GA
 from libhmmer.impl.p7_oprofile cimport (
     P7_OPROFILE,
     p7_oprofile_Compare,
@@ -115,6 +119,21 @@ from threading import Lock as _Lock
 from plan7_gpu import _telemetry as _telemetry_module
 
 DIRECT_V3_STAGING_SCHEMA_VERSION = 2
+
+# These are the exact interval constants used by the patched HMMER compact
+# continuation seam.  The Phase 9 evaluator applies the same input and final
+# rounding allowance before it certifies any GA rejection.
+cdef float _GA_COMPACT_INPUT_EPSILON_NATS = <float> 0.004
+cdef float _GA_COMPACT_ROUND_EPSILON_BITS = <float> 0.00001
+
+
+cdef float _ga_null_score_for_length(int length) noexcept nogil:
+    """Reproduce p7_bg_SetLength() followed by p7_bg_NullOne()."""
+    cdef float p1 = <float> length / <float> (length + 1)
+    return <float> (
+        <float> length * log(<double> p1)
+        + log(1.0 - <double> p1)
+    )
 
 cdef extern from "dlfcn.h" nogil:
     ctypedef struct Dl_info:
@@ -11906,6 +11925,265 @@ def _search_hmm_sealed_sparse_journal_v3_bound(
         )
     finally:
         free(compact_rebased_offsets)
+
+
+def _sealed_ga_cutoff_census_bound(
+    sealed_object,
+    Py_ssize_t row,
+    Pipeline pipeline,
+    bint include_indices=False,
+):
+    """Census certified GA rejections without changing continuation state.
+
+    The evaluator is deliberately restricted to authenticated compact-domain
+    rows.  Those rows contain every isolated-domain Forward score needed to
+    upper-bound both alternatives used by HMMER's final target score.  It does
+    not claim that a whole-target Forward score alone bounds reconstruction.
+    """
+    cdef _SealedPostfilterBatch sealed
+    cdef const uint8_t *base
+    cdef const plan7_continuation_journal_v3_profile *profiles
+    cdef const plan7_continuation_journal_v3_exception *exceptions
+    cdef const plan7_continuation_journal_v3_profile *profile
+    cdef const plan7_continuation_journal_v3_exception *exception
+    cdef const plan7_domain_rescore_result *all_results
+    cdef const plan7_domain_rescore_result *result
+    cdef const ESL_SQ **targets
+    cdef const ESL_SQ *target
+    cdef OptimizedProfile optimized_profile
+    cdef P7_OPROFILE *om
+    cdef plan7_continuation_journal_row domain
+    cdef uint64_t local_index
+    cdef uint64_t compact_index
+    cdef uint64_t evaluable_row_count = 0
+    cdef uint64_t region_count = 0
+    cdef uint64_t region_cells = 0
+    cdef uint64_t domain_below_count = 0
+    cdef uint64_t domain_below_cells = 0
+    cdef uint64_t target_below_count = 0
+    cdef uint64_t target_below_region_count = 0
+    cdef uint64_t target_below_region_cells = 0
+    cdef uint64_t whole_below_count = 0
+    cdef uint64_t reconstruction_below_count = 0
+    cdef uint64_t cell_count
+    cdef uint64_t scratch
+    cdef int length
+    cdef float null_score
+    cdef float target_cutoff
+    cdef float domain_cutoff
+    cdef double input_error = <double> _GA_COMPACT_INPUT_EPSILON_NATS
+    cdef double round_error = <double> _GA_COMPACT_ROUND_EPSILON_BITS
+    cdef double whole_upper
+    cdef double reconstruction_nats
+    cdef double reconstruction_upper
+    cdef double target_upper
+    cdef double domain_upper
+    cdef double upper_envsc
+    cdef object preflight_start_ns
+    cdef object preflight_ns
+    cdef object scan_start_ns
+    cdef object scan_ns
+    cdef list certified_indices = []
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    if sealed._journal_v3 == NULL:
+        raise TypeError("GA census requires a sparse journal v3 packet")
+    if row < 0 or row >= len(sealed._queries):
+        raise IndexError("sealed post-filter row out of range")
+
+    preflight_start_ns = _time.perf_counter_ns()
+    _v3_preflight_live_pipeline_row(
+        sealed._journal_v3, sealed, pipeline, <size_t> row
+    )
+    preflight_ns = _time.perf_counter_ns() - preflight_start_ns
+
+    optimized_profile = <OptimizedProfile> sealed._optimized_profiles[row]
+    om = optimized_profile._om
+    if pipeline._pli.use_bit_cutoffs != p7H_GA:
+        raise ValueError("GA census requires gathering bit cutoffs")
+    if om == NULL:
+        raise ValueError("GA census optimized profile is unavailable")
+    target_cutoff = om.cutoff[<int> p7_GA1]
+    domain_cutoff = om.cutoff[<int> p7_GA2]
+    if (
+        not isfinite(target_cutoff)
+        or not isfinite(domain_cutoff)
+        or target_cutoff == p7_CUTOFF_UNSET
+        or domain_cutoff == p7_CUTOFF_UNSET
+    ):
+        raise ValueError("GA census profile has no finite gathering cutoffs")
+
+    base = <const uint8_t *> sealed._journal_v3
+    profiles = <const plan7_continuation_journal_v3_profile *> (
+        base + sealed._journal_v3.profiles_offset
+    )
+    exceptions = <const plan7_continuation_journal_v3_exception *> (
+        base + sealed._journal_v3.exceptions_offset
+    )
+    all_results = <const plan7_domain_rescore_result *> (
+        base + sealed._journal_v3.compact_results_offset
+    )
+    targets = <const ESL_SQ **> sealed._sequences._refs
+    profile = &profiles[row]
+
+    scan_start_ns = _time.perf_counter_ns()
+    for local_index in range(profile.exception_count):
+        exception = &exceptions[profile.exception_begin + local_index]
+        if exception.route != PLAN7_CONTINUATION_V3_COMPACT_DOMAINS:
+            continue
+        if (
+            not (exception.payload_flags & PLAN7_CONTINUATION_V3_HAS_COMPACT)
+            or exception.compact_result_count == 0
+            or exception.sequence_index >= sealed._sequences._length
+        ):
+            raise RuntimeError("GA census compact exception is incomplete")
+        evaluable_row_count += 1
+        target = targets[exception.sequence_index]
+        if target == NULL or target.n <= 0 or target.n > 100000:
+            raise RuntimeError("GA census target length is invalid")
+        null_score = _ga_null_score_for_length(target.n)
+        if not isfinite(null_score):
+            raise RuntimeError("GA census null score is invalid")
+        memcpy(
+            &domain,
+            exception.domain_record,
+            sizeof(plan7_continuation_journal_row),
+        )
+        if not isfinite(domain.fwdsc):
+            raise RuntimeError("GA census target Forward score is invalid")
+
+        # HMMER's whole-target final score subtracts a nonnegative null2 bias.
+        # The compact seam permits at most input_error nats in fwdsc and then
+        # budgets round_error bits for the final score expression.
+        whole_upper = (
+            (<double> domain.fwdsc + input_error - <double> null_score)
+            / <double> eslCONST_LOG2
+            + round_error
+        )
+        reconstruction_nats = 0.0
+        cell_count = 0
+        for compact_index in range(exception.compact_result_count):
+            result = &all_results[
+                exception.compact_result_begin + compact_index
+            ]
+            if (
+                result.status != PLAN7_DOMAIN_RESCORE_OK
+                or result.action != PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+                or result.has_own_scales
+                or result.profile_index != <uint32_t> row
+                or result.sequence_index != exception.sequence_index
+                or result.envelope_begin == 0
+                or result.envelope_begin > result.envelope_end
+                or result.envelope_end > <uint32_t> target.n
+                or not isfinite(result.forward_score)
+            ):
+                raise RuntimeError("GA census compact result is invalid")
+            length = <int> (result.envelope_end - result.envelope_begin + 1)
+            if not plan7_continuation_journal_v3_checked_multiply(
+                <uint64_t> om.M, <uint64_t> length, &scratch
+            ):
+                raise OverflowError("GA census region cells overflow")
+            if not plan7_continuation_journal_v3_checked_add(
+                cell_count, scratch, &cell_count
+            ):
+                raise OverflowError("GA census row cells overflow")
+
+            # The exact per-domain score additionally applies a nonpositive
+            # length adjustment and a nonnegative null2 correction.  Omitting
+            # both yields a conservative upper bound.
+            domain_upper = (
+                (<double> result.forward_score + input_error
+                 - <double> null_score)
+                / <double> eslCONST_LOG2
+                + round_error
+            )
+            if domain_upper < <double> domain_cutoff:
+                domain_below_count += 1
+                if not plan7_continuation_journal_v3_checked_add(
+                    domain_below_cells, scratch, &domain_below_cells
+                ):
+                    raise OverflowError("GA census domain cells overflow")
+
+            # HMMER reconstruction selects only a subset of domains and adds a
+            # nonpositive length term before subtracting nonnegative null2.
+            # Summing every positive per-domain input upper bound is therefore
+            # conservative even when a selected exact envsc is negative.
+            upper_envsc = <double> result.forward_score + input_error
+            if upper_envsc > 0.0:
+                reconstruction_nats += upper_envsc
+
+        if not plan7_continuation_journal_v3_checked_add(
+            region_count, exception.compact_result_count, &region_count
+        ) or not plan7_continuation_journal_v3_checked_add(
+            region_cells, cell_count, &region_cells
+        ):
+            raise OverflowError("GA census aggregate cells overflow")
+        reconstruction_upper = (
+            (reconstruction_nats - <double> null_score)
+            / <double> eslCONST_LOG2
+            + round_error
+        )
+        target_upper = (
+            whole_upper
+            if whole_upper >= reconstruction_upper
+            else reconstruction_upper
+        )
+        if whole_upper < <double> target_cutoff:
+            whole_below_count += 1
+        if reconstruction_upper < <double> target_cutoff:
+            reconstruction_below_count += 1
+        if target_upper < <double> target_cutoff:
+            target_below_count += 1
+            target_below_region_count += exception.compact_result_count
+            if not plan7_continuation_journal_v3_checked_add(
+                target_below_region_cells,
+                cell_count,
+                &target_below_region_cells,
+            ):
+                raise OverflowError("GA census target-reject cells overflow")
+            if include_indices:
+                certified_indices.append(exception.sequence_index)
+    scan_ns = _time.perf_counter_ns() - scan_start_ns
+
+    if target_below_region_count > region_count:
+        raise RuntimeError("GA census target region count is inconsistent")
+    return {
+        "schema_version": 1,
+        "mode": "gathering",
+        "profile_index": row,
+        "target_cutoff_bits": target_cutoff,
+        "domain_cutoff_bits": domain_cutoff,
+        "input_error_nats": _GA_COMPACT_INPUT_EPSILON_NATS,
+        "round_error_bits": _GA_COMPACT_ROUND_EPSILON_BITS,
+        "source_domain_rows": profile.source_domain_count,
+        "evaluable_target_rows": evaluable_row_count,
+        "compact_region_count": region_count,
+        "compact_region_cells_per_downstream_pass": region_cells,
+        "whole_forward_upper_below_ga_count": whole_below_count,
+        "reconstruction_upper_below_ga_count": reconstruction_below_count,
+        "certified_target_reject_count": target_below_count,
+        "certified_target_reject_region_count": target_below_region_count,
+        "certified_target_reject_region_cells_per_downstream_pass": (
+            target_below_region_cells
+        ),
+        "domain_upper_below_ga_count": domain_below_count,
+        "domain_upper_below_ga_region_cells_per_downstream_pass": (
+            domain_below_cells
+        ),
+        "certified_target_indices": (
+            tuple(certified_indices) if include_indices else None
+        ),
+        "certified_target_index_payload_bytes": (
+            len(certified_indices) * sizeof(uint32_t) if include_indices else 0
+        ),
+        "native_temporary_bytes": 0,
+        "preflight_ns": preflight_ns,
+        "scan_ns": scan_ns,
+    }
 
 
 cdef TopHits _v3_dense_reference_profile_preallocated(

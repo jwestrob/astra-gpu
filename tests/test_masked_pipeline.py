@@ -152,8 +152,13 @@ class MaskedPipelineTests(unittest.TestCase):
         *,
         status,
         action,
+        forward_score=None,
+        oa_score=None,
     ):
         score = 0.0 if action == 1 else math.nan
+        if forward_score is not None:
+            score = forward_score
+        oa = score if oa_score is None else oa_score
         return struct.pack(
             "=9I5f4BI",
             row,
@@ -167,8 +172,8 @@ class MaskedPipelineTests(unittest.TestCase):
             1,
             score,
             score,
-            score,
-            score,
+            oa,
+            0.0 if action == 1 else math.nan,
             0.0,
             status,
             action,
@@ -1154,6 +1159,135 @@ print(json.dumps(after_repeat, sort_keys=True))
         )
         self.assertTrue(
             all(item["compact_null2_count"] == 29 for item in compact)
+        )
+
+    def test_ga_census_certifies_only_complete_compact_target_bounds(self):
+        if not _pipeline._simple_regions_seam_available():
+            self.skipTest("private simple-region seam is unavailable")
+        if not _pipeline._compact_domains_seam_available():
+            self.skipTest("private compact-domain seam is unavailable")
+
+        targets = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [self.sequences[0], self.sequences[1]]
+        )
+        query = self.hmms[0].copy()
+        profile = self.optimized_profiles[0].copy()
+        query.cutoffs.gathering = (50.0, 20.0)
+        profile.cutoffs.gathering = (50.0, 20.0)
+        options = {
+            "F1": 1.0,
+            "F2": 1.0,
+            "F3": 1.0,
+            "bit_cutoffs": "gathering",
+        }
+        generation = self.pipeline(**options)
+        row_offsets = array("Q", [0, 2])
+        postfilter = b"".join(
+            self.postfilter_record(index, 0.0, 0, 0, 2, 0.0)
+            for index in range(2)
+        )
+        forward = b"".join(
+            self.forward_record(index, -100.0, 0, 2)
+            for index in range(2)
+        )
+        special_offsets = array("Q", [0])
+        specials = array("f")
+        for target in targets:
+            specials.extend([0.0] * (6 * (len(target) + 1)))
+            special_offsets.append(len(specials))
+        domain_rows = b"".join(
+            self.continuation_row(
+                0,
+                index,
+                domain_status=0,
+                domain_route=2,
+                region_count=1,
+                compact_count=1,
+                compact_route=2,
+                fwdsc=-100.0,
+            )
+            for index in range(2)
+        )
+        region_offsets = array("Q", [0, 1, 2])
+        regions = b"".join(struct.pack("=II", 1, 1) for _ in range(2))
+        compact_results = b"".join(
+            (
+                self.compact_result(
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    status=0,
+                    action=1,
+                    forward_score=-100.0,
+                    oa_score=1.0,
+                ),
+                self.compact_result(
+                    1,
+                    0,
+                    1,
+                    1,
+                    1,
+                    status=0,
+                    action=1,
+                    forward_score=100.0,
+                    oa_score=1.0,
+                ),
+            )
+        )
+        trace_offsets = array("Q", [0, 1, 2])
+        traces = b"".join(
+            struct.pack("=IIfB3x", 1, 1, 1.0, 1) for _ in range(2)
+        )
+        null2 = array("f", [1.0] * 58)
+        sealed = _pipeline._seal_continuation_journal_v2_test_fixture_bound(
+            (query,),
+            (profile,),
+            targets,
+            self.residue_offsets(targets),
+            1.0,
+            self.background_fingerprint(generation.background),
+            postfilter,
+            row_offsets,
+            forward,
+            row_offsets,
+            special_offsets,
+            specials,
+            row_offsets,
+            domain_rows,
+            region_offsets,
+            regions,
+            region_offsets,
+            compact_results,
+            trace_offsets,
+            traces,
+            null2,
+            generation,
+            2.0e-4,
+            True,
+        )
+        census_pipeline = self.pipeline(**options)
+        before = _pipeline._semantic_pipeline_state_fingerprint_bound(
+            census_pipeline
+        )
+        census = _pipeline._sealed_ga_cutoff_census_bound(
+            sealed, 0, census_pipeline, include_indices=True
+        )
+
+        self.assertEqual(census["evaluable_target_rows"], 2)
+        self.assertEqual(census["whole_forward_upper_below_ga_count"], 2)
+        self.assertEqual(census["reconstruction_upper_below_ga_count"], 1)
+        self.assertEqual(census["certified_target_reject_count"], 1)
+        self.assertEqual(census["certified_target_indices"], (0,))
+        self.assertEqual(census["domain_upper_below_ga_count"], 1)
+        self.assertEqual(census["compact_region_count"], 2)
+        self.assertEqual(census["native_temporary_bytes"], 0)
+        self.assertEqual(
+            _pipeline._semantic_pipeline_state_fingerprint_bound(
+                census_pipeline
+            ),
+            before,
         )
 
     def test_journal_v3_partitions_first_last_consecutive_and_large_gaps(self):

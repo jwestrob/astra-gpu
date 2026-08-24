@@ -1016,6 +1016,48 @@ class CandidateBatch:
             raise RuntimeError("sealed generation statistics are not a dict")
         return value
 
+    def evaluate_ga_pruning(
+        self,
+        row: int,
+        pipeline: Any,
+        *,
+        include_indices: bool = False,
+    ) -> dict[str, Any]:
+        """Evaluate certified ``--cut_ga`` pruning without changing search.
+
+        This Phase 9 diagnostic scans authenticated compact-domain results and
+        applies conservative upper bounds to HMMER's final target and domain
+        scores.  It never suppresses work or changes a continuation decision.
+        """
+        row_index = self._row_index(row)
+        if type(include_indices) is not bool:
+            raise TypeError("include_indices must be bool")
+        if type(pipeline) is not pyhmmer.plan7.Pipeline:
+            raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+        if not _native.bias_host_environment_attested():
+            raise RuntimeError(
+                "GA pruning census requires the attested host floating-point environment"
+            )
+        candidate_state = _candidate_state(self)
+        sealed_postfilter = candidate_state.sealed_postfilter
+        if sealed_postfilter is None:
+            raise ValueError("GA pruning census requires a sealed fused batch")
+        pair = candidate_state.pairs[row_index]
+        state = _pair_state(pair)
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        with _lease_pipeline(pipeline):
+            with state.lock:
+                value = _pipeline._sealed_ga_cutoff_census_bound(
+                    sealed_postfilter,
+                    row_index,
+                    pipeline,
+                    include_indices=include_indices,
+                )
+        if type(value) is not dict:
+            raise RuntimeError("GA pruning census did not return a dict")
+        return cast(dict[str, Any], value)
+
     def _row_index(self, row: int) -> int:
         if isinstance(row, bool):
             raise TypeError("candidate row must be an integer, not bool")
