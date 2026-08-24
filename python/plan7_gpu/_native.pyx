@@ -83,6 +83,19 @@ cdef uint64_t _resident_rescore_eliminated_upstream_h2d_bytes = 0
 cdef uint64_t _resident_rescore_selection_h2d_bytes = 0
 cdef double _resident_rescore_upstream_upload_milliseconds = 0.0
 cdef double _resident_rescore_prepare_milliseconds = 0.0
+cdef uint64_t _f3_compiled_profile_count = 0
+cdef uint64_t _f3_unsupported_profile_count = 0
+cdef uint64_t _f3_host_audit_count = 0
+cdef uint64_t _f3_host_decision_avoided_count = 0
+cdef uint64_t _f3_device_decision_count = 0
+cdef uint64_t _f3_device_reject_count = 0
+cdef uint64_t _f3_device_pass_count = 0
+cdef uint64_t _f3_host_fallback_count = 0
+cdef uint64_t _f3_decision_mismatch_count = 0
+cdef uint64_t _f3_device_compaction_run_count = 0
+cdef uint64_t _f3_device_compaction_candidate_count = 0
+cdef uint64_t _f3_device_compacted_survivor_count = 0
+cdef uint64_t _f3_survivor_upload_avoided_bytes = 0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 GENERATION_TELEMETRY_SCHEMA_VERSION = 2
 DIRECT_V3_STAGING_SCHEMA_VERSION = 2
@@ -3597,6 +3610,74 @@ def _forward_backward_residency_statistics():
             _resident_rescore_upstream_upload_milliseconds
         ),
         "rescore_prepare_ms": _resident_rescore_prepare_milliseconds,
+    }
+
+
+cdef void _accumulate_forward_f3_device_statistics(
+    const plan7_forward_f3_device_statistics *statistics,
+) noexcept:
+    global _f3_compiled_profile_count
+    global _f3_unsupported_profile_count
+    global _f3_host_audit_count
+    global _f3_host_decision_avoided_count
+    global _f3_device_decision_count
+    global _f3_device_reject_count
+    global _f3_device_pass_count
+    global _f3_host_fallback_count
+    global _f3_decision_mismatch_count
+    global _f3_device_compaction_run_count
+    global _f3_device_compaction_candidate_count
+    global _f3_device_compacted_survivor_count
+    global _f3_survivor_upload_avoided_bytes
+    if statistics == NULL:
+        return
+    _f3_compiled_profile_count += statistics.compiled_profile_count
+    _f3_unsupported_profile_count += statistics.unsupported_profile_count
+    _f3_host_audit_count += statistics.host_audit_count
+    _f3_host_decision_avoided_count += (
+        statistics.host_decision_avoided_count
+    )
+    _f3_device_decision_count += statistics.device_decision_count
+    _f3_device_reject_count += statistics.device_reject_count
+    _f3_device_pass_count += statistics.device_pass_count
+    _f3_host_fallback_count += statistics.host_fallback_count
+    _f3_decision_mismatch_count += statistics.decision_mismatch_count
+    _f3_device_compaction_run_count += statistics.device_compaction_run_count
+    _f3_device_compaction_candidate_count += (
+        statistics.device_compaction_candidate_count
+    )
+    _f3_device_compacted_survivor_count += (
+        statistics.device_compacted_survivor_count
+    )
+    _f3_survivor_upload_avoided_bytes += (
+        statistics.survivor_upload_avoided_bytes
+    )
+
+
+def _forward_f3_device_statistics():
+    """Return cumulative production Forward F3 decision/compaction counters."""
+    return {
+        "f3_compiled_profile_count": _f3_compiled_profile_count,
+        "f3_unsupported_profile_count": _f3_unsupported_profile_count,
+        "f3_host_audit_count": _f3_host_audit_count,
+        "f3_host_decision_avoided_count": (
+            _f3_host_decision_avoided_count
+        ),
+        "f3_device_decision_count": _f3_device_decision_count,
+        "f3_device_reject_count": _f3_device_reject_count,
+        "f3_device_pass_count": _f3_device_pass_count,
+        "f3_host_fallback_count": _f3_host_fallback_count,
+        "f3_decision_mismatch_count": _f3_decision_mismatch_count,
+        "f3_device_compaction_run_count": _f3_device_compaction_run_count,
+        "f3_device_compaction_candidate_count": (
+            _f3_device_compaction_candidate_count
+        ),
+        "f3_device_compacted_survivor_count": (
+            _f3_device_compacted_survivor_count
+        ),
+        "f3_survivor_upload_avoided_bytes": (
+            _f3_survivor_upload_avoided_bytes
+        ),
     }
 
 
@@ -8145,6 +8226,9 @@ cdef class SequenceBatch:
                     native_residency_statistics,
                     native_domain_residency_statistics,
                     native_rescore_residency_statistics,
+                )
+                _accumulate_forward_f3_device_statistics(
+                    plan7_forward_output_f3_device_statistics(output)
                 )
                 sealed_stage_timings = (
                     SEALED_STAGE_TIMING_SCHEMA_VERSION,
