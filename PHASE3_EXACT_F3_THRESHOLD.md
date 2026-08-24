@@ -116,3 +116,37 @@ mode, and stable device compactor are retained. Candidate filter scores are
 still temporarily uploaded and kernel results are still materialized for the
 existing result/provenance/journal ABI; later Phase 3 residency work can remove
 those remaining transfers when Backward consumes the resident view directly.
+
+## Combined full-workload result
+
+The compiler/compactor was then combined with resident Forward-to-Backward and
+Backward-to-rescore handoffs. Slurm job 1182713 ran the exact first-1,000 gate
+and the complete 300,186-target by 27,481-profile workload in one process and
+one persistent profile session. Both outputs matched their immutable oracles;
+the full TSV SHA-256 was
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`.
+
+The sealed full request took 535.213 seconds, including 463.471 seconds of
+native generation, 400.136 seconds of overlapped CPU continuation/output, and
+336.246 seconds of measured overlap. This is 11.008 seconds (2.02%) below the
+546.221-second prior H200 request and 1.313x faster than Astra CPU64 at 702.79
+seconds.
+
+Across all 83 chunks, 12,121,540 supported F3 host decisions were avoided,
+exactly matching the device-decision count. Host audit, decision mismatch,
+unsupported-profile, and host-fallback counts were all zero. The device ran
+168 stable compactions and avoided 9,918,780 bytes of survivor-index/offset
+uploads. Output-cap rows can be classified without being gathered, so the
+compaction-input count (12,019,742) is correctly a bounded subset of classified
+rows. The avoided-upload identity held exactly:
+
+```text
+avoided bytes = 12 * compacted survivors + 8 * compaction runs
+              = 12 * 826,453 + 8 * 168
+              = 9,918,780
+```
+
+The combined residency gates also recorded zero legacy Forward-special H2D
+bytes, zero legacy rescore-upstream H2D bytes, and zero allocation fallbacks;
+3,291,870,792 and 21,425,952 bytes respectively were eliminated. Peak selected
+H200 memory was 3,368 MiB. The optimization is retained.
