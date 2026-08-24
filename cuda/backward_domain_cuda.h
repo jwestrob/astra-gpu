@@ -135,6 +135,14 @@ typedef struct plan7_backward_domain_statistics {
   float total_milliseconds;
 } plan7_backward_domain_statistics;
 
+/* Additive transfer accounting for the resident Forward handoff. */
+typedef struct plan7_backward_domain_residency_statistics {
+  uint64_t forward_special_h2d_bytes;
+  uint64_t eliminated_forward_special_h2d_bytes;
+  uint64_t resident_input_count;
+  float forward_special_upload_milliseconds;
+} plan7_backward_domain_residency_statistics;
+
 typedef struct plan7_backward_domain_output plan7_backward_domain_output;
 
 /* Low-level diagnostic seam. Calls must be serialized with all other uses and
@@ -173,6 +181,41 @@ int plan7_backward_domain_run_with_reason_facts(
   const uint64_t *forward_offsets,
   const float *forward_specials,
   size_t forward_special_count,
+  float rt1,
+  float rt2,
+  float rt3,
+  float guard_band,
+  uint64_t posterior_byte_budget,
+  plan7_backward_domain_output **output,
+  char *error,
+  size_t error_size);
+
+/* Opaque production seam.  Host validation and final output semantics are
+ * identical to plan7_backward_domain_run(), but the recurrence consumes the
+ * generation-owned resident Forward trajectories directly. */
+int plan7_backward_domain_run_from_forward_output(
+  const plan7_forward_database *database,
+  const plan7_ssv_sequence_batch *batch,
+  const plan7_backward_domain_candidate *candidates,
+  size_t candidate_count,
+  const uint64_t *forward_offsets,
+  const plan7_forward_output *forward_output,
+  float rt1,
+  float rt2,
+  float rt3,
+  float guard_band,
+  uint64_t posterior_byte_budget,
+  plan7_backward_domain_output **output,
+  char *error,
+  size_t error_size);
+
+int plan7_backward_domain_run_from_forward_output_with_reason_facts(
+  const plan7_forward_database *database,
+  const plan7_ssv_sequence_batch *batch,
+  const plan7_backward_domain_candidate *candidates,
+  size_t candidate_count,
+  const uint64_t *forward_offsets,
+  const plan7_forward_output *forward_output,
   float rt1,
   float rt2,
   float rt3,
@@ -228,6 +271,9 @@ plan7_backward_domain_output_provenance(
   const plan7_backward_domain_output *output);
 const plan7_backward_domain_statistics *
 plan7_backward_domain_output_statistics(
+  const plan7_backward_domain_output *output);
+const plan7_backward_domain_residency_statistics *
+plan7_backward_domain_output_residency_statistics(
   const plan7_backward_domain_output *output);
 size_t plan7_backward_domain_output_reason_count(
   const plan7_backward_domain_output *output);

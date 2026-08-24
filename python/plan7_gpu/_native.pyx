@@ -60,6 +60,17 @@ cdef uint64_t _direct_v3_eliminated_v2_bytes = 0
 cdef uint64_t _direct_v3_staging_payload_bytes = 0
 cdef uint64_t _direct_v3_staging_build_ns = 0
 cdef uint64_t _direct_v3_source_validation_ns = 0
+cdef uint64_t _resident_forward_call_count = 0
+cdef uint64_t _resident_forward_requested_bytes = 0
+cdef uint64_t _resident_forward_allocated_bytes = 0
+cdef uint64_t _resident_forward_materialized_bytes = 0
+cdef uint64_t _resident_forward_allocation_fallback_count = 0
+cdef double _resident_forward_allocation_milliseconds = 0.0
+cdef double _resident_forward_materialization_milliseconds = 0.0
+cdef uint64_t _resident_backward_call_count = 0
+cdef uint64_t _resident_backward_forward_h2d_bytes = 0
+cdef uint64_t _resident_backward_eliminated_forward_h2d_bytes = 0
+cdef double _resident_backward_forward_upload_milliseconds = 0.0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 GENERATION_TELEMETRY_SCHEMA_VERSION = 2
 DIRECT_V3_STAGING_SCHEMA_VERSION = 2
@@ -860,6 +871,23 @@ cdef extern from "forward_cuda.h" nogil:
         uint64_t generation_f3_bits
         uint64_t integrity_tag
 
+    ctypedef struct plan7_forward_residency_statistics:
+        uint64_t requested_bytes
+        uint64_t allocated_bytes
+        uint64_t materialized_bytes
+        uint64_t allocation_fallback_count
+        float allocation_milliseconds
+        float materialization_milliseconds
+
+    ctypedef struct plan7_forward_resident_view:
+        uint64_t database_generation
+        uint64_t batch_generation
+        uint64_t pass_count
+        uint64_t special_count
+        int32_t device_ordinal
+        uint32_t reserved
+        const float *specials
+
     ctypedef struct plan7_forward_output:
         pass
 
@@ -961,6 +989,38 @@ cdef extern from "forward_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_forward_run_batch_workspace_resident(
+        const plan7_forward_database *database,
+        plan7_ssv_sequence_batch *batch,
+        const uintptr_t *source_profile_pointers,
+        size_t profile_count,
+        const uint64_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        const float *filter_scores,
+        size_t candidate_count,
+        double f3,
+        uint64_t gathered_byte_budget,
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_forward_run_batch_workspace_resident_reason_facts(
+        const plan7_forward_database *database,
+        plan7_ssv_sequence_batch *batch,
+        const uintptr_t *source_profile_pointers,
+        size_t profile_count,
+        const uint64_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        const float *filter_scores,
+        size_t candidate_count,
+        double f3,
+        uint64_t gathered_byte_budget,
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_forward_output_destroy(
         plan7_forward_output **output,
         char *error,
@@ -997,6 +1057,17 @@ cdef extern from "forward_cuda.h" nogil:
 
     const plan7_forward_statistics *plan7_forward_output_statistics(
         const plan7_forward_output *output,
+    )
+
+    const plan7_forward_residency_statistics *plan7_forward_output_residency_statistics(
+        const plan7_forward_output *output,
+    )
+
+    int plan7_forward_output_get_resident_view(
+        const plan7_forward_output *output,
+        plan7_forward_resident_view *view,
+        char *error,
+        size_t error_size,
     )
 
     float plan7_forward_output_upload_milliseconds(
@@ -1120,6 +1191,12 @@ cdef extern from "backward_domain_cuda.h" nogil:
         float download_milliseconds
         float total_milliseconds
 
+    ctypedef struct plan7_backward_domain_residency_statistics:
+        uint64_t forward_special_h2d_bytes
+        uint64_t eliminated_forward_special_h2d_bytes
+        uint64_t resident_input_count
+        float forward_special_upload_milliseconds
+
     ctypedef struct plan7_backward_domain_output:
         pass
 
@@ -1151,6 +1228,40 @@ cdef extern from "backward_domain_cuda.h" nogil:
         const uint64_t *forward_offsets,
         const float *forward_specials,
         size_t forward_special_count,
+        float rt1,
+        float rt2,
+        float rt3,
+        float guard_band,
+        uint64_t posterior_byte_budget,
+        plan7_backward_domain_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_backward_domain_run_from_forward_output(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_candidate *candidates,
+        size_t candidate_count,
+        const uint64_t *forward_offsets,
+        const plan7_forward_output *forward_output,
+        float rt1,
+        float rt2,
+        float rt3,
+        float guard_band,
+        uint64_t posterior_byte_budget,
+        plan7_backward_domain_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_backward_domain_run_from_forward_output_with_reason_facts(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_candidate *candidates,
+        size_t candidate_count,
+        const uint64_t *forward_offsets,
+        const plan7_forward_output *forward_output,
         float rt1,
         float rt2,
         float rt3,
@@ -1222,6 +1333,10 @@ cdef extern from "backward_domain_cuda.h" nogil:
     )
 
     const plan7_backward_domain_statistics *plan7_backward_domain_output_statistics(
+        const plan7_backward_domain_output *output,
+    )
+
+    const plan7_backward_domain_residency_statistics *plan7_backward_domain_output_residency_statistics(
         const plan7_backward_domain_output *output,
     )
 
@@ -3259,6 +3374,77 @@ def _sealed_journal_transport_statistics():
             _direct_v3_source_validation_ns
         ),
     }
+
+
+def _forward_backward_residency_statistics():
+    """Return cumulative exact transfer counters for resident continuation."""
+    return {
+        "forward_call_count": _resident_forward_call_count,
+        "forward_requested_bytes": _resident_forward_requested_bytes,
+        "forward_allocated_bytes": _resident_forward_allocated_bytes,
+        "forward_materialized_bytes": _resident_forward_materialized_bytes,
+        "forward_allocation_fallback_count": (
+            _resident_forward_allocation_fallback_count
+        ),
+        "forward_allocation_ms": (
+            _resident_forward_allocation_milliseconds
+        ),
+        "forward_materialization_ms": (
+            _resident_forward_materialization_milliseconds
+        ),
+        "backward_call_count": _resident_backward_call_count,
+        "backward_forward_h2d_bytes": (
+            _resident_backward_forward_h2d_bytes
+        ),
+        "backward_eliminated_forward_h2d_bytes": (
+            _resident_backward_eliminated_forward_h2d_bytes
+        ),
+        "backward_forward_upload_ms": (
+            _resident_backward_forward_upload_milliseconds
+        ),
+    }
+
+
+cdef void _accumulate_forward_backward_residency_statistics(
+    const plan7_forward_residency_statistics *forward,
+    const plan7_backward_domain_residency_statistics *backward,
+) noexcept:
+    global _resident_forward_call_count
+    global _resident_forward_requested_bytes
+    global _resident_forward_allocated_bytes
+    global _resident_forward_materialized_bytes
+    global _resident_forward_allocation_fallback_count
+    global _resident_forward_allocation_milliseconds
+    global _resident_forward_materialization_milliseconds
+    global _resident_backward_call_count
+    global _resident_backward_forward_h2d_bytes
+    global _resident_backward_eliminated_forward_h2d_bytes
+    global _resident_backward_forward_upload_milliseconds
+    if forward != NULL:
+        _resident_forward_call_count += 1
+        _resident_forward_requested_bytes += forward.requested_bytes
+        _resident_forward_allocated_bytes += forward.allocated_bytes
+        _resident_forward_materialized_bytes += forward.materialized_bytes
+        _resident_forward_allocation_fallback_count += (
+            forward.allocation_fallback_count
+        )
+        _resident_forward_allocation_milliseconds += (
+            forward.allocation_milliseconds
+        )
+        _resident_forward_materialization_milliseconds += (
+            forward.materialization_milliseconds
+        )
+    if backward != NULL:
+        _resident_backward_call_count += backward.resident_input_count
+        _resident_backward_forward_h2d_bytes += (
+            backward.forward_special_h2d_bytes
+        )
+        _resident_backward_eliminated_forward_h2d_bytes += (
+            backward.eliminated_forward_special_h2d_bytes
+        )
+        _resident_backward_forward_upload_milliseconds += (
+            backward.forward_special_upload_milliseconds
+        )
 
 
 def bias_host_environment_attested():
@@ -6046,6 +6232,7 @@ cdef class SequenceBatch:
         cdef uint64_t sequence_length
         cdef plan7_forward_database *database = NULL
         cdef plan7_forward_output *output = NULL
+        cdef plan7_forward_resident_view resident_view
         cdef plan7_backward_domain_output *domain_output = NULL
         cdef plan7_domain_rescore_output *rescore_output = NULL
         cdef const plan7_forward_result *native_results
@@ -6053,7 +6240,9 @@ cdef class SequenceBatch:
         cdef const float *native_specials
         cdef const plan7_forward_provenance *native_provenance
         cdef const plan7_forward_statistics *native_statistics
+        cdef const plan7_forward_residency_statistics *native_residency_statistics
         cdef const plan7_backward_domain_statistics *native_domain_statistics
+        cdef const plan7_backward_domain_residency_statistics *native_domain_residency_statistics
         cdef const plan7_domain_rescore_statistics *native_rescore_statistics
         cdef const uint32_t *native_domain_reasons
         cdef const uint32_t *native_rescore_reasons
@@ -6065,6 +6254,7 @@ cdef class SequenceBatch:
         cdef char error[512]
         cdef char destroy_error[512]
         cdef int status = 0
+        cdef int resident_status = 0
         cdef int destroy_status = 0
         cdef size_t result_count
         cdef size_t result_bytes
@@ -6537,39 +6727,77 @@ cdef class SequenceBatch:
                 if status != 0:
                     break
         if status == 0 and collect_generation_telemetry:
-            with nogil:
-                status = plan7_forward_run_batch_workspace_reason_facts(
-                    database,
-                    self._batch,
-                    view.identity_tokens,
-                    profile_count,
-                    candidate_offsets.data(),
-                    candidate_indices.data(),
-                    filter_scores.data(),
-                    candidate_count,
-                    f3,
-                    gathered_byte_budget,
-                    &output,
-                    error,
-                    sizeof(error),
-                )
+            if sealed_domain_journal:
+                with nogil:
+                    status = (
+                        plan7_forward_run_batch_workspace_resident_reason_facts(
+                            database,
+                            self._batch,
+                            view.identity_tokens,
+                            profile_count,
+                            candidate_offsets.data(),
+                            candidate_indices.data(),
+                            filter_scores.data(),
+                            candidate_count,
+                            f3,
+                            gathered_byte_budget,
+                            &output,
+                            error,
+                            sizeof(error),
+                        )
+                    )
+            else:
+                with nogil:
+                    status = plan7_forward_run_batch_workspace_reason_facts(
+                        database,
+                        self._batch,
+                        view.identity_tokens,
+                        profile_count,
+                        candidate_offsets.data(),
+                        candidate_indices.data(),
+                        filter_scores.data(),
+                        candidate_count,
+                        f3,
+                        gathered_byte_budget,
+                        &output,
+                        error,
+                        sizeof(error),
+                    )
         elif status == 0:
-            with nogil:
-                status = plan7_forward_run_batch_workspace(
-                    database,
-                    self._batch,
-                    view.identity_tokens,
-                    profile_count,
-                    candidate_offsets.data(),
-                    candidate_indices.data(),
-                    filter_scores.data(),
-                    candidate_count,
-                    f3,
-                    gathered_byte_budget,
-                    &output,
-                    error,
-                    sizeof(error),
-                )
+            if sealed_domain_journal:
+                with nogil:
+                    status = plan7_forward_run_batch_workspace_resident(
+                        database,
+                        self._batch,
+                        view.identity_tokens,
+                        profile_count,
+                        candidate_offsets.data(),
+                        candidate_indices.data(),
+                        filter_scores.data(),
+                        candidate_count,
+                        f3,
+                        gathered_byte_budget,
+                        &output,
+                        error,
+                        sizeof(error),
+                    )
+            else:
+                with nogil:
+                    status = plan7_forward_run_batch_workspace(
+                        database,
+                        self._batch,
+                        view.identity_tokens,
+                        profile_count,
+                        candidate_offsets.data(),
+                        candidate_indices.data(),
+                        filter_scores.data(),
+                        candidate_count,
+                        f3,
+                        gathered_byte_budget,
+                        &output,
+                        error,
+                        sizeof(error),
+                    )
         if status != 0:
             if database != NULL:
                 plan7_forward_database_destroy(&database, NULL, 0)
@@ -6754,7 +6982,38 @@ cdef class SequenceBatch:
                     raise RuntimeError("Forward pass provenance count changed")
 
                 error[0] = 0
-                if collect_generation_telemetry:
+                with nogil:
+                    resident_status = plan7_forward_output_get_resident_view(
+                        output, &resident_view, error, sizeof(error)
+                    )
+                if resident_status < 0:
+                    raise RuntimeError(error.decode("utf-8", "replace"))
+                error[0] = 0
+                if collect_generation_telemetry and resident_status == 1:
+                    with nogil:
+                        status = (
+                            plan7_backward_domain_run_from_forward_output_with_reason_facts(
+                                database,
+                                self._batch,
+                                (
+                                    domain_candidates.data()
+                                    if pass_count
+                                    else NULL
+                                ),
+                                pass_count,
+                                pass_special_offsets.data(),
+                                output,
+                                rt1,
+                                rt2,
+                                rt3,
+                                guard_band,
+                                0,
+                                &domain_output,
+                                error,
+                                sizeof(error),
+                            )
+                        )
+                elif collect_generation_telemetry:
                     with nogil:
                         status = plan7_backward_domain_run_with_reason_facts(
                             database,
@@ -6765,6 +7024,24 @@ cdef class SequenceBatch:
                             pass_special_offsets.data(),
                             native_specials if special_count else NULL,
                             special_count,
+                            rt1,
+                            rt2,
+                            rt3,
+                            guard_band,
+                            0,
+                            &domain_output,
+                            error,
+                            sizeof(error),
+                        )
+                elif resident_status == 1:
+                    with nogil:
+                        status = plan7_backward_domain_run_from_forward_output(
+                            database,
+                            self._batch,
+                            domain_candidates.data() if pass_count else NULL,
+                            pass_count,
+                            pass_special_offsets.data(),
+                            output,
                             rt1,
                             rt2,
                             rt3,
@@ -7534,8 +7811,16 @@ cdef class SequenceBatch:
                     direct_compact_null2_count,
                 )
                 native_statistics = plan7_forward_output_statistics(output)
+                native_residency_statistics = (
+                    plan7_forward_output_residency_statistics(output)
+                )
                 native_domain_statistics = (
                     plan7_backward_domain_output_statistics(domain_output)
+                )
+                native_domain_residency_statistics = (
+                    plan7_backward_domain_output_residency_statistics(
+                        domain_output
+                    )
                 )
                 native_rescore_statistics = (
                     plan7_domain_rescore_output_statistics(rescore_output)
@@ -7544,7 +7829,9 @@ cdef class SequenceBatch:
                 )
                 if (
                     native_statistics == NULL
+                    or native_residency_statistics == NULL
                     or native_domain_statistics == NULL
+                    or native_domain_residency_statistics == NULL
                     or (
                         rescore_output != NULL
                         and native_rescore_statistics == NULL
@@ -7553,6 +7840,10 @@ cdef class SequenceBatch:
                     raise RuntimeError(
                         "sealed native stage timing storage is incomplete"
                     )
+                _accumulate_forward_backward_residency_statistics(
+                    native_residency_statistics,
+                    native_domain_residency_statistics,
+                )
                 sealed_stage_timings = (
                     SEALED_STAGE_TIMING_SCHEMA_VERSION,
                     (

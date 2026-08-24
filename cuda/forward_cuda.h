@@ -155,6 +155,32 @@ typedef struct plan7_forward_workspace_statistics {
   uint64_t capacity_bytes[PLAN7_FORWARD_CAPACITY_COUNT];
 } plan7_forward_workspace_statistics;
 
+/* Additive instrumentation for the opt-in resident continuation path.  This
+ * stays outside plan7_forward_statistics so the existing result/statistics
+ * ABI remains unchanged. */
+typedef struct plan7_forward_residency_statistics {
+  uint64_t requested_bytes;
+  uint64_t allocated_bytes;
+  uint64_t materialized_bytes;
+  uint64_t allocation_fallback_count;
+  float allocation_milliseconds;
+  float materialization_milliseconds;
+} plan7_forward_residency_statistics;
+
+/* Read-only internal view consumed by the next native CUDA stage.  The
+ * pointer is generation-owned by plan7_forward_output and is valid only until
+ * that output is destroyed.  Public callers must treat it as opaque device
+ * storage. */
+typedef struct plan7_forward_resident_view {
+  uint64_t database_generation;
+  uint64_t batch_generation;
+  uint64_t pass_count;
+  uint64_t special_count;
+  int32_t device_ordinal;
+  uint32_t reserved;
+  const float *specials;
+} plan7_forward_resident_view;
+
 /* Profiles are retained by the Python owner for this object's lifetime. */
 int plan7_forward_database_create(const uintptr_t *profile_pointers,
                                   size_t profile_count,
@@ -290,6 +316,41 @@ int plan7_forward_run_batch_workspace_reason_facts(
   char *error,
   size_t error_size);
 
+/* Production continuation twins.  In addition to the unchanged host output,
+ * these retain the gathered pass trajectories on the selected device so an
+ * immediately following Backward/domain call can consume them without an
+ * H2D replay.  Allocation pressure fails soft to the legacy host-only output;
+ * callers must query plan7_forward_output_get_resident_view(). */
+int plan7_forward_run_batch_workspace_resident(
+  const plan7_forward_database *database,
+  plan7_ssv_sequence_batch *batch,
+  const uintptr_t *source_profile_pointers,
+  size_t profile_count,
+  const uint64_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  const float *filter_scores,
+  size_t candidate_count,
+  double f3,
+  uint64_t gathered_byte_budget,
+  plan7_forward_output **output,
+  char *error,
+  size_t error_size);
+
+int plan7_forward_run_batch_workspace_resident_reason_facts(
+  const plan7_forward_database *database,
+  plan7_ssv_sequence_batch *batch,
+  const uintptr_t *source_profile_pointers,
+  size_t profile_count,
+  const uint64_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  const float *filter_scores,
+  size_t candidate_count,
+  double f3,
+  uint64_t gathered_byte_budget,
+  plan7_forward_output **output,
+  char *error,
+  size_t error_size);
+
 int plan7_forward_output_destroy(plan7_forward_output **output,
                                  char *error,
                                  size_t error_size);
@@ -307,6 +368,18 @@ const float *plan7_forward_output_specials(
   const plan7_forward_output *output);
 const plan7_forward_statistics *plan7_forward_output_statistics(
   const plan7_forward_output *output);
+const plan7_forward_residency_statistics *
+plan7_forward_output_residency_statistics(
+  const plan7_forward_output *output);
+
+/* Returns 1 when a complete resident view is available, 0 for the ordinary
+ * host-only/fail-soft path, and -1 for invalid arguments or an inconsistent
+ * generation-owned view. */
+int plan7_forward_output_get_resident_view(
+  const plan7_forward_output *output,
+  plan7_forward_resident_view *view,
+  char *error,
+  size_t error_size);
 /* Additive instrumentation accessors on the opaque output. They do not alter
  * plan7_forward_statistics, the continuation journal, or provenance hashes. */
 float plan7_forward_output_upload_milliseconds(

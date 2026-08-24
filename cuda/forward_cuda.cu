@@ -541,6 +541,31 @@ struct plan7_forward_workspace {
   uint64_t run_count;
 };
 
+struct ResidentForwardSpecials {
+  float *pointer = nullptr;
+  int device_ordinal = -1;
+
+  ~ResidentForwardSpecials() {
+    if (pointer == nullptr || device_ordinal < 0) return;
+    int original_device = -1;
+    const cudaError_t get_status = cudaGetDevice(&original_device);
+    bool restore_device = false;
+    if (get_status == cudaSuccess && original_device != device_ordinal) {
+      if (cudaSetDevice(device_ordinal) != cudaSuccess) return;
+      restore_device = true;
+    } else if (get_status != cudaSuccess &&
+               cudaSetDevice(device_ordinal) != cudaSuccess) {
+      return;
+    }
+    cudaFree(pointer);
+    if (restore_device) cudaSetDevice(original_device);
+  }
+
+  ResidentForwardSpecials() = default;
+  ResidentForwardSpecials(const ResidentForwardSpecials &) = delete;
+  ResidentForwardSpecials &operator=(const ResidentForwardSpecials &) = delete;
+};
+
 struct plan7_forward_output {
   std::vector<plan7_forward_result> results;
   std::vector<uint16_t> reason_facts;
@@ -548,6 +573,8 @@ struct plan7_forward_output {
   std::vector<float> specials;
   plan7_forward_statistics statistics;
   plan7_forward_provenance provenance;
+  ResidentForwardSpecials resident_specials;
+  plan7_forward_residency_statistics residency_statistics{};
   float upload_milliseconds;
   float total_milliseconds;
   bool contract_fallback = false;
@@ -1413,6 +1440,7 @@ static int forward_run_with_workspace_impl(
     const float *filter_scores, size_t candidate_count, double f3,
     uint64_t gathered_byte_budget,
     plan7_forward_output **output, bool collect_reason_facts,
+    bool retain_device_specials,
     char *error, size_t error_size) {
   const auto call_begin = std::chrono::steady_clock::now();
   if (output == nullptr || *output != nullptr || workspace == nullptr ||
@@ -1715,9 +1743,6 @@ static int forward_run_with_workspace_impl(
   }
   dp_bytes = static_cast<size_t>(maximum_dp_cells) * sizeof(float);
   xmx_bytes = static_cast<size_t>(maximum_x_cells) * sizeof(float);
-  created->statistics.gather_workspace_bytes =
-      static_cast<uint64_t>(xmx_bytes) + survivor_candidate_bytes +
-      survivor_offset_bytes;
 
   int maximum_grid_x = 0;
   status = cudaDeviceGetAttribute(
@@ -1782,10 +1807,51 @@ static int forward_run_with_workspace_impl(
           survivor_offset_bytes, &workspace->growth_count,
           "cudaMalloc(Forward survivor offsets)", error, error_size) != 0 ||
       grow_forward_workspace_buffer(
-          &buffers.gathered, &workspace->gathered_capacity, xmx_bytes,
+          &buffers.gathered, &workspace->gathered_capacity,
+          xmx_bytes,
           &workspace->growth_count, "cudaMalloc(Forward gather workspace)",
           error, error_size) != 0)
     return -1;
+
+  /* The tile XMX buffer is overwritten by the next tile.  The resident path
+   * therefore reserves one generation-owned append buffer, bounded by both
+   * the existing output cap and the total possible row bytes.  Persistent
+   * legacy work buffers are grown first, so allocation pressure here fails
+   * soft without turning an otherwise viable run into an error. */
+  if (retain_device_specials && output_byte_limit != 0) {
+    const uint64_t total_x_cells = host_x_offsets.back();
+    const uint64_t output_cell_limit = output_byte_limit / sizeof(float);
+    const uint64_t requested_cells =
+        std::min(total_x_cells, output_cell_limit);
+    const size_t requested_bytes =
+        static_cast<size_t>(requested_cells) * sizeof(float);
+    created->residency_statistics.requested_bytes = requested_bytes;
+    if (requested_bytes != 0) {
+      const auto allocation_begin = std::chrono::steady_clock::now();
+      status = cudaMalloc(&created->resident_specials.pointer,
+                          requested_bytes);
+      created->residency_statistics.allocation_milliseconds =
+          std::chrono::duration<float, std::milli>(
+              std::chrono::steady_clock::now() - allocation_begin).count();
+      if (status == cudaSuccess) {
+        created->resident_specials.device_ordinal = current_device;
+        created->residency_statistics.allocated_bytes = requested_bytes;
+      } else if (status == cudaErrorMemoryAllocation) {
+        created->resident_specials.pointer = nullptr;
+        ++created->residency_statistics.allocation_fallback_count;
+        /* Do not let the optional allocation's per-thread last-error state
+         * poison the next legacy kernel launch check. */
+        cudaGetLastError();
+      } else {
+        set_cuda_error(error, error_size,
+                       "cudaMalloc(Forward resident specials)", status);
+        return -1;
+      }
+    }
+  }
+  created->statistics.gather_workspace_bytes =
+      static_cast<uint64_t>(xmx_bytes) + survivor_candidate_bytes +
+      survivor_offset_bytes;
   const auto input_upload_begin = std::chrono::steady_clock::now();
   CUDA_RUN(cudaMemcpy(buffers.candidate_profiles,
                       host_candidate_profiles.data(),
@@ -1968,11 +2034,15 @@ static int forward_run_with_workspace_impl(
         std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - survivor_upload_begin).count();
     CUDA_RUN(cudaEventRecord(buffers.begin_event));
+    float *gather_destination =
+        created->resident_specials.pointer == nullptr
+            ? buffers.gathered
+            : created->resident_specials.pointer + old_special_count;
     gather_specials_kernel<<<static_cast<unsigned>(survivor_count),
                              kGatherThreads>>>(
         buffers.xmx, buffers.x_offsets, buffers.survivor_candidates,
         buffers.survivor_offsets, survivor_count, host_x_offsets[begin],
-        buffers.gathered);
+        gather_destination);
     CUDA_RUN(cudaGetLastError());
     CUDA_RUN(cudaEventRecord(buffers.end_event));
     CUDA_RUN(cudaEventSynchronize(buffers.end_event));
@@ -1980,9 +2050,11 @@ static int forward_run_with_workspace_impl(
     CUDA_RUN(cudaEventElapsedTime(
         &elapsed, buffers.begin_event, buffers.end_event));
     created->statistics.gather_milliseconds += elapsed;
+    if (created->resident_specials.pointer != nullptr)
+      created->residency_statistics.materialization_milliseconds += elapsed;
     const auto gather_download_begin = std::chrono::steady_clock::now();
     CUDA_RUN(cudaMemcpy(created->specials.data() + old_special_count,
-                        buffers.gathered,
+                        gather_destination,
                         static_cast<size_t>(tile_gathered_cells) *
                             sizeof(float),
                         cudaMemcpyDeviceToHost));
@@ -1993,6 +2065,9 @@ static int forward_run_with_workspace_impl(
 #undef CUDA_RUN
   created->statistics.gathered_xmx_bytes =
       gathered_cells * sizeof(float);
+  if (created->resident_specials.pointer != nullptr)
+    created->residency_statistics.materialized_bytes =
+        created->statistics.gathered_xmx_bytes;
   created->statistics.total_milliseconds =
       std::chrono::duration<float, std::milli>(
           std::chrono::steady_clock::now() - total_begin).count();
@@ -2021,7 +2096,7 @@ extern "C" int plan7_forward_run_with_workspace(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, false, error, error_size);
+      f3, gathered_byte_budget, output, false, false, error, error_size);
 }
 
 extern "C" int plan7_forward_run(
@@ -2083,7 +2158,43 @@ extern "C" int plan7_forward_run_batch_workspace_reason_facts(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, true, error, error_size);
+      f3, gathered_byte_budget, output, true, false, error, error_size);
+}
+
+extern "C" int plan7_forward_run_batch_workspace_resident(
+    const plan7_forward_database *database,
+    plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  plan7_forward_workspace *workspace = nullptr;
+  if (plan7_ssv_sequence_batch_get_forward_workspace(
+          batch, &workspace, error, error_size) != 0)
+    return -1;
+  return forward_run_with_workspace_impl(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, false, true, error, error_size);
+}
+
+extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
+    const plan7_forward_database *database,
+    plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  plan7_forward_workspace *workspace = nullptr;
+  if (plan7_ssv_sequence_batch_get_forward_workspace(
+          batch, &workspace, error, error_size) != 0)
+    return -1;
+  return forward_run_with_workspace_impl(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, true, true, error, error_size);
 }
 
 extern "C" int plan7_forward_output_destroy(
@@ -2139,6 +2250,42 @@ extern "C" const float *plan7_forward_output_specials(
 extern "C" const plan7_forward_statistics *
 plan7_forward_output_statistics(const plan7_forward_output *output) {
   return output == nullptr ? nullptr : &output->statistics;
+}
+
+extern "C" const plan7_forward_residency_statistics *
+plan7_forward_output_residency_statistics(
+    const plan7_forward_output *output) {
+  return output == nullptr ? nullptr : &output->residency_statistics;
+}
+
+extern "C" int plan7_forward_output_get_resident_view(
+    const plan7_forward_output *output,
+    plan7_forward_resident_view *view,
+    char *error, size_t error_size) {
+  if (output == nullptr || view == nullptr) {
+    set_error(error, error_size, "invalid Forward resident view request");
+    return -1;
+  }
+  *view = {};
+  if (output->resident_specials.pointer == nullptr) return 0;
+  if (output->residency_statistics.materialized_bytes !=
+          output->specials.size() * sizeof(float) ||
+      output->residency_statistics.materialized_bytes >
+          output->residency_statistics.allocated_bytes ||
+      output->provenance.special_count != output->specials.size() ||
+      output->provenance.pass_count > output->results.size() ||
+      output->resident_specials.device_ordinal < 0) {
+    set_error(error, error_size,
+              "Forward resident generation is incomplete");
+    return -1;
+  }
+  view->database_generation = output->provenance.database_generation;
+  view->batch_generation = output->provenance.batch_generation;
+  view->pass_count = output->provenance.pass_count;
+  view->special_count = output->provenance.special_count;
+  view->device_ordinal = output->resident_specials.device_ordinal;
+  view->specials = output->resident_specials.pointer;
+  return 1;
 }
 
 extern "C" float plan7_forward_output_upload_milliseconds(

@@ -726,6 +726,7 @@ struct plan7_backward_domain_output {
   std::vector<plan7_simple_region> regions;
   std::vector<uint32_t> reason_facts;
   plan7_backward_domain_statistics statistics;
+  plan7_backward_domain_residency_statistics residency_statistics{};
   plan7_backward_domain_provenance provenance;
   float rt1 = NAN;
   float rt2 = NAN;
@@ -822,6 +823,7 @@ int backward_domain_run_impl(
     size_t candidate_count, const plan7_forward_provenance *provenance,
     const uint64_t *forward_offsets,
     const float *forward_specials, size_t forward_special_count,
+    const plan7_forward_resident_view *resident_view,
     float rt1, float rt2, float rt3, float guard_band,
     uint64_t posterior_byte_budget,
     bool unsealed_test, bool collect_reason_facts,
@@ -840,6 +842,11 @@ int backward_domain_run_impl(
   }
   if (candidate_count > UINT32_MAX) {
     set_error(error, error_size, "Backward/domain candidate count exceeds uint32");
+    return -1;
+  }
+  if (unsealed_test && resident_view != nullptr) {
+    set_error(error, error_size,
+              "test-only Backward/domain cannot consume resident Forward state");
     return -1;
   }
   if (candidate_count >
@@ -911,6 +918,20 @@ int backward_domain_run_impl(
               "Backward/domain input device pointer is invalid");
     return -1;
   }
+  if (resident_view != nullptr &&
+      (resident_view->database_generation !=
+           provenance_snapshot.database_generation ||
+       resident_view->batch_generation != provenance_snapshot.batch_generation ||
+       resident_view->pass_count != candidate_count ||
+       resident_view->special_count != forward_special_count ||
+       resident_view->device_ordinal != current_device ||
+       (forward_special_count != 0 &&
+        (resident_view->specials == nullptr ||
+         !device_allocation_on(resident_view->specials, current_device))))) {
+    set_error(error, error_size,
+              "Backward/domain resident Forward generation mismatch");
+    return -1;
+  }
   if (forward_offsets == nullptr || forward_offsets[0] != 0 ||
       forward_offsets[candidate_count] != forward_special_count) {
     set_error(error, error_size, "invalid Backward/domain Forward offsets");
@@ -949,6 +970,8 @@ int backward_domain_run_impl(
     return -1;
   }
   created->statistics.candidate_count = candidate_count;
+  created->residency_statistics.resident_input_count =
+      resident_view == nullptr ? 0 : 1;
   created->statistics.output_byte_limit = std::min(
       posterior_byte_budget,
       static_cast<uint64_t>(PLAN7_BACKWARD_DOMAIN_MAX_POSTERIOR_BYTES));
@@ -979,11 +1002,16 @@ int backward_domain_run_impl(
   uint64_t backward_bytes = 0;
   uint64_t forward_bytes = 0;
   uint64_t work_cells = 0;
+  const bool use_resident_forward = resident_view != nullptr;
   try {
     active_sources.reserve(candidate_count);
     active_candidates.reserve(candidate_count);
-    active_forward_specials.reserve(forward_special_count);
-    active_forward_offsets.push_back(0);
+    if (!use_resident_forward) {
+      active_forward_specials.reserve(forward_special_count);
+      active_forward_offsets.push_back(0);
+    } else {
+      active_forward_offsets.reserve(candidate_count + 1);
+    }
     active_dp_offsets.push_back(0);
     active_backward_offsets.push_back(0);
     active_posterior_offsets.push_back(0);
@@ -1149,12 +1177,16 @@ int backward_domain_run_impl(
     }
     active_sources.push_back(candidate);
     active_candidates.push_back(row);
-    active_forward_specials.insert(
-        active_forward_specials.end(),
-        forward_specials + forward_offsets[candidate],
-        forward_specials + forward_offsets[candidate + 1]);
-    active_forward_offsets.push_back(
-        active_forward_offsets.back() + expected_forward_cells);
+    if (use_resident_forward) {
+      active_forward_offsets.push_back(forward_offsets[candidate]);
+    } else {
+      active_forward_specials.insert(
+          active_forward_specials.end(),
+          forward_specials + forward_offsets[candidate],
+          forward_specials + forward_offsets[candidate + 1]);
+      active_forward_offsets.push_back(
+          active_forward_offsets.back() + expected_forward_cells);
+    }
     active_dp_offsets.push_back(active_dp_offsets.back() + row_dp_cells);
     active_backward_offsets.push_back(
         active_backward_offsets.back() + expected_forward_cells);
@@ -1169,6 +1201,9 @@ int backward_domain_run_impl(
       return -1;
     }
   }
+
+  if (use_resident_forward)
+    active_forward_offsets.push_back(forward_special_count);
 
   const size_t active_count = active_candidates.size();
   std::vector<plan7_backward_domain_result> active_results;
@@ -1190,14 +1225,18 @@ int backward_domain_run_impl(
         !checked_bytes(active_count, sizeof(plan7_backward_domain_result),
                        &result_bytes) ||
         !checked_bytes(active_count + 1, sizeof(uint64_t), &offset_bytes) ||
-        !checked_bytes(active_forward_specials.size(), sizeof(float),
-                       &forward_special_bytes) ||
+        (!use_resident_forward &&
+         !checked_bytes(active_forward_specials.size(), sizeof(float),
+                        &forward_special_bytes)) ||
+        (use_resident_forward && forward_bytes > SIZE_MAX) ||
         requested_posterior_bytes > SIZE_MAX ||
         (collect_reason_facts &&
          !checked_bytes(active_count, sizeof(uint32_t), &reason_bytes))) {
       set_error(error, error_size, "Backward/domain device size overflow");
       return -1;
     }
+    if (use_resident_forward)
+      forward_special_bytes = static_cast<size_t>(forward_bytes);
     posterior_bytes = static_cast<size_t>(requested_posterior_bytes);
     const auto upload_begin = std::chrono::steady_clock::now();
     cudaEvent_t begin_event = nullptr;
@@ -1218,7 +1257,8 @@ int backward_domain_run_impl(
     CUDA_RUN(cudaMalloc(&buffers.dp_offsets, offset_bytes));
     CUDA_RUN(cudaMalloc(&buffers.backward_offsets, offset_bytes));
     CUDA_RUN(cudaMalloc(&buffers.posterior_offsets, offset_bytes));
-    CUDA_RUN(cudaMalloc(&buffers.forward_specials, forward_special_bytes));
+    if (!use_resident_forward)
+      CUDA_RUN(cudaMalloc(&buffers.forward_specials, forward_special_bytes));
     CUDA_RUN(cudaMalloc(&buffers.dp, static_cast<size_t>(dp_bytes)));
     CUDA_RUN(cudaMalloc(&buffers.backward_specials,
                         static_cast<size_t>(backward_bytes)));
@@ -1241,9 +1281,20 @@ int backward_domain_run_impl(
     CUDA_RUN(cudaMemcpy(buffers.posterior_offsets,
                         active_posterior_offsets.data(), offset_bytes,
                         cudaMemcpyHostToDevice));
-    CUDA_RUN(cudaMemcpy(buffers.forward_specials,
-                        active_forward_specials.data(), forward_special_bytes,
-                        cudaMemcpyHostToDevice));
+    if (!use_resident_forward) {
+      const auto forward_upload_begin = std::chrono::steady_clock::now();
+      CUDA_RUN(cudaMemcpy(buffers.forward_specials,
+                          active_forward_specials.data(),
+                          forward_special_bytes, cudaMemcpyHostToDevice));
+      created->residency_statistics.forward_special_upload_milliseconds =
+          std::chrono::duration<float, std::milli>(
+              std::chrono::steady_clock::now() - forward_upload_begin).count();
+      created->residency_statistics.forward_special_h2d_bytes =
+          forward_special_bytes;
+    } else {
+      created->residency_statistics.eliminated_forward_special_h2d_bytes =
+          forward_special_bytes;
+    }
     created->statistics.upload_milliseconds =
         std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - upload_begin).count();
@@ -1253,13 +1304,15 @@ int backward_domain_run_impl(
     CUDA_RUN(cudaEventRecord(begin_event));
     const size_t block_count =
         (active_count + kCandidatesPerBlock - 1) / kCandidatesPerBlock;
+    const float *kernel_forward_specials = use_resident_forward
+        ? resident_view->specials : buffers.forward_specials;
     if (collect_reason_facts) {
       backward_domain_kernel<true><<<
           static_cast<unsigned>(block_count), kThreads>>>(
           sequence_view.device_residues, sequence_view.device_offsets,
           profile_view.profiles, profile_view.emissions,
           profile_view.transitions, buffers.candidates,
-          buffers.forward_offsets, buffers.forward_specials,
+          buffers.forward_offsets, kernel_forward_specials,
           buffers.dp_offsets, buffers.backward_offsets,
           buffers.posterior_offsets, active_count, rt1, rt2, rt3, guard_band,
           buffers.dp, buffers.backward_specials, buffers.posteriors,
@@ -1270,7 +1323,7 @@ int backward_domain_run_impl(
           sequence_view.device_residues, sequence_view.device_offsets,
           profile_view.profiles, profile_view.emissions,
           profile_view.transitions, buffers.candidates,
-          buffers.forward_offsets, buffers.forward_specials,
+          buffers.forward_offsets, kernel_forward_specials,
           buffers.dp_offsets, buffers.backward_offsets,
           buffers.posterior_offsets, active_count, rt1, rt2, rt3, guard_band,
           buffers.dp, buffers.backward_specials, buffers.posteriors,
@@ -1506,7 +1559,7 @@ extern "C" int plan7_backward_domain_run(
   try {
     return backward_domain_run_impl(
         database, batch, candidates, candidate_count, provenance,
-        forward_offsets, forward_specials, forward_special_count,
+        forward_offsets, forward_specials, forward_special_count, nullptr,
         rt1, rt2, rt3, guard_band, posterior_byte_budget, false, false,
         output, error, error_size);
   } catch (const std::bad_alloc &) {
@@ -1532,9 +1585,99 @@ extern "C" int plan7_backward_domain_run_with_reason_facts(
   try {
     return backward_domain_run_impl(
         database, batch, candidates, candidate_count, provenance,
-        forward_offsets, forward_specials, forward_special_count,
+        forward_offsets, forward_specials, forward_special_count, nullptr,
         rt1, rt2, rt3, guard_band, posterior_byte_budget, false, true,
         output, error, error_size);
+  } catch (const std::bad_alloc &) {
+    set_error(error, error_size, "Backward/domain host allocation failed");
+    return -1;
+  } catch (...) {
+    set_error(error, error_size, "Backward/domain unexpected native failure");
+    return -1;
+  }
+}
+
+namespace {
+
+int backward_domain_run_from_forward_output_impl(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const plan7_backward_domain_candidate *candidates,
+    size_t candidate_count, const uint64_t *forward_offsets,
+    const plan7_forward_output *forward_output,
+    float rt1, float rt2, float rt3, float guard_band,
+    uint64_t posterior_byte_budget, bool collect_reason_facts,
+    plan7_backward_domain_output **output,
+    char *error, size_t error_size) {
+  if (forward_output == nullptr) {
+    set_error(error, error_size,
+              "Backward/domain resident Forward output is null");
+    return -1;
+  }
+  plan7_forward_resident_view resident_view{};
+  const int resident_status = plan7_forward_output_get_resident_view(
+      forward_output, &resident_view, error, error_size);
+  if (resident_status != 1) {
+    if (resident_status == 0)
+      set_error(error, error_size,
+                "Backward/domain resident Forward output is unavailable");
+    return -1;
+  }
+  const plan7_forward_provenance *provenance =
+      plan7_forward_output_provenance(forward_output);
+  const float *host_specials =
+      plan7_forward_output_specials(forward_output);
+  const size_t special_count =
+      plan7_forward_output_special_count(forward_output);
+  return backward_domain_run_impl(
+      database, batch, candidates, candidate_count, provenance,
+      forward_offsets, host_specials, special_count, &resident_view,
+      rt1, rt2, rt3, guard_band, posterior_byte_budget, false,
+      collect_reason_facts, output, error, error_size);
+}
+
+}  // namespace
+
+extern "C" int plan7_backward_domain_run_from_forward_output(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const plan7_backward_domain_candidate *candidates,
+    size_t candidate_count, const uint64_t *forward_offsets,
+    const plan7_forward_output *forward_output,
+    float rt1, float rt2, float rt3, float guard_band,
+    uint64_t posterior_byte_budget,
+    plan7_backward_domain_output **output,
+    char *error, size_t error_size) {
+  try {
+    return backward_domain_run_from_forward_output_impl(
+        database, batch, candidates, candidate_count, forward_offsets,
+        forward_output, rt1, rt2, rt3, guard_band, posterior_byte_budget,
+        false, output, error, error_size);
+  } catch (const std::bad_alloc &) {
+    set_error(error, error_size, "Backward/domain host allocation failed");
+    return -1;
+  } catch (...) {
+    set_error(error, error_size, "Backward/domain unexpected native failure");
+    return -1;
+  }
+}
+
+extern "C" int
+plan7_backward_domain_run_from_forward_output_with_reason_facts(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const plan7_backward_domain_candidate *candidates,
+    size_t candidate_count, const uint64_t *forward_offsets,
+    const plan7_forward_output *forward_output,
+    float rt1, float rt2, float rt3, float guard_band,
+    uint64_t posterior_byte_budget,
+    plan7_backward_domain_output **output,
+    char *error, size_t error_size) {
+  try {
+    return backward_domain_run_from_forward_output_impl(
+        database, batch, candidates, candidate_count, forward_offsets,
+        forward_output, rt1, rt2, rt3, guard_band, posterior_byte_budget,
+        true, output, error, error_size);
   } catch (const std::bad_alloc &) {
     set_error(error, error_size, "Backward/domain host allocation failed");
     return -1;
@@ -1557,7 +1700,7 @@ extern "C" int plan7_backward_domain_unsealed_test_run(
   try {
     return backward_domain_run_impl(
         database, batch, candidates, candidate_count, nullptr,
-        forward_offsets, forward_specials, forward_special_count,
+        forward_offsets, forward_specials, forward_special_count, nullptr,
         rt1, rt2, rt3, guard_band, posterior_byte_budget, true, false,
         output, error, error_size);
   } catch (const std::bad_alloc &) {
@@ -1663,6 +1806,12 @@ extern "C" const plan7_backward_domain_statistics *
 plan7_backward_domain_output_statistics(
     const plan7_backward_domain_output *output) {
   return output == nullptr ? nullptr : &output->statistics;
+}
+
+extern "C" const plan7_backward_domain_residency_statistics *
+plan7_backward_domain_output_residency_statistics(
+    const plan7_backward_domain_output *output) {
+  return output == nullptr ? nullptr : &output->residency_statistics;
 }
 
 extern "C" int plan7_backward_domain_output_is_production_calibrated(
