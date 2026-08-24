@@ -34,6 +34,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, Phase 2 device compaction | 64 host workers | 538.822140 s | 13,175,768 KiB | exact; 0.495% slower than one-pass sparse v3 |
 | Astra GPU, H200, resident Forward-to-Backward handoff | 64 host workers | 534.276010 s | see run record | exact; 0.844% faster than Phase 2 |
 | Astra GPU, H200, Phase 5 profile-packed SSV | 64 host workers | **455.026448 s** | 13,201,996 KiB | **exact; 1.5445x faster than Astra CPU64** |
+| Astra GPU, H200, Phase 6 length-class metadata | 64 host workers | **454.247490 s** | 13,305,384 KiB | **exact; 1.5472x faster than Astra CPU64** |
 
 Additional GPU timing layers:
 
@@ -95,6 +96,15 @@ overlap. All 83 chunks used the packed path; 27,160 of 27,481 profiles ran in
 fallback. Against the retained combined Phase 3 width-one run, request wall
 fell by 80.186 seconds (14.982%) and generation fell by 118.276 seconds
 (25.520%). Peak sampled H200 memory was 3,372 MiB. This path is retained.
+
+Phase 6 length-class metadata full job `1182743` was byte-identical and
+completed in 454.247 seconds: 342.648 seconds generation, 446.653 seconds of
+pipeline wall, 402.233 seconds continuation/output, and 298.385 seconds
+overlap. All 83 chunks used the compact metadata path. They uploaded 121,595
+transition bytes and avoided 24,915,438 bytes of counterfactual dense H2D,
+while materializing the unchanged dense device layout for existing kernels.
+Against Phase 5, request wall improved by 0.779 seconds (0.171%) and generation
+improved by 2.547 seconds (0.738%). This path is retained.
 
 ## GPU request-stage ledger
 
@@ -167,6 +177,7 @@ These paths exist in the development workspace and are excluded from Git because
 - Phase 2 full run: `build/phase1b-benchmark-harness/build/h200-phase2-device-compaction-20260823/attempt-02-full/runs/h200-full`; worker SHA-256 `dcc3da2eafdcf076ab76a867472282cc290a529b8e7b10e64906e4a5709363f9`, raw-validation SHA-256 `7428eb2fd2c4cf152564f51b512b6f6ec0636b21cf1bed2945e98f7b8e022f2b`.
 - Phase 3 Forward-to-Backward residency full run: `build/phase1b-benchmark-harness/build/h200-phase3-forward-residency-20260823/attempt-02-full/runs/h200-full`; worker SHA-256 `1e33ad05c1d38bcc01cbb24f61577c0375fb2420d964cf3a48a82694cec6c083`, raw-validation SHA-256 `688f20c47de5dc982af530457594a9a5ea61383be13c7cff37e2bb7d4e9794dd`.
 - Phase 5 profile-packed SSV full run: `build/h200-phase5-profile-packed-ssv-20260824/attempt-01-full/runs/h200-full`; worker SHA-256 `92cb6510e11f0b248fe68c4ffd8c657ee2f903472ad224b834f9ad4e4ec814ab`, raw-validation SHA-256 `a4d7f394071acea2775c6bcef4239bb5d951f207a427cb3965ef1e4913cf2893`.
+- Phase 6 length-class metadata full run: `build/h200-phase6-length-metadata-20260824/attempt-01-full/runs/h200-full`; worker SHA-256 `08690b39b78dc7edd5a391f8470ff0c5b70d4676870029f2fdd20490e406690e`, raw-validation SHA-256 `27b539254c7bf9031f9c5f6e75e3e70b0631239801d0a3fdadad02a33d9dd724`.
 - CPU48 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu48/artifact.sha256`, manifest SHA-256 `9e6d4d96073c565a9b61fac5b804f98dd5f7ec57dd67af07c5a289b198dadd42`.
 - CPU64 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu64/artifact.sha256`, manifest SHA-256 `e3a2e4cd5674addfe347aa8c4604571a5bdc38f14b8e9fdade60f71cf5f35b46`.
 - CPU semantic normalization report: `build/astra-full-plm-pfam-cpu-comparison-20260817/runs/validation-01/comparison.json`, SHA-256 `78bee4fd2d03c2658d0779345893f89e6dc3777f1a380123a85c25c9a9b2525`.

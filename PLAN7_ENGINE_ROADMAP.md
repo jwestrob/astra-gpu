@@ -218,3 +218,21 @@ fallback profiles and 3,372 MiB peak sampled H200 memory.
 
 Phase 5 is retained. Phase 6 proceeds from this path and targets exact
 length-dependent execution metadata without changing logical sequence order.
+
+## Phase 6 target-length metadata result
+
+`SequenceBatch` now compiles stable target-length classes once and uploads one
+class index per target. Fused F1 computes exact `tjb` values over unique
+profile-scale by length-class pairs, then expands them on device into the
+unchanged dense layout. Small or poorly compressible workloads retain the old
+path, and original sequence ordinals never change.
+
+Focused job `1182742` proved forced-expanded versus forced-compact equality.
+Full job `1182743` reproduced the exact 39,010,327-byte output and completed in
+454.247 seconds, 0.171% faster than Phase 5. Generation improved by 0.738%.
+Across all 83 chunks, compact metadata reduced transition H2D from a
+counterfactual 24,915,438 bytes to 121,595 bytes. The path is retained.
+
+Phase 7 proceeds from this exact baseline and evaluates packed integer MSV and
+Viterbi arithmetic. Production work must compact the rare full-MSV rows before
+packing them; it must not add packed work across the complete postfilter stream.
