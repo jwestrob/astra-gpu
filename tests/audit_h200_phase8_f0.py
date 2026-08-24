@@ -206,10 +206,13 @@ def main():
     survivor_cells = sum(row["survivor_exact_cell_count"] for row in best_rows)
     profile_records = []
     for index, (profile, row) in enumerate(zip(profiles, best_rows, strict=True)):
+        profile_name = profile.name
+        if isinstance(profile_name, bytes):
+            profile_name = profile_name.decode("utf-8", "replace")
         profile_records.append(
             {
                 "profile_index": index,
-                "name": profile.name.decode("utf-8", "replace"),
+                "name": str(profile_name),
                 "model_length": profile.M,
                 "exact_candidate_count": row["exact_candidate_count"],
                 "coarse_candidate_count": row["coarse_candidate_count"],
