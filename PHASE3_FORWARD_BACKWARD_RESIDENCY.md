@@ -42,12 +42,27 @@ Python native module exposes cumulative production counters through
 The complete CUDA/Cython extension builds for sm_75 and sm_90 with CUDA hidden.
 The resident route deliberately uses the same host trajectory bytes for
 provenance and final journal construction, and the same device trajectory bits
-already emitted by the existing gather kernel.  Exact GPU/output-oracle and
-transfer-counter validation are pending on the next available H200 run.
+already emitted by the existing gather kernel.
+
+Full H200 job `1182690` reproduced the established exact output SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`
+(39,010,327 bytes; 383,235 lines). All 83 Forward calls and all 83 Backward
+calls used the resident route. There were zero allocation fallbacks, zero
+legacy Forward-special H2D bytes, and 3,291,870,792 bytes of redundant H2D
+traffic were eliminated. The run materialized 6,022,020,720 resident Forward
+special-state bytes.
+
+The request completed in 534.2760 seconds: 464.6889 seconds of native
+generation, 526.7634 seconds of pipeline wall, and 336.2174 seconds of overlap.
+Compared with the exact Phase 2 run, request wall fell by 4.5461 seconds
+(0.844%) and generation wall fell by 3.5544 seconds (0.759%). Aggregate
+Backward Forward-special upload time fell from 439.13 ms to 49.16 ms, while
+aggregate Backward wall fell from 26.880 seconds to 24.853 seconds.
 
 ## Status
 
-Provisionally retained as the smallest Forward-to-Backward residency slice.
+Retained. The exact full-workload result validates the first
+Forward-to-Backward residency slice and shows a small end-to-end improvement.
 It does not yet remove the Forward D2H copy needed by the current journal, make
 Backward workspaces persistent, retain Backward output into rescore, or compile
 host F3 classification onto the device.

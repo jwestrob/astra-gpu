@@ -32,6 +32,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, warm persistent request | 64 host workers | 546.220704615 s | see telemetry below | **1.286641085x faster than CPU64; 22.278% less wall time** |
 | Astra GPU, H200, one-pass sparse-v3 experiment | 64 host workers | 536.168411 s | 13,143,840 KiB | **1.31076x faster than CPU64; 23.71% less wall time** |
 | Astra GPU, H200, Phase 2 device compaction | 64 host workers | 538.822140 s | 13,175,768 KiB | exact; 0.495% slower than one-pass sparse v3 |
+| Astra GPU, H200, resident Forward-to-Backward handoff | 64 host workers | 534.276010 s | see run record | exact; 0.844% faster than Phase 2 |
 
 Additional GPU timing layers:
 
@@ -64,6 +65,16 @@ device F1 compaction; host expansions and candidate-mapping uploads were both
 zero, and 83 uploads were avoided. The structural change is retained, but the
 0.495% regression from the 536.168-second one-pass run supports no standalone
 Phase 2 speedup claim. It remained 1.354% faster than the original dense run.
+
+Phase 3 Forward-to-Backward residency job `1182690` was byte-identical and
+completed in 534.276 seconds: 464.689 seconds generation, 526.763 seconds of
+pipeline wall, and 336.217 seconds overlap. All 83 Forward and 83 Backward calls
+used the resident handoff, with zero fallbacks and zero legacy Forward-special
+H2D bytes. It materialized 6,022,020,720 resident bytes and eliminated
+3,291,870,792 bytes of redundant H2D traffic. Backward Forward-special upload
+time fell from 439.13 ms to 49.16 ms and aggregate Backward wall fell from
+26.880 seconds to 24.853 seconds. Request wall improved by 4.546 seconds
+(0.844%) versus Phase 2, so this first residency slice is retained.
 
 ## GPU request-stage ledger
 
@@ -134,6 +145,7 @@ These paths exist in the development workspace and are excluded from Git because
 - Final H200 evidence manifest: `build/astra-h200-full-plm-pfam-slurm-20260817/attempt-06/final-evidence.sha256`, SHA-256 `02f049611e5585ccbf82c3e4c3d692346f0358874a1cc2a008a6d53f29a0eb7c`; 78/78 entries verified.
 - Exact CPU/GPU output comparison: `build/astra-h200-full-plm-pfam-slurm-20260817/attempt-06/comparison/full-output-comparison.json`, SHA-256 `c32745fdce9ce64c5204dac02d9aa7611b089206e3156e09f5e14807dfa248f0`.
 - Phase 2 full run: `build/phase1b-benchmark-harness/build/h200-phase2-device-compaction-20260823/attempt-02-full/runs/h200-full`; worker SHA-256 `dcc3da2eafdcf076ab76a867472282cc290a529b8e7b10e64906e4a5709363f9`, raw-validation SHA-256 `7428eb2fd2c4cf152564f51b512b6f6ec0636b21cf1bed2945e98f7b8e022f2b`.
+- Phase 3 Forward-to-Backward residency full run: `build/phase1b-benchmark-harness/build/h200-phase3-forward-residency-20260823/attempt-02-full/runs/h200-full`; worker SHA-256 `1e33ad05c1d38bcc01cbb24f61577c0375fb2420d964cf3a48a82694cec6c083`, raw-validation SHA-256 `688f20c47de5dc982af530457594a9a5ea61383be13c7cff37e2bb7d4e9794dd`.
 - CPU48 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu48/artifact.sha256`, manifest SHA-256 `9e6d4d96073c565a9b61fac5b804f98dd5f7ec57dd67af07c5a289b198dadd42`.
 - CPU64 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu64/artifact.sha256`, manifest SHA-256 `e3a2e4cd5674addfe347aa8c4604571a5bdc38f14b8e9fdade60f71cf5f35b46`.
 - CPU semantic normalization report: `build/astra-full-plm-pfam-cpu-comparison-20260817/runs/validation-01/comparison.json`, SHA-256 `78bee4fd2d03c2658d0779345893f89e6dc3777f1a380123a85c25c9a9b2525`.
