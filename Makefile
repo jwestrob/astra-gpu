@@ -56,8 +56,8 @@ HMMER_HEADERS := $(HMMER_ROOT)/src/hmmer.h \
 	$(HMMER_ROOT)/src/p7_config.h \
 	$(HMMER_ROOT)/src/impl_sse/impl_sse.h
 
-.PHONY: all oracle bias-attestation cuda cuda-test h200-first1000-audit \
-	pipeline pipeline-test test clean
+.PHONY: all oracle bias-attestation phase5-profile-packed-ssv cuda cuda-test \
+	h200-first1000-audit pipeline pipeline-test test clean
 
 all: oracle
 
@@ -65,6 +65,13 @@ oracle: $(ORACLE_BIN)
 
 bias-attestation: $(BIAS_ATTEST_BIN)
 	$(BIAS_ATTEST_BIN) 0x1000000 64
+
+phase5-profile-packed-ssv: $(BUILD_DIR)/experiments/phase5-profile-packed-ssv
+
+$(BUILD_DIR)/experiments/phase5-profile-packed-ssv: \
+		experiments/phase5_profile_packed_ssv.cu
+	mkdir -p $(@D)
+	$(NVCC) -O3 -lineinfo -std=c++17 $(CUDA_ARCH_FLAGS) -o $@ $<
 
 cuda: $(CUDA_MODULE) $(PIPELINE_MODULE)
 
