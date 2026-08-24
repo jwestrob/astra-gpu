@@ -5,6 +5,7 @@
 #include "ssv_cuda.h"
 
 #include <cuda_runtime.h>
+#include <cub/device/device_scan.cuh>
 
 extern "C" {
 #include <easel.h>
@@ -16,6 +17,7 @@ extern "C" {
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -508,6 +510,64 @@ __global__ void gather_specials_kernel(
     gathered[output_begin + cell] = tile_xmx[input_begin + cell];
 }
 
+__global__ void apply_f3_overrides_kernel(
+    ForwardKernelResult *results, const uint64_t *overrides,
+    size_t override_count) {
+  const size_t override_index =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (override_index >= override_count) return;
+  const uint64_t encoded = overrides[override_index];
+  const uint32_t candidate = static_cast<uint32_t>(encoded >> 32);
+  const uint32_t decision = static_cast<uint32_t>(encoded);
+  results[candidate].status_and_f3 =
+      (results[candidate].status_and_f3 & kKernelStatusMask) |
+      (decision << kKernelF3Shift);
+}
+
+__global__ void mark_f3_survivors_kernel(
+    const ForwardKernelResult *results, size_t candidate_begin,
+    size_t tile_count, size_t accepted_candidate_end,
+    uint64_t *survivor_ranks) {
+  const size_t tile_candidate =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (tile_candidate >= tile_count) return;
+  const size_t candidate = candidate_begin + tile_candidate;
+  const KernelF3Decision decision = static_cast<KernelF3Decision>(
+      results[candidate].status_and_f3 >> kKernelF3Shift);
+  survivor_ranks[tile_candidate] =
+      candidate < accepted_candidate_end && decision == kKernelF3Pass ? 1 : 0;
+}
+
+__global__ void scatter_f3_survivors_kernel(
+    const ForwardKernelResult *results, const uint64_t *survivor_ranks,
+    size_t candidate_begin, size_t tile_count,
+    size_t accepted_candidate_end, uint32_t *survivor_candidates) {
+  const size_t tile_candidate =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (tile_candidate >= tile_count) return;
+  const size_t candidate = candidate_begin + tile_candidate;
+  const KernelF3Decision decision = static_cast<KernelF3Decision>(
+      results[candidate].status_and_f3 >> kKernelF3Shift);
+  if (candidate < accepted_candidate_end && decision == kKernelF3Pass)
+    survivor_candidates[survivor_ranks[tile_candidate]] =
+        static_cast<uint32_t>(candidate);
+}
+
+__global__ void survivor_cell_counts_kernel(
+    const uint32_t *survivor_candidates, size_t survivor_count,
+    const uint64_t *global_x_offsets, uint64_t *survivor_offsets) {
+  const size_t survivor =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (survivor < survivor_count) {
+    const uint32_t candidate = survivor_candidates[survivor];
+    survivor_offsets[survivor] =
+        global_x_offsets[static_cast<size_t>(candidate) + 1] -
+        global_x_offsets[candidate];
+  } else if (survivor == survivor_count) {
+    survivor_offsets[survivor] = 0;
+  }
+}
+
 struct RunBuffers {
   uint32_t *candidate_profiles = nullptr;
   uint32_t *candidate_sequences = nullptr;
@@ -571,8 +631,7 @@ struct plan7_forward_workspace {
   std::vector<uint64_t> host_x_offsets;
   std::vector<size_t> tile_boundaries;
   std::vector<ForwardKernelResult> host_kernel_results;
-  std::vector<uint32_t> host_survivor_candidates;
-  std::vector<uint64_t> host_survivor_offsets;
+  std::vector<uint64_t> host_f3_overrides;
   uint64_t growth_count;
   uint64_t event_create_count;
   uint64_t run_count;
@@ -1484,7 +1543,7 @@ static int forward_run_with_workspace_impl(
     const float *filter_scores, size_t candidate_count, double f3,
     uint64_t gathered_byte_budget,
     plan7_forward_output **output, bool collect_reason_facts,
-    bool retain_device_specials,
+    bool retain_device_specials, bool audit_f3,
     char *error, size_t error_size) {
   const auto call_begin = std::chrono::steady_clock::now();
   if (output == nullptr || *output != nullptr || workspace == nullptr ||
@@ -1792,6 +1851,8 @@ static int forward_run_with_workspace_impl(
   size_t xmx_bytes;
   size_t survivor_candidate_bytes;
   size_t survivor_offset_bytes;
+  size_t scan_workspace_bytes = 0;
+  size_t gather_buffer_bytes;
   if (!checked_bytes(candidate_count, sizeof(uint32_t),
                      &candidate_bytes) ||
       !checked_bytes(profile_count, sizeof(uint32_t), &threshold_bytes) ||
@@ -1807,6 +1868,11 @@ static int forward_run_with_workspace_impl(
       !checked_bytes(maximum_tile_count + 1, sizeof(uint64_t),
                      &survivor_offset_bytes)) {
     set_error(error, error_size, "Forward device workspace size overflow");
+    return -1;
+  }
+  if (maximum_tile_count >= static_cast<size_t>(INT_MAX)) {
+    set_error(error, error_size,
+              "Forward survivor tile exceeds the CUB scan item limit");
     return -1;
   }
   dp_bytes = static_cast<size_t>(maximum_dp_cells) * sizeof(float);
@@ -1882,12 +1948,22 @@ static int forward_run_with_workspace_impl(
       grow_forward_workspace_buffer(
           &buffers.survivor_offsets, &workspace->survivor_offsets_capacity,
           survivor_offset_bytes, &workspace->growth_count,
-          "cudaMalloc(Forward survivor offsets)", error, error_size) != 0 ||
-      grow_forward_workspace_buffer(
+          "cudaMalloc(Forward survivor offsets)", error, error_size) != 0)
+    return -1;
+  status = cub::DeviceScan::ExclusiveSum(
+      nullptr, scan_workspace_bytes, buffers.survivor_offsets,
+      static_cast<int>(maximum_tile_count + 1));
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "CUB Forward survivor scan workspace query", status);
+    return -1;
+  }
+  gather_buffer_bytes = std::max(xmx_bytes, scan_workspace_bytes);
+  if (grow_forward_workspace_buffer(
           &buffers.gathered, &workspace->gathered_capacity,
-          xmx_bytes,
-          &workspace->growth_count, "cudaMalloc(Forward gather workspace)",
-          error, error_size) != 0)
+          gather_buffer_bytes, &workspace->growth_count,
+          "cudaMalloc(Forward gather/scan workspace)", error,
+          error_size) != 0)
     return -1;
 
   /* The tile XMX buffer is overwritten by the next tile.  The resident path
@@ -1927,7 +2003,7 @@ static int forward_run_with_workspace_impl(
     }
   }
   created->statistics.gather_workspace_bytes =
-      static_cast<uint64_t>(xmx_bytes) + survivor_candidate_bytes +
+      static_cast<uint64_t>(gather_buffer_bytes) + survivor_candidate_bytes +
       survivor_offset_bytes;
   const auto input_upload_begin = std::chrono::steady_clock::now();
   CUDA_RUN(cudaMemcpy(buffers.candidate_profiles,
@@ -1962,14 +2038,11 @@ static int forward_run_with_workspace_impl(
 
   std::vector<ForwardKernelResult> &host_kernel_results =
       workspace->host_kernel_results;
-  std::vector<uint32_t> &host_survivor_candidates =
-      workspace->host_survivor_candidates;
-  std::vector<uint64_t> &host_survivor_offsets =
-      workspace->host_survivor_offsets;
+  std::vector<uint64_t> &host_f3_overrides =
+      workspace->host_f3_overrides;
   try {
     host_kernel_results.resize(candidate_count);
-    host_survivor_candidates.reserve(maximum_tile_count);
-    host_survivor_offsets.reserve(maximum_tile_count + 1);
+    host_f3_overrides.reserve(maximum_tile_count);
   } catch (...) {
     set_error(error, error_size, "Forward host result allocation failed");
     return -1;
@@ -2016,14 +2089,15 @@ static int forward_run_with_workspace_impl(
             std::chrono::steady_clock::now() - download_begin).count();
 
     const auto classification_begin = std::chrono::steady_clock::now();
-    host_survivor_candidates.clear();
-    host_survivor_offsets.clear();
-    host_survivor_offsets.push_back(0);
+    host_f3_overrides.clear();
     uint64_t tile_gathered_cells = 0;
+    size_t survivor_count = 0;
+    size_t accepted_candidate_end = output_cap_exhausted ? begin : end;
     for (size_t candidate = begin; candidate < end; ++candidate) {
       created->special_offsets[candidate] = gathered_cells;
+      const uint32_t profile_index = host_candidate_profiles[candidate];
       const ForwardProfile &profile =
-          database->host_profiles[host_candidate_profiles[candidate]];
+          database->host_profiles[profile_index];
       const ForwardKernelResult kernel_result =
           host_kernel_results[candidate];
       plan7_forward_result &result = created->results[candidate];
@@ -2041,29 +2115,57 @@ static int forward_run_with_workspace_impl(
           std::isfinite(profile.f_tau) &&
           std::isfinite(profile.f_lambda) && profile.f_lambda > 0.0f) {
         result.fwdsc = fwdsc.value;
-        const float difference = fwdsc.value - filter_scores[candidate];
-        const float bit_score = static_cast<float>(
-            static_cast<double>(difference) / kLog2);
-        const double probability = esl_exp_surv(
-            bit_score, profile.f_tau, profile.f_lambda);
-        const bool host_pass = !(probability > f3);
-        bool f3_pass = host_pass;
-        ++created->f3_device_statistics.host_audit_count;
+        bool f3_pass = false;
         if (device_f3 == kKernelF3Reject || device_f3 == kKernelF3Pass) {
           const bool device_pass = device_f3 == kKernelF3Pass;
+          if (host_f3_threshold_bits[profile_index] ==
+              UINT32_C(0x7fc00000)) {
+            set_error(error, error_size,
+                      "unsupported Forward profile produced a device F3 decision");
+            return -1;
+          }
           ++created->f3_device_statistics.device_decision_count;
           if (device_pass)
             ++created->f3_device_statistics.device_pass_count;
           else
             ++created->f3_device_statistics.device_reject_count;
-          if (device_pass == host_pass) {
-            f3_pass = device_pass;
+          f3_pass = device_pass;
+          if (audit_f3) {
+            const float difference = fwdsc.value - filter_scores[candidate];
+            const float bit_score = static_cast<float>(
+                static_cast<double>(difference) / kLog2);
+            const double probability = esl_exp_surv(
+                bit_score, profile.f_tau, profile.f_lambda);
+            const bool host_pass = !(probability > f3);
+            ++created->f3_device_statistics.host_audit_count;
+            if (device_pass != host_pass) {
+              ++created->f3_device_statistics.decision_mismatch_count;
+              set_error(error, error_size,
+                        "device and host Forward F3 decisions differ");
+              return -1;
+            }
           } else {
-            ++created->f3_device_statistics.host_fallback_count;
-            ++created->f3_device_statistics.decision_mismatch_count;
+            ++created->f3_device_statistics.host_decision_avoided_count;
           }
         } else {
+          if (device_f3 != kKernelF3Unavailable ||
+              host_f3_threshold_bits[profile_index] !=
+                  UINT32_C(0x7fc00000)) {
+            set_error(error, error_size,
+                      "compiled Forward profile has no device F3 decision");
+            return -1;
+          }
+          const float difference = fwdsc.value - filter_scores[candidate];
+          const float bit_score = static_cast<float>(
+              static_cast<double>(difference) / kLog2);
+          const double probability = esl_exp_surv(
+              bit_score, profile.f_tau, profile.f_lambda);
+          f3_pass = !(probability > f3);
           ++created->f3_device_statistics.host_fallback_count;
+          host_f3_overrides.push_back(
+              (static_cast<uint64_t>(candidate) << 32) |
+              static_cast<uint32_t>(f3_pass ? kKernelF3Pass
+                                            : kKernelF3Reject));
         }
         if (!f3_pass) {
           result.action = PLAN7_FORWARD_DEFINITE_REJECT;
@@ -2078,6 +2180,8 @@ static int forward_run_with_workspace_impl(
             if (collect_reason_facts)
               created->reason_facts[candidate] |=
                   PLAN7_FORWARD_REASON_OUTPUT_CAP;
+            if (!output_cap_exhausted)
+              accepted_candidate_end = candidate;
             output_cap_exhausted = true;
             ++created->statistics.output_cap_fallback_count;
           } else if (!checked_add(tile_gathered_cells, x_cells,
@@ -2090,9 +2194,7 @@ static int forward_run_with_workspace_impl(
             return -1;
           } else {
             result.action = PLAN7_FORWARD_DEFINITE_PASS;
-            host_survivor_candidates.push_back(
-                static_cast<uint32_t>(candidate));
-            host_survivor_offsets.push_back(tile_gathered_cells);
+            ++survivor_count;
             ++created->statistics.survivor_count;
           }
         }
@@ -2106,7 +2208,6 @@ static int forward_run_with_workspace_impl(
         std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - classification_begin).count();
 
-    const size_t survivor_count = host_survivor_candidates.size();
     if (survivor_count == 0) continue;
     if (survivor_count > static_cast<size_t>(maximum_grid_x) ||
         tile_gathered_cells > maximum_x_cells) {
@@ -2127,19 +2228,50 @@ static int forward_run_with_workspace_impl(
                 "Forward special matrix allocation failed");
       return -1;
     }
-    const auto survivor_upload_begin = std::chrono::steady_clock::now();
-    CUDA_RUN(cudaMemcpy(buffers.survivor_candidates,
-                        host_survivor_candidates.data(),
-                        survivor_count * sizeof(uint32_t),
-                        cudaMemcpyHostToDevice));
-    CUDA_RUN(cudaMemcpy(buffers.survivor_offsets,
-                        host_survivor_offsets.data(),
-                        (survivor_count + 1) * sizeof(uint64_t),
-                        cudaMemcpyHostToDevice));
-    created->upload_milliseconds +=
-        std::chrono::duration<float, std::milli>(
-            std::chrono::steady_clock::now() - survivor_upload_begin).count();
     CUDA_RUN(cudaEventRecord(buffers.begin_event));
+    if (!host_f3_overrides.empty()) {
+      const auto override_upload_begin = std::chrono::steady_clock::now();
+      CUDA_RUN(cudaMemcpy(buffers.survivor_offsets,
+                          host_f3_overrides.data(),
+                          host_f3_overrides.size() * sizeof(uint64_t),
+                          cudaMemcpyHostToDevice));
+      created->upload_milliseconds +=
+          std::chrono::duration<float, std::milli>(
+              std::chrono::steady_clock::now() -
+              override_upload_begin).count();
+      const size_t override_blocks =
+          (host_f3_overrides.size() + kGatherThreads - 1) / kGatherThreads;
+      apply_f3_overrides_kernel<<<static_cast<unsigned>(override_blocks),
+                                  kGatherThreads>>>(
+          buffers.results, buffers.survivor_offsets,
+          host_f3_overrides.size());
+      CUDA_RUN(cudaGetLastError());
+    }
+    const size_t compact_blocks =
+        (tile_count + kGatherThreads - 1) / kGatherThreads;
+    mark_f3_survivors_kernel<<<static_cast<unsigned>(compact_blocks),
+                               kGatherThreads>>>(
+        buffers.results, begin, tile_count, accepted_candidate_end,
+        buffers.survivor_offsets);
+    CUDA_RUN(cudaGetLastError());
+    CUDA_RUN(cub::DeviceScan::ExclusiveSum(
+        buffers.gathered, scan_workspace_bytes, buffers.survivor_offsets,
+        static_cast<int>(tile_count)));
+    scatter_f3_survivors_kernel<<<static_cast<unsigned>(compact_blocks),
+                                  kGatherThreads>>>(
+        buffers.results, buffers.survivor_offsets, begin, tile_count,
+        accepted_candidate_end, buffers.survivor_candidates);
+    CUDA_RUN(cudaGetLastError());
+    const size_t count_blocks =
+        (survivor_count + 1 + kGatherThreads - 1) / kGatherThreads;
+    survivor_cell_counts_kernel<<<static_cast<unsigned>(count_blocks),
+                                   kGatherThreads>>>(
+        buffers.survivor_candidates, survivor_count, buffers.x_offsets,
+        buffers.survivor_offsets);
+    CUDA_RUN(cudaGetLastError());
+    CUDA_RUN(cub::DeviceScan::ExclusiveSum(
+        buffers.gathered, scan_workspace_bytes, buffers.survivor_offsets,
+        static_cast<int>(survivor_count + 1)));
     float *gather_destination =
         created->resident_specials.pointer == nullptr
             ? buffers.gathered
@@ -2158,6 +2290,14 @@ static int forward_run_with_workspace_impl(
     created->statistics.gather_milliseconds += elapsed;
     if (created->resident_specials.pointer != nullptr)
       created->residency_statistics.materialization_milliseconds += elapsed;
+    ++created->f3_device_statistics.device_compaction_run_count;
+    created->f3_device_statistics.device_compaction_candidate_count +=
+        tile_count;
+    created->f3_device_statistics.device_compacted_survivor_count +=
+        survivor_count;
+    created->f3_device_statistics.survivor_upload_avoided_bytes +=
+        static_cast<uint64_t>(survivor_count) * sizeof(uint32_t) +
+        static_cast<uint64_t>(survivor_count + 1) * sizeof(uint64_t);
     const auto gather_download_begin = std::chrono::steady_clock::now();
     CUDA_RUN(cudaMemcpy(created->specials.data() + old_special_count,
                         gather_destination,
@@ -2202,7 +2342,8 @@ extern "C" int plan7_forward_run_with_workspace(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, false, false, error, error_size);
+      f3, gathered_byte_budget, output, false, false, false, error,
+      error_size);
 }
 
 extern "C" int plan7_forward_run(
@@ -2264,7 +2405,8 @@ extern "C" int plan7_forward_run_batch_workspace_reason_facts(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, true, false, error, error_size);
+      f3, gathered_byte_budget, output, true, false, false, error,
+      error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident(
@@ -2282,7 +2424,8 @@ extern "C" int plan7_forward_run_batch_workspace_resident(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, false, true, error, error_size);
+      f3, gathered_byte_budget, output, false, true, false, error,
+      error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
@@ -2300,7 +2443,27 @@ extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, true, true, error, error_size);
+      f3, gathered_byte_budget, output, true, true, false, error,
+      error_size);
+}
+
+extern "C" int plan7_forward_run_batch_workspace_f3_audit(
+    const plan7_forward_database *database,
+    plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  plan7_forward_workspace *workspace = nullptr;
+  if (plan7_ssv_sequence_batch_get_forward_workspace(
+          batch, &workspace, error, error_size) != 0)
+    return -1;
+  return forward_run_with_workspace_impl(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, false, false, true, error,
+      error_size);
 }
 
 extern "C" int plan7_forward_output_destroy(

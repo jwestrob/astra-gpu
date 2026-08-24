@@ -51,19 +51,32 @@ by `eslCONST_LOG2`, and binary32 round-to-nearest conversion. Its pass/reject
 bit is packed into the existing eight-byte kernel result, so result D2H traffic
 does not grow.
 
-The old host predicate still audits every otherwise eligible row. A matching
-device decision is consumed; an unavailable or mismatching decision uses the
-host answer. Separate additive counters record compiled/unsupported profiles,
-host audits, device passes/rejects, fallbacks, and mismatches. These counters
-do not change result, continuation, or provenance ABIs.
+The production resident entry point now treats a certified device decision as
+authoritative and does not call `esl_exp_surv()` for supported profiles. The
+host predicate remains available through an explicit audit entry point; audit
+mode consumes the same device answer but fails the call on any disagreement.
+Only profiles for which the compiler returned `unsupported` use the host
+predicate, and those compact fallback decisions are patched into the device
+result array before survivor selection.
+
+F3 survivors are stably compacted on the device. An integer CUB exclusive scan
+builds ranks in candidate order, a scatter writes survivor indices, and a
+second integer scan builds their variable-length XMX offsets. The existing
+gather allocation doubles as temporary scan storage, so this adds no new
+persistent buffer class. Output-cap behavior is unchanged: the host constructs
+the exact result ABI and determines the first excluded candidate, while the
+device compacts only the accepted prefix. The old per-tile survivor-index and
+offset uploads are eliminated. Additive counters record host decisions avoided,
+compaction inputs/results, and avoided upload bytes without changing result,
+continuation, or provenance ABIs.
 
 ## Correctness evidence
 
-The focused host oracle completed in 0.630 seconds:
+The focused host oracle completed in 0.607 seconds after this change:
 
 ```text
 python -m unittest discover -s tests -p 'test_f3_threshold.py' -v
-Ran 4 tests in 0.630s -- OK
+Ran 4 tests in 0.607s -- OK
 ```
 
 It checks the exact host predicate at every compiled predecessor/threshold/
@@ -84,13 +97,22 @@ It checks exact pass and reject decisions on opposite sides of the host F3
 boundary, requires zero device/host mismatches, and verifies that a noncanonical
 `F3 > 1` takes the host fallback.
 
+The production-authority/device-compaction follow-up passed its focused H200
+oracle in Slurm job 1182692 (one test in 0.183 seconds). The test compares
+production output with explicit host-audit output byte-for-byte, exercises both
+sides of the compiled boundary, checks the unsupported-profile patch path, and
+requires the avoided-host-decision and device-compaction counters.
+Slurm job 1182694 independently preserved four known-row Forward scores,
+stable order, and XMX byte hashes; job 1182695 preserved the exact output-cap
+prefix and later-row CPU fallback behavior.
+
 ## Cost and decision
 
 A Python-exposed microbenchmark compiled 100,000 varying boundaries in
 0.654 seconds (6.54 microseconds each, including dictionary construction).
 At 27,481 profiles that is about 0.18 seconds before batching or removing the
-test wrapper. The exact compiler and conservative CUDA consumer are retained.
-This is a correctness slice, not yet the transfer optimization: candidate
-filter scores are temporarily uploaded into a persistent workspace buffer and
-the host audit remains enabled. Phase 3 residency can remove that upload and
-the per-row host oracle after a representative zero-mismatch gate.
+test wrapper. The exact compiler, authoritative CUDA consumer, explicit audit
+mode, and stable device compactor are retained. Candidate filter scores are
+still temporarily uploaded and kernel results are still materialized for the
+existing result/provenance/journal ABI; later Phase 3 residency work can remove
+those remaining transfers when Backward consumes the resident view directly.

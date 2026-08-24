@@ -878,11 +878,16 @@ cdef extern from "forward_cuda.h" nogil:
         uint64_t compiled_profile_count
         uint64_t unsupported_profile_count
         uint64_t host_audit_count
+        uint64_t host_decision_avoided_count
         uint64_t device_decision_count
         uint64_t device_reject_count
         uint64_t device_pass_count
         uint64_t host_fallback_count
         uint64_t decision_mismatch_count
+        uint64_t device_compaction_run_count
+        uint64_t device_compaction_candidate_count
+        uint64_t device_compacted_survivor_count
+        uint64_t survivor_upload_avoided_bytes
 
     ctypedef struct plan7_forward_provenance:
         uint64_t database_generation
@@ -1030,6 +1035,22 @@ cdef extern from "forward_cuda.h" nogil:
     )
 
     int plan7_forward_run_batch_workspace_resident_reason_facts(
+        const plan7_forward_database *database,
+        plan7_ssv_sequence_batch *batch,
+        const uintptr_t *source_profile_pointers,
+        size_t profile_count,
+        const uint64_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        const float *filter_scores,
+        size_t candidate_count,
+        double f3,
+        uint64_t gathered_byte_budget,
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_forward_run_batch_workspace_f3_audit(
         const plan7_forward_database *database,
         plan7_ssv_sequence_batch *batch,
         const uintptr_t *source_profile_pointers,
@@ -4134,11 +4155,22 @@ cdef dict _forward_f3_device_statistics_from_output(
         "f3_compiled_profile_count": native.compiled_profile_count,
         "f3_unsupported_profile_count": native.unsupported_profile_count,
         "f3_host_audit_count": native.host_audit_count,
+        "f3_host_decision_avoided_count": native.host_decision_avoided_count,
         "f3_device_decision_count": native.device_decision_count,
         "f3_device_reject_count": native.device_reject_count,
         "f3_device_pass_count": native.device_pass_count,
         "f3_host_fallback_count": native.host_fallback_count,
         "f3_decision_mismatch_count": native.decision_mismatch_count,
+        "f3_device_compaction_run_count": native.device_compaction_run_count,
+        "f3_device_compaction_candidate_count": (
+            native.device_compaction_candidate_count
+        ),
+        "f3_device_compacted_survivor_count": (
+            native.device_compacted_survivor_count
+        ),
+        "f3_survivor_upload_avoided_bytes": (
+            native.survivor_upload_avoided_bytes
+        ),
     }
 
 
@@ -5944,6 +5976,7 @@ cdef class SequenceBatch:
         source_profiles,
         ForwardProfiles forward_profiles,
         uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
+        bint _f3_audit=False,
     ):
         """Classify F3 and return only passing parser special-state rows."""
         cdef char error[512]
@@ -6013,21 +6046,38 @@ cdef class SequenceBatch:
 
         error[0] = 0
         # Keep the GIL while native code validates live private profile arrays.
-        status = plan7_forward_run_batch_workspace(
-            forward_profiles._database,
-            self._batch,
-            source_pointers.data() if source_pointers.size() else NULL,
-            profile_count,
-            &candidate_offsets[0],
-            &candidate_indices[0] if candidate_count else NULL,
-            &filter_scores[0] if candidate_count else NULL,
-            candidate_count,
-            f3,
-            gathered_byte_budget,
-            &output,
-            error,
-            sizeof(error),
-        )
+        if _f3_audit:
+            status = plan7_forward_run_batch_workspace_f3_audit(
+                forward_profiles._database,
+                self._batch,
+                source_pointers.data() if source_pointers.size() else NULL,
+                profile_count,
+                &candidate_offsets[0],
+                &candidate_indices[0] if candidate_count else NULL,
+                &filter_scores[0] if candidate_count else NULL,
+                candidate_count,
+                f3,
+                gathered_byte_budget,
+                &output,
+                error,
+                sizeof(error),
+            )
+        else:
+            status = plan7_forward_run_batch_workspace(
+                forward_profiles._database,
+                self._batch,
+                source_pointers.data() if source_pointers.size() else NULL,
+                profile_count,
+                &candidate_offsets[0],
+                &candidate_indices[0] if candidate_count else NULL,
+                &filter_scores[0] if candidate_count else NULL,
+                candidate_count,
+                f3,
+                gathered_byte_budget,
+                &output,
+                error,
+                sizeof(error),
+            )
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
         try:

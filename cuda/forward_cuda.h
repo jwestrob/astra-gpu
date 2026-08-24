@@ -81,11 +81,16 @@ typedef struct plan7_forward_f3_device_statistics {
   uint64_t compiled_profile_count;
   uint64_t unsupported_profile_count;
   uint64_t host_audit_count;
+  uint64_t host_decision_avoided_count;
   uint64_t device_decision_count;
   uint64_t device_reject_count;
   uint64_t device_pass_count;
   uint64_t host_fallback_count;
   uint64_t decision_mismatch_count;
+  uint64_t device_compaction_run_count;
+  uint64_t device_compaction_candidate_count;
+  uint64_t device_compacted_survivor_count;
+  uint64_t survivor_upload_avoided_bytes;
 } plan7_forward_f3_device_statistics;
 
 /* Sealed identity of the exact resident profile database, sequence batch,
@@ -353,6 +358,25 @@ int plan7_forward_run_batch_workspace_resident(
   size_t error_size);
 
 int plan7_forward_run_batch_workspace_resident_reason_facts(
+  const plan7_forward_database *database,
+  plan7_ssv_sequence_batch *batch,
+  const uintptr_t *source_profile_pointers,
+  size_t profile_count,
+  const uint64_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  const float *filter_scores,
+  size_t candidate_count,
+  double f3,
+  uint64_t gathered_byte_budget,
+  plan7_forward_output **output,
+  char *error,
+  size_t error_size);
+
+/* Exact diagnostic twin of the production decision path. Supported profiles
+ * still consume the authenticated device decision, but the linked host HMMER
+ * predicate is also evaluated and any disagreement fails the call. Unsupported
+ * profiles use the host predicate in both modes. */
+int plan7_forward_run_batch_workspace_f3_audit(
   const plan7_forward_database *database,
   plan7_ssv_sequence_batch *batch,
   const uintptr_t *source_profile_pointers,

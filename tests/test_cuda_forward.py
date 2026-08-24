@@ -75,6 +75,7 @@ def run_forward(
     filters,
     f3,
     gathered_byte_budget=None,
+    f3_audit=False,
 ):
     with _native.ForwardProfiles(profiles) as resident:
         cold = resident.statistics
@@ -88,10 +89,12 @@ def run_forward(
                 resident,
             )
             if gathered_byte_budget is None:
-                output = batch.forward_candidates_many_raw(*arguments)
+                output = batch.forward_candidates_many_raw(
+                    *arguments, _f3_audit=f3_audit
+                )
             else:
                 output = batch.forward_candidates_many_raw(
-                    *arguments, gathered_byte_budget
+                    *arguments, gathered_byte_budget, _f3_audit=f3_audit
                 )
     return (*output, cold)
 
@@ -327,11 +330,35 @@ class CudaForwardTests(unittest.TestCase):
         self.assertEqual(list(offsets), [0, 6 * (len(sequence) + 1)])
         self.assertEqual(len(specials), offsets[1])
         self.assertEqual(statistics["f3_compiled_profile_count"], 1)
-        self.assertEqual(statistics["f3_host_audit_count"], 1)
+        self.assertEqual(statistics["f3_host_audit_count"], 0)
+        self.assertEqual(statistics["f3_host_decision_avoided_count"], 1)
         self.assertEqual(statistics["f3_device_decision_count"], 1)
         self.assertEqual(statistics["f3_device_pass_count"], 1)
         self.assertEqual(statistics["f3_host_fallback_count"], 0)
         self.assertEqual(statistics["f3_decision_mismatch_count"], 0)
+        self.assertEqual(statistics["f3_device_compaction_run_count"], 1)
+        self.assertEqual(statistics["f3_device_compaction_candidate_count"], 1)
+        self.assertEqual(statistics["f3_device_compacted_survivor_count"], 1)
+        self.assertEqual(statistics["f3_survivor_upload_avoided_bytes"], 20)
+
+        audited = run_forward(
+            [profile], [sequence], [0, 1], [0], [0.0], 1.0,
+            f3_audit=True,
+        )
+        self.assertEqual(audited[0], records)
+        self.assertEqual(list(audited[1]), list(offsets))
+        self.assertEqual(audited[2].tobytes(), specials.tobytes())
+        for key in (
+            "row_hash",
+            "special_hash",
+            "continuation_hash",
+            "pass_count",
+            "special_count",
+        ):
+            self.assertEqual(audited[3][key], statistics[key])
+        self.assertEqual(audited[3]["f3_host_audit_count"], 1)
+        self.assertEqual(audited[3]["f3_host_decision_avoided_count"], 0)
+        self.assertEqual(audited[3]["f3_decision_mismatch_count"], 0)
 
         tau, lambda_ = profile.evalue_parameters.as_vector()[4:6]
         difference = float32(row[1] - 0.0)
@@ -376,7 +403,8 @@ class CudaForwardTests(unittest.TestCase):
         self.assertEqual(at_statistics["f3_device_pass_count"], 1)
         self.assertEqual(below_statistics["f3_device_reject_count"], 1)
         for observed in (at_statistics, below_statistics):
-            self.assertEqual(observed["f3_host_audit_count"], 1)
+            self.assertEqual(observed["f3_host_audit_count"], 0)
+            self.assertEqual(observed["f3_host_decision_avoided_count"], 1)
             self.assertEqual(observed["f3_device_decision_count"], 1)
             self.assertEqual(observed["f3_host_fallback_count"], 0)
             self.assertEqual(observed["f3_decision_mismatch_count"], 0)
