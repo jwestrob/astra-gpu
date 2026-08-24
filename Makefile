@@ -38,6 +38,7 @@ CUDA_OBJ := $(BUILD_DIR)/cuda/ssv_cuda.o
 BIAS_CUDA_OBJ := $(BUILD_DIR)/cuda/bias_cuda.o
 POSTFILTER_CUDA_OBJ := $(BUILD_DIR)/cuda/postfilter_cuda.o
 FORWARD_CUDA_OBJ := $(BUILD_DIR)/cuda/forward_cuda.o
+F3_THRESHOLD_OBJ := $(BUILD_DIR)/cuda/f3_threshold.o
 BACKWARD_DOMAIN_CUDA_OBJ := $(BUILD_DIR)/cuda/backward_domain_cuda.o
 DOMAIN_RESCORE_CUDA_OBJ := $(BUILD_DIR)/cuda/domain_rescore_cuda.o
 CUDA_MODULE := python/plan7_gpu/_native$(PYTHON_EXT_SUFFIX)
@@ -102,7 +103,7 @@ $(BIAS_ATTEST_BIN): oracle/bias_log_attestation.cu
 
 $(CYTHON_CPP): python/plan7_gpu/_native.pyx cuda/ssv_cuda.h cuda/bias_cuda.h \
 		cuda/postfilter_cuda.h cuda/forward_cuda.h cuda/backward_domain_cuda.h \
-		cuda/domain_rescore_cuda.h \
+		cuda/domain_rescore_cuda.h cuda/f3_threshold.h \
 		cuda/continuation_journal.h \
 		$(PYHMMER_ABI_STAMP) \
 		$(PYHMMER_PACKAGE_DIR)/plan7.pxd \
@@ -120,7 +121,7 @@ $(CYTHON_CPP): python/plan7_gpu/_native.pyx cuda/ssv_cuda.h cuda/bias_cuda.h \
 
 $(CYTHON_OBJ): $(CYTHON_CPP) cuda/ssv_cuda.h cuda/bias_cuda.h \
 		cuda/postfilter_cuda.h cuda/forward_cuda.h cuda/backward_domain_cuda.h \
-		cuda/domain_rescore_cuda.h \
+		cuda/domain_rescore_cuda.h cuda/f3_threshold.h \
 		cuda/continuation_journal.h
 	$(CXX) -O3 -g -std=c++17 -fPIC -Wall -Wextra $(PYHMMER_SIMD_CFLAGS) \
 		-Icuda $$($(PYTHON)-config --includes) \
@@ -162,6 +163,12 @@ $(FORWARD_CUDA_OBJ): cuda/forward_cuda.cu cuda/forward_cuda.h \
 		-I$(PYHMMER_EASEL_INCLUDE) -I$(PYHMMER_INCLUDE)/libhmmer \
 		-c -o $@ $<
 
+$(F3_THRESHOLD_OBJ): cuda/f3_threshold.cc cuda/f3_threshold.h \
+		$(PYHMMER_EASEL_INCLUDE)/esl_exponential.h
+	mkdir -p $(@D)
+	$(CXX) -O3 -g -std=c++17 -fPIC -Wall -Wextra \
+		-Icuda -I$(PYHMMER_EASEL_INCLUDE) -c -o $@ $<
+
 $(BACKWARD_DOMAIN_CUDA_OBJ): cuda/backward_domain_cuda.cu \
 		cuda/backward_domain_cuda.h cuda/forward_cuda.h cuda/ssv_cuda.h \
 		$(PYHMMER_INCLUDE)/libhmmer/hmmer.h \
@@ -186,11 +193,12 @@ $(DOMAIN_RESCORE_CUDA_OBJ): cuda/domain_rescore_cuda.cu \
 		-c -o $@ $<
 
 $(CUDA_MODULE): $(CYTHON_OBJ) $(CUDA_OBJ) $(BIAS_CUDA_OBJ) \
-		$(POSTFILTER_CUDA_OBJ) $(FORWARD_CUDA_OBJ) \
+		$(POSTFILTER_CUDA_OBJ) $(FORWARD_CUDA_OBJ) $(F3_THRESHOLD_OBJ) \
 		$(BACKWARD_DOMAIN_CUDA_OBJ) $(DOMAIN_RESCORE_CUDA_OBJ) \
 		$(PYHMMER_HMMER_LIB) $(PYHMMER_EASEL_LIB)
 	$(NVCC) -shared $(CUDA_ARCH_FLAGS) -o $@ $(CYTHON_OBJ) $(CUDA_OBJ) \
 		$(BIAS_CUDA_OBJ) $(POSTFILTER_CUDA_OBJ) $(FORWARD_CUDA_OBJ) \
+		$(F3_THRESHOLD_OBJ) \
 		$(BACKWARD_DOMAIN_CUDA_OBJ) $(DOMAIN_RESCORE_CUDA_OBJ) \
 		-L$(PYHMMER_LIB_DIR) -Xlinker --no-as-needed -llibhmmer -llibeasel \
 		-ldl -lpthread \

@@ -1099,6 +1099,48 @@ cdef extern from "forward_cuda.h" nogil:
     )
 
 
+cdef extern from "f3_threshold.h" nogil:
+    cdef enum plan7_f3_threshold_reason:
+        PLAN7_F3_THRESHOLD_REASON_NONE
+        PLAN7_F3_THRESHOLD_REASON_INVALID_PARAMETERS
+        PLAN7_F3_THRESHOLD_REASON_NO_NUMERIC_PASS
+        PLAN7_F3_THRESHOLD_REASON_CERTIFICATE_FAILED
+
+    ctypedef struct plan7_f3_threshold:
+        uint32_t tau_bits
+        uint32_t lambda_bits
+        uint64_t f3_bits
+        uint32_t threshold_bits
+        uint32_t predecessor_bits
+        uint32_t successor_bits
+        uint8_t supported
+        uint8_t reason
+        uint8_t has_predecessor
+        uint8_t has_successor
+        uint8_t negative_infinity_pass
+        uint8_t predecessor_pass
+        uint8_t threshold_pass
+        uint8_t successor_pass
+        uint8_t positive_infinity_pass
+        uint8_t quiet_nan_oracle_pass
+        uint8_t nan_requires_fallback
+        uint8_t reserved
+
+    int plan7_forward_compile_f3_threshold(
+        float tau,
+        float lambda_,
+        double f3,
+        plan7_f3_threshold *result,
+    )
+
+    int plan7_forward_f3_oracle_pass_bits(
+        uint32_t bit_score_bits,
+        float tau,
+        float lambda_,
+        double f3,
+    )
+
+
 cdef extern from "backward_domain_cuda.h" nogil:
     cdef enum plan7_backward_domain_abi:
         PLAN7_BACKWARD_DOMAIN_RECORD_VERSION
@@ -3046,6 +3088,60 @@ def postfilter_execution_cells_for_test(
     if execution_count != 0 and base_cells > (<uint64_t> -1) // execution_count:
         raise OverflowError("post-filter test execution cells overflow uint64")
     return base_cells * execution_count
+
+
+def compile_f3_threshold_for_test(float tau, float lambda_, double f3):
+    """Compile the exact non-NaN binary32 HMMER F3 decision boundary."""
+    cdef plan7_f3_threshold threshold
+    cdef int status = plan7_forward_compile_f3_threshold(
+        tau, lambda_, f3, &threshold
+    )
+    if status != 0:
+        raise RuntimeError("F3 threshold compiler rejected its output buffer")
+    return {
+        "supported": threshold.supported != 0,
+        "reason": threshold.reason,
+        "tau_bits": threshold.tau_bits,
+        "lambda_bits": threshold.lambda_bits,
+        "f3_bits": threshold.f3_bits,
+        "threshold_bits": (
+            threshold.threshold_bits if threshold.supported else None
+        ),
+        "predecessor_bits": (
+            threshold.predecessor_bits
+            if threshold.supported and threshold.has_predecessor
+            else None
+        ),
+        "successor_bits": (
+            threshold.successor_bits
+            if threshold.supported and threshold.has_successor
+            else None
+        ),
+        "negative_infinity_pass": threshold.negative_infinity_pass != 0,
+        "predecessor_pass": (
+            threshold.predecessor_pass != 0
+            if threshold.has_predecessor
+            else None
+        ),
+        "threshold_pass": threshold.threshold_pass != 0,
+        "successor_pass": (
+            threshold.successor_pass != 0
+            if threshold.has_successor
+            else None
+        ),
+        "positive_infinity_pass": threshold.positive_infinity_pass != 0,
+        "quiet_nan_oracle_pass": threshold.quiet_nan_oracle_pass != 0,
+        "nan_requires_fallback": threshold.nan_requires_fallback != 0,
+    }
+
+
+def f3_oracle_pass_bits_for_test(
+    uint32_t bit_score_bits, float tau, float lambda_, double f3,
+):
+    """Evaluate HMMER's exact host F3 predicate for raw binary32 score bits."""
+    return plan7_forward_f3_oracle_pass_bits(
+        bit_score_bits, tau, lambda_, f3
+    ) != 0
 
 
 cdef inline void _count_forward_reason(
