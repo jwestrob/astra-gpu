@@ -52,7 +52,7 @@ the complete oracle suite and representative end-to-end workloads.
 | 6 | Length-cohort decision metadata | complete; retained | through `cfd756c` | exact job 1182743: 454.247 s; transition H2D reduced 24.92 MB -> 0.12 MB |
 | 7 | Packed integer MSV/Viterbi | MSV retained; Viterbi rejected | through `f5ac24a` | packed MSV exact/flat at 454.007 s; packed Viterbi exact but slower and larger, so excluded from `main` |
 | 8 | Certified reduced-alphabet F0 | complete; production rejected | through `913be5d` | exact job 1182800: best codebook certified only 0.145% of cells while F0 cost about 1.9x exact packed F1 |
-| 9 | GA-specialized certified pruning | active research | pending | source proof and reject census required before implementation |
+| 9 | GA-specialized certified pruning | complete; retained for gathering cutoffs | through `c5eec74` | exact job 1182813: 449.104 s, 1.08% faster than prior best, 117,545 target rows certified |
 | 10 | Mandatory-seed/global-profile index | pending research | pending | optional/cached only; formal sensitivity proof required |
 | 11 | Internal GPU execution policy | pending | pending | deterministic policy only after multiple retained GPU algorithms exist |
 
@@ -277,13 +277,24 @@ an isolated branch for evidence and is deliberately not an ancestor of
 The immutable run evidence is under
 `build/h200-phase7-packed-viterbi-20260824/attempt-03-full/runs/h200-full`.
 
+## Phase 9 certified GA-pruning result
+
+The source proof established a conservative final-score upper bound only
+after isolated-domain Forward scores are known. Full H200 job `1182813`
+reproduced the exact 39,010,327-byte output and certified 117,545 target rows /
+203,880 regions below their gathering cutoffs. Request wall fell from the
+previous best 454.007 seconds to 449.104 seconds (1.080%); generation fell to
+340.105 seconds and continuation/output to 398.199 seconds. Compact attempts
+fell 91.61%, the sparse packet shrank 18.15%, maximum RSS fell 0.65%, and peak
+H200 memory remained effectively flat. The path is retained for compatible
+gathering-cutoff searches; the ordinary path remains the non-GA and audit
+fallback.
+
 ## Remaining implementation order
 
-1. Phase 9: census GA-specialized early rejects only after proving a valid
-   upper bound from exact HMMER scoring semantics.
-2. Phase 10: keep mandatory-seed/global-profile indexing as an optional
+1. Phase 10: keep mandatory-seed/global-profile indexing as an optional
    research path with a formal sensitivity proof and no small-workload tax.
-3. Phase 11: add a deterministic internal GPU policy only for validated GPU
+2. Phase 11: add a deterministic internal GPU policy only for validated GPU
    algorithms; retain force-policy controls and the simple path.
 
 Every retained full-workload result will continue to report exact output

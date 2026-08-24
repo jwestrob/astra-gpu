@@ -8,8 +8,9 @@ known. Such targets could skip the remaining isolated-domain Backward,
 optimal-accuracy decoding, traceback, and null2 work without changing any
 HMMER decision.
 
-The first commit was census-only. The production experiment remains an
-explicit private opt-in until exact-output, runtime, and memory gates pass.
+The first commit was census-only. The production implementation was kept as
+an explicit private opt-in until its exact-output, runtime, and memory gates
+passed.
 
 ## Source proof
 
@@ -145,5 +146,57 @@ The focused production gate is
 `tests/audit_h200_phase9_ga_pruning_production.py`. It compares the complete
 target table, domain table, query identity, and pipeline accounting of the
 ordinary and optimized paths for the first 64 Pfam profiles against 1,000
-targets, including 11 certified target rows / 19 compact regions. A full H200
-run is required before promotion.
+targets, including 11 certified target rows / 19 compact regions. The full
+H200 run below is the promotion gate.
+
+## Production result and decision
+
+Focused H200 job `1182812` passed the ordinary-versus-optimized semantic
+oracle. Both paths produced canonical digest
+`2af479c8b8343c98e8b68152194e72f1484a036849a678f3e27de970c5a15672`;
+the optimized path certified 11 target rows / 19 regions and skipped 202,319
+per-pass DP cells. Its generation time was 0.0925 seconds versus 0.1034
+seconds for the ordinary path. Evidence is
+`build/phase9-ga-production-h200-20260824/attempt-02/result.json`, SHA-256
+`cf53d419449267ef48634e338c29e756153e7c31ecb8e66ee8c72c5876772279`.
+
+Full H200 job `1182813` then searched all 27,481 Pfam profiles against all
+300,186 targets. It reproduced the exact established output:
+
+- SHA-256
+  `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`;
+- 39,010,327 bytes; and
+- 383,235 lines including the header.
+
+Measured request wall was **449.104112 seconds**, with 340.105077 seconds of
+generation, 398.198633 seconds of continuation/output, 296.918163 seconds of
+overlap, and 441.512164 seconds of pipeline wall. Against the previous best
+retained packed-MSV run (454.006856 seconds), request wall improved by
+4.902743 seconds (1.080%). Against the original 546.220705-second H200 run it
+improved by 97.116593 seconds (17.780%). It is 1.5649x faster than Astra CPU64.
+
+The optimization certified 117,545 target rows containing 203,880 regions.
+Those rows moved from the `SIMPLE` continuation route into exact terminal
+certificates, reducing compact attempts from 128,314 to 10,769 (91.61%) while
+leaving all 552,390 `CPU_REQUIRED` rows unchanged. The sparse packet shrank
+from 5,801,342,068 to 4,748,364,004 bytes (18.15%), and its maximum retained
+CandidateBatch payload fell from 427,998,281 to 417,962,513 bytes (2.35%).
+
+Maximum process RSS was 13,159,348 KiB, 86,508 KiB (0.65%) below the prior
+best run. Peak sampled H200 memory was 3,392 MiB versus 3,390 MiB previously,
+which is effectively flat and expected because this first production slice
+deliberately retains the existing matrix allocation.
+
+Decision: **retain** the exact gathering-cutoff GA-pruning path. It produces a
+real end-to-end runtime win and a modest host-memory win without changing
+HMMER output. The ordinary path remains available for non-GA modes and as the
+explicit audit/rollback strategy.
+
+Full evidence is under
+`build/h200-phase9-ga-pruning-20260824/attempt-01-full/runs/h200-full`.
+`worker.json` SHA-256 is
+`e7930b72344676ca96d5d43fc97daa45fd8c6b2e066a8588efe732d199ab9320`;
+`raw-validation.json` SHA-256 is
+`4c71eab4bd7eac4359f434baf0fcdf688e82b00c62872c607b771e86ced53245`;
+and the artifact-manifest SHA-256 is
+`7157bfa28635e0532a5306eb2ac3eb68deb02908438cecac3f59d27f8bc86af8`.

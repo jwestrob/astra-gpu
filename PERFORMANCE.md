@@ -36,6 +36,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, Phase 5 profile-packed SSV | 64 host workers | **455.026448 s** | 13,201,996 KiB | **exact; 1.5445x faster than Astra CPU64** |
 | Astra GPU, H200, Phase 6 length-class metadata | 64 host workers | **454.247490 s** | 13,305,384 KiB | **exact; 1.5472x faster than Astra CPU64** |
 | Astra GPU, H200, Phase 7 packed full MSV | 64 host workers | **454.006856 s** | 13,245,856 KiB | exact; effectively tied with Phase 6 |
+| Astra GPU, H200, Phase 9 certified GA pruning | 64 host workers | **449.104112 s** | 13,159,348 KiB | **exact; 1.5649x faster than Astra CPU64; new best** |
 | Rejected experiment: packed Viterbi | 64 host workers | 454.963381 s | 13,340,692 KiB | exact, but 0.211% slower and 94,836 KiB larger; excluded from `main` |
 
 Additional GPU timing layers:
@@ -147,6 +148,16 @@ seconds versus 0.678 seconds for exact packed F1 and added 36.7 MiB of
 temporary HBM. Production F0 is rejected; the offline evaluator and negative
 evidence are retained.
 
+Phase 9 full H200 job `1182813` was byte-identical and completed in
+449.104 seconds: 340.105 seconds generation, 441.512 seconds pipeline wall,
+398.199 seconds continuation/output, and 296.918 seconds overlap. Exact GA
+certificates removed 117,545 target rows / 203,880 regions from downstream
+compact processing, reducing compact attempts from 128,314 to 10,769. The
+sparse packet shrank 18.15% to 4,748,364,004 bytes. Against the previous best
+packed-MSV run, request wall improved by 4.903 seconds (1.080%) and maximum RSS
+fell 86,508 KiB (0.65%) to 13,159,348 KiB. Peak sampled H200 memory was
+effectively flat at 3,392 MiB. The exact GA-pruning path is retained.
+
 ## GPU request-stage ledger
 
 The measured 546.220704615 s request decomposed as follows:
@@ -223,6 +234,7 @@ These paths exist in the development workspace and are excluded from Git because
 - Phase 7 packed full-MSV full run: `build/h200-phase7-packed-msv-20260824/attempt-01-full/runs/h200-full`; worker SHA-256 `53f958666c3eaeee3dcd9b19ace58e831b5dc235a2f0b57e8721a0295f5218e9`, raw-validation SHA-256 `1615f9180674b669aae26ec1536bef9e197ba01cc522fe13f7fbd23df5b00c4d`.
 - Rejected packed-Viterbi full run: `build/h200-phase7-packed-viterbi-20260824/attempt-03-full/runs/h200-full`; worker SHA-256 `3f47ae09605d23dce158e5a0d6ebe7606221ee2ab7c08e9840aa6c5c94daf10d`, raw-validation SHA-256 `2192571756e5dda6daef9c4b42bc310ef05cfac961d86c9aa6ebdd25489e13c6`.
 - Phase 8 reduced-alphabet F0 census: `build/phase8-f0-evaluator-h200-20260824/attempt-02/result.json`, SHA-256 `071822c93880ad98a190e0fdd2593c14c514acb786c1968b41a5b1dd7afc960d`.
+- Phase 9 certified-GA-pruning full run: `build/h200-phase9-ga-pruning-20260824/attempt-01-full/runs/h200-full`; worker SHA-256 `e7930b72344676ca96d5d43fc97daa45fd8c6b2e066a8588efe732d199ab9320`, raw-validation SHA-256 `4c71eab4bd7eac4359f434baf0fcdf688e82b00c62872c607b771e86ced53245`.
 - CPU48 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu48/artifact.sha256`, manifest SHA-256 `9e6d4d96073c565a9b61fac5b804f98dd5f7ec57dd67af07c5a289b198dadd42`.
 - CPU64 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu64/artifact.sha256`, manifest SHA-256 `e3a2e4cd5674addfe347aa8c4604571a5bdc38f14b8e9fdade60f71cf5f35b46`.
 - CPU semantic normalization report: `build/astra-full-plm-pfam-cpu-comparison-20260817/runs/validation-01/comparison.json`, SHA-256 `78bee4fd2d03c2658d0779345893f89e6dc3777f1a380123a85c25c9a9b2525`.
