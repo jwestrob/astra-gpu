@@ -488,6 +488,7 @@ __global__ void isolated_backward_decode_kernel(
   float *bck = posterior_matrix + matrix_offsets[region];
   float *bx = posterior_specials + special_offsets[region];
   plan7_domain_rescore_result &result = results[region];
+  if (result.action == PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT) return;
   if (result.status != PLAN7_DOMAIN_RESCORE_OK) return;
 
   float xJ = 0.0f;
@@ -954,6 +955,7 @@ __global__ void isolated_null2_oa_trace_kernel(
   const float *px = posterior_specials + special_offsets[region];
   float *row_null2 = null2 + region * PLAN7_DOMAIN_RESCORE_NULL2_COUNT;
   plan7_domain_rescore_result &result = results[region];
+  if (result.action == PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT) return;
   if (result.status != PLAN7_DOMAIN_RESCORE_OK || result.has_own_scales) {
     if (sublane == 0) {
       result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
@@ -1530,6 +1532,8 @@ int domain_rescore_run_impl(
     const plan7_backward_domain_output *upstream,
     uint64_t compact_byte_budget, uint64_t matrix_byte_budget,
     uint64_t trace_byte_budget, bool collect_reason_facts,
+    const float *whole_forward_scores, size_t whole_forward_score_count,
+    const float *target_ga_cutoffs, size_t target_ga_cutoff_count,
     plan7_domain_rescore_output **output,
     char *error, size_t error_size);
 
@@ -1558,6 +1562,7 @@ extern "C" int plan7_domain_rescore_run(
     return domain_rescore_run_impl(
         database, batch, upstream, compact_byte_budget,
         matrix_byte_budget, trace_byte_budget, false,
+        nullptr, 0, nullptr, 0,
         output, error, error_size);
   } catch (const std::bad_alloc &) {
     set_error(error, error_size, "isolated-domain host allocation failed");
@@ -1581,6 +1586,59 @@ extern "C" int plan7_domain_rescore_run_with_reason_facts(
     return domain_rescore_run_impl(
         database, batch, upstream, compact_byte_budget,
         matrix_byte_budget, trace_byte_budget, true,
+        nullptr, 0, nullptr, 0,
+        output, error, error_size);
+  } catch (const std::bad_alloc &) {
+    set_error(error, error_size, "isolated-domain host allocation failed");
+    return -1;
+  } catch (...) {
+    set_error(error, error_size,
+              "isolated-domain unexpected native failure");
+    return -1;
+  }
+}
+
+extern "C" int plan7_domain_rescore_run_ga(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const plan7_backward_domain_output *upstream,
+    const float *whole_forward_scores, size_t whole_forward_score_count,
+    const float *target_ga_cutoffs, size_t target_ga_cutoff_count,
+    uint64_t compact_byte_budget, uint64_t matrix_byte_budget,
+    uint64_t trace_byte_budget, plan7_domain_rescore_output **output,
+    char *error, size_t error_size) {
+  try {
+    return domain_rescore_run_impl(
+        database, batch, upstream, compact_byte_budget,
+        matrix_byte_budget, trace_byte_budget, false,
+        whole_forward_scores, whole_forward_score_count,
+        target_ga_cutoffs, target_ga_cutoff_count,
+        output, error, error_size);
+  } catch (const std::bad_alloc &) {
+    set_error(error, error_size, "isolated-domain host allocation failed");
+    return -1;
+  } catch (...) {
+    set_error(error, error_size,
+              "isolated-domain unexpected native failure");
+    return -1;
+  }
+}
+
+extern "C" int plan7_domain_rescore_run_ga_with_reason_facts(
+    const plan7_forward_database *database,
+    const plan7_ssv_sequence_batch *batch,
+    const plan7_backward_domain_output *upstream,
+    const float *whole_forward_scores, size_t whole_forward_score_count,
+    const float *target_ga_cutoffs, size_t target_ga_cutoff_count,
+    uint64_t compact_byte_budget, uint64_t matrix_byte_budget,
+    uint64_t trace_byte_budget, plan7_domain_rescore_output **output,
+    char *error, size_t error_size) {
+  try {
+    return domain_rescore_run_impl(
+        database, batch, upstream, compact_byte_budget,
+        matrix_byte_budget, trace_byte_budget, true,
+        whole_forward_scores, whole_forward_score_count,
+        target_ga_cutoffs, target_ga_cutoff_count,
         output, error, error_size);
   } catch (const std::bad_alloc &) {
     set_error(error, error_size, "isolated-domain host allocation failed");
@@ -1951,6 +2009,8 @@ int domain_rescore_run_impl(
     const plan7_backward_domain_output *upstream,
     uint64_t compact_byte_budget, uint64_t matrix_byte_budget,
     uint64_t trace_byte_budget, bool collect_reason_facts,
+    const float *whole_forward_scores, size_t whole_forward_score_count,
+    const float *target_ga_cutoffs, size_t target_ga_cutoff_count,
     plan7_domain_rescore_output **output,
     char *error, size_t error_size) {
   const auto total_begin = std::chrono::steady_clock::now();
@@ -1996,6 +2056,33 @@ int domain_rescore_run_impl(
       plan7_ssv_sequence_batch_get_view(
           batch, &sequence_view, error, error_size) != 0)
     return -1;
+  const bool ga_pruning = whole_forward_scores != nullptr ||
+                          target_ga_cutoffs != nullptr ||
+                          whole_forward_score_count != 0 ||
+                          target_ga_cutoff_count != 0;
+  if (ga_pruning &&
+      ((whole_forward_score_count != 0 && whole_forward_scores == nullptr) ||
+       target_ga_cutoffs == nullptr ||
+       whole_forward_score_count != upstream_row_count ||
+       target_ga_cutoff_count != profile_view.profile_count)) {
+    set_error(error, error_size,
+              "isolated-domain GA metadata is incomplete");
+    return -1;
+  }
+  if (ga_pruning) {
+    for (size_t profile = 0; profile < target_ga_cutoff_count; ++profile)
+      if (!std::isfinite(target_ga_cutoffs[profile])) {
+        set_error(error, error_size,
+                  "isolated-domain GA cutoff is not finite");
+        return -1;
+      }
+    for (size_t row = 0; row < whole_forward_score_count; ++row)
+      if (!std::isfinite(whole_forward_scores[row])) {
+        set_error(error, error_size,
+                  "isolated-domain whole Forward score is not finite");
+        return -1;
+      }
+  }
   if (profile_view.generation_id !=
           upstream_provenance->forward.database_generation ||
       sequence_view.generation_id !=
@@ -2398,18 +2485,25 @@ int domain_rescore_run_impl(
     cudaEvent_t end_event = nullptr;
     cudaEvent_t resident_begin_event = nullptr;
     cudaEvent_t resident_end_event = nullptr;
+    const auto cleanup_device_run = [&]() {
+      if (resident_end_event != nullptr)
+        cudaEventDestroy(resident_end_event);
+      if (resident_begin_event != nullptr)
+        cudaEventDestroy(resident_begin_event);
+      if (end_event != nullptr) cudaEventDestroy(end_event);
+      if (begin_event != nullptr) cudaEventDestroy(begin_event);
+      resident_end_event = nullptr;
+      resident_begin_event = nullptr;
+      end_event = nullptr;
+      begin_event = nullptr;
+      free_device_buffers(&buffers);
+    };
 #define CUDA_RUN(call)                                                        \
     do {                                                                      \
       cuda_status = (call);                                                   \
       if (cuda_status != cudaSuccess) {                                       \
         set_cuda_error(error, error_size, #call, cuda_status);                \
-        if (resident_end_event != nullptr)                                    \
-          cudaEventDestroy(resident_end_event);                               \
-        if (resident_begin_event != nullptr)                                  \
-          cudaEventDestroy(resident_begin_event);                             \
-        if (end_event != nullptr) cudaEventDestroy(end_event);                \
-        if (begin_event != nullptr) cudaEventDestroy(begin_event);            \
-        free_device_buffers(&buffers);                                        \
+        cleanup_device_run();                                                 \
         return -1;                                                            \
       }                                                                       \
     } while (0)
@@ -2499,6 +2593,121 @@ int domain_rescore_run_impl(
           buffers.special_offsets, active_count, buffers.forward_matrix,
           buffers.forward_specials, buffers.results, nullptr);
     CUDA_RUN(cudaGetLastError());
+
+    if (ga_pruning) {
+      const auto classification_begin = std::chrono::steady_clock::now();
+      CUDA_RUN(cudaMemcpy(device_results.data(), buffers.results, result_bytes,
+                          cudaMemcpyDeviceToHost));
+      size_t active = 0;
+      while (active < active_count) {
+        const size_t row_begin = active;
+        const uint32_t source_row = active_work[active].row_index;
+        const uint32_t profile_index = active_work[active].profile_index;
+        const uint32_t target_length = active_work[active].target_length;
+        while (active < active_count &&
+               active_work[active].row_index == source_row)
+          ++active;
+        if (source_row >= upstream_row_count ||
+            profile_index >= target_ga_cutoff_count || target_length == 0) {
+          set_error(error, error_size,
+                    "isolated-domain GA row identity changed");
+          cleanup_device_run();
+          return -1;
+        }
+        const float p1 = static_cast<float>(target_length) /
+                         static_cast<float>(target_length + 1);
+        const float null_score = static_cast<float>(
+            static_cast<float>(target_length) *
+                std::log(static_cast<double>(p1)) +
+            std::log(1.0 - static_cast<double>(p1)));
+        if (!std::isfinite(null_score)) {
+          set_error(error, error_size,
+                    "isolated-domain GA null score is invalid");
+          cleanup_device_run();
+          return -1;
+        }
+        const double input_error = static_cast<double>(
+            static_cast<float>(0.004));
+        const double round_error = static_cast<double>(
+            static_cast<float>(0.00001));
+        const double whole_upper =
+            (static_cast<double>(whole_forward_scores[source_row]) +
+             input_error - static_cast<double>(null_score)) /
+                static_cast<double>(eslCONST_LOG2) +
+            round_error;
+        double reconstruction_nats = 0.0;
+        uint64_t skipped_cells = 0;
+        for (size_t item = row_begin; item < active; ++item) {
+          const auto &result = device_results[item];
+          const auto &work = active_work[item];
+          if (work.profile_index != profile_index ||
+              work.target_length != target_length ||
+              result.status != PLAN7_DOMAIN_RESCORE_OK ||
+              !std::isfinite(result.forward_score)) {
+            reconstruction_nats = HUGE_VAL;
+            break;
+          }
+          const double upper =
+              static_cast<double>(result.forward_score) + input_error;
+          if (upper > 0.0) reconstruction_nats += upper;
+          const uint64_t length =
+              static_cast<uint64_t>(work.envelope_end) -
+              static_cast<uint64_t>(work.envelope_begin) + 1;
+          const uint64_t model_length =
+              snapshots[profile_index].model_length;
+          if (model_length != 0 && length > UINT64_MAX / model_length) {
+            set_error(error, error_size,
+                      "isolated-domain GA skipped work overflows");
+            cleanup_device_run();
+            return -1;
+          }
+          const uint64_t cells = length * model_length;
+          if (skipped_cells > UINT64_MAX - cells) {
+            set_error(error, error_size,
+                      "isolated-domain GA skipped work overflows");
+            cleanup_device_run();
+            return -1;
+          }
+          skipped_cells += cells;
+        }
+        const double reconstruction_upper =
+            (reconstruction_nats - static_cast<double>(null_score)) /
+                static_cast<double>(eslCONST_LOG2) +
+            round_error;
+        const double target_upper =
+            std::max(whole_upper, reconstruction_upper);
+        if (target_upper <
+            static_cast<double>(target_ga_cutoffs[profile_index])) {
+          ++created->statistics.certified_ga_row_count;
+          created->statistics.certified_ga_region_count += active - row_begin;
+          if (created->statistics.certified_ga_skipped_work_cells >
+              UINT64_MAX - skipped_cells) {
+            set_error(error, error_size,
+                      "isolated-domain GA skipped work total overflows");
+            cleanup_device_run();
+            return -1;
+          }
+          created->statistics.certified_ga_skipped_work_cells += skipped_cells;
+          for (size_t item = row_begin; item < active; ++item) {
+            device_results[item].action =
+                PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT;
+            if (collect_reason_facts)
+              active_reason_facts[item] |=
+                  PLAN7_DOMAIN_RESCORE_REASON_CERTIFIED_GA_REJECT;
+          }
+        }
+      }
+      CUDA_RUN(cudaMemcpy(buffers.results, device_results.data(), result_bytes,
+                          cudaMemcpyHostToDevice));
+      if (collect_reason_facts)
+        CUDA_RUN(cudaMemcpy(buffers.reason_facts,
+                            active_reason_facts.data(), reason_bytes,
+                            cudaMemcpyHostToDevice));
+      created->statistics.ga_classification_milliseconds =
+          std::chrono::duration<float, std::milli>(
+              std::chrono::steady_clock::now() - classification_begin)
+              .count();
+    }
     if (collect_reason_facts)
       isolated_backward_decode_kernel<true><<<blocks, kThreads>>>(
           sequence_view.device_residues, sequence_view.device_offsets,
@@ -2630,6 +2839,17 @@ int domain_rescore_run_impl(
       return -1;
     }
     const auto &snapshot = snapshots[result.profile_index];
+    if (result.action == PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT) {
+      if (!ga_pruning || result.status != PLAN7_DOMAIN_RESCORE_OK ||
+          result.has_own_scales || !std::isfinite(result.forward_score) ||
+          result.alignment_begin != 0 || result.alignment_end != 0 ||
+          result.model_begin != 0 || result.model_end != 0) {
+        set_error(error, error_size,
+                  "isolated-domain certified GA result is invalid");
+        return -1;
+      }
+      continue;
+    }
     if (result.action != PLAN7_DOMAIN_RESCORE_DEVICE_RESULT ||
         result.status != PLAN7_DOMAIN_RESCORE_OK ||
         result.has_own_scales ||
@@ -2660,6 +2880,9 @@ int domain_rescore_run_impl(
     const size_t result_index = active_work[active].result_index;
     const uint32_t source_row = result_rows[result_index];
     if (row_failed[source_row]) continue;
+    if (created->results[result_index].action ==
+        PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT)
+      continue;
     const uint64_t capacity =
         trace_capacity_offsets[active + 1] -
         trace_capacity_offsets[active];
@@ -2738,6 +2961,15 @@ int domain_rescore_run_impl(
     const auto &result = created->results[result_index];
     if (result.action == PLAN7_DOMAIN_RESCORE_DEVICE_RESULT)
       ++created->statistics.device_result_count;
+    else if (result.action == PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT) {
+      if (collect_reason_facts &&
+          !(created->reason_facts[result_index] &
+            PLAN7_DOMAIN_RESCORE_REASON_CERTIFIED_GA_REJECT)) {
+        set_error(error, error_size,
+                  "isolated-domain GA result lacks source fact");
+        return -1;
+      }
+    }
     else {
       ++created->statistics.cpu_required_count;
       if (result.status == PLAN7_DOMAIN_RESCORE_ECAP)

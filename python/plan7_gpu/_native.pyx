@@ -118,7 +118,7 @@ cdef uint64_t _subwarp_active_lane_slots = 0
 cdef uint64_t _subwarp_issued_lane_slots = 0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 GENERATION_TELEMETRY_SCHEMA_VERSION = 2
-DIRECT_V3_STAGING_SCHEMA_VERSION = 2
+DIRECT_V3_STAGING_SCHEMA_VERSION = 3
 
 # Host F2 decisions are made in this Cython translation unit, so their exact
 # version-1 facts intentionally live beside that source predicate.
@@ -1664,6 +1664,7 @@ cdef extern from "domain_rescore_cuda.h" nogil:
     cdef enum plan7_domain_rescore_action:
         PLAN7_DOMAIN_RESCORE_CPU_REQUIRED
         PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
+        PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT
 
     cdef enum plan7_domain_rescore_status:
         PLAN7_DOMAIN_RESCORE_OK
@@ -1698,6 +1699,7 @@ cdef extern from "domain_rescore_cuda.h" nogil:
         PLAN7_DOMAIN_RESCORE_REASON_OTHER_CPU_REQUIRED
         PLAN7_DOMAIN_RESCORE_REASON_UPSTREAM_OWN_SCALES
         PLAN7_DOMAIN_RESCORE_REASON_FINAL_CPU_REQUIRED
+        PLAN7_DOMAIN_RESCORE_REASON_CERTIFIED_GA_REJECT
 
     ctypedef struct plan7_domain_rescore_result:
         uint32_t row_index
@@ -1756,6 +1758,10 @@ cdef extern from "domain_rescore_cuda.h" nogil:
         float upload_milliseconds
         float download_milliseconds
         float total_milliseconds
+        uint64_t certified_ga_row_count
+        uint64_t certified_ga_region_count
+        uint64_t certified_ga_skipped_work_cells
+        float ga_classification_milliseconds
 
     ctypedef struct plan7_domain_rescore_residency_statistics:
         uint64_t upstream_h2d_bytes
@@ -1784,6 +1790,38 @@ cdef extern from "domain_rescore_cuda.h" nogil:
         const plan7_forward_database *database,
         const plan7_ssv_sequence_batch *batch,
         const plan7_backward_domain_output *upstream,
+        uint64_t compact_byte_budget,
+        uint64_t matrix_byte_budget,
+        uint64_t trace_byte_budget,
+        plan7_domain_rescore_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_domain_rescore_run_ga(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_output *upstream,
+        const float *whole_forward_scores,
+        size_t whole_forward_score_count,
+        const float *target_ga_cutoffs,
+        size_t target_ga_cutoff_count,
+        uint64_t compact_byte_budget,
+        uint64_t matrix_byte_budget,
+        uint64_t trace_byte_budget,
+        plan7_domain_rescore_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_domain_rescore_run_ga_with_reason_facts(
+        const plan7_forward_database *database,
+        const plan7_ssv_sequence_batch *batch,
+        const plan7_backward_domain_output *upstream,
+        const float *whole_forward_scores,
+        size_t whole_forward_score_count,
+        const float *target_ga_cutoffs,
+        size_t target_ga_cutoff_count,
         uint64_t compact_byte_budget,
         uint64_t matrix_byte_budget,
         uint64_t trace_byte_budget,
@@ -2202,6 +2240,7 @@ cdef object _build_continuation_journal_capsule(
     cdef size_t simple_row_count = 0
     cdef size_t device_result_count = 0
     cdef size_t cpu_required_count = 0
+    cdef size_t certified_ga_count = 0
     cdef size_t compact_bytes = 0
     cdef size_t region_begin
     cdef size_t region_end
@@ -2457,7 +2496,8 @@ cdef object _build_continuation_journal_capsule(
             or rescore_statistics.simple_row_count != simple_row_count
             or rescore_statistics.region_count != region_count
             or rescore_statistics.device_result_count
-            + rescore_statistics.cpu_required_count != region_count
+            + rescore_statistics.cpu_required_count
+            + rescore_statistics.certified_ga_region_count != region_count
             or rescore_statistics.numeric_fallback_count
             + rescore_statistics.cap_fallback_count
             != rescore_statistics.cpu_required_count
@@ -2482,6 +2522,7 @@ cdef object _build_continuation_journal_capsule(
             if (
                 rescore_statistics.device_result_count != 0
                 or rescore_statistics.cpu_required_count != region_count
+                or rescore_statistics.certified_ga_region_count != 0
                 or rescore_statistics.global_cpu_fallback_count != region_count
                 or compact_trace_count != 0
             ):
@@ -2511,6 +2552,7 @@ cdef object _build_continuation_journal_capsule(
                         or compact_result.action not in (
                             PLAN7_DOMAIN_RESCORE_CPU_REQUIRED,
                             PLAN7_DOMAIN_RESCORE_DEVICE_RESULT,
+                            PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT,
                         )
                     ):
                         raise RuntimeError(
@@ -2520,6 +2562,10 @@ cdef object _build_continuation_journal_capsule(
                         PLAN7_DOMAIN_RESCORE_DEVICE_RESULT
                     ):
                         device_result_count += 1
+                    elif compact_result.action == (
+                        PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT
+                    ):
+                        certified_ga_count += 1
                     else:
                         cpu_required_count += 1
             if (
@@ -2527,6 +2573,8 @@ cdef object _build_continuation_journal_capsule(
                 != rescore_statistics.device_result_count
                 or cpu_required_count
                 != rescore_statistics.cpu_required_count
+                or certified_ga_count
+                != rescore_statistics.certified_ga_region_count
             ):
                 raise RuntimeError("compact-domain action counts differ")
 
@@ -2704,9 +2752,17 @@ cdef object _build_continuation_journal_capsule(
                         rows[row].compact_route = (
                             PLAN7_CONTINUATION_COMPACT_DEVICE
                         )
-                    else:
+                    elif rescore_results[region_begin].action == (
+                        PLAN7_DOMAIN_RESCORE_CPU_REQUIRED
+                    ):
                         rows[row].compact_route = (
                             PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
+                        )
+                    elif rescore_results[region_begin].action != (
+                        PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT
+                    ):
+                        raise RuntimeError(
+                            "direct v3 compact action is invalid"
                         )
             elif (
                 rescore_output != NULL
@@ -2885,6 +2941,10 @@ cdef object _build_continuation_journal_capsule(
             validation_elapsed_ns,
             direct_decision_storage,
             direct_decision_counts,
+            (
+                rescore_statistics.certified_ga_region_count
+                if rescore_statistics != NULL else 0
+            ),
         )
 
     _sealed_journal_validation_ns += <uint64_t> validation_elapsed_ns
@@ -3195,7 +3255,8 @@ cdef enum generation_metric_index:
     GENERATION_RESCORE_CPU_COUNT = 19
     GENERATION_RESCORE_DEVICE_COUNT = 20
     GENERATION_RESCORE_REGION_COUNT = 21
-    GENERATION_METRIC_COUNT = 22
+    GENERATION_RESCORE_CERTIFIED_GA_COUNT = 22
+    GENERATION_METRIC_COUNT = 23
 
 
 cdef enum generation_reason_width:
@@ -3203,7 +3264,7 @@ cdef enum generation_reason_width:
     GENERATION_F2_REASON_COUNT = 5
     GENERATION_FORWARD_REASON_COUNT = 10
     GENERATION_BACKWARD_REASON_COUNT = 18
-    GENERATION_RESCORE_REASON_COUNT = 25
+    GENERATION_RESCORE_REASON_COUNT = 26
 
 
 GENERATION_REASON_FACT_LAYOUT = (
@@ -3401,7 +3462,7 @@ cdef inline bint _rescore_reason_admitted_work(uint32_t facts) noexcept nogil:
 
 def domain_rescore_reason_admitted_work_for_test(uint32_t facts):
     """Host boundary for exact rescore preflight-versus-active facts."""
-    if facts & <uint32_t> 0xfe000000:
+    if facts & <uint32_t> 0xfc000000:
         raise ValueError("rescore reason facts contain unknown bits")
     return bool(_rescore_reason_admitted_work(facts))
 
@@ -4684,6 +4745,16 @@ cdef object _domain_rescore_payload_from_output(
                 statistics.compact_output_byte_limit
             ),
             "compact_output_bytes": statistics.compact_output_bytes,
+            "certified_ga_row_count": statistics.certified_ga_row_count,
+            "certified_ga_region_count": (
+                statistics.certified_ga_region_count
+            ),
+            "certified_ga_skipped_work_cells": (
+                statistics.certified_ga_skipped_work_cells
+            ),
+            "ga_classification_ms": (
+                statistics.ga_classification_milliseconds
+            ),
             "kernel_ms": statistics.kernel_milliseconds,
             "upload_ms": statistics.upload_milliseconds,
             "download_ms": statistics.download_milliseconds,
@@ -7060,6 +7131,7 @@ cdef class SequenceBatch:
         object generation_telemetry_seed,
         object postfilter_owner,
         bint direct_sparse_v3,
+        object ga_target_cutoffs,
     ):
         """Run selection-aware F2/F3 without reading a live optimized profile."""
         cdef plan7_profile_selection_view view = selection._view()
@@ -7072,6 +7144,7 @@ cdef class SequenceBatch:
         cdef vector[size_t] candidate_postfilter_sources
         cdef vector[plan7_backward_domain_candidate] domain_candidates
         cdef vector[size_t] pass_sources
+        cdef vector[float] ga_whole_forward_scores
         cdef vector[uint64_t] pass_special_offsets
         cdef vector[uint64_t] journal_profile_offsets
         cdef vector[uint64_t] generation_metrics
@@ -7159,6 +7232,7 @@ cdef class SequenceBatch:
         )
         cdef bint direct_domain_safe
         cdef bint direct_no_region
+        cdef bint direct_ga_reject
         cdef size_t direct_postfilter_source
         cdef size_t direct_region_begin
         cdef size_t direct_region_end
@@ -7201,11 +7275,24 @@ cdef class SequenceBatch:
         cdef bytes profile_fingerprint_storage = b""
         cdef const uint8_t[::1] profile_fingerprint_view
         cdef const uint8_t[::1] sequence_fingerprint_view
+        cdef const float[::1] ga_target_cutoff_view
+        cdef bint ga_pruning = ga_target_cutoffs is not None
         cdef double_bits threshold_bits
         cdef float_bits threshold_float_bits
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
+        if ga_pruning:
+            if not sealed_domain_journal or not direct_sparse_v3:
+                raise ValueError(
+                    "GA pruning requires direct sparse sealed continuation"
+                )
+            ga_target_cutoff_view = ga_target_cutoffs
+            if ga_target_cutoff_view.shape[0] != profile_count:
+                raise ValueError("GA target cutoff count changed")
+            for profile_index in range(profile_count):
+                if not isfinite(ga_target_cutoff_view[profile_index]):
+                    raise ValueError("GA target cutoff is not finite")
         if sizeof(plan7_postfilter_result) != PLAN7_POSTFILTER_RECORD_SIZE:
             raise RuntimeError("post-filter result ABI size mismatch")
         if sizeof(plan7_forward_result) != PLAN7_FORWARD_RECORD_SIZE:
@@ -7862,6 +7949,17 @@ cdef class SequenceBatch:
                     or pass_special_offsets[pass_count] != special_count
                 ):
                     raise RuntimeError("Forward pass provenance count changed")
+                if ga_pruning:
+                    ga_whole_forward_scores.resize(pass_count)
+                    for row in range(pass_count):
+                        source = pass_sources[row]
+                        if not isfinite(native_results[source].fwdsc):
+                            raise RuntimeError(
+                                "GA whole Forward score is not finite"
+                            )
+                        ga_whole_forward_scores[row] = (
+                            native_results[source].fwdsc
+                        )
 
                 error[0] = 0
                 with nogil:
@@ -8112,7 +8210,59 @@ cdef class SequenceBatch:
                                 error.decode("utf-8", "replace")
                             )
                     error[0] = 0
-                    if collect_generation_telemetry:
+                    if ga_pruning and collect_generation_telemetry:
+                        with nogil:
+                            status = (
+                                plan7_domain_rescore_run_ga_with_reason_facts(
+                                    database,
+                                    self._batch,
+                                    domain_output,
+                                    (
+                                        ga_whole_forward_scores.data()
+                                        if pass_count
+                                        else NULL
+                                    ),
+                                    pass_count,
+                                    (
+                                        &ga_target_cutoff_view[0]
+                                        if profile_count
+                                        else NULL
+                                    ),
+                                    profile_count,
+                                    rescore_compact_byte_budget,
+                                    rescore_matrix_byte_budget,
+                                    rescore_trace_byte_budget,
+                                    &rescore_output,
+                                    error,
+                                    sizeof(error),
+                                )
+                            )
+                    elif ga_pruning:
+                        with nogil:
+                            status = plan7_domain_rescore_run_ga(
+                                database,
+                                self._batch,
+                                domain_output,
+                                (
+                                    ga_whole_forward_scores.data()
+                                    if pass_count
+                                    else NULL
+                                ),
+                                pass_count,
+                                (
+                                    &ga_target_cutoff_view[0]
+                                    if profile_count
+                                    else NULL
+                                ),
+                                profile_count,
+                                rescore_compact_byte_budget,
+                                rescore_matrix_byte_budget,
+                                rescore_trace_byte_budget,
+                                &rescore_output,
+                                error,
+                                sizeof(error),
+                            )
+                    elif collect_generation_telemetry:
                         with nogil:
                             status = (
                                 plan7_domain_rescore_run_with_reason_facts(
@@ -8187,7 +8337,7 @@ cdef class SequenceBatch:
                                     profile_index * GENERATION_METRIC_COUNT
                                 )
                                 reason32 = native_rescore_reasons[region]
-                                if reason32 & <uint32_t> 0xfe000000:
+                                if reason32 & <uint32_t> 0xfc000000:
                                     raise RuntimeError(
                                         "rescore reason facts contain unknown bits"
                                     )
@@ -8232,6 +8382,20 @@ cdef class SequenceBatch:
                                     generation_metrics[
                                         reason_base
                                         + GENERATION_RESCORE_CPU_COUNT
+                                    ] += 1
+                                elif native_rescore_results[region].action == (
+                                    PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT
+                                ):
+                                    if not (
+                                        reason32
+                                        & PLAN7_DOMAIN_RESCORE_REASON_CERTIFIED_GA_REJECT
+                                    ):
+                                        raise RuntimeError(
+                                            "rescore GA reject lacks source fact"
+                                        )
+                                    generation_metrics[
+                                        reason_base
+                                        + GENERATION_RESCORE_CERTIFIED_GA_COUNT
                                     ] += 1
                                 else:
                                     raise RuntimeError(
@@ -8285,7 +8449,7 @@ cdef class SequenceBatch:
                                 ]
                                 while region < stop:
                                     reason32 = native_rescore_reasons[region]
-                                    if reason32 & <uint32_t> 0xfe000000:
+                                    if reason32 & <uint32_t> 0xfc000000:
                                         raise RuntimeError(
                                             "rescore reason facts contain unknown bits"
                                         )
@@ -8477,6 +8641,14 @@ cdef class SequenceBatch:
                                     direct_compact_route = (
                                         PLAN7_CONTINUATION_COMPACT_CPU_REQUIRED
                                     )
+                                elif native_rescore_results[
+                                    direct_region_begin
+                                ].action == (
+                                    PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT
+                                ):
+                                    direct_compact_route = (
+                                        PLAN7_CONTINUATION_COMPACT_NONE
+                                    )
                                 else:
                                     raise RuntimeError(
                                         "direct v3 compact action is invalid"
@@ -8510,7 +8682,19 @@ cdef class SequenceBatch:
                             and direct_compact_route
                             == PLAN7_CONTINUATION_COMPACT_NONE
                         )
-                        if direct_no_region:
+                        direct_ga_reject = (
+                            ga_pruning
+                            and direct_domain_safe
+                            and native_domain_results[row].route
+                            == PLAN7_BACKWARD_DOMAIN_SIMPLE
+                            and direct_region_begin < direct_region_end
+                            and native_rescore_results != NULL
+                            and native_rescore_results[
+                                direct_region_begin
+                            ].action
+                            == PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT
+                        )
+                        if direct_no_region or direct_ga_reject:
                             if direct_exception_count == 0:
                                 raise RuntimeError(
                                     "direct v3 exception count underflow"
@@ -8928,6 +9112,22 @@ cdef class SequenceBatch:
                                 "cpu_required_count": (
                                     native_rescore_statistics.cpu_required_count
                                 ),
+                                "certified_ga_region_count": (
+                                    native_rescore_statistics
+                                    .certified_ga_region_count
+                                ),
+                                "certified_ga_row_count": (
+                                    native_rescore_statistics
+                                    .certified_ga_row_count
+                                ),
+                                "certified_ga_skipped_work_cells": (
+                                    native_rescore_statistics
+                                    .certified_ga_skipped_work_cells
+                                ),
+                                "ga_classification_ms": (
+                                    native_rescore_statistics
+                                    .ga_classification_milliseconds
+                                ),
                                 "work_cells": (
                                     native_rescore_statistics.work_cells
                                 ),
@@ -9135,6 +9335,7 @@ cdef class SequenceBatch:
             None,
             None,
             False,
+            None,
         )
 
     def _postfilter_forward_domain_selection_sealed(
@@ -9154,6 +9355,7 @@ cdef class SequenceBatch:
         bint _return_stage_timings=False,
         bint _return_generation_statistics=False,
         bint _direct_sparse_v3=False,
+        object _ga_target_cutoffs=None,
     ):
         """Run the fused package-internal path and return one opaque seal.
 
@@ -9239,6 +9441,7 @@ cdef class SequenceBatch:
             generation_telemetry_seed,
             postfilter_records,
             _direct_sparse_v3,
+            _ga_target_cutoffs,
         )
         if (
             rescore_simple_diagnostic

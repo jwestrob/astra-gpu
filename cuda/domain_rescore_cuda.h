@@ -26,7 +26,8 @@ enum plan7_domain_rescore_abi {
 
 enum plan7_domain_rescore_action {
   PLAN7_DOMAIN_RESCORE_CPU_REQUIRED = 0,
-  PLAN7_DOMAIN_RESCORE_DEVICE_RESULT = 1
+  PLAN7_DOMAIN_RESCORE_DEVICE_RESULT = 1,
+  PLAN7_DOMAIN_RESCORE_CERTIFIED_GA_REJECT = 2
 };
 
 enum plan7_domain_rescore_status {
@@ -65,7 +66,8 @@ enum plan7_domain_rescore_reason_fact {
   PLAN7_DOMAIN_RESCORE_REASON_OTHER_CPU_REQUIRED = UINT32_C(0x00400000),
   /* Distinct from OWN_SCALES discovered after isolated DP was admitted. */
   PLAN7_DOMAIN_RESCORE_REASON_UPSTREAM_OWN_SCALES = UINT32_C(0x00800000),
-  PLAN7_DOMAIN_RESCORE_REASON_FINAL_CPU_REQUIRED = UINT32_C(0x01000000)
+  PLAN7_DOMAIN_RESCORE_REASON_FINAL_CPU_REQUIRED = UINT32_C(0x01000000),
+  PLAN7_DOMAIN_RESCORE_REASON_CERTIFIED_GA_REJECT = UINT32_C(0x02000000)
 };
 
 /* One record describes one simple region. All coordinates are one-based and
@@ -133,6 +135,10 @@ typedef struct plan7_domain_rescore_statistics {
   float upload_milliseconds;
   float download_milliseconds;
   float total_milliseconds;
+  uint64_t certified_ga_row_count;
+  uint64_t certified_ga_region_count;
+  uint64_t certified_ga_skipped_work_cells;
+  float ga_classification_milliseconds;
 } plan7_domain_rescore_statistics;
 
 /* Additive transfer accounting for the resident Backward/domain handoff.
@@ -170,6 +176,40 @@ int plan7_domain_rescore_run_with_reason_facts(
   const plan7_forward_database *database,
   const plan7_ssv_sequence_batch *batch,
   const plan7_backward_domain_output *upstream,
+  uint64_t compact_byte_budget,
+  uint64_t matrix_byte_budget,
+  uint64_t trace_byte_budget,
+  plan7_domain_rescore_output **output,
+  char *error,
+  size_t error_size);
+
+/* Exact --cut_ga specialization. The caller supplies one whole-target
+ * Forward score per upstream row and one binary32 GA target cutoff per
+ * selected profile. Rows certified below GA after isolated Forward retain
+ * their exact Forward score but skip isolated Backward/OA/trace/null2. */
+int plan7_domain_rescore_run_ga(
+  const plan7_forward_database *database,
+  const plan7_ssv_sequence_batch *batch,
+  const plan7_backward_domain_output *upstream,
+  const float *whole_forward_scores,
+  size_t whole_forward_score_count,
+  const float *target_ga_cutoffs,
+  size_t target_ga_cutoff_count,
+  uint64_t compact_byte_budget,
+  uint64_t matrix_byte_budget,
+  uint64_t trace_byte_budget,
+  plan7_domain_rescore_output **output,
+  char *error,
+  size_t error_size);
+
+int plan7_domain_rescore_run_ga_with_reason_facts(
+  const plan7_forward_database *database,
+  const plan7_ssv_sequence_batch *batch,
+  const plan7_backward_domain_output *upstream,
+  const float *whole_forward_scores,
+  size_t whole_forward_score_count,
+  const float *target_ga_cutoffs,
+  size_t target_ga_cutoff_count,
   uint64_t compact_byte_budget,
   uint64_t matrix_byte_budget,
   uint64_t trace_byte_budget,

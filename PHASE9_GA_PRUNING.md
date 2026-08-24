@@ -8,8 +8,8 @@ known. Such targets could skip the remaining isolated-domain Backward,
 optimal-accuracy decoding, traceback, and null2 work without changing any
 HMMER decision.
 
-This phase is census-only until both the proof and real-workload opportunity
-are strong. It does not change production search decisions.
+The first commit was census-only. The production experiment remains an
+explicit private opt-in until exact-output, runtime, and memory gates pass.
 
 ## Source proof
 
@@ -119,3 +119,31 @@ row decision immediately after isolated-domain Forward and skips downstream
 Backward/OA/trace/null2 only for certified rows. Keep the current path as the
 audit/rollback mode and require exact output plus runtime and memory evidence
 before promotion.
+
+## Production experiment
+
+The `_ga_pruning=True` fused-generation option is deliberately restricted to
+gathering cutoffs and direct sparse journal v3. After isolated-domain Forward,
+the native rescore stage evaluates the same certified target bound as the
+census. Certified rows retain their exact isolated Forward results but do not
+enter isolated Backward, optimal-accuracy decoding, traceback, or null2.
+
+The existing path remains byte-for-byte available when the option is false.
+The first implementation also retains the existing matrix allocation so that
+the experiment changes execution, not workspace admission; consequently its
+initial memory high-water may remain flat. New counters report certified rows,
+regions, skipped DP cells, and classification time.
+
+For order-sensitive continuation, a certified row is encoded as the existing
+exact terminal/no-region journal certificate: it contributes all four filter
+promotion counters and no hit, while original target ordinals and residue
+accounting remain unchanged. The native rescore census separately identifies
+these GA certificates so they cannot be confused with Backward no-region
+outcomes in performance analysis.
+
+The focused production gate is
+`tests/audit_h200_phase9_ga_pruning_production.py`. It compares the complete
+target table, domain table, query identity, and pipeline accounting of the
+ordinary and optimized paths for the first 64 Pfam profiles against 1,000
+targets, including 11 certified target rows / 19 compact regions. A full H200
+run is required before promotion.

@@ -118,7 +118,7 @@ from threading import Lock as _Lock
 # importlib loads this DSO under its bare ``_pipeline`` initialization name.
 from plan7_gpu import _telemetry as _telemetry_module
 
-DIRECT_V3_STAGING_SCHEMA_VERSION = 2
+DIRECT_V3_STAGING_SCHEMA_VERSION = 3
 
 # These are the exact interval constants used by the patched HMMER compact
 # continuation seam.  The Phase 9 evaluator applies the same input and final
@@ -947,6 +947,7 @@ cdef class _SealedPostfilterBatch:
     cdef uint64_t _rescore_simple_row_count
     cdef uint64_t _rescore_device_result_count
     cdef uint64_t _rescore_cpu_required_count
+    cdef uint64_t _rescore_certified_ga_count
     cdef uint64_t _rescore_numeric_fallback_count
     cdef uint64_t _rescore_cap_fallback_count
     cdef uint64_t _rescore_global_cpu_fallback_count
@@ -7055,7 +7056,7 @@ cdef tuple _consume_validate_direct_v3_staging(
         raise TypeError("direct v3 staging must be exactly tuple")
     source = <tuple> source_object
     if (
-        len(source) != 44
+        len(source) != 45
         or type(source[0]) is not int
         or source[0] != DIRECT_V3_STAGING_SCHEMA_VERSION
     ):
@@ -7084,6 +7085,8 @@ cdef tuple _consume_validate_direct_v3_staging(
         raise TypeError("direct v3 decision plan must be immutable bytes")
     if type(source[43]) is not tuple or len(source[43]) != 7:
         raise TypeError("direct v3 decision counts must be a seven-item tuple")
+    if type(source[44]) is not int or not 0 <= source[44] <= <uint64_t> -1:
+        raise TypeError("direct v3 GA count must be uint64")
     decision_counts = <tuple> source[43]
     for index in range(7):
         if (
@@ -7331,7 +7334,7 @@ cdef tuple _consume_validate_direct_v3_staging(
             or rescore_provenance.result_count != compact_result_count
             or rescore_provenance.trace_count != compact_trace_count
             or rescore_provenance.null2_count != compact_null2_count
-            or source[20] + source[21] != region_count
+            or source[20] + source[21] + source[44] != region_count
         ):
             raise ValueError("direct v3 rescore provenance differs")
     elif (
@@ -7372,6 +7375,7 @@ cdef tuple _consume_validate_direct_v3_staging(
         source[24],
         decision_owner,
         decision_counts,
+        source[44],
     )
 
 
@@ -7836,6 +7840,7 @@ def _seal_profile_selection_continuation_bound(
     cdef uint64_t rescore_simple_row_count = 0
     cdef uint64_t rescore_device_result_count = 0
     cdef uint64_t rescore_cpu_required_count = 0
+    cdef uint64_t rescore_certified_ga_count = 0
     cdef uint64_t rescore_numeric_fallback_count = 0
     cdef uint64_t rescore_cap_fallback_count = 0
     cdef uint64_t rescore_global_cpu_fallback_count = 0
@@ -8013,6 +8018,8 @@ def _seal_profile_selection_continuation_bound(
     rescore_numeric_fallback_count = journal_values[22]
     rescore_cap_fallback_count = journal_values[23]
     rescore_global_cpu_fallback_count = journal_values[24]
+    if direct_v3_source:
+        rescore_certified_ga_count = journal_values[27]
     if native_stage_timings is not None:
         validated_stage_timings = _validate_native_stage_timings(
             native_stage_timings,
@@ -8213,6 +8220,7 @@ def _seal_profile_selection_continuation_bound(
     sealed._rescore_simple_row_count = rescore_simple_row_count
     sealed._rescore_device_result_count = rescore_device_result_count
     sealed._rescore_cpu_required_count = rescore_cpu_required_count
+    sealed._rescore_certified_ga_count = rescore_certified_ga_count
     sealed._rescore_numeric_fallback_count = rescore_numeric_fallback_count
     sealed._rescore_cap_fallback_count = rescore_cap_fallback_count
     sealed._rescore_global_cpu_fallback_count = (
@@ -9401,6 +9409,9 @@ def _sealed_continuation_statistics_bound(sealed_object):
         ),
         "compact_cpu_required_count": (
             sealed._rescore_cpu_required_count
+        ),
+        "compact_certified_ga_count": (
+            sealed._rescore_certified_ga_count
         ),
         "compact_numeric_fallback_count": (
             sealed._rescore_numeric_fallback_count

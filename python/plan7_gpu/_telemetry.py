@@ -38,6 +38,7 @@ _METRIC_NAMES = (
     "rescore_cpu_required_count",
     "rescore_device_count",
     "rescore_region_count",
+    "rescore_certified_ga_count",
 )
 
 _COUNT_METRICS = (
@@ -53,6 +54,7 @@ _COUNT_METRICS = (
     "rescore_cpu_required_count",
     "rescore_device_count",
     "rescore_region_count",
+    "rescore_certified_ga_count",
 )
 
 _CELL_METRICS = (
@@ -147,6 +149,7 @@ _REASON_FACTS = {
         ("other_cpu_required", 0x00400000),
         ("upstream_backward_own_scales", 0x00800000),
         ("final_cpu_required", 0x01000000),
+        ("certified_ga_reject", 0x02000000),
     ),
 }
 
@@ -317,6 +320,7 @@ def build_generation_statistics(
         if (
             metric["rescore_cpu_required_count"]
             + metric["rescore_device_count"]
+            + metric["rescore_certified_ga_count"]
             != metric["rescore_region_count"]
         ):
             raise ValueError("rescore route partition changed")
@@ -456,6 +460,8 @@ def build_generation_statistics(
             != metric["rescore_device_count"]
             or rescore_reasons.get("final_cpu_required", 0)
             != metric["rescore_cpu_required_count"]
+            or rescore_reasons.get("certified_ga_reject", 0)
+            != metric["rescore_certified_ga_count"]
         ):
             raise ValueError("rescore terminal route facts changed")
         for name, value in metric.items():
@@ -597,6 +603,10 @@ def build_generation_statistics(
             "region_count",
             "device_result_count",
             "cpu_required_count",
+            "certified_ga_region_count",
+            "certified_ga_row_count",
+            "certified_ga_skipped_work_cells",
+            "ga_classification_ms",
             "work_cells",
         }:
             raise ValueError("native rescore totals are invalid")
@@ -612,7 +622,30 @@ def build_generation_statistics(
             "native rescore device routes",
         ) != totals["rescore_device_count"]:
             raise ValueError("native rescore device-route attribution changed")
-        if _uint64(rescore_native.get("work_cells"), "native rescore cells") != totals["rescore_logical_cells"]:
+        if _uint64(
+            rescore_native.get("certified_ga_region_count"),
+            "native rescore GA rejects",
+        ) != totals["rescore_certified_ga_count"]:
+            raise ValueError("native rescore GA-reject attribution changed")
+        ga_rows = _uint64(
+            rescore_native.get("certified_ga_row_count"),
+            "native rescore GA rows",
+        )
+        ga_cells = _uint64(
+            rescore_native.get("certified_ga_skipped_work_cells"),
+            "native rescore GA skipped cells",
+        )
+        work_cells = _uint64(
+            rescore_native.get("work_cells"), "native rescore cells"
+        )
+        ga_ms = rescore_native.get("ga_classification_ms")
+        if ga_rows > totals["rescore_certified_ga_count"]:
+            raise ValueError("native rescore GA row count exceeds region count")
+        if ga_cells > work_cells:
+            raise ValueError("native rescore GA skipped cells exceed admitted work")
+        if type(ga_ms) is not float or ga_ms != ga_ms or not 0.0 <= ga_ms < float("inf"):
+            raise ValueError("native rescore GA classification time is invalid")
+        if work_cells != totals["rescore_logical_cells"]:
             raise ValueError("native rescore work-cell attribution changed")
 
     return {

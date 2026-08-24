@@ -1719,6 +1719,7 @@ class SequenceBatch:
         _rescore_test_fault: int = 0,
         telemetry: bool = False,
         sparse_journal_v3: bool = False,
+        _ga_pruning: bool = False,
     ) -> CandidateBatch:
         """Build a sealed selection batch with bounded Forward results."""
         try:
@@ -1732,6 +1733,8 @@ class SequenceBatch:
             raise TypeError("telemetry must be bool")
         if type(sparse_journal_v3) is not bool:
             raise TypeError("sparse_journal_v3 must be bool")
+        if type(_ga_pruning) is not bool:
+            raise TypeError("_ga_pruning must be bool")
         if pipeline is not None:
             return self._postfilter_forward_domain_selection(
                 selection,
@@ -1747,6 +1750,7 @@ class SequenceBatch:
                 _rescore_test_fault,
                 telemetry,
                 sparse_journal_v3,
+                _ga_pruning,
             )
         if any(
             value != 0
@@ -1766,6 +1770,8 @@ class SequenceBatch:
             raise ValueError(
                 "sparse journal v3 requires a sealed fused pipeline batch"
             )
+        if _ga_pruning:
+            raise ValueError("GA pruning requires a sealed fused pipeline batch")
         return self._postfilter_selection(
             selection, F1, (f2, f3, bias_filter)
         )
@@ -1785,6 +1791,7 @@ class SequenceBatch:
         rescore_test_fault: int,
         telemetry: bool,
         sparse_journal_v3: bool,
+        ga_pruning: bool,
     ) -> CandidateBatch:
         """Build one opaque fused Forward/domain continuation batch."""
         from . import _pipeline  # type: ignore[attr-defined]
@@ -1860,6 +1867,7 @@ class SequenceBatch:
         native_stage_timings: Any | None = None
         generation_statistics: Any | None = None
         compact_tail_fingerprint = 0
+        ga_target_cutoffs: array[float] | None = None
 
         with _lease_pipeline(pipeline):
             _pipeline._validate_simple_region_generation_bound(
@@ -1879,6 +1887,20 @@ class SequenceBatch:
                 compact_tail_fingerprint = (
                     _pipeline._compact_tail_fingerprint_bound(pipeline)
                 )
+            if ga_pruning:
+                if not sparse_journal_v3:
+                    raise ValueError("GA pruning requires sparse journal v3")
+                if pipeline.bit_cutoffs != "gathering":
+                    raise ValueError("GA pruning requires gathering cutoffs")
+                cutoff_values = []
+                for pair in selection_state.pairs:
+                    gathering = pair.cutoffs.gathering
+                    if gathering is None or not math.isfinite(gathering[0]):
+                        raise ValueError(
+                            "GA pruning requires finite target gathering cutoffs"
+                        )
+                    cutoff_values.append(gathering[0])
+                ga_target_cutoffs = array("f", cutoff_values)
 
             # Native generation is fully self-contained. Capture it under the
             # selection/sequence locks, then release them before pair locks to
@@ -1935,6 +1957,7 @@ class SequenceBatch:
                             _return_stage_timings=True,
                             _return_generation_statistics=telemetry,
                             _direct_sparse_v3=sparse_journal_v3,
+                            _ga_target_cutoffs=ga_target_cutoffs,
                         )
                     )
                     if telemetry:
