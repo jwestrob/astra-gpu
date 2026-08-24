@@ -319,22 +319,28 @@ class CudaForwardTests(unittest.TestCase):
     def test_exact_f3_boundary_and_device_gather(self):
         _, _, profile = load_profile("Thioesterase.hmm")
         sequence = digitize(profile, ["ACDEFGHIKLMNPQRSTVWY" * 3])[0]
-        records, offsets, specials, _, _ = run_forward(
+        records, offsets, specials, statistics, _ = run_forward(
             [profile], [sequence], [0, 1], [0], [0.0], 1.0
         )
         row = struct.unpack(FORWARD_FORMAT, records)
         self.assertEqual(row[3], _native.FORWARD_DEFINITE_PASS)
         self.assertEqual(list(offsets), [0, 6 * (len(sequence) + 1)])
         self.assertEqual(len(specials), offsets[1])
+        self.assertEqual(statistics["f3_compiled_profile_count"], 1)
+        self.assertEqual(statistics["f3_host_audit_count"], 1)
+        self.assertEqual(statistics["f3_device_decision_count"], 1)
+        self.assertEqual(statistics["f3_device_pass_count"], 1)
+        self.assertEqual(statistics["f3_host_fallback_count"], 0)
+        self.assertEqual(statistics["f3_decision_mismatch_count"], 0)
 
         tau, lambda_ = profile.evalue_parameters.as_vector()[4:6]
         difference = float32(row[1] - 0.0)
         bit_score = float32(float(difference) / 0.69314718055994529)
         probability = 1.0 if bit_score < tau else math.exp(-lambda_ * (bit_score - tau))
-        at, at_offsets, at_specials, _, _ = run_forward(
+        at, at_offsets, at_specials, at_statistics, _ = run_forward(
             [profile], [sequence], [0, 1], [0], [0.0], probability
         )
-        below, below_offsets, below_specials, _, _ = run_forward(
+        below, below_offsets, below_specials, below_statistics, _ = run_forward(
             [profile],
             [sequence],
             [0, 1],
@@ -342,7 +348,7 @@ class CudaForwardTests(unittest.TestCase):
             [0.0],
             math.nextafter(probability, -math.inf),
         )
-        above, above_offsets, above_specials, _, _ = run_forward(
+        above, above_offsets, above_specials, above_statistics, _ = run_forward(
             [profile],
             [sequence],
             [0, 1],
@@ -367,6 +373,17 @@ class CudaForwardTests(unittest.TestCase):
         self.assertEqual(len(below_specials), 0)
         self.assertGreater(above_offsets[1], 0)
         self.assertEqual(len(at_specials), len(above_specials))
+        self.assertEqual(at_statistics["f3_device_pass_count"], 1)
+        self.assertEqual(below_statistics["f3_device_reject_count"], 1)
+        for observed in (at_statistics, below_statistics):
+            self.assertEqual(observed["f3_host_audit_count"], 1)
+            self.assertEqual(observed["f3_device_decision_count"], 1)
+            self.assertEqual(observed["f3_host_fallback_count"], 0)
+            self.assertEqual(observed["f3_decision_mismatch_count"], 0)
+        self.assertEqual(above_statistics["f3_compiled_profile_count"], 0)
+        self.assertEqual(above_statistics["f3_unsupported_profile_count"], 1)
+        self.assertEqual(above_statistics["f3_device_decision_count"], 0)
+        self.assertEqual(above_statistics["f3_host_fallback_count"], 1)
 
     def test_unsupported_f3_values_fail_closed_with_exact_provenance(self):
         _, _, profile = load_profile("Thioesterase.hmm")

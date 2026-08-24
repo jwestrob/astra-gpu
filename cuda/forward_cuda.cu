@@ -1,6 +1,7 @@
 #include "forward_cuda.h"
 
 #include "bias_cuda.h"
+#include "f3_threshold.h"
 #include "ssv_cuda.h"
 
 #include <cuda_runtime.h>
@@ -90,9 +91,21 @@ struct ForwardLengthTransitions {
 };
 
 struct ForwardKernelResult {
-  int32_t status;
+  uint32_t status_and_f3;
   uint32_t score_bits;
 };
+
+static_assert(sizeof(ForwardKernelResult) == 8,
+              "Forward kernel result transport changed");
+
+enum KernelF3Decision : uint32_t {
+  kKernelF3Unavailable = 0,
+  kKernelF3Reject = 1,
+  kKernelF3Pass = 2
+};
+
+constexpr uint32_t kKernelStatusMask = UINT32_C(0xff);
+constexpr unsigned kKernelF3Shift = 8;
 
 union FloatBits {
   float value;
@@ -275,7 +288,8 @@ __global__ void forward_kernel(
     const uint8_t *residues, const uint64_t *sequence_offsets,
     const plan7_forward_device_profile *profiles, const float *emissions,
     const float *transitions, const uint32_t *candidate_profiles,
-    const uint32_t *candidate_sequences,
+    const uint32_t *candidate_sequences, const float *filter_scores,
+    const uint32_t *f3_threshold_bits,
     const ForwardLengthTransitions *length_transitions,
     const uint64_t *dp_offsets, const uint64_t *x_offsets,
     size_t candidate_begin, size_t tile_count, uint64_t tile_dp_begin,
@@ -442,16 +456,34 @@ __global__ void forward_kernel(
 
   if (sublane == 0) {
     ForwardKernelResult result{};
-    result.status = eslOK;
+    uint32_t status = eslOK;
+    KernelF3Decision f3_decision = kKernelF3Unavailable;
     FloatBits score{};
     if (isnan(xC) || (sequence_length > 0 && xC == 0.0f) || isinf(xC)) {
-      result.status = eslERANGE;
+      status = eslERANGE;
       score.bits = UINT32_C(0x7fc00000);
     } else {
       const float terminal = mul_rn(xC, length.move);
       score.value = static_cast<float>(
           static_cast<double>(totscale) + log(static_cast<double>(terminal)));
     }
+    if (status == eslOK && isfinite(score.value) &&
+        isfinite(filter_scores[candidate])) {
+      FloatBits threshold{};
+      threshold.bits = f3_threshold_bits[profile_index];
+      if (!isnan(threshold.value)) {
+        const float difference = __fsub_rn(
+            score.value, filter_scores[candidate]);
+        const double quotient = __ddiv_rn(
+            static_cast<double>(difference), kLog2);
+        const float bit_score = __double2float_rn(quotient);
+        if (!isnan(bit_score))
+          f3_decision = bit_score >= threshold.value
+              ? kKernelF3Pass : kKernelF3Reject;
+      }
+    }
+    result.status_and_f3 = status |
+        (static_cast<uint32_t>(f3_decision) << kKernelF3Shift);
     result.score_bits = score.bits;
     results[candidate] = result;
   }
@@ -479,6 +511,8 @@ __global__ void gather_specials_kernel(
 struct RunBuffers {
   uint32_t *candidate_profiles = nullptr;
   uint32_t *candidate_sequences = nullptr;
+  float *filter_scores = nullptr;
+  uint32_t *f3_threshold_bits = nullptr;
   ForwardLengthTransitions *length_transitions = nullptr;
   uint64_t *dp_offsets = nullptr;
   uint64_t *x_offsets = nullptr;
@@ -518,6 +552,8 @@ struct plan7_forward_workspace {
   RunBuffers buffers;
   size_t candidate_profiles_capacity;
   size_t candidate_sequences_capacity;
+  size_t filter_scores_capacity;
+  size_t f3_threshold_bits_capacity;
   size_t length_transitions_capacity;
   size_t dp_offsets_capacity;
   size_t x_offsets_capacity;
@@ -529,6 +565,7 @@ struct plan7_forward_workspace {
   size_t gathered_capacity;
   std::vector<uint32_t> host_candidate_profiles;
   std::vector<uint32_t> host_candidate_sequences;
+  std::vector<uint32_t> host_f3_threshold_bits;
   std::vector<ForwardLengthTransitions> host_length_transitions;
   std::vector<uint64_t> host_dp_offsets;
   std::vector<uint64_t> host_x_offsets;
@@ -572,6 +609,7 @@ struct plan7_forward_output {
   std::vector<uint64_t> special_offsets;
   std::vector<float> specials;
   plan7_forward_statistics statistics;
+  plan7_forward_f3_device_statistics f3_device_statistics;
   plan7_forward_provenance provenance;
   ResidentForwardSpecials resident_specials;
   plan7_forward_residency_statistics residency_statistics{};
@@ -689,6 +727,8 @@ uint64_t forward_workspace_device_bytes(
   const size_t capacities[] = {
       workspace->candidate_profiles_capacity,
       workspace->candidate_sequences_capacity,
+      workspace->filter_scores_capacity,
+      workspace->f3_threshold_bits_capacity,
       workspace->length_transitions_capacity,
       workspace->dp_offsets_capacity,
       workspace->x_offsets_capacity,
@@ -758,6 +798,8 @@ int destroy_forward_workspace_device(plan7_forward_workspace *workspace,
   CUDA_DESTROY_FORWARD(buffers.x_offsets);
   CUDA_DESTROY_FORWARD(buffers.dp_offsets);
   CUDA_DESTROY_FORWARD(buffers.length_transitions);
+  CUDA_DESTROY_FORWARD(buffers.f3_threshold_bits);
+  CUDA_DESTROY_FORWARD(buffers.filter_scores);
   CUDA_DESTROY_FORWARD(buffers.candidate_sequences);
   CUDA_DESTROY_FORWARD(buffers.candidate_profiles);
 #undef CUDA_DESTROY_FORWARD_EVENT
@@ -1417,6 +1459,8 @@ extern "C" int plan7_forward_workspace_get_statistics(
   const size_t capacities[PLAN7_FORWARD_CAPACITY_COUNT] = {
       workspace->candidate_profiles_capacity,
       workspace->candidate_sequences_capacity,
+      workspace->filter_scores_capacity,
+      workspace->f3_threshold_bits_capacity,
       workspace->length_transitions_capacity,
       workspace->dp_offsets_capacity,
       workspace->x_offsets_capacity,
@@ -1568,6 +1612,7 @@ static int forward_run_with_workspace_impl(
     return -1;
   }
   created->statistics = {};
+  created->f3_device_statistics = {};
   DoubleBits generation_f3{};
   generation_f3.value = f3;
   const uint64_t output_byte_limit =
@@ -1626,6 +1671,8 @@ static int forward_run_with_workspace_impl(
       workspace->host_candidate_profiles;
   std::vector<uint32_t> &host_candidate_sequences =
       workspace->host_candidate_sequences;
+  std::vector<uint32_t> &host_f3_threshold_bits =
+      workspace->host_f3_threshold_bits;
   std::vector<ForwardLengthTransitions> &host_length_transitions =
       workspace->host_length_transitions;
   std::vector<uint64_t> &host_dp_offsets = workspace->host_dp_offsets;
@@ -1637,6 +1684,7 @@ static int forward_run_with_workspace_impl(
   try {
     host_candidate_profiles.resize(candidate_count);
     host_candidate_sequences.resize(candidate_count);
+    host_f3_threshold_bits.resize(profile_count);
     host_length_transitions.resize(candidate_count);
     host_dp_offsets.assign(candidate_count + 1, 0);
     host_x_offsets.assign(candidate_count + 1, 0);
@@ -1645,6 +1693,24 @@ static int forward_run_with_workspace_impl(
   } catch (...) {
     set_error(error, error_size, "Forward host workspace allocation failed");
     return -1;
+  }
+
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    plan7_f3_threshold threshold{};
+    if (plan7_forward_compile_f3_threshold(
+            database->host_profiles[profile].f_tau,
+            database->host_profiles[profile].f_lambda,
+            f3, &threshold) != 0) {
+      set_error(error, error_size, "Forward F3 threshold compilation failed");
+      return -1;
+    }
+    if (threshold.supported) {
+      host_f3_threshold_bits[profile] = threshold.threshold_bits;
+      ++created->f3_device_statistics.compiled_profile_count;
+    } else {
+      host_f3_threshold_bits[profile] = UINT32_C(0x7fc00000);
+      ++created->f3_device_statistics.unsupported_profile_count;
+    }
   }
 
   uint64_t work_cells = 0;
@@ -1718,6 +1784,7 @@ static int forward_run_with_workspace_impl(
       maximum_x_cells * sizeof(float);
 
   size_t candidate_bytes;
+  size_t threshold_bytes;
   size_t length_transition_bytes;
   size_t offset_bytes;
   size_t result_bytes;
@@ -1727,6 +1794,7 @@ static int forward_run_with_workspace_impl(
   size_t survivor_offset_bytes;
   if (!checked_bytes(candidate_count, sizeof(uint32_t),
                      &candidate_bytes) ||
+      !checked_bytes(profile_count, sizeof(uint32_t), &threshold_bytes) ||
       !checked_bytes(candidate_count, sizeof(ForwardLengthTransitions),
                      &length_transition_bytes) ||
       !checked_bytes(candidate_count + 1, sizeof(uint64_t), &offset_bytes) ||
@@ -1771,6 +1839,15 @@ static int forward_run_with_workspace_impl(
           &buffers.candidate_sequences,
           &workspace->candidate_sequences_capacity, candidate_bytes,
           &workspace->growth_count, "cudaMalloc(Forward sequence indexes)",
+          error, error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.filter_scores, &workspace->filter_scores_capacity,
+          candidate_bytes, &workspace->growth_count,
+          "cudaMalloc(Forward filter scores)", error, error_size) != 0 ||
+      grow_forward_workspace_buffer(
+          &buffers.f3_threshold_bits,
+          &workspace->f3_threshold_bits_capacity, threshold_bytes,
+          &workspace->growth_count, "cudaMalloc(Forward F3 thresholds)",
           error, error_size) != 0 ||
       grow_forward_workspace_buffer(
           &buffers.length_transitions,
@@ -1859,6 +1936,11 @@ static int forward_run_with_workspace_impl(
   CUDA_RUN(cudaMemcpy(buffers.candidate_sequences,
                       host_candidate_sequences.data(),
                       candidate_bytes, cudaMemcpyHostToDevice));
+  CUDA_RUN(cudaMemcpy(buffers.filter_scores, filter_scores,
+                      candidate_bytes, cudaMemcpyHostToDevice));
+  CUDA_RUN(cudaMemcpy(buffers.f3_threshold_bits,
+                      host_f3_threshold_bits.data(),
+                      threshold_bytes, cudaMemcpyHostToDevice));
   CUDA_RUN(cudaMemcpy(buffers.length_transitions,
                       host_length_transitions.data(),
                       length_transition_bytes, cudaMemcpyHostToDevice));
@@ -1911,7 +1993,8 @@ static int forward_run_with_workspace_impl(
         batch_view.device_residues, batch_view.device_offsets,
         database->device_profiles, database->device_emissions,
         database->device_transitions, buffers.candidate_profiles,
-        buffers.candidate_sequences,
+        buffers.candidate_sequences, buffers.filter_scores,
+        buffers.f3_threshold_bits,
         buffers.length_transitions, buffers.dp_offsets, buffers.x_offsets,
         begin, tile_count, host_dp_offsets[begin], host_x_offsets[begin],
         buffers.dp, buffers.xmx, buffers.results);
@@ -1944,10 +2027,14 @@ static int forward_run_with_workspace_impl(
       const ForwardKernelResult kernel_result =
           host_kernel_results[candidate];
       plan7_forward_result &result = created->results[candidate];
-      result.status = static_cast<uint8_t>(kernel_result.status);
+      const uint32_t kernel_status =
+          kernel_result.status_and_f3 & kKernelStatusMask;
+      const KernelF3Decision device_f3 = static_cast<KernelF3Decision>(
+          kernel_result.status_and_f3 >> kKernelF3Shift);
+      result.status = static_cast<uint8_t>(kernel_status);
       FloatBits fwdsc{};
       fwdsc.bits = kernel_result.score_bits;
-      if (kernel_result.status == eslOK &&
+      if (kernel_status == eslOK &&
           batch_view.host_lengths[host_candidate_sequences[candidate]] != 0 &&
           std::isfinite(fwdsc.value) &&
           std::isfinite(filter_scores[candidate]) &&
@@ -1959,7 +2046,26 @@ static int forward_run_with_workspace_impl(
             static_cast<double>(difference) / kLog2);
         const double probability = esl_exp_surv(
             bit_score, profile.f_tau, profile.f_lambda);
-        if (probability > f3) {
+        const bool host_pass = !(probability > f3);
+        bool f3_pass = host_pass;
+        ++created->f3_device_statistics.host_audit_count;
+        if (device_f3 == kKernelF3Reject || device_f3 == kKernelF3Pass) {
+          const bool device_pass = device_f3 == kKernelF3Pass;
+          ++created->f3_device_statistics.device_decision_count;
+          if (device_pass)
+            ++created->f3_device_statistics.device_pass_count;
+          else
+            ++created->f3_device_statistics.device_reject_count;
+          if (device_pass == host_pass) {
+            f3_pass = device_pass;
+          } else {
+            ++created->f3_device_statistics.host_fallback_count;
+            ++created->f3_device_statistics.decision_mismatch_count;
+          }
+        } else {
+          ++created->f3_device_statistics.host_fallback_count;
+        }
+        if (!f3_pass) {
           result.action = PLAN7_FORWARD_DEFINITE_REJECT;
         } else {
           const uint64_t x_cells =
@@ -2286,6 +2392,12 @@ extern "C" int plan7_forward_output_get_resident_view(
   view->device_ordinal = output->resident_specials.device_ordinal;
   view->specials = output->resident_specials.pointer;
   return 1;
+}
+
+extern "C" const plan7_forward_f3_device_statistics *
+plan7_forward_output_f3_device_statistics(
+    const plan7_forward_output *output) {
+  return output == nullptr ? nullptr : &output->f3_device_statistics;
 }
 
 extern "C" float plan7_forward_output_upload_milliseconds(

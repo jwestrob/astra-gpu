@@ -122,6 +122,8 @@ _DEVICE_CAPACITY_NAMES = (
     "postfilter_results",
     "forward_candidate_profiles",
     "forward_candidate_sequences",
+    "forward_filter_scores",
+    "forward_f3_thresholds",
     "forward_length_transitions",
     "forward_dp_offsets",
     "forward_x_offsets",
@@ -872,6 +874,16 @@ cdef extern from "forward_cuda.h" nogil:
         float download_milliseconds
         float total_milliseconds
 
+    ctypedef struct plan7_forward_f3_device_statistics:
+        uint64_t compiled_profile_count
+        uint64_t unsupported_profile_count
+        uint64_t host_audit_count
+        uint64_t device_decision_count
+        uint64_t device_reject_count
+        uint64_t device_pass_count
+        uint64_t host_fallback_count
+        uint64_t decision_mismatch_count
+
     ctypedef struct plan7_forward_provenance:
         uint64_t database_generation
         uint64_t batch_generation
@@ -1080,6 +1092,10 @@ cdef extern from "forward_cuda.h" nogil:
         plan7_forward_resident_view *view,
         char *error,
         size_t error_size,
+    )
+
+    const plan7_forward_f3_device_statistics *plan7_forward_output_f3_device_statistics(
+        const plan7_forward_output *output,
     )
 
     float plan7_forward_output_upload_milliseconds(
@@ -4107,6 +4123,25 @@ cdef ForwardProvenance _forward_provenance_from_output(
     return token
 
 
+cdef dict _forward_f3_device_statistics_from_output(
+    const plan7_forward_output *output,
+):
+    cdef const plan7_forward_f3_device_statistics *native
+    native = plan7_forward_output_f3_device_statistics(output)
+    if native == NULL:
+        raise RuntimeError("Forward device F3 statistics are null")
+    return {
+        "f3_compiled_profile_count": native.compiled_profile_count,
+        "f3_unsupported_profile_count": native.unsupported_profile_count,
+        "f3_host_audit_count": native.host_audit_count,
+        "f3_device_decision_count": native.device_decision_count,
+        "f3_device_reject_count": native.device_reject_count,
+        "f3_device_pass_count": native.device_pass_count,
+        "f3_host_fallback_count": native.host_fallback_count,
+        "f3_decision_mismatch_count": native.decision_mismatch_count,
+    }
+
+
 cdef class BackwardDomainProvenance:
     """Opaque seal for one compact Backward/domain continuation journal."""
 
@@ -6076,6 +6111,7 @@ cdef class SequenceBatch:
                 "download_ms": native_statistics.download_milliseconds,
                 "total_ms": native_statistics.total_milliseconds,
             }
+            statistics.update(_forward_f3_device_statistics_from_output(output))
             provenance = _forward_provenance_from_output(output)
             statistics.update({
                 "database_generation": provenance._value.database_generation,
@@ -8386,6 +8422,7 @@ cdef class SequenceBatch:
                 "download_ms": native_statistics.download_milliseconds,
                 "total_ms": native_statistics.total_milliseconds,
             }
+            statistics.update(_forward_f3_device_statistics_from_output(output))
             provenance = _forward_provenance_from_output(output)
             statistics.update({
                 "database_generation": provenance._value.database_generation,

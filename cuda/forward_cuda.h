@@ -74,6 +74,20 @@ typedef struct plan7_forward_statistics {
   float total_milliseconds;
 } plan7_forward_statistics;
 
+/* Additive audit counters for host-compiled F3 thresholds consumed by CUDA.
+ * This remains outside plan7_forward_statistics so the existing timing and
+ * continuation ABIs do not change. */
+typedef struct plan7_forward_f3_device_statistics {
+  uint64_t compiled_profile_count;
+  uint64_t unsupported_profile_count;
+  uint64_t host_audit_count;
+  uint64_t device_decision_count;
+  uint64_t device_reject_count;
+  uint64_t device_pass_count;
+  uint64_t host_fallback_count;
+  uint64_t decision_mismatch_count;
+} plan7_forward_f3_device_statistics;
+
 /* Sealed identity of the exact resident profile database, sequence batch,
  * ordered F3-pass rows, and gathered Forward special-state bits. Later
  * stages must validate all fields before doing work. */
@@ -132,16 +146,18 @@ typedef struct plan7_forward_device_view {
 enum plan7_forward_workspace_capacity {
   PLAN7_FORWARD_CAPACITY_CANDIDATE_PROFILES = 0,
   PLAN7_FORWARD_CAPACITY_CANDIDATE_SEQUENCES = 1,
-  PLAN7_FORWARD_CAPACITY_LENGTH_TRANSITIONS = 2,
-  PLAN7_FORWARD_CAPACITY_DP_OFFSETS = 3,
-  PLAN7_FORWARD_CAPACITY_X_OFFSETS = 4,
-  PLAN7_FORWARD_CAPACITY_DP = 5,
-  PLAN7_FORWARD_CAPACITY_XMX = 6,
-  PLAN7_FORWARD_CAPACITY_RESULTS = 7,
-  PLAN7_FORWARD_CAPACITY_SURVIVOR_CANDIDATES = 8,
-  PLAN7_FORWARD_CAPACITY_SURVIVOR_OFFSETS = 9,
-  PLAN7_FORWARD_CAPACITY_GATHERED = 10,
-  PLAN7_FORWARD_CAPACITY_COUNT = 11
+  PLAN7_FORWARD_CAPACITY_FILTER_SCORES = 2,
+  PLAN7_FORWARD_CAPACITY_F3_THRESHOLDS = 3,
+  PLAN7_FORWARD_CAPACITY_LENGTH_TRANSITIONS = 4,
+  PLAN7_FORWARD_CAPACITY_DP_OFFSETS = 5,
+  PLAN7_FORWARD_CAPACITY_X_OFFSETS = 6,
+  PLAN7_FORWARD_CAPACITY_DP = 7,
+  PLAN7_FORWARD_CAPACITY_XMX = 8,
+  PLAN7_FORWARD_CAPACITY_RESULTS = 9,
+  PLAN7_FORWARD_CAPACITY_SURVIVOR_CANDIDATES = 10,
+  PLAN7_FORWARD_CAPACITY_SURVIVOR_OFFSETS = 11,
+  PLAN7_FORWARD_CAPACITY_GATHERED = 12,
+  PLAN7_FORWARD_CAPACITY_COUNT = 13
 };
 
 typedef struct plan7_forward_workspace_statistics {
@@ -380,6 +396,10 @@ int plan7_forward_output_get_resident_view(
   plan7_forward_resident_view *view,
   char *error,
   size_t error_size);
+
+const plan7_forward_f3_device_statistics *
+plan7_forward_output_f3_device_statistics(
+  const plan7_forward_output *output);
 /* Additive instrumentation accessors on the opaque output. They do not alter
  * plan7_forward_statistics, the continuation journal, or provenance hashes. */
 float plan7_forward_output_upload_milliseconds(

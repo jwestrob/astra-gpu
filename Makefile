@@ -152,7 +152,7 @@ $(POSTFILTER_CUDA_OBJ): cuda/postfilter_cuda.cu cuda/postfilter_cuda.h \
 		-c -o $@ $<
 
 $(FORWARD_CUDA_OBJ): cuda/forward_cuda.cu cuda/forward_cuda.h \
-		cuda/bias_cuda.h cuda/ssv_cuda.h \
+		cuda/bias_cuda.h cuda/ssv_cuda.h cuda/f3_threshold.h \
 		$(PYHMMER_INCLUDE)/libhmmer/hmmer.h \
 		$(PYHMMER_INCLUDE)/libhmmer/impl_sse/impl_sse.h \
 		$(PYHMMER_EASEL_INCLUDE)/easel.h \

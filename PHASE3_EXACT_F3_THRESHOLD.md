@@ -44,20 +44,26 @@ as not greater and therefore promotes it, while an ordered comparison with NaN
 is false. Valid finite `fwdsc` and `filtersc` cannot produce NaN by subtraction,
 but the guard remains explicit rather than relying on that fact.
 
-Production dispatch is intentionally unchanged in this commit.
-Before enabling it, the device classifier must separately prove that it forms
-the bit score in the existing order: binary32 subtraction, binary64 division
-by `eslCONST_LOG2`, then binary32 rounding. This compiler proves the decision
-boundary for that resulting bit pattern; it does not relax score-generation
-equivalence.
+The follow-up production slice uploads one threshold per profile and the
+existing candidate filter scores, then forms the device bit score explicitly
+as binary32 round-to-nearest subtraction, binary64 round-to-nearest division
+by `eslCONST_LOG2`, and binary32 round-to-nearest conversion. Its pass/reject
+bit is packed into the existing eight-byte kernel result, so result D2H traffic
+does not grow.
+
+The old host predicate still audits every otherwise eligible row. A matching
+device decision is consumed; an unavailable or mismatching decision uses the
+host answer. Separate additive counters record compiled/unsupported profiles,
+host audits, device passes/rejects, fallbacks, and mismatches. These counters
+do not change result, continuation, or provenance ABIs.
 
 ## Correctness evidence
 
-The focused host oracle completed in 0.617 seconds:
+The focused host oracle completed in 0.630 seconds:
 
 ```text
 python -m unittest discover -s tests -p 'test_f3_threshold.py' -v
-Ran 4 tests in 0.617s -- OK
+Ran 4 tests in 0.630s -- OK
 ```
 
 It checks the exact host predicate at every compiled predecessor/threshold/
@@ -66,10 +72,25 @@ window around each boundary, both zeros, infinities, canonical NaNs, and all
 63,490 non-NaN binary16 values promoted exactly to binary32. Invalid and
 degenerate parameters all select the conservative unsupported path.
 
+The focused H200 old-vs-new oracle also passed:
+
+```text
+Slurm job 1182629
+test_exact_f3_boundary_and_device_gather ... ok
+Ran 1 test in 0.159s -- OK
+```
+
+It checks exact pass and reject decisions on opposite sides of the host F3
+boundary, requires zero device/host mismatches, and verifies that a noncanonical
+`F3 > 1` takes the host fallback.
+
 ## Cost and decision
 
 A Python-exposed microbenchmark compiled 100,000 varying boundaries in
 0.654 seconds (6.54 microseconds each, including dictionary construction).
 At 27,481 profiles that is about 0.18 seconds before batching or removing the
-test wrapper. The exact compiler is retained as Phase 3 metadata machinery;
-it is not yet used to classify production rows.
+test wrapper. The exact compiler and conservative CUDA consumer are retained.
+This is a correctness slice, not yet the transfer optimization: candidate
+filter scores are temporarily uploaded into a persistent workspace buffer and
+the host audit remains enabled. Phase 3 residency can remove that upload and
+the per-row host oracle after a representative zero-mismatch gate.
