@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <vector>
 
 extern "C" {
@@ -425,6 +426,23 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
       continue;
     }
 
+    /* A certified reject needs ordinary unsigned arithmetic below to remain
+     * monotone. Real HMMER profiles satisfy this bound. Unknown raw callers
+     * are retained for exact SSV instead of relying on unsigned underflow. */
+    const unsigned transition_total =
+      static_cast<unsigned>(
+        tjb[profile_descriptor.tjb_offset + sequence]) +
+      static_cast<unsigned>(profile_descriptor.profile.tbm) +
+      static_cast<unsigned>(profile_descriptor.profile.tec);
+    if (static_cast<unsigned>(profile_descriptor.profile.base) <
+        transition_total) {
+      if (threadIdx.x == 0) {
+        const size_t word = profile * words_per_profile + sequence / 32;
+        atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+      }
+      continue;
+    }
+
     plan7_ssv_result result;
     ssv_filter_block<true>(
       packed_scores + profile_descriptor.profile.score_offset,
@@ -440,6 +458,169 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
       profile_descriptor.profile.bias,
       &result,
       maxima);
+    if (threadIdx.x == 0 &&
+        f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
+      const size_t word = profile * words_per_profile + sequence / 32;
+      atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+    }
+    __syncthreads();
+  }
+}
+
+/* This deliberately mirrors ssv_filter_block instead of changing the
+ * production primitive. Each reduced score is the minimum signed exact cost
+ * over its residue class, so signed saturating subtraction produces an
+ * optimistic state. If that optimistic path could cross the signed-byte wrap,
+ * the unchanged overflow/J-state guards retain it for exact SSV. */
+__device__ __forceinline__ void
+ssv_f0_filter_block(const uint8_t *coarse_scores,
+                    size_t coarse_score_offset,
+                    size_t class_count,
+                    const uint8_t *residue_classes,
+                    int model_length,
+                    const uint8_t *residues,
+                    const uint64_t *offsets,
+                    size_t sequence,
+                    uint8_t length_tjb,
+                    uint8_t tbm,
+                    uint8_t tec,
+                    uint8_t base,
+                    uint8_t bias,
+                    plan7_ssv_result *result_out,
+                    unsigned *maxima)
+{
+  const uint64_t start = offsets[sequence];
+  const int length = static_cast<int>(offsets[sequence + 1] - start);
+  unsigned local_maximum = 128;
+
+  if (length == 0) {
+    if (threadIdx.x == 0)
+      *result_out = {128, PLAN7_SSV_EMPTY, length_tjb, 0, 0};
+    return;
+  }
+
+  const int diagonal_count = model_length + length - 1;
+  for (int diagonal = threadIdx.x; diagonal < diagonal_count;
+       diagonal += blockDim.x) {
+    const int delta = diagonal - (length - 1);
+    int i = delta < 0 ? -delta : 0;
+    int k = i + delta;
+    int value = INT8_MIN;
+
+    while (i < length && k < model_length) {
+      const unsigned residue = residues[start + static_cast<uint64_t>(i)];
+      const unsigned residue_class = residue_classes[residue];
+      const unsigned raw_cost = coarse_scores[
+        coarse_score_offset + static_cast<size_t>(k) * class_count +
+        residue_class];
+      const int cost = raw_cost < 128 ? static_cast<int>(raw_cost)
+                                     : static_cast<int>(raw_cost) - 256;
+      value = saturating_signed_subtract(value, cost);
+      const unsigned raw_value = value < 0 ? static_cast<unsigned>(value + 256)
+                                           : static_cast<unsigned>(value);
+      local_maximum = max(local_maximum, raw_value);
+      ++i;
+      ++k;
+    }
+  }
+
+  for (int width = 16; width > 0; width >>= 1)
+    local_maximum = max(
+      local_maximum,
+      __shfl_down_sync(UINT32_MAX, local_maximum, width));
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  if (lane == 0) maxima[warp] = local_maximum;
+  __syncthreads();
+  if (warp == 0) {
+    local_maximum = lane < blockDim.x / 32 ? maxima[lane] : 128;
+    for (int width = 16; width > 0; width >>= 1)
+      local_maximum = max(
+        local_maximum,
+        __shfl_down_sync(UINT32_MAX, local_maximum, width));
+    if (lane == 0) maxima[0] = local_maximum;
+  }
+
+  if (threadIdx.x == 0) {
+    const unsigned raw_xE = maxima[0];
+    plan7_ssv_result result = {
+      static_cast<uint8_t>(raw_xE), PLAN7_SSV_OK,
+      static_cast<uint8_t>(length_tjb), 0, 0
+    };
+    if (length_tjb + tbm + tec + bias >= 127) {
+      result.status = PLAN7_SSV_ENORESULT;
+    } else if (raw_xE >= 255U - bias) {
+      result.status =
+        static_cast<int>(base) - static_cast<int>(length_tjb) -
+            static_cast<int>(tbm) < 128
+          ? PLAN7_SSV_ENORESULT
+          : PLAN7_SSV_ERANGE;
+    } else {
+      unsigned adjusted = raw_xE + base - length_tjb - tbm;
+      adjusted -= 128;
+      if (adjusted >= 255U - bias) {
+        result.status = PLAN7_SSV_ERANGE;
+      } else {
+        const unsigned xJ = adjusted - tec;
+        if (xJ > base) {
+          result.status = PLAN7_SSV_ENORESULT;
+        } else {
+          result.numerator = static_cast<int16_t>(
+            static_cast<int>(xJ) - static_cast<int>(length_tjb) -
+            static_cast<int>(base));
+        }
+      }
+    }
+    *result_out = result;
+  }
+}
+
+__global__ void
+ssv_f0_mask_many_kernel(const uint8_t *coarse_scores,
+                        const plan7_ssv_f1_profile *profiles,
+                        size_t sequence_count,
+                        const uint8_t *residues,
+                        const uint64_t *offsets,
+                        const float *null_scores,
+                        const uint8_t *tjb,
+                        const uint8_t *residue_classes,
+                        size_t exact_alphabet_size,
+                        size_t class_count,
+                        size_t words_per_profile,
+                        uint32_t *candidate_words)
+{
+  __shared__ unsigned maxima[kThreads];
+  __shared__ plan7_ssv_f1_profile profile_descriptor;
+  const size_t profile = static_cast<size_t>(blockIdx.y);
+  if (threadIdx.x == 0) profile_descriptor = profiles[profile];
+  __syncthreads();
+
+  const size_t first_sequence =
+    static_cast<size_t>(blockIdx.x) * kSequencesPerBlock;
+  for (int iteration = 0; iteration < kSequencesPerBlock; ++iteration) {
+    const size_t sequence = first_sequence + static_cast<size_t>(iteration);
+    if (sequence >= sequence_count) break;
+    if (profile_descriptor.cutoff_mode == PLAN7_F1_CUTOFF_INVALID ||
+        profile_descriptor.cutoff_mode == PLAN7_F1_CUTOFF_ALWAYS_CPU) {
+      if (threadIdx.x == 0) {
+        const size_t word = profile * words_per_profile + sequence / 32;
+        atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+      }
+      continue;
+    }
+
+    plan7_ssv_result result;
+    const size_t model_offset =
+      static_cast<size_t>(profile_descriptor.profile.score_offset) /
+      exact_alphabet_size;
+    ssv_f0_filter_block(
+      coarse_scores, model_offset * class_count, class_count,
+      residue_classes, profile_descriptor.profile.model_length, residues,
+      offsets, sequence,
+      tjb[profile_descriptor.tjb_offset + sequence],
+      profile_descriptor.profile.tbm, profile_descriptor.profile.tec,
+      profile_descriptor.profile.base, profile_descriptor.profile.bias,
+      &result, maxima);
     if (threadIdx.x == 0 &&
         f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
       const size_t word = profile * words_per_profile + sequence / 32;
@@ -3065,6 +3246,320 @@ plan7_ssv_sequence_batch_get_f1_candidate_view(
   view->candidate_offsets = batch->host_candidate_offsets;
   view->candidates = batch->host_bias_candidates;
   return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_evaluate_f0_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  const float *m_mu,
+  const float *m_lambda,
+  double f1,
+  const uint8_t *residue_classes,
+  size_t residue_class_count,
+  size_t class_count,
+  plan7_f0_profile_statistics *profile_statistics,
+  size_t profile_statistics_count,
+  plan7_f0_evaluation_statistics *statistics,
+  char *error,
+  size_t error_size)
+{
+  using Clock = std::chrono::steady_clock;
+  uint8_t *device_coarse_scores = nullptr;
+  uint8_t *device_residue_classes = nullptr;
+  uint32_t *device_coarse_words = nullptr;
+  cudaEvent_t upload_start = nullptr;
+  cudaEvent_t upload_stop = nullptr;
+  cudaEvent_t kernel_start = nullptr;
+  cudaEvent_t kernel_stop = nullptr;
+  cudaError_t status = cudaSuccess;
+  std::vector<uint8_t> coarse_scores;
+  std::vector<uint32_t> exact_words;
+  std::vector<uint32_t> coarse_words;
+  std::vector<uint8_t> class_seen;
+  size_t words_per_profile = 0;
+  size_t word_count = 0;
+  size_t word_bytes = 0;
+  size_t coarse_score_count = 0;
+  uint64_t residue_total = 0;
+  int rc = -1;
+
+  if (statistics == nullptr || batch == nullptr ||
+      (profile_count != 0 &&
+       (profile_statistics == nullptr || profiles == nullptr ||
+        packed_scores == nullptr || m_mu == nullptr || m_lambda == nullptr)) ||
+      profile_statistics_count != profile_count ||
+      residue_classes == nullptr || residue_class_count !=
+        static_cast<size_t>(batch->alphabet_size) ||
+      class_count < 2 || class_count > residue_class_count) {
+    set_error(error, error_size, "invalid F0 evaluator arguments");
+    return -1;
+  }
+  memset(statistics, 0, sizeof(*statistics));
+  if (profile_count != 0)
+    memset(profile_statistics, 0,
+           profile_count * sizeof(*profile_statistics));
+  statistics->profile_count = profile_count;
+  statistics->sequence_count = batch->sequence_count;
+  statistics->class_count = class_count;
+
+  try {
+    class_seen.assign(class_count, 0);
+    for (size_t residue = 0; residue < residue_class_count; ++residue) {
+      if (residue_classes[residue] >= class_count) {
+        set_error(error, error_size, "F0 residue class is out of range");
+        return -1;
+      }
+      class_seen[residue_classes[residue]] = 1;
+    }
+    if (std::find(class_seen.begin(), class_seen.end(), 0) !=
+        class_seen.end()) {
+      set_error(error, error_size, "F0 residue partition has an empty class");
+      return -1;
+    }
+    if (batch->sequence_count > SIZE_MAX - 31 ||
+        !checked_product(profile_count,
+                         (batch->sequence_count + 31) / 32,
+                         &word_count) ||
+        !checked_product(word_count, sizeof(uint32_t), &word_bytes)) {
+      set_error(error, error_size, "F0 candidate mask size overflow");
+      return -1;
+    }
+    words_per_profile = (batch->sequence_count + 31) / 32;
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      size_t profile_coarse_count;
+      if (!checked_product(static_cast<size_t>(profiles[profile].model_length),
+                           class_count, &profile_coarse_count) ||
+          profile_coarse_count > SIZE_MAX - coarse_score_count) {
+        set_error(error, error_size, "F0 score table size overflow");
+        return -1;
+      }
+      coarse_score_count += profile_coarse_count;
+    }
+    coarse_scores.resize(coarse_score_count);
+    exact_words.resize(word_count);
+    coarse_words.resize(word_count);
+  } catch (...) {
+    set_error(error, error_size, "F0 evaluator host allocation failed");
+    return -1;
+  }
+
+  {
+    const auto start = Clock::now();
+    if (sequence_batch_f1_mask_many_impl(
+          batch, packed_scores, packed_score_count, profiles, profile_count,
+          m_mu, m_lambda, f1, nullptr, 0, false, error, error_size) != 0)
+      goto cleanup;
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size, "F0 exact F1 synchronization", status);
+      goto cleanup;
+    }
+    statistics->exact_generation_milliseconds =
+      std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  }
+  if (profile_count == 0 || batch->sequence_count == 0) {
+    rc = 0;
+    goto cleanup;
+  }
+
+  {
+    const auto start = Clock::now();
+    size_t output = 0;
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      const plan7_ssv_profile &descriptor = profiles[profile];
+      for (int k = 0; k < descriptor.model_length; ++k) {
+        int minimum[256];
+        for (size_t residue_class = 0; residue_class < class_count;
+             ++residue_class)
+          minimum[residue_class] = INT_MAX;
+        for (size_t residue = 0; residue < residue_class_count; ++residue) {
+          const uint8_t raw = packed_scores[
+            descriptor.score_offset +
+            static_cast<size_t>(k) * descriptor.score_stride + residue];
+          const int cost = raw < 128 ? static_cast<int>(raw)
+                                     : static_cast<int>(raw) - 256;
+          /* HMMER's signed-byte SSV pack guarantees cost >= -bias. This is
+           * the step-size invariant that makes crossing the signed-byte wrap
+           * hit the existing 255-bias overflow guard before a reject can be
+           * certified. Refuse non-HMMER tables rather than weakening the
+           * upper-bound proof. */
+          if (cost < -static_cast<int>(descriptor.bias)) {
+            set_error(error, error_size,
+                      "F0 profile score violates the HMMER bias bound");
+            goto cleanup;
+          }
+          minimum[residue_classes[residue]] =
+            std::min(minimum[residue_classes[residue]], cost);
+        }
+        for (size_t residue_class = 0; residue_class < class_count;
+             ++residue_class)
+          coarse_scores[output++] = static_cast<uint8_t>(
+            minimum[residue_class]);
+      }
+    }
+    if (output != coarse_score_count) {
+      set_error(error, error_size, "F0 score table size changed");
+      goto cleanup;
+    }
+    statistics->coarse_table_build_milliseconds =
+      std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  }
+
+#define CUDA_TRY_F0(call, label)                                             \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, label, status);                       \
+      goto cleanup;                                                           \
+    }                                                                         \
+  } while (0)
+
+  CUDA_TRY_F0(cudaEventCreate(&upload_start), "F0 upload event create");
+  CUDA_TRY_F0(cudaEventCreate(&upload_stop), "F0 upload event create");
+  CUDA_TRY_F0(cudaEventCreate(&kernel_start), "F0 kernel event create");
+  CUDA_TRY_F0(cudaEventCreate(&kernel_stop), "F0 kernel event create");
+  CUDA_TRY_F0(cudaMalloc(&device_coarse_scores, coarse_score_count),
+              "cudaMalloc(F0 scores)");
+  CUDA_TRY_F0(cudaMalloc(&device_residue_classes, residue_class_count),
+              "cudaMalloc(F0 residue classes)");
+  CUDA_TRY_F0(cudaMalloc(&device_coarse_words, word_bytes),
+              "cudaMalloc(F0 mask)");
+  CUDA_TRY_F0(cudaEventRecord(upload_start), "F0 upload event record");
+  CUDA_TRY_F0(cudaMemcpy(device_coarse_scores, coarse_scores.data(),
+                         coarse_score_count, cudaMemcpyHostToDevice),
+              "cudaMemcpy(F0 scores)");
+  CUDA_TRY_F0(cudaMemcpy(device_residue_classes, residue_classes,
+                         residue_class_count, cudaMemcpyHostToDevice),
+              "cudaMemcpy(F0 residue classes)");
+  CUDA_TRY_F0(cudaMemset(device_coarse_words, 0, word_bytes),
+              "cudaMemset(F0 mask)");
+  CUDA_TRY_F0(cudaEventRecord(upload_stop), "F0 upload event record");
+  CUDA_TRY_F0(cudaEventRecord(kernel_start), "F0 kernel event record");
+  {
+    const unsigned sequence_blocks = static_cast<unsigned>(
+      (batch->sequence_count + kSequencesPerBlock - 1) /
+      kSequencesPerBlock);
+    ssv_f0_mask_many_kernel<<<
+      dim3(sequence_blocks, static_cast<unsigned>(profile_count)), kThreads>>>(
+        device_coarse_scores, batch->device_f1_profiles,
+        batch->sequence_count, batch->device_residues, batch->device_offsets,
+        batch->device_null_scores, batch->device_tjb,
+        device_residue_classes, residue_class_count, class_count,
+        words_per_profile, device_coarse_words);
+  }
+  CUDA_TRY_F0(cudaGetLastError(), "F0 kernel launch");
+  CUDA_TRY_F0(cudaEventRecord(kernel_stop), "F0 kernel event record");
+  CUDA_TRY_F0(cudaEventSynchronize(kernel_stop), "F0 kernel synchronize");
+  {
+    float milliseconds = 0.0f;
+    CUDA_TRY_F0(cudaEventElapsedTime(
+                  &milliseconds, upload_start, upload_stop),
+                "F0 upload event elapsed");
+    statistics->coarse_upload_milliseconds = milliseconds;
+    CUDA_TRY_F0(cudaEventElapsedTime(
+                  &milliseconds, kernel_start, kernel_stop),
+                "F0 kernel event elapsed");
+    statistics->coarse_kernel_milliseconds = milliseconds;
+  }
+  CUDA_TRY_F0(cudaMemcpy(exact_words.data(), batch->device_candidate_words,
+                         word_bytes, cudaMemcpyDeviceToHost),
+              "cudaMemcpy(exact F1 mask)");
+  CUDA_TRY_F0(cudaMemcpy(coarse_words.data(), device_coarse_words,
+                         word_bytes, cudaMemcpyDeviceToHost),
+              "cudaMemcpy(F0 mask)");
+
+  {
+    const auto start = Clock::now();
+    for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence) {
+      if (batch->host_lengths[sequence] > UINT64_MAX - residue_total) {
+        set_error(error, error_size, "F0 residue total overflow");
+        goto cleanup;
+      }
+      residue_total += batch->host_lengths[sequence];
+    }
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      plan7_f0_profile_statistics &row = profile_statistics[profile];
+      const uint64_t model_length = static_cast<uint64_t>(
+        profiles[profile].model_length);
+      row.logical_pair_count = batch->sequence_count;
+      if (!checked_product_u64(model_length, residue_total,
+                               &row.logical_cell_count)) {
+        set_error(error, error_size, "F0 logical cell count overflow");
+        goto cleanup;
+      }
+      for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence) {
+        const size_t word = profile * words_per_profile + sequence / 32;
+        const uint32_t bit = UINT32_C(1) << (sequence % 32);
+        const bool exact = (exact_words[word] & bit) != 0;
+        const bool coarse = (coarse_words[word] & bit) != 0;
+        row.exact_candidate_count += exact;
+        row.coarse_candidate_count += coarse;
+        row.certified_reject_count += !coarse;
+        row.false_reject_count += exact && !coarse;
+        if (coarse) {
+          uint64_t cells;
+          if (!checked_product_u64(model_length,
+                                   batch->host_lengths[sequence], &cells) ||
+              !checked_add_u64(row.survivor_exact_cell_count, cells,
+                               &row.survivor_exact_cell_count)) {
+            set_error(error, error_size,
+                      "F0 survivor exact cell count overflow");
+            goto cleanup;
+          }
+        }
+      }
+      if (!checked_add_u64(statistics->logical_pair_count,
+                           row.logical_pair_count,
+                           &statistics->logical_pair_count) ||
+          !checked_add_u64(statistics->exact_candidate_count,
+                           row.exact_candidate_count,
+                           &statistics->exact_candidate_count) ||
+          !checked_add_u64(statistics->coarse_candidate_count,
+                           row.coarse_candidate_count,
+                           &statistics->coarse_candidate_count) ||
+          !checked_add_u64(statistics->certified_reject_count,
+                           row.certified_reject_count,
+                           &statistics->certified_reject_count) ||
+          !checked_add_u64(statistics->false_reject_count,
+                           row.false_reject_count,
+                           &statistics->false_reject_count) ||
+          !checked_add_u64(statistics->logical_cell_count,
+                           row.logical_cell_count,
+                           &statistics->logical_cell_count) ||
+          !checked_add_u64(statistics->survivor_exact_cell_count,
+                           row.survivor_exact_cell_count,
+                           &statistics->survivor_exact_cell_count)) {
+        set_error(error, error_size, "F0 aggregate count overflow");
+        goto cleanup;
+      }
+    }
+    statistics->analysis_milliseconds =
+      std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  }
+  statistics->coarse_table_bytes = coarse_score_count;
+  if (coarse_score_count > UINT64_MAX - residue_class_count ||
+      coarse_score_count + residue_class_count > UINT64_MAX - word_bytes) {
+    set_error(error, error_size, "F0 temporary byte count overflow");
+    goto cleanup;
+  }
+  statistics->temporary_device_bytes =
+    coarse_score_count + residue_class_count + word_bytes;
+  rc = 0;
+
+cleanup:
+  if (kernel_stop != nullptr) cudaEventDestroy(kernel_stop);
+  if (kernel_start != nullptr) cudaEventDestroy(kernel_start);
+  if (upload_stop != nullptr) cudaEventDestroy(upload_stop);
+  if (upload_start != nullptr) cudaEventDestroy(upload_start);
+  if (device_coarse_words != nullptr) cudaFree(device_coarse_words);
+  if (device_residue_classes != nullptr) cudaFree(device_residue_classes);
+  if (device_coarse_scores != nullptr) cudaFree(device_coarse_scores);
+#undef CUDA_TRY_F0
+  return rc;
 }
 
 extern "C" int

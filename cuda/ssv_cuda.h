@@ -210,6 +210,38 @@ typedef struct plan7_ssv_f1_candidate_view {
   const plan7_bias_candidate *candidates;
 } plan7_ssv_f1_candidate_view;
 
+/* Experimental Phase-8 census only. A coarse candidate is unresolved and
+ * must still execute exact SSV; a certified reject may safely skip it. */
+typedef struct plan7_f0_profile_statistics {
+  uint64_t logical_pair_count;
+  uint64_t exact_candidate_count;
+  uint64_t coarse_candidate_count;
+  uint64_t certified_reject_count;
+  uint64_t false_reject_count;
+  uint64_t logical_cell_count;
+  uint64_t survivor_exact_cell_count;
+} plan7_f0_profile_statistics;
+
+typedef struct plan7_f0_evaluation_statistics {
+  uint64_t profile_count;
+  uint64_t sequence_count;
+  uint64_t class_count;
+  uint64_t logical_pair_count;
+  uint64_t exact_candidate_count;
+  uint64_t coarse_candidate_count;
+  uint64_t certified_reject_count;
+  uint64_t false_reject_count;
+  uint64_t logical_cell_count;
+  uint64_t survivor_exact_cell_count;
+  uint64_t coarse_table_bytes;
+  uint64_t temporary_device_bytes;
+  double exact_generation_milliseconds;
+  double coarse_table_build_milliseconds;
+  double coarse_upload_milliseconds;
+  double coarse_kernel_milliseconds;
+  double analysis_milliseconds;
+} plan7_f0_evaluation_statistics;
+
 int plan7_cuda_device_count(char *error, size_t error_size);
 int plan7_cuda_memory_info(int *device_ordinal,
                            uint64_t *free_bytes,
@@ -380,6 +412,28 @@ int plan7_ssv_sequence_batch_f1_compact_many(
 int plan7_ssv_sequence_batch_get_f1_candidate_view(
   const plan7_ssv_sequence_batch *batch,
   plan7_ssv_f1_candidate_view *view,
+  char *error,
+  size_t error_size);
+
+/* Offline evaluator for a certified reduced-alphabet F0 hypothesis. It first
+ * produces the ordinary exact F1 mask, then evaluates the optimistic coarse
+ * recurrence. This function is diagnostic-only and never participates in
+ * production dispatch. */
+int plan7_ssv_sequence_batch_evaluate_f0_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  const float *m_mu,
+  const float *m_lambda,
+  double f1,
+  const uint8_t *residue_classes,
+  size_t residue_class_count,
+  size_t class_count,
+  plan7_f0_profile_statistics *profile_statistics,
+  size_t profile_statistics_count,
+  plan7_f0_evaluation_statistics *statistics,
   char *error,
   size_t error_size);
 

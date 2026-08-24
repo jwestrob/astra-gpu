@@ -455,6 +455,34 @@ cdef extern from "ssv_cuda.h" nogil:
         const size_t *candidate_offsets
         const plan7_bias_candidate *candidates
 
+    ctypedef struct plan7_f0_profile_statistics:
+        uint64_t logical_pair_count
+        uint64_t exact_candidate_count
+        uint64_t coarse_candidate_count
+        uint64_t certified_reject_count
+        uint64_t false_reject_count
+        uint64_t logical_cell_count
+        uint64_t survivor_exact_cell_count
+
+    ctypedef struct plan7_f0_evaluation_statistics:
+        uint64_t profile_count
+        uint64_t sequence_count
+        uint64_t class_count
+        uint64_t logical_pair_count
+        uint64_t exact_candidate_count
+        uint64_t coarse_candidate_count
+        uint64_t certified_reject_count
+        uint64_t false_reject_count
+        uint64_t logical_cell_count
+        uint64_t survivor_exact_cell_count
+        uint64_t coarse_table_bytes
+        uint64_t temporary_device_bytes
+        double exact_generation_milliseconds
+        double coarse_table_build_milliseconds
+        double coarse_upload_milliseconds
+        double coarse_kernel_milliseconds
+        double analysis_milliseconds
+
     int plan7_cuda_device_count(char *error, size_t error_size)
     int plan7_cuda_memory_info(
         int *device_ordinal,
@@ -638,6 +666,25 @@ cdef extern from "ssv_cuda.h" nogil:
     int plan7_ssv_sequence_batch_get_f1_candidate_view(
         const plan7_ssv_sequence_batch *batch,
         plan7_ssv_f1_candidate_view *view,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_evaluate_f0_many(
+        plan7_ssv_sequence_batch *batch,
+        const uint8_t *packed_scores,
+        size_t packed_score_count,
+        const plan7_ssv_profile *profiles,
+        size_t profile_count,
+        const float *m_mu,
+        const float *m_lambda,
+        double f1,
+        const uint8_t *residue_classes,
+        size_t residue_class_count,
+        size_t class_count,
+        plan7_f0_profile_statistics *profile_statistics,
+        size_t profile_statistics_count,
+        plan7_f0_evaluation_statistics *statistics,
         char *error,
         size_t error_size,
     )
@@ -6052,6 +6099,111 @@ cdef class SequenceBatch:
                 )
             output.append(candidates)
         return output
+
+    def evaluate_f0_many_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+        const uint8_t[::1] residue_classes,
+        int class_count,
+    ):
+        """Evaluate a certified reduced-alphabet F0 outside production."""
+        cdef size_t profile_count = <size_t> score_offsets.shape[0]
+        cdef size_t profile_index
+        cdef int status
+        cdef char error[512]
+        cdef vector[plan7_f0_profile_statistics] rows
+        cdef plan7_f0_profile_statistics row
+        cdef plan7_f0_evaluation_statistics summary
+        cdef list profiles = []
+
+        if (
+            <size_t> m_mu.shape[0] != profile_count
+            or <size_t> m_lambda.shape[0] != profile_count
+        ):
+            raise ValueError("e-value parameter lengths differ")
+        profile_count = self._prepare_profiles(
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+        )
+        if class_count < 2:
+            raise ValueError("F0 class count must be at least two")
+        rows.resize(profile_count)
+        error[0] = 0
+        with nogil:
+            status = plan7_ssv_sequence_batch_evaluate_f0_many(
+                self._batch,
+                &packed_scores[0] if packed_scores.shape[0] else NULL,
+                <size_t> packed_scores.shape[0],
+                self._profiles.data() if profile_count else NULL,
+                profile_count,
+                &m_mu[0] if profile_count else NULL,
+                &m_lambda[0] if profile_count else NULL,
+                f1,
+                &residue_classes[0] if residue_classes.shape[0] else NULL,
+                <size_t> residue_classes.shape[0],
+                <size_t> class_count,
+                rows.data() if profile_count else NULL,
+                profile_count,
+                &summary,
+                error,
+                sizeof(error),
+            )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        for profile_index in range(profile_count):
+            row = rows[profile_index]
+            profiles.append(
+                {
+                    "profile_index": profile_index,
+                    "logical_pair_count": row.logical_pair_count,
+                    "exact_candidate_count": row.exact_candidate_count,
+                    "coarse_candidate_count": row.coarse_candidate_count,
+                    "certified_reject_count": row.certified_reject_count,
+                    "false_reject_count": row.false_reject_count,
+                    "logical_cell_count": row.logical_cell_count,
+                    "survivor_exact_cell_count": (
+                        row.survivor_exact_cell_count
+                    ),
+                }
+            )
+        return {
+            "schema": "plan7_gpu.phase8_f0_evaluation.v1",
+            "profile_count": summary.profile_count,
+            "sequence_count": summary.sequence_count,
+            "class_count": summary.class_count,
+            "logical_pair_count": summary.logical_pair_count,
+            "exact_candidate_count": summary.exact_candidate_count,
+            "coarse_candidate_count": summary.coarse_candidate_count,
+            "certified_reject_count": summary.certified_reject_count,
+            "false_reject_count": summary.false_reject_count,
+            "logical_cell_count": summary.logical_cell_count,
+            "survivor_exact_cell_count": summary.survivor_exact_cell_count,
+            "coarse_table_bytes": summary.coarse_table_bytes,
+            "temporary_device_bytes": summary.temporary_device_bytes,
+            "exact_generation_milliseconds": (
+                summary.exact_generation_milliseconds
+            ),
+            "coarse_table_build_milliseconds": (
+                summary.coarse_table_build_milliseconds
+            ),
+            "coarse_upload_milliseconds": summary.coarse_upload_milliseconds,
+            "coarse_kernel_milliseconds": summary.coarse_kernel_milliseconds,
+            "analysis_milliseconds": summary.analysis_milliseconds,
+            "profiles": profiles,
+        }
 
     def cpu_candidates_many_csr_raw(
         self,
