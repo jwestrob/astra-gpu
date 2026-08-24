@@ -87,6 +87,35 @@ memory.
 
 ## Benchmark result and decision
 
-Pending the focused H200 census. Do not integrate pruning into production
-unless the certified share of downstream compact-rescore cells is substantial
-and the census remains exact.
+H200 job `1182810` ran all 27,481 Pfam profiles against the immutable first
+1,000 targets. The complete target/domain/accounting digest was exactly the
+established CPU/GPU oracle
+`a0d928902cd8f6c3342b05c71aedaf0190ac2e02478ff879988a41d250de85b1`,
+and no certified target appeared as a reported hit.
+
+Opportunity:
+
+- 1,592 / 1,748 compact target rows certified: **91.08%**;
+- 2,753 / 3,002 compact regions covered: **91.71%**;
+- 24,618,449 / 28,625,148 region DP cells per downstream pass covered:
+  **86.00%**; and
+- 1,270 profiles had at least one certified target rejection.
+
+The diagnostic scan took 0.437 s including 27,481 Python calls; its native
+scan component was 0.00394 s and native temporary bytes were zero. Maximum
+diagnostic CandidateBatch payload was 2,746,705 host bytes and zero owned
+device bytes. The complete run observed 611,385,344 CUDA bytes in use and a
+3,854,992 KiB process RSS high-water mark.
+
+Evidence:
+`build/phase9-ga-pruning-h200-20260824/attempt-01/result.json`, SHA-256
+`709b529da95f678d01c7d5496dd9baeffdfdc49cefd7bad15ebed5dee9d1e8e2`.
+The record's dirty flag refers only to two untracked fixture symlinks present
+during launch; tracked source was exact commit `d4a00589...`, and the symlinks
+were removed immediately afterward.
+
+Decision: **proceed** with a production experiment that performs this exact
+row decision immediately after isolated-domain Forward and skips downstream
+Backward/OA/trace/null2 only for certified rows. Keep the current path as the
+audit/rollback mode and require exact output plus runtime and memory evidence
+before promotion.
