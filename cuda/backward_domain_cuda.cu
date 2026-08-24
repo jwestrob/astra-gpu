@@ -31,6 +31,9 @@ static_assert(sizeof(plan7_domain_posterior) ==
               "Domain posterior ABI changed");
 static_assert(sizeof(plan7_simple_region) == PLAN7_BACKWARD_DOMAIN_REGION_SIZE,
               "Simple region ABI changed");
+static_assert(sizeof(plan7_backward_domain_resident_region) ==
+                  PLAN7_BACKWARD_DOMAIN_RESIDENT_REGION_SIZE,
+              "Resident Backward region ABI changed");
 static_assert(sizeof(plan7_forward_provenance) == 72,
               "Forward provenance ABI changed");
 static_assert(sizeof(plan7_backward_domain_provenance) == 112,
@@ -647,8 +650,12 @@ __global__ void gather_simple_regions_kernel(
     const plan7_domain_posterior *posteriors,
     const uint64_t *posterior_offsets,
     const uint64_t *region_offsets,
+    const uint64_t *sequence_offsets,
+    const plan7_backward_domain_candidate *candidates,
+    const plan7_backward_domain_result *results,
     size_t candidate_count, float rt1, float rt2,
-    plan7_simple_region *regions) {
+    plan7_simple_region *regions,
+    plan7_backward_domain_resident_region *resident_regions) {
   const size_t candidate = static_cast<size_t>(blockIdx.x);
   if (candidate >= candidate_count || threadIdx.x != 0) return;
   const uint64_t output_begin = region_offsets[candidate];
@@ -672,9 +679,24 @@ __global__ void gather_simple_regions_kernel(
       if (left < rt2 || region_begin == -1) region_begin = j;
       if (posterior[j].mocc >= rt1) triggered = true;
     } else if (right < rt2) {
-      if (output < output_end)
+      if (output < output_end) {
         regions[output] = {static_cast<uint32_t>(region_begin),
                            static_cast<uint32_t>(j)};
+        if (resident_regions != nullptr) {
+          const plan7_backward_domain_candidate source = candidates[candidate];
+          const uint64_t target_length =
+              sequence_offsets[source.sequence_index + 1] -
+              sequence_offsets[source.sequence_index];
+          resident_regions[output] = {
+              source.profile_index,
+              source.sequence_index,
+              static_cast<uint32_t>(region_begin),
+              static_cast<uint32_t>(j),
+              static_cast<uint32_t>(target_length),
+              results[candidate].has_own_scales,
+              {0, 0, 0}};
+        }
+      }
       ++output;
       region_begin = -1;
       triggered = false;
@@ -694,6 +716,7 @@ struct DeviceBuffers {
   float *backward_specials = nullptr;
   plan7_domain_posterior *posteriors = nullptr;
   plan7_simple_region *regions = nullptr;
+  plan7_backward_domain_resident_region *resident_regions = nullptr;
   plan7_backward_domain_result *results = nullptr;
   uint32_t *reason_facts = nullptr;
 };
@@ -702,6 +725,7 @@ void free_device_buffers(DeviceBuffers *buffers) {
   if (buffers == nullptr) return;
   cudaFree(buffers->reason_facts);
   cudaFree(buffers->results);
+  cudaFree(buffers->resident_regions);
   cudaFree(buffers->regions);
   cudaFree(buffers->posteriors);
   cudaFree(buffers->backward_specials);
@@ -718,6 +742,38 @@ void free_device_buffers(DeviceBuffers *buffers) {
 
 }  // namespace
 
+struct ResidentBackwardRegions {
+  plan7_backward_domain_resident_region *pointer = nullptr;
+  int device_ordinal = -1;
+  uint64_t database_generation = 0;
+  uint64_t batch_generation = 0;
+  uint64_t result_hash = 0;
+  uint64_t region_hash = 0;
+  uint64_t row_count = 0;
+  uint64_t region_count = 0;
+  bool valid = false;
+
+  ~ResidentBackwardRegions() {
+    if (pointer == nullptr || device_ordinal < 0) return;
+    int original_device = -1;
+    const cudaError_t get_status = cudaGetDevice(&original_device);
+    bool restore_device = false;
+    if (get_status == cudaSuccess && original_device != device_ordinal) {
+      if (cudaSetDevice(device_ordinal) != cudaSuccess) return;
+      restore_device = true;
+    } else if (get_status != cudaSuccess &&
+               cudaSetDevice(device_ordinal) != cudaSuccess) {
+      return;
+    }
+    cudaFree(pointer);
+    if (restore_device) cudaSetDevice(original_device);
+  }
+
+  ResidentBackwardRegions() = default;
+  ResidentBackwardRegions(const ResidentBackwardRegions &) = delete;
+  ResidentBackwardRegions &operator=(const ResidentBackwardRegions &) = delete;
+};
+
 struct plan7_backward_domain_output {
   std::vector<plan7_backward_domain_result> results;
   std::vector<uint64_t> posterior_offsets;
@@ -727,6 +783,7 @@ struct plan7_backward_domain_output {
   std::vector<uint32_t> reason_facts;
   plan7_backward_domain_statistics statistics;
   plan7_backward_domain_residency_statistics residency_statistics{};
+  ResidentBackwardRegions resident_regions;
   plan7_backward_domain_provenance provenance;
   float rt1 = NAN;
   float rt2 = NAN;
@@ -1407,8 +1464,12 @@ int backward_domain_run_impl(
 
     size_t region_bytes = 0;
     size_t region_offset_bytes = 0;
+    size_t resident_region_bytes = 0;
     if (!checked_bytes(static_cast<size_t>(region_count),
                        sizeof(plan7_simple_region), &region_bytes) ||
+        !checked_bytes(static_cast<size_t>(region_count),
+                       sizeof(plan7_backward_domain_resident_region),
+                       &resident_region_bytes) ||
         !checked_bytes(active_count + 1, sizeof(uint64_t),
                        &region_offset_bytes) ||
         diagnostic_cells > SIZE_MAX) {
@@ -1430,15 +1491,50 @@ int backward_domain_run_impl(
     if (region_count != 0) {
       CUDA_RUN(cudaMalloc(&buffers.region_offsets, region_offset_bytes));
       CUDA_RUN(cudaMalloc(&buffers.regions, region_bytes));
+      if (!unsealed_test) {
+        created->residency_statistics.resident_region_requested_bytes =
+            resident_region_bytes;
+        const auto resident_allocation_begin =
+            std::chrono::steady_clock::now();
+        cuda_status = cudaMalloc(&buffers.resident_regions,
+                                 resident_region_bytes);
+        created->residency_statistics.
+            resident_region_allocation_milliseconds =
+            std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() -
+                resident_allocation_begin).count();
+        if (cuda_status == cudaSuccess) {
+          created->residency_statistics.resident_region_allocated_bytes =
+              resident_region_bytes;
+        } else {
+          buffers.resident_regions = nullptr;
+          ++created->residency_statistics.
+              resident_region_allocation_fallback_count;
+          cudaGetLastError();
+        }
+      }
       CUDA_RUN(cudaMemcpy(buffers.region_offsets,
                           active_region_offsets.data(), region_offset_bytes,
                           cudaMemcpyHostToDevice));
+      const auto resident_materialization_begin =
+          std::chrono::steady_clock::now();
       gather_simple_regions_kernel<<<static_cast<unsigned>(active_count), 32>>>(
           buffers.posteriors, buffers.posterior_offsets,
-          buffers.region_offsets, active_count, rt1, rt2, buffers.regions);
+          buffers.region_offsets, sequence_view.device_offsets,
+          buffers.candidates, buffers.results, active_count, rt1, rt2,
+          buffers.regions, buffers.resident_regions);
       CUDA_RUN(cudaGetLastError());
       CUDA_RUN(cudaMemcpy(created->regions.data(), buffers.regions,
                           region_bytes, cudaMemcpyDeviceToHost));
+      if (buffers.resident_regions != nullptr) {
+        created->residency_statistics.resident_region_materialized_bytes =
+            resident_region_bytes;
+        created->residency_statistics.
+            resident_region_materialization_milliseconds =
+            std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() -
+                resident_materialization_begin).count();
+      }
     }
     for (size_t active = 0; active < active_count; ++active) {
       const uint64_t output_begin = active_diagnostic_offsets[active];
@@ -1476,6 +1572,17 @@ int backward_domain_run_impl(
     }
     created->posterior_offsets[candidate_count] = posterior_offset;
     created->region_offsets[candidate_count] = region_offset;
+    if (buffers.resident_regions != nullptr) {
+      created->resident_regions.pointer = buffers.resident_regions;
+      created->resident_regions.device_ordinal = current_device;
+      created->resident_regions.database_generation =
+          provenance_snapshot.database_generation;
+      created->resident_regions.batch_generation =
+          provenance_snapshot.batch_generation;
+      created->resident_regions.row_count = candidate_count;
+      created->resident_regions.region_count = region_count;
+      buffers.resident_regions = nullptr;
+    }
     created->statistics.download_milliseconds =
         std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - download_begin).count();
@@ -1538,6 +1645,11 @@ int backward_domain_run_impl(
       return -1;
     }
     created->sealed = true;
+    if (created->resident_regions.pointer != nullptr) {
+      created->resident_regions.result_hash = created->provenance.result_hash;
+      created->resident_regions.region_hash = created->provenance.region_hash;
+      created->resident_regions.valid = true;
+    }
   }
   *output = created.release();
   return 0;
@@ -1814,6 +1926,53 @@ plan7_backward_domain_output_residency_statistics(
   return output == nullptr ? nullptr : &output->residency_statistics;
 }
 
+extern "C" int plan7_backward_domain_output_get_resident_view(
+    const plan7_backward_domain_output *output,
+    plan7_backward_domain_resident_view *view,
+    char *error, size_t error_size) {
+  if (output == nullptr || view == nullptr) {
+    set_error(error, error_size,
+              "invalid Backward/domain resident view request");
+    return -1;
+  }
+  *view = {};
+  if (output->resident_regions.pointer == nullptr ||
+      !output->resident_regions.valid)
+    return 0;
+  const ResidentBackwardRegions &resident = output->resident_regions;
+  const uint64_t expected_bytes =
+      resident.region_count * sizeof(plan7_backward_domain_resident_region);
+  if (!output->sealed || resident.device_ordinal < 0 ||
+      resident.database_generation !=
+          output->provenance.forward.database_generation ||
+      resident.batch_generation !=
+          output->provenance.forward.batch_generation ||
+      resident.result_hash != output->provenance.result_hash ||
+      resident.region_hash != output->provenance.region_hash ||
+      resident.row_count != output->provenance.candidate_count ||
+      resident.region_count != output->provenance.region_count ||
+      resident.region_count != output->regions.size() ||
+      output->residency_statistics.resident_region_allocated_bytes !=
+          expected_bytes ||
+      output->residency_statistics.resident_region_materialized_bytes !=
+          expected_bytes ||
+      expected_bytes >
+          output->residency_statistics.resident_region_requested_bytes) {
+    set_error(error, error_size,
+              "Backward/domain resident generation is incomplete");
+    return -1;
+  }
+  view->database_generation = resident.database_generation;
+  view->batch_generation = resident.batch_generation;
+  view->result_hash = resident.result_hash;
+  view->region_hash = resident.region_hash;
+  view->row_count = resident.row_count;
+  view->region_count = resident.region_count;
+  view->device_ordinal = resident.device_ordinal;
+  view->regions = resident.pointer;
+  return 1;
+}
+
 extern "C" int plan7_backward_domain_output_is_production_calibrated(
     const plan7_backward_domain_output *output) {
   if (output == nullptr || !output->sealed || output->rt1 != 0.25f ||
@@ -1862,6 +2021,11 @@ extern "C" int plan7_backward_domain_output_apply_test_fault(
                     "Backward/domain own-scale test reseal failed");
           return -1;
         }
+        /* This test intentionally mutates a sealed host row after the device
+         * descriptor generation was materialized.  Keep the old allocation
+         * for ordinary ownership cleanup, but force the consumer through the
+         * exact legacy host replay. */
+        output->resident_regions.valid = false;
         return 0;
       }
       set_error(error, error_size,

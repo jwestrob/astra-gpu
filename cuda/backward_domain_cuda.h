@@ -16,6 +16,7 @@ enum plan7_backward_domain_abi {
   PLAN7_BACKWARD_DOMAIN_RECORD_SIZE = 32,
   PLAN7_BACKWARD_DOMAIN_POSTERIOR_SIZE = 12,
   PLAN7_BACKWARD_DOMAIN_REGION_SIZE = 8,
+  PLAN7_BACKWARD_DOMAIN_RESIDENT_REGION_SIZE = 24,
   PLAN7_BACKWARD_DOMAIN_MAX_POSTERIOR_BYTES = 384 * 1024 * 1024,
   PLAN7_BACKWARD_DOMAIN_MAX_ROW_WORK_CELLS = 10000000,
   PLAN7_BACKWARD_DOMAIN_MAX_RUN_WORK_CELLS = 256 * 1024 * 1024
@@ -99,6 +100,19 @@ typedef struct plan7_simple_region {
   uint32_t end;
 } plan7_simple_region;
 
+/* Device-resident form of one sealed SIMPLE interval.  It carries exactly
+ * the immutable source identity needed to compile domain-rescore work without
+ * replaying the host Backward journal to the device. */
+typedef struct plan7_backward_domain_resident_region {
+  uint32_t profile_index;
+  uint32_t sequence_index;
+  uint32_t envelope_begin;
+  uint32_t envelope_end;
+  uint32_t target_length;
+  uint8_t has_own_scales;
+  uint8_t reserved[3];
+} plan7_backward_domain_resident_region;
+
 /* Seals the exact Forward generation, decision thresholds, ordered result
  * records, and compact interval journal consumed by the continuation seam. */
 typedef struct plan7_backward_domain_provenance {
@@ -141,7 +155,29 @@ typedef struct plan7_backward_domain_residency_statistics {
   uint64_t eliminated_forward_special_h2d_bytes;
   uint64_t resident_input_count;
   float forward_special_upload_milliseconds;
+  uint64_t resident_region_requested_bytes;
+  uint64_t resident_region_allocated_bytes;
+  uint64_t resident_region_materialized_bytes;
+  uint64_t resident_region_allocation_fallback_count;
+  float resident_region_allocation_milliseconds;
+  float resident_region_materialization_milliseconds;
 } plan7_backward_domain_residency_statistics;
+
+/* Read-only view consumed synchronously by isolated-domain rescore.  Storage
+ * is owned by plan7_backward_domain_output and expires when that handle is
+ * destroyed.  Hashes and generations bind the resident descriptors to the
+ * unchanged host journal and its provenance seal. */
+typedef struct plan7_backward_domain_resident_view {
+  uint64_t database_generation;
+  uint64_t batch_generation;
+  uint64_t result_hash;
+  uint64_t region_hash;
+  uint64_t row_count;
+  uint64_t region_count;
+  int32_t device_ordinal;
+  uint32_t reserved;
+  const plan7_backward_domain_resident_region *regions;
+} plan7_backward_domain_resident_view;
 
 typedef struct plan7_backward_domain_output plan7_backward_domain_output;
 
@@ -275,6 +311,14 @@ plan7_backward_domain_output_statistics(
 const plan7_backward_domain_residency_statistics *
 plan7_backward_domain_output_residency_statistics(
   const plan7_backward_domain_output *output);
+/* Returns 1 when the sealed device generation is available, 0 when bounded
+ * allocation failed soft to the legacy host replay, and -1 for an invalid or
+ * incomplete output. */
+int plan7_backward_domain_output_get_resident_view(
+  const plan7_backward_domain_output *output,
+  plan7_backward_domain_resident_view *view,
+  char *error,
+  size_t error_size);
 size_t plan7_backward_domain_output_reason_count(
   const plan7_backward_domain_output *output);
 const uint32_t *plan7_backward_domain_output_reason_facts(

@@ -71,6 +71,18 @@ cdef uint64_t _resident_backward_call_count = 0
 cdef uint64_t _resident_backward_forward_h2d_bytes = 0
 cdef uint64_t _resident_backward_eliminated_forward_h2d_bytes = 0
 cdef double _resident_backward_forward_upload_milliseconds = 0.0
+cdef uint64_t _resident_backward_region_requested_bytes = 0
+cdef uint64_t _resident_backward_region_allocated_bytes = 0
+cdef uint64_t _resident_backward_region_materialized_bytes = 0
+cdef uint64_t _resident_backward_region_allocation_fallback_count = 0
+cdef double _resident_backward_region_allocation_milliseconds = 0.0
+cdef double _resident_backward_region_materialization_milliseconds = 0.0
+cdef uint64_t _resident_rescore_call_count = 0
+cdef uint64_t _resident_rescore_upstream_h2d_bytes = 0
+cdef uint64_t _resident_rescore_eliminated_upstream_h2d_bytes = 0
+cdef uint64_t _resident_rescore_selection_h2d_bytes = 0
+cdef double _resident_rescore_upstream_upload_milliseconds = 0.0
+cdef double _resident_rescore_prepare_milliseconds = 0.0
 SEALED_STAGE_TIMING_SCHEMA_VERSION = 1
 GENERATION_TELEMETRY_SCHEMA_VERSION = 2
 DIRECT_V3_STAGING_SCHEMA_VERSION = 2
@@ -1196,6 +1208,12 @@ cdef extern from "backward_domain_cuda.h" nogil:
         uint64_t eliminated_forward_special_h2d_bytes
         uint64_t resident_input_count
         float forward_special_upload_milliseconds
+        uint64_t resident_region_requested_bytes
+        uint64_t resident_region_allocated_bytes
+        uint64_t resident_region_materialized_bytes
+        uint64_t resident_region_allocation_fallback_count
+        float resident_region_allocation_milliseconds
+        float resident_region_materialization_milliseconds
 
     ctypedef struct plan7_backward_domain_output:
         pass
@@ -1491,6 +1509,14 @@ cdef extern from "domain_rescore_cuda.h" nogil:
         float download_milliseconds
         float total_milliseconds
 
+    ctypedef struct plan7_domain_rescore_residency_statistics:
+        uint64_t upstream_h2d_bytes
+        uint64_t eliminated_upstream_h2d_bytes
+        uint64_t resident_selection_h2d_bytes
+        uint64_t resident_input_count
+        float upstream_upload_milliseconds
+        float resident_prepare_milliseconds
+
     ctypedef struct plan7_domain_rescore_output:
         pass
 
@@ -1557,6 +1583,10 @@ cdef extern from "domain_rescore_cuda.h" nogil:
     )
 
     const plan7_domain_rescore_statistics *plan7_domain_rescore_output_statistics(
+        const plan7_domain_rescore_output *output,
+    )
+
+    const plan7_domain_rescore_residency_statistics *plan7_domain_rescore_output_residency_statistics(
         const plan7_domain_rescore_output *output,
     )
 
@@ -3402,12 +3432,45 @@ def _forward_backward_residency_statistics():
         "backward_forward_upload_ms": (
             _resident_backward_forward_upload_milliseconds
         ),
+        "backward_region_requested_bytes": (
+            _resident_backward_region_requested_bytes
+        ),
+        "backward_region_allocated_bytes": (
+            _resident_backward_region_allocated_bytes
+        ),
+        "backward_region_materialized_bytes": (
+            _resident_backward_region_materialized_bytes
+        ),
+        "backward_region_allocation_fallback_count": (
+            _resident_backward_region_allocation_fallback_count
+        ),
+        "backward_region_allocation_ms": (
+            _resident_backward_region_allocation_milliseconds
+        ),
+        "backward_region_materialization_ms": (
+            _resident_backward_region_materialization_milliseconds
+        ),
+        "rescore_call_count": _resident_rescore_call_count,
+        "rescore_upstream_h2d_bytes": (
+            _resident_rescore_upstream_h2d_bytes
+        ),
+        "rescore_eliminated_upstream_h2d_bytes": (
+            _resident_rescore_eliminated_upstream_h2d_bytes
+        ),
+        "rescore_selection_h2d_bytes": (
+            _resident_rescore_selection_h2d_bytes
+        ),
+        "rescore_upstream_upload_ms": (
+            _resident_rescore_upstream_upload_milliseconds
+        ),
+        "rescore_prepare_ms": _resident_rescore_prepare_milliseconds,
     }
 
 
 cdef void _accumulate_forward_backward_residency_statistics(
     const plan7_forward_residency_statistics *forward,
     const plan7_backward_domain_residency_statistics *backward,
+    const plan7_domain_rescore_residency_statistics *rescore,
 ) noexcept:
     global _resident_forward_call_count
     global _resident_forward_requested_bytes
@@ -3420,6 +3483,18 @@ cdef void _accumulate_forward_backward_residency_statistics(
     global _resident_backward_forward_h2d_bytes
     global _resident_backward_eliminated_forward_h2d_bytes
     global _resident_backward_forward_upload_milliseconds
+    global _resident_backward_region_requested_bytes
+    global _resident_backward_region_allocated_bytes
+    global _resident_backward_region_materialized_bytes
+    global _resident_backward_region_allocation_fallback_count
+    global _resident_backward_region_allocation_milliseconds
+    global _resident_backward_region_materialization_milliseconds
+    global _resident_rescore_call_count
+    global _resident_rescore_upstream_h2d_bytes
+    global _resident_rescore_eliminated_upstream_h2d_bytes
+    global _resident_rescore_selection_h2d_bytes
+    global _resident_rescore_upstream_upload_milliseconds
+    global _resident_rescore_prepare_milliseconds
     if forward != NULL:
         _resident_forward_call_count += 1
         _resident_forward_requested_bytes += forward.requested_bytes
@@ -3444,6 +3519,39 @@ cdef void _accumulate_forward_backward_residency_statistics(
         )
         _resident_backward_forward_upload_milliseconds += (
             backward.forward_special_upload_milliseconds
+        )
+        _resident_backward_region_requested_bytes += (
+            backward.resident_region_requested_bytes
+        )
+        _resident_backward_region_allocated_bytes += (
+            backward.resident_region_allocated_bytes
+        )
+        _resident_backward_region_materialized_bytes += (
+            backward.resident_region_materialized_bytes
+        )
+        _resident_backward_region_allocation_fallback_count += (
+            backward.resident_region_allocation_fallback_count
+        )
+        _resident_backward_region_allocation_milliseconds += (
+            backward.resident_region_allocation_milliseconds
+        )
+        _resident_backward_region_materialization_milliseconds += (
+            backward.resident_region_materialization_milliseconds
+        )
+    if rescore != NULL:
+        _resident_rescore_call_count += rescore.resident_input_count
+        _resident_rescore_upstream_h2d_bytes += rescore.upstream_h2d_bytes
+        _resident_rescore_eliminated_upstream_h2d_bytes += (
+            rescore.eliminated_upstream_h2d_bytes
+        )
+        _resident_rescore_selection_h2d_bytes += (
+            rescore.resident_selection_h2d_bytes
+        )
+        _resident_rescore_upstream_upload_milliseconds += (
+            rescore.upstream_upload_milliseconds
+        )
+        _resident_rescore_prepare_milliseconds += (
+            rescore.resident_prepare_milliseconds
         )
 
 
@@ -6244,6 +6352,7 @@ cdef class SequenceBatch:
         cdef const plan7_backward_domain_statistics *native_domain_statistics
         cdef const plan7_backward_domain_residency_statistics *native_domain_residency_statistics
         cdef const plan7_domain_rescore_statistics *native_rescore_statistics
+        cdef const plan7_domain_rescore_residency_statistics *native_rescore_residency_statistics
         cdef const uint32_t *native_domain_reasons
         cdef const uint32_t *native_rescore_reasons
         cdef const plan7_backward_domain_result *native_domain_results = NULL
@@ -7827,6 +7936,13 @@ cdef class SequenceBatch:
                     if rescore_output != NULL
                     else NULL
                 )
+                native_rescore_residency_statistics = (
+                    plan7_domain_rescore_output_residency_statistics(
+                        rescore_output
+                    )
+                    if rescore_output != NULL
+                    else NULL
+                )
                 if (
                     native_statistics == NULL
                     or native_residency_statistics == NULL
@@ -7834,7 +7950,10 @@ cdef class SequenceBatch:
                     or native_domain_residency_statistics == NULL
                     or (
                         rescore_output != NULL
-                        and native_rescore_statistics == NULL
+                        and (
+                            native_rescore_statistics == NULL
+                            or native_rescore_residency_statistics == NULL
+                        )
                     )
                 ):
                     raise RuntimeError(
@@ -7843,6 +7962,7 @@ cdef class SequenceBatch:
                 _accumulate_forward_backward_residency_statistics(
                     native_residency_statistics,
                     native_domain_residency_statistics,
+                    native_rescore_residency_statistics,
                 )
                 sealed_stage_timings = (
                     SEALED_STAGE_TIMING_SCHEMA_VERSION,

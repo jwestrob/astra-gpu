@@ -135,6 +135,17 @@ typedef struct plan7_domain_rescore_statistics {
   float total_milliseconds;
 } plan7_domain_rescore_statistics;
 
+/* Additive transfer accounting for the resident Backward/domain handoff.
+ * The legacy ABI and ordinary stage statistics remain unchanged. */
+typedef struct plan7_domain_rescore_residency_statistics {
+  uint64_t upstream_h2d_bytes;
+  uint64_t eliminated_upstream_h2d_bytes;
+  uint64_t resident_selection_h2d_bytes;
+  uint64_t resident_input_count;
+  float upstream_upload_milliseconds;
+  float resident_prepare_milliseconds;
+} plan7_domain_rescore_residency_statistics;
+
 typedef struct plan7_domain_rescore_output plan7_domain_rescore_output;
 
 /* Production entry point. The upstream output is opaque and immutable. Calls
@@ -188,6 +199,9 @@ const float *plan7_domain_rescore_output_null2(
 const plan7_domain_rescore_provenance *plan7_domain_rescore_output_provenance(
   const plan7_domain_rescore_output *output);
 const plan7_domain_rescore_statistics *plan7_domain_rescore_output_statistics(
+  const plan7_domain_rescore_output *output);
+const plan7_domain_rescore_residency_statistics *
+plan7_domain_rescore_output_residency_statistics(
   const plan7_domain_rescore_output *output);
 size_t plan7_domain_rescore_output_reason_count(
   const plan7_domain_rescore_output *output);

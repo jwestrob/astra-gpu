@@ -31,6 +31,9 @@ static_assert(sizeof(plan7_domain_rescore_trace_step) ==
               "isolated-domain trace ABI changed");
 static_assert(sizeof(plan7_backward_domain_provenance) == 112,
               "Backward/domain provenance ABI changed");
+static_assert(sizeof(plan7_backward_domain_resident_region) ==
+                  PLAN7_BACKWARD_DOMAIN_RESIDENT_REGION_SIZE,
+              "Resident Backward region ABI changed");
 static_assert(sizeof(plan7_forward_device_profile) == 32,
               "Forward device-profile ABI changed");
 static_assert(p7X_NXCELLS == 6 && p7X_NSCELLS == 3 &&
@@ -147,6 +150,51 @@ struct RegionWork {
 };
 
 static_assert(sizeof(RegionWork) == 32, "region work descriptor changed");
+
+struct ResidentSelection {
+  uint32_t result_index;
+  uint32_t row_index;
+};
+
+static_assert(sizeof(ResidentSelection) == 8,
+              "resident region selection changed");
+
+__global__ void prepare_resident_rescore_inputs_kernel(
+    const plan7_backward_domain_resident_region *resident_regions,
+    const ResidentSelection *selections, size_t selection_count,
+    RegionWork *work, plan7_domain_rescore_result *results) {
+  const size_t active = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  if (active >= selection_count) return;
+  const ResidentSelection selection = selections[active];
+  const plan7_backward_domain_resident_region source =
+      resident_regions[selection.result_index];
+  work[active] = {
+      selection.result_index,
+      selection.row_index,
+      source.profile_index,
+      source.sequence_index,
+      source.envelope_begin,
+      source.envelope_end,
+      source.target_length,
+      0};
+  plan7_domain_rescore_result result{};
+  result.row_index = selection.row_index;
+  result.profile_index = source.profile_index;
+  result.sequence_index = source.sequence_index;
+  result.envelope_begin = source.envelope_begin;
+  result.envelope_end = source.envelope_end;
+  const float canonical_nan = __uint_as_float(UINT32_C(0x7fc00000));
+  result.forward_score = canonical_nan;
+  result.backward_score = canonical_nan;
+  result.oa_score = canonical_nan;
+  result.domain_correction = canonical_nan;
+  result.score_consistency = canonical_nan;
+  result.status = PLAN7_DOMAIN_RESCORE_OK;
+  result.action = PLAN7_DOMAIN_RESCORE_CPU_REQUIRED;
+  result.has_own_scales = source.has_own_scales;
+  results[active] = result;
+}
 
 __device__ __forceinline__ float add_rn(float left, float right) {
   return __fadd_rn(left, right);
@@ -1269,6 +1317,7 @@ __global__ void isolated_null2_oa_trace_kernel(
 
 struct DeviceBuffers {
   RegionWork *work = nullptr;
+  ResidentSelection *resident_selections = nullptr;
   uint64_t *matrix_offsets = nullptr;
   uint64_t *special_offsets = nullptr;
   uint64_t *trace_offsets = nullptr;
@@ -1297,6 +1346,7 @@ void free_device_buffers(DeviceBuffers *buffers) {
   cudaFree(buffers->trace_offsets);
   cudaFree(buffers->special_offsets);
   cudaFree(buffers->matrix_offsets);
+  cudaFree(buffers->resident_selections);
   cudaFree(buffers->work);
   *buffers = {};
 }
@@ -1493,6 +1543,7 @@ struct plan7_domain_rescore_output {
   std::vector<uint32_t> reason_facts;
   plan7_domain_rescore_provenance provenance;
   plan7_domain_rescore_statistics statistics;
+  plan7_domain_rescore_residency_statistics residency_statistics{};
 };
 
 extern "C" int plan7_domain_rescore_run(
@@ -1625,6 +1676,12 @@ extern "C" const plan7_domain_rescore_statistics *
 plan7_domain_rescore_output_statistics(
     const plan7_domain_rescore_output *output) {
   return output == nullptr ? nullptr : &output->statistics;
+}
+
+extern "C" const plan7_domain_rescore_residency_statistics *
+plan7_domain_rescore_output_residency_statistics(
+    const plan7_domain_rescore_output *output) {
+  return output == nullptr ? nullptr : &output->residency_statistics;
 }
 
 extern "C" int plan7_domain_rescore_own_scale_required_for_test(float xB) {
@@ -1968,6 +2025,28 @@ int domain_rescore_run_impl(
     return -1;
   }
 
+  plan7_backward_domain_resident_view resident_view{};
+  const int resident_status = plan7_backward_domain_output_get_resident_view(
+      upstream, &resident_view, error, error_size);
+  if (resident_status < 0) return -1;
+  const bool use_resident_backward = resident_status == 1;
+  if (use_resident_backward &&
+      (resident_view.database_generation !=
+           upstream_provenance->forward.database_generation ||
+       resident_view.batch_generation !=
+           upstream_provenance->forward.batch_generation ||
+       resident_view.result_hash != upstream_provenance->result_hash ||
+       resident_view.region_hash != upstream_provenance->region_hash ||
+       resident_view.row_count != upstream_row_count ||
+       resident_view.region_count != region_count ||
+       resident_view.device_ordinal != current_device ||
+       resident_view.regions == nullptr ||
+       !device_allocation_on(resident_view.regions, current_device))) {
+    set_error(error, error_size,
+              "isolated-domain resident Backward generation mismatch");
+    return -1;
+  }
+
   std::unique_ptr<plan7_domain_rescore_output> created(
       new (std::nothrow) plan7_domain_rescore_output{});
   if (!created) {
@@ -1977,6 +2056,8 @@ int domain_rescore_run_impl(
   created->provenance.backward = *upstream_provenance;
   created->statistics.upstream_row_count = upstream_row_count;
   created->statistics.region_count = region_count;
+  created->residency_statistics.resident_input_count =
+      use_resident_backward ? 1 : 0;
   if (collect_reason_facts) {
     try {
       created->reason_facts.assign(region_count, 0);
@@ -2255,6 +2336,15 @@ int domain_rescore_run_impl(
 
   const size_t active_count = active_work.size();
   DeviceBuffers buffers{};
+  std::vector<ResidentSelection> resident_selections;
+  if (use_resident_backward) {
+    resident_selections.resize(active_count);
+    for (size_t active = 0; active < active_count; ++active) {
+      resident_selections[active] = {
+          active_work[active].result_index,
+          active_work[active].row_index};
+    }
+  }
   std::vector<plan7_domain_rescore_result> device_results(active_count);
   for (size_t active = 0; active < active_count; ++active)
     device_results[active] =
@@ -2280,6 +2370,7 @@ int domain_rescore_run_impl(
     size_t null2_bytes;
     size_t trace_storage_bytes;
     size_t trace_count_bytes;
+    size_t resident_selection_bytes = 0;
     size_t reason_bytes = 0;
     if (!checked_bytes(active_count, sizeof(RegionWork), &work_bytes) ||
         !checked_bytes(active_count + 1, sizeof(uint64_t), &offset_bytes) ||
@@ -2294,6 +2385,9 @@ int domain_rescore_run_impl(
                        sizeof(plan7_domain_rescore_trace_step),
                        &trace_storage_bytes) ||
         !checked_bytes(active_count, sizeof(uint32_t), &trace_count_bytes) ||
+        (use_resident_backward &&
+         !checked_bytes(active_count, sizeof(ResidentSelection),
+                        &resident_selection_bytes)) ||
         (collect_reason_facts &&
          !checked_bytes(active_count, sizeof(uint32_t), &reason_bytes))) {
       set_error(error, error_size, "isolated-domain device size overflow");
@@ -2302,11 +2396,17 @@ int domain_rescore_run_impl(
     const auto upload_begin = std::chrono::steady_clock::now();
     cudaEvent_t begin_event = nullptr;
     cudaEvent_t end_event = nullptr;
+    cudaEvent_t resident_begin_event = nullptr;
+    cudaEvent_t resident_end_event = nullptr;
 #define CUDA_RUN(call)                                                        \
     do {                                                                      \
       cuda_status = (call);                                                   \
       if (cuda_status != cudaSuccess) {                                       \
         set_cuda_error(error, error_size, #call, cuda_status);                \
+        if (resident_end_event != nullptr)                                    \
+          cudaEventDestroy(resident_end_event);                               \
+        if (resident_begin_event != nullptr)                                  \
+          cudaEventDestroy(resident_begin_event);                             \
         if (end_event != nullptr) cudaEventDestroy(end_event);                \
         if (begin_event != nullptr) cudaEventDestroy(begin_event);            \
         free_device_buffers(&buffers);                                        \
@@ -2314,6 +2414,9 @@ int domain_rescore_run_impl(
       }                                                                       \
     } while (0)
     CUDA_RUN(cudaMalloc(&buffers.work, work_bytes));
+    if (use_resident_backward)
+      CUDA_RUN(cudaMalloc(&buffers.resident_selections,
+                          resident_selection_bytes));
     CUDA_RUN(cudaMalloc(&buffers.matrix_offsets, offset_bytes));
     CUDA_RUN(cudaMalloc(&buffers.special_offsets, offset_bytes));
     CUDA_RUN(cudaMalloc(&buffers.trace_offsets, offset_bytes));
@@ -2327,16 +2430,32 @@ int domain_rescore_run_impl(
     CUDA_RUN(cudaMalloc(&buffers.results, result_bytes));
     if (collect_reason_facts)
       CUDA_RUN(cudaMalloc(&buffers.reason_facts, reason_bytes));
-    CUDA_RUN(cudaMemcpy(buffers.work, active_work.data(), work_bytes,
-                        cudaMemcpyHostToDevice));
+    const auto upstream_upload_begin = std::chrono::steady_clock::now();
+    if (use_resident_backward) {
+      CUDA_RUN(cudaMemcpy(buffers.resident_selections,
+                          resident_selections.data(), resident_selection_bytes,
+                          cudaMemcpyHostToDevice));
+      created->residency_statistics.eliminated_upstream_h2d_bytes =
+          static_cast<uint64_t>(work_bytes) + result_bytes;
+      created->residency_statistics.resident_selection_h2d_bytes =
+          resident_selection_bytes;
+    } else {
+      CUDA_RUN(cudaMemcpy(buffers.work, active_work.data(), work_bytes,
+                          cudaMemcpyHostToDevice));
+      CUDA_RUN(cudaMemcpy(buffers.results, device_results.data(), result_bytes,
+                          cudaMemcpyHostToDevice));
+      created->residency_statistics.upstream_h2d_bytes =
+          static_cast<uint64_t>(work_bytes) + result_bytes;
+    }
+    created->residency_statistics.upstream_upload_milliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - upstream_upload_begin).count();
     CUDA_RUN(cudaMemcpy(buffers.matrix_offsets, matrix_offsets.data(),
                         offset_bytes, cudaMemcpyHostToDevice));
     CUDA_RUN(cudaMemcpy(buffers.special_offsets, special_offsets.data(),
                         offset_bytes, cudaMemcpyHostToDevice));
     CUDA_RUN(cudaMemcpy(buffers.trace_offsets, trace_capacity_offsets.data(),
                         offset_bytes, cudaMemcpyHostToDevice));
-    CUDA_RUN(cudaMemcpy(buffers.results, device_results.data(), result_bytes,
-                        cudaMemcpyHostToDevice));
     CUDA_RUN(cudaMemcpy(buffers.null2, active_null2.data(), null2_bytes,
                         cudaMemcpyHostToDevice));
     if (collect_reason_facts)
@@ -2344,6 +2463,18 @@ int domain_rescore_run_impl(
                           reason_bytes, cudaMemcpyHostToDevice));
     CUDA_RUN(cudaMemset(buffers.traces, 0, trace_storage_bytes));
     CUDA_RUN(cudaMemset(buffers.trace_counts, 0, trace_count_bytes));
+    if (use_resident_backward) {
+      CUDA_RUN(cudaEventCreate(&resident_begin_event));
+      CUDA_RUN(cudaEventCreate(&resident_end_event));
+      CUDA_RUN(cudaEventRecord(resident_begin_event));
+      const unsigned prepare_blocks = static_cast<unsigned>(
+          (active_count + kThreads - 1) / kThreads);
+      prepare_resident_rescore_inputs_kernel<<<prepare_blocks, kThreads>>>(
+          resident_view.regions, buffers.resident_selections, active_count,
+          buffers.work, buffers.results);
+      CUDA_RUN(cudaGetLastError());
+      CUDA_RUN(cudaEventRecord(resident_end_event));
+    }
     created->statistics.upload_milliseconds =
         std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - upload_begin).count();
@@ -2410,6 +2541,15 @@ int domain_rescore_run_impl(
     CUDA_RUN(cudaEventSynchronize(end_event));
     CUDA_RUN(cudaEventElapsedTime(&created->statistics.kernel_milliseconds,
                                   begin_event, end_event));
+    if (use_resident_backward) {
+      CUDA_RUN(cudaEventElapsedTime(
+          &created->residency_statistics.resident_prepare_milliseconds,
+          resident_begin_event, resident_end_event));
+      cudaEventDestroy(resident_end_event);
+      cudaEventDestroy(resident_begin_event);
+      resident_end_event = nullptr;
+      resident_begin_event = nullptr;
+    }
     cudaEventDestroy(end_event);
     cudaEventDestroy(begin_event);
     end_event = nullptr;
