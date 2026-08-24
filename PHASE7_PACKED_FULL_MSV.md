@@ -38,6 +38,24 @@ executed three quartets (12 candidates) plus one scalar candidate.
 
 ## Performance gate
 
-The full sealed workload remains the deciding gate. It must reproduce the
-established 39,010,327-byte TSV exactly and report the packed/scalar partition
-for every chunk. Full-run timing and the retain/reject decision are pending.
+Full H200 job `1182771` reproduced the established TSV exactly: SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
+39,010,327 bytes, and 383,235 lines. All 83 chunks used packed arithmetic.
+They executed 6,013,946 quartets containing 24,055,784 candidates and kept
+16,601,562 scalar leftovers; together these exactly equal the 40,657,346
+compacted full-MSV rows.
+
+The request completed in 454.006856 seconds: 346.997314 seconds generation,
+446.517924 seconds pipeline wall, 399.448593 seconds continuation/output, and
+300.075803 seconds overlap. This is 1.781588 seconds (0.391%) faster than the
+unpacked Phase 7 compaction run and 0.240634 seconds (0.053%) faster than Phase
+6. The difference is too small to claim a material end-to-end speedup from one
+run, but it is exact and introduces no measured regression, so the packed path
+is retained while Phase 7 proceeds to the much larger Viterbi workload.
+
+Evidence lives under
+`build/h200-phase7-packed-msv-20260824/attempt-01-full/runs/h200-full`.
+`worker.json` SHA-256 is
+`53f958666c3eaeee3dcd9b19ace58e831b5dc235a2f0b57e8721a0295f5218e9`;
+`raw-validation.json` SHA-256 is
+`1615f9180674b669aae26ec1536bef9e197ba01cc522fe13f7fbd23df5b00c4d`.

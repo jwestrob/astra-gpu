@@ -246,3 +246,14 @@ full-MSV executions, avoiding 163,013,763 no-op launches. It completed in
 required exact work-list foundation for packed full-MSV arithmetic, without a
 standalone performance claim. The prior 467,289 count referred only to final
 MSV-range CPU fallbacks and must not be used as the full-MSV execution census.
+
+## Phase 7 packed full-MSV result
+
+Job `1182771` reproduced the exact 39,010,327-byte output. It packed
+24,055,784 compacted full-MSV candidates into 6,013,946 profile-and-length
+matched quartets and retained 16,601,562 scalar leftovers. Request wall was
+454.007 seconds, 0.391% faster than the unpacked compaction run and effectively
+tied with Phase 6. The packed implementation is retained as exact,
+non-regressing infrastructure. Phase 7 now targets Viterbi, which executed
+202,849,174 rows on the sealed workload and therefore offers substantially
+more arithmetic work to densify.
