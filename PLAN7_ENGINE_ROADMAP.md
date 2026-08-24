@@ -45,8 +45,8 @@ the complete oracle suite and representative end-to-end workloads.
 | 0 | Per-profile/chunk work telemetry and real CPU-fallback taxonomy | complete | through `f9ef356` | jobs 1182345/1182355 PASS; work and matrix caps dominate CPU fallback |
 | 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | complete; production performance rejected | through `039c092` | exact full job 1182349 was 3.82% slower despite 41.35% fewer packet bytes |
 | 1B | Produce sparse certificate before dense host materialization | complete; retained opt-in | through `87727cd` | jobs 1182389/1182391 exact; one-pass wall 536.168 s, 1.84% faster than dense, zero dense-v2 retention |
-| 2 | Device-side stable F1 candidate compaction | active | pending | isolated implementation/review complete; H200 oracle pending |
-| 3 | Device-resident Forward -> Backward/domain -> rescore chain | blocked on 2 | pending | pending |
+| 2 | Device-side stable F1 candidate compaction | complete; retained | through `959cdf6` | job 1182619 exact; 83 device compactions, zero host expansions/uploads; no standalone speedup claim |
+| 3 | Device-resident Forward -> Backward/domain -> rescore chain | active | pending | implementation in progress |
 | 4 | Forward/Backward/rescore candidates-per-warp variants | blocked on 3 | pending | pending |
 | 5+ | Profile-axis SSV, cohorts, packed integer DP, certified F0/GA/index research | deferred | pending | pending |
 
@@ -156,3 +156,14 @@ the later certified/profile-axis research paths.
 
 Every completed phase appends its exact commit, tests, workload, output hash,
 measurements, and retain/reject decision to this file.
+
+## Phase 2 result
+
+Stable CUB compaction preserved profile-major and sequence order while
+eliminating the mask expansion and candidate-mapping re-upload on all 83 full
+workload chunks. Full H200 job `1182619` passed the first-1,000 gate and
+reproduced the established output SHA-256 exactly (39,010,327 bytes; 383,235
+lines). It ran in 538.822 seconds, 0.495% slower than the retained one-pass
+sparse-v3 run and 1.354% faster than the original dense baseline. Phase 2 is
+therefore retained as required infrastructure for Phase 3, without claiming a
+standalone performance improvement.

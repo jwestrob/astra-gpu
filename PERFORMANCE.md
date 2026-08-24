@@ -31,6 +31,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Stock Astra/PyHMMER, standard CPU node | 64 | 702.79 s (11:42.79) | 2,622,124 KB | baseline for the primary GPU comparison |
 | Astra GPU, H200, warm persistent request | 64 host workers | 546.220704615 s | see telemetry below | **1.286641085x faster than CPU64; 22.278% less wall time** |
 | Astra GPU, H200, one-pass sparse-v3 experiment | 64 host workers | 536.168411 s | 13,143,840 KiB | **1.31076x faster than CPU64; 23.71% less wall time** |
+| Astra GPU, H200, Phase 2 device compaction | 64 host workers | 538.822140 s | 13,175,768 KiB | exact; 0.495% slower than one-pass sparse v3 |
 
 Additional GPU timing layers:
 
@@ -54,7 +55,15 @@ seconds overlap.  It retained a 5,801,342,068-byte sparse packet instead of a
 counterfactual 9,890,721,120-byte dense journal, performed 83 source scans and
 zero separate decision scans, and improved the original request by 10.052
 seconds (1.84%).  The result is retained, while the next material performance
-target is device-side F1 compaction.
+target is device residency across Forward, Backward/domain, and rescore.
+
+Phase 2 full H200 job `1182619` was also byte-identical. It completed in
+538.822 seconds: 468.243 seconds generation, 401.387 seconds
+continuation/output, and 338.475 seconds overlap. All 83 chunks used stable
+device F1 compaction; host expansions and candidate-mapping uploads were both
+zero, and 83 uploads were avoided. The structural change is retained, but the
+0.495% regression from the 536.168-second one-pass run supports no standalone
+Phase 2 speedup claim. It remained 1.354% faster than the original dense run.
 
 ## GPU request-stage ledger
 
@@ -124,6 +133,7 @@ These paths exist in the development workspace and are excluded from Git because
 - Final H200 attempt seal: `build/astra-h200-full-plm-pfam-slurm-20260817/attempt-06/FINAL_ATTEMPT_SEALED`, SHA-256 `13e27632fc77cba4ed981a3651a1bf009ddfeded5ba5cfea8c8aee407fa313d1`.
 - Final H200 evidence manifest: `build/astra-h200-full-plm-pfam-slurm-20260817/attempt-06/final-evidence.sha256`, SHA-256 `02f049611e5585ccbf82c3e4c3d692346f0358874a1cc2a008a6d53f29a0eb7c`; 78/78 entries verified.
 - Exact CPU/GPU output comparison: `build/astra-h200-full-plm-pfam-slurm-20260817/attempt-06/comparison/full-output-comparison.json`, SHA-256 `c32745fdce9ce64c5204dac02d9aa7611b089206e3156e09f5e14807dfa248f0`.
+- Phase 2 full run: `build/phase1b-benchmark-harness/build/h200-phase2-device-compaction-20260823/attempt-02-full/runs/h200-full`; worker SHA-256 `dcc3da2eafdcf076ab76a867472282cc290a529b8e7b10e64906e4a5709363f9`, raw-validation SHA-256 `7428eb2fd2c4cf152564f51b512b6f6ec0636b21cf1bed2945e98f7b8e022f2b`.
 - CPU48 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu48/artifact.sha256`, manifest SHA-256 `9e6d4d96073c565a9b61fac5b804f98dd5f7ec57dd67af07c5a289b198dadd42`.
 - CPU64 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu64/artifact.sha256`, manifest SHA-256 `e3a2e4cd5674addfe347aa8c4604571a5bdc38f14b8e9fdade60f71cf5f35b46`.
 - CPU semantic normalization report: `build/astra-full-plm-pfam-cpu-comparison-20260817/runs/validation-01/comparison.json`, SHA-256 `78bee4fd2d03c2658d0779345893f89e6dc3777f1a380123a85c25c9a9b2525`.
