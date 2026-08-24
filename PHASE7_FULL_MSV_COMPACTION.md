@@ -4,10 +4,11 @@
 
 The postfilter launches the exact full-MSV recurrence over every retained F1
 candidate and returns immediately for rows whose SSV status is not
-`eslENORESULT`. On the sealed full workload only 467,289 of 203,671,109
-postfilter records require that recurrence. Launching one warp for every row
-therefore spends most of the launch topology on no-op warps and also builds a
-dense MSV DP-offset vector that is never consumed.
+`eslENORESULT`. The earlier 467,289-row census was the final MSV-range CPU
+fallback count, not the number of rows executing full MSV. The new exact
+launch census shows that 40,657,346 of 203,671,109 postfilter records require
+the recurrence. The remaining 163,013,763 rows still consumed no-op launch
+topology and dense DP-offset planning.
 
 ## Implementation
 
@@ -41,4 +42,30 @@ sparse-index transfer totals.
 - A representative/full H200 run retains the established final output and
   reports fewer full-MSV launch candidates than source candidates.
 
-H200 evidence and the retain/reject decision will be appended after execution.
+## Full H200 result
+
+Job `1182754` passed its exact first-1,000 prerequisite and the full sealed
+workload oracle. The final TSV remained byte-identical to Astra CPU64:
+
+- SHA-256: `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`
+- bytes: 39,010,327
+- lines: 383,235
+
+All 83 full chunks used device compaction. They selected and launched
+40,657,346 exact full-MSV rows from 203,671,109 source rows, avoiding
+163,013,763 no-op candidate launches (80.038%). Sparse-index D2H was
+162,629,384 bytes. No chunk used the legacy launch path.
+
+Request wall was 455.788 seconds, including 346.818 seconds generation,
+448.291 seconds pipeline wall, 400.770 seconds continuation/output, and
+299.448 seconds overlap. Against Phase 6, request wall regressed 1.541 seconds
+(0.339%) and generation regressed 4.170 seconds (1.217%). The structural path
+is retained because packed full-MSV arithmetic requires the exact sparse work
+list, but no standalone speedup is claimed.
+
+Evidence lives at
+`build/h200-phase7-msv-compaction-20260824/attempt-01-full/runs/h200-full`.
+The worker JSON SHA-256 is
+`856819b4f605c2a0ac91c2c1d34839ba3bd765fb90fffc615e7f5ab0cb8c3f8e`; raw
+validation SHA-256 is
+`2a6bf3e53c3a55e919de3a3122fa5130b5192bb2f8d9e98af180067d57b94935`.

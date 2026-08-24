@@ -236,3 +236,13 @@ counterfactual 24,915,438 bytes to 121,595 bytes. The path is retained.
 Phase 7 proceeds from this exact baseline and evaluates packed integer MSV and
 Viterbi arithmetic. Production work must compact the rare full-MSV rows before
 packing them; it must not add packed work across the complete postfilter stream.
+
+## Phase 7 full-MSV compaction result
+
+Job `1182754` reproduced the exact 39,010,327-byte output. Device compaction
+ran for all 83 chunks and reduced 203,671,109 source rows to 40,657,346 actual
+full-MSV executions, avoiding 163,013,763 no-op launches. It completed in
+455.788 seconds, 0.339% slower than Phase 6. The compactor is retained as the
+required exact work-list foundation for packed full-MSV arithmetic, without a
+standalone performance claim. The prior 467,289 count referred only to final
+MSV-range CPU fallbacks and must not be used as the full-MSV execution census.
