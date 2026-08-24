@@ -73,6 +73,11 @@ typedef struct plan7_ssv_workspace_statistics {
   uint64_t f1_profile_packed_profile_count;
   uint64_t f1_profile_scalar_profile_count;
   uint64_t f1_profile_packed_score_bytes;
+  uint64_t f1_length_class_run_count;
+  uint64_t f1_length_class_value_count;
+  uint64_t f1_length_compact_h2d_bytes;
+  uint64_t f1_length_dense_h2d_bytes_avoided;
+  uint64_t f1_length_dense_materialized_bytes;
   uint64_t postfilter_device_bytes;
   uint64_t postfilter_dp_capacity_bytes;
   uint64_t postfilter_growth_count;
@@ -155,7 +160,9 @@ enum plan7_ssv_device_capacity {
   PLAN7_SSV_CAPACITY_F1_PROFILE_PACKED_SCORES = 41,
   PLAN7_SSV_CAPACITY_F1_PROFILE_PACKED_QUARTETS = 42,
   PLAN7_SSV_CAPACITY_F1_SCALAR_PROFILE_INDICES = 43,
-  PLAN7_SSV_DEVICE_CAPACITY_COUNT = 44
+  PLAN7_SSV_CAPACITY_LENGTH_CLASS_INDICES = 44,
+  PLAN7_SSV_CAPACITY_F1_COMPACT_TJB = 45,
+  PLAN7_SSV_DEVICE_CAPACITY_COUNT = 46
 };
 
 typedef struct plan7_ssv_memory_snapshot {

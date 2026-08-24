@@ -205,10 +205,12 @@ class CudaMemorySnapshotTests(unittest.TestCase):
             capacities = initial["capacity_bytes"]
             self.assertLessEqual(initial["cuda_free_bytes"], initial["cuda_total_bytes"])
             self.assertEqual(initial["persistent_device_bytes"], sum(capacities.values()))
-            self.assertEqual(len(capacities), 39)
+            self.assertEqual(len(capacities), 46)
             self.assertEqual(capacities["input_residues"], 4)
             self.assertEqual(capacities["input_offsets"], 24)
             self.assertEqual(capacities["input_null_scores"], 8)
+            self.assertEqual(capacities["length_class_indices"], 8)
+            self.assertEqual(capacities["f1_compact_tjb"], 0)
             self.assertEqual(capacities["length_tjb"], 2)
             self.assertEqual(capacities["results"], 12)
 

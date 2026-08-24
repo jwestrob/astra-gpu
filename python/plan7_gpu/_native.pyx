@@ -173,6 +173,8 @@ _DEVICE_CAPACITY_NAMES = (
     "f1_profile_packed_scores",
     "f1_profile_packed_quartets",
     "f1_scalar_profile_indices",
+    "length_class_indices",
+    "f1_compact_tjb",
 )
 
 
@@ -388,6 +390,11 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t f1_profile_packed_profile_count
         uint64_t f1_profile_scalar_profile_count
         uint64_t f1_profile_packed_score_bytes
+        uint64_t f1_length_class_run_count
+        uint64_t f1_length_class_value_count
+        uint64_t f1_length_compact_h2d_bytes
+        uint64_t f1_length_dense_h2d_bytes_avoided
+        uint64_t f1_length_dense_materialized_bytes
         uint64_t postfilter_device_bytes
         uint64_t postfilter_dp_capacity_bytes
         uint64_t postfilter_growth_count
@@ -428,7 +435,7 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t cuda_free_bytes
         uint64_t cuda_total_bytes
         uint64_t persistent_device_bytes
-        uint64_t device_capacity_bytes[44]
+        uint64_t device_capacity_bytes[46]
 
     ctypedef struct plan7_ssv_f1_candidate_view:
         size_t profile_count
@@ -5483,6 +5490,19 @@ cdef class SequenceBatch:
             ),
             "f1_profile_packed_score_bytes": (
                 statistics.f1_profile_packed_score_bytes
+            ),
+            "f1_length_class_run_count": statistics.f1_length_class_run_count,
+            "f1_length_class_value_count": (
+                statistics.f1_length_class_value_count
+            ),
+            "f1_length_compact_h2d_bytes": (
+                statistics.f1_length_compact_h2d_bytes
+            ),
+            "f1_length_dense_h2d_bytes_avoided": (
+                statistics.f1_length_dense_h2d_bytes_avoided
+            ),
+            "f1_length_dense_materialized_bytes": (
+                statistics.f1_length_dense_materialized_bytes
             ),
             "postfilter_device_bytes": statistics.postfilter_device_bytes,
             "postfilter_dp_capacity_bytes": (

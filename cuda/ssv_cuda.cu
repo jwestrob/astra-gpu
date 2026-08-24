@@ -31,6 +31,9 @@ struct plan7_ssv_sequence_batch {
   float *host_bias_logp;
   float *host_bias_log1mp;
   float *host_tjb_log_terms;
+  uint32_t *host_length_class_indices;
+  float *host_length_class_log_terms;
+  size_t length_class_count;
   uint8_t *host_tjb;
   size_t host_tjb_capacity;
   plan7_ssv_f1_profile *host_f1_profiles;
@@ -52,6 +55,10 @@ struct plan7_ssv_sequence_batch {
   size_t device_bias_logp_capacity;
   float *device_bias_log1mp;
   size_t device_bias_log1mp_capacity;
+  uint32_t *device_length_class_indices;
+  size_t device_length_class_index_capacity;
+  uint8_t *device_f1_compact_tjb;
+  size_t device_f1_compact_tjb_capacity;
   uint8_t *device_tjb;
   size_t device_tjb_capacity;
   plan7_ssv_result *device_results;
@@ -106,6 +113,11 @@ struct plan7_ssv_sequence_batch {
   uint64_t f1_profile_packed_profile_count;
   uint64_t f1_profile_scalar_profile_count;
   uint64_t f1_profile_packed_score_bytes;
+  uint64_t f1_length_class_run_count;
+  uint64_t f1_length_class_value_count;
+  uint64_t f1_length_compact_h2d_bytes;
+  uint64_t f1_length_dense_h2d_bytes_avoided;
+  uint64_t f1_length_dense_materialized_bytes;
 };
 
 namespace {
@@ -151,6 +163,7 @@ constexpr uint64_t kMaximumModelLength = 100000;
 constexpr float kEvparamUnset = -99999.0f;
 constexpr size_t kProfilePackedMinimumProfiles = 32;
 constexpr int kProfilesPerPackedWord = 4;
+constexpr size_t kLengthClassMinimumSequences = 256;
 
 struct ProfilePackedQuartet {
   uint64_t score_word_offset;
@@ -682,6 +695,24 @@ ssv_f1_mask_indexed_kernel(const uint8_t *packed_scores,
     }
     __syncthreads();
   }
+}
+
+__global__ void
+expand_length_class_tjb_kernel(const uint8_t *compact_tjb,
+                               const uint32_t *sequence_length_classes,
+                               size_t sequence_count,
+                               size_t length_class_count,
+                               size_t dense_count,
+                               uint8_t *dense_tjb)
+{
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+  if (index >= dense_count) return;
+  const size_t sequence = index % sequence_count;
+  const size_t row = index / sequence_count;
+  const uint32_t length_class = sequence_length_classes[sequence];
+  if (length_class < length_class_count)
+    dense_tjb[index] = compact_tjb[row * length_class_count + length_class];
 }
 
 __global__ void
@@ -1239,6 +1270,8 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   CUDA_FREE(batch->device_bias_results);
   CUDA_FREE(batch->device_bias_log1mp);
   CUDA_FREE(batch->device_bias_logp);
+  CUDA_FREE(batch->device_f1_compact_tjb);
+  CUDA_FREE(batch->device_length_class_indices);
   CUDA_FREE(batch->device_results);
   CUDA_FREE(batch->device_tjb);
   CUDA_FREE(batch->device_null_scores);
@@ -1255,6 +1288,8 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   free(batch->host_f1_scores);
   free(batch->host_bias_candidates);
   free(batch->host_candidate_offsets);
+  free(batch->host_length_class_log_terms);
+  free(batch->host_length_class_indices);
   free(batch->host_tjb_log_terms);
   free(batch->host_bias_log1mp);
   free(batch->host_bias_logp);
@@ -1557,6 +1592,8 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
   size_t offset_bytes;
   size_t result_bytes;
   size_t null_score_bytes;
+  size_t length_class_index_bytes;
+  uint32_t *length_to_class = nullptr;
   int rc = -1;
   int device_ordinal;
 
@@ -1601,6 +1638,8 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
       !checked_product(sequence_count, sizeof(plan7_ssv_result),
                        &result_bytes) ||
       !checked_product(sequence_count, sizeof(float), &null_score_bytes) ||
+      !checked_product(sequence_count, sizeof(uint32_t),
+                       &length_class_index_bytes) ||
       (residue_count == 0 ? 1 : residue_count) > SIZE_MAX - offset_bytes) {
     set_error(error, error_size, "sequence batch size overflow");
     return -1;
@@ -1631,14 +1670,27 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
     static_cast<float *>(malloc(sequence_count * sizeof(float)));
   batch->host_tjb_log_terms =
     static_cast<float *>(malloc(sequence_count * sizeof(float)));
+  batch->host_length_class_indices =
+    static_cast<uint32_t *>(malloc(length_class_index_bytes));
+  batch->host_length_class_log_terms =
+    static_cast<float *>(malloc(null_score_bytes));
   batch->host_tjb = static_cast<uint8_t *>(malloc(sequence_count));
+  length_to_class = static_cast<uint32_t *>(
+    malloc((static_cast<size_t>(kMaximumTargetLength) + 1) *
+           sizeof(uint32_t)));
   if (batch->host_lengths == nullptr || batch->host_null_scores == nullptr ||
       batch->host_bias_logp == nullptr ||
       batch->host_bias_log1mp == nullptr ||
-      batch->host_tjb_log_terms == nullptr || batch->host_tjb == nullptr) {
+      batch->host_tjb_log_terms == nullptr ||
+      batch->host_length_class_indices == nullptr ||
+      batch->host_length_class_log_terms == nullptr ||
+      batch->host_tjb == nullptr || length_to_class == nullptr) {
     set_error(error, error_size, "host sequence metadata allocation failed");
     goto cleanup;
   }
+  std::fill_n(length_to_class,
+              static_cast<size_t>(kMaximumTargetLength) + 1,
+              UINT32_MAX);
   batch->host_tjb_capacity = sequence_count;
   for (size_t i = 0; i < sequence_count; ++i) {
     batch->host_lengths[i] = offsets[i + 1] - offsets[i];
@@ -1653,7 +1705,17 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
     }
     batch->host_tjb_log_terms[i] =
       compute_tjb_log_term(batch->host_lengths[i]);
+    uint32_t length_class = length_to_class[batch->host_lengths[i]];
+    if (length_class == UINT32_MAX) {
+      length_class = static_cast<uint32_t>(batch->length_class_count++);
+      length_to_class[batch->host_lengths[i]] = length_class;
+      batch->host_length_class_log_terms[length_class] =
+        batch->host_tjb_log_terms[i];
+    }
+    batch->host_length_class_indices[i] = length_class;
   }
+  free(length_to_class);
+  length_to_class = nullptr;
 
 #define CUDA_TRY(call)                                                        \
   do {                                                                        \
@@ -1671,6 +1733,9 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
   batch->device_offset_capacity = offset_bytes;
   CUDA_TRY(cudaMalloc(&batch->device_null_scores, null_score_bytes));
   batch->device_null_score_capacity = null_score_bytes;
+  CUDA_TRY(cudaMalloc(&batch->device_length_class_indices,
+                      length_class_index_bytes));
+  batch->device_length_class_index_capacity = length_class_index_bytes;
   CUDA_TRY(cudaMalloc(&batch->device_tjb, sequence_count));
   batch->device_tjb_capacity = sequence_count;
   CUDA_TRY(cudaMalloc(&batch->device_results, result_bytes));
@@ -1682,12 +1747,17 @@ plan7_ssv_sequence_batch_create(const uint8_t *residues,
                       cudaMemcpyHostToDevice));
   CUDA_TRY(cudaMemcpy(batch->device_null_scores, batch->host_null_scores,
                       null_score_bytes, cudaMemcpyHostToDevice));
+  CUDA_TRY(cudaMemcpy(batch->device_length_class_indices,
+                      batch->host_length_class_indices,
+                      length_class_index_bytes,
+                      cudaMemcpyHostToDevice));
   batch->input_device_bytes = static_cast<uint64_t>(
       (residue_count == 0 ? 1 : residue_count) + offset_bytes);
   *batch_out = batch;
   rc = 0;
 
 cleanup:
+  free(length_to_class);
   if (rc != 0) destroy_sequence_batch(batch, nullptr, 0);
 #undef CUDA_TRY
   return rc;
@@ -1797,6 +1867,16 @@ plan7_ssv_sequence_batch_get_workspace_statistics(
     batch->f1_profile_scalar_profile_count;
   statistics->f1_profile_packed_score_bytes =
     batch->f1_profile_packed_score_bytes;
+  statistics->f1_length_class_run_count =
+    batch->f1_length_class_run_count;
+  statistics->f1_length_class_value_count =
+    batch->f1_length_class_value_count;
+  statistics->f1_length_compact_h2d_bytes =
+    batch->f1_length_compact_h2d_bytes;
+  statistics->f1_length_dense_h2d_bytes_avoided =
+    batch->f1_length_dense_h2d_bytes_avoided;
+  statistics->f1_length_dense_materialized_bytes =
+    batch->f1_length_dense_materialized_bytes;
   if (batch->postfilter_workspace != nullptr) {
     plan7_postfilter_workspace_statistics postfilter{};
     if (plan7_postfilter_workspace_get_statistics(
@@ -1892,6 +1972,10 @@ plan7_ssv_sequence_batch_get_memory_snapshot(
   snapshot->device_capacity_bytes[
       PLAN7_SSV_CAPACITY_F1_SCALAR_PROFILE_INDICES] =
       static_cast<uint64_t>(batch->device_f1_scalar_profile_index_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_LENGTH_CLASS_INDICES] =
+      static_cast<uint64_t>(batch->device_length_class_index_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_F1_COMPACT_TJB] =
+      static_cast<uint64_t>(batch->device_f1_compact_tjb_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_PROFILES] =
       static_cast<uint64_t>(batch->device_bias_profile_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_CANDIDATES] =
@@ -2254,6 +2338,9 @@ sequence_batch_f1_mask_many_impl(
   size_t f1_profile_bytes;
   size_t unique_tjb_rows = 0;
   size_t tjb_count;
+  size_t compact_tjb_count = 0;
+  size_t host_tjb_count;
+  bool use_length_classes = false;
   size_t packed_score_word_count = 0;
   size_t packed_score_bytes = 0;
   size_t packed_quartet_bytes = 0;
@@ -2477,8 +2564,28 @@ sequence_batch_f1_mask_many_impl(
     set_error(error, error_size, "fused F1 transition size overflow");
     return -1;
   }
-  if (tjb_count > batch->host_tjb_capacity) {
-    void *replacement = realloc(batch->host_tjb, tjb_count);
+  if (!checked_product(unique_tjb_rows, batch->length_class_count,
+                       &compact_tjb_count)) {
+    set_error(error, error_size,
+              "length-class F1 transition size overflow");
+    return -1;
+  }
+  const char *length_policy = getenv("PLAN7_GPU_SSV_LENGTH_METADATA");
+  const bool force_length_classes =
+    length_policy != nullptr && strcmp(length_policy, "compact") == 0;
+  const bool disable_length_classes =
+    length_policy != nullptr && strcmp(length_policy, "expanded") == 0;
+  const size_t expansion_blocks = (tjb_count + kThreads - 1) / kThreads;
+  use_length_classes =
+    !disable_length_classes && batch->device_length_class_indices != nullptr &&
+    batch->length_class_count != 0 &&
+    expansion_blocks <= static_cast<size_t>(maximum_grid_x) &&
+    (force_length_classes ||
+     (batch->sequence_count >= kLengthClassMinimumSequences &&
+      batch->length_class_count <= batch->sequence_count / 2));
+  host_tjb_count = use_length_classes ? compact_tjb_count : tjb_count;
+  if (host_tjb_count > batch->host_tjb_capacity) {
+    void *replacement = realloc(batch->host_tjb, host_tjb_count);
     if (replacement == nullptr) {
       set_error(error, error_size,
                 "host fused F1 transition allocation failed");
@@ -2499,10 +2606,21 @@ sequence_batch_f1_mask_many_impl(
       }
     }
     if (!first_for_scale) continue;
-    for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence)
-      batch->host_tjb[row_offset + sequence] =
-        compute_tjb_from_log_term(profiles[profile].scale,
-                                  batch->host_tjb_log_terms[sequence]);
+    if (use_length_classes) {
+      const size_t compact_row =
+        (row_offset / batch->sequence_count) * batch->length_class_count;
+      for (size_t length_class = 0;
+           length_class < batch->length_class_count; ++length_class)
+        batch->host_tjb[compact_row + length_class] =
+          compute_tjb_from_log_term(
+            profiles[profile].scale,
+            batch->host_length_class_log_terms[length_class]);
+    } else {
+      for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence)
+        batch->host_tjb[row_offset + sequence] =
+          compute_tjb_from_log_term(profiles[profile].scale,
+                                    batch->host_tjb_log_terms[sequence]);
+    }
   }
   batch->tjb_cache_valid = 0;
 
@@ -2541,6 +2659,14 @@ sequence_batch_f1_mask_many_impl(
                          "cudaFree(profile-packed F1 scalar indexes)",
                          error,
                          error_size) != 0 ||
+      (use_length_classes &&
+       grow_device_buffer(&batch->device_f1_compact_tjb,
+                          &batch->device_f1_compact_tjb_capacity,
+                          compact_tjb_count,
+                          "cudaMalloc(length-class F1 transitions)",
+                          "cudaFree(length-class F1 transitions)",
+                          error,
+                          error_size) != 0) ||
       grow_device_buffer(&batch->device_tjb,
                          &batch->device_tjb_capacity,
                          tjb_count,
@@ -2583,10 +2709,26 @@ sequence_batch_f1_mask_many_impl(
       batch->device_f1_scalar_profile_indices,
       scalar_profile_indices.data(), scalar_profile_index_bytes,
       cudaMemcpyHostToDevice));
-  CUDA_TRY_FUSED(cudaMemcpy(batch->device_tjb,
-                            batch->host_tjb,
-                            tjb_count,
-                            cudaMemcpyHostToDevice));
+  if (use_length_classes) {
+    CUDA_TRY_FUSED(cudaMemcpy(batch->device_f1_compact_tjb,
+                              batch->host_tjb,
+                              compact_tjb_count,
+                              cudaMemcpyHostToDevice));
+    expand_length_class_tjb_kernel<<<
+      static_cast<unsigned>(expansion_blocks), kThreads>>>(
+        batch->device_f1_compact_tjb,
+        batch->device_length_class_indices,
+        batch->sequence_count,
+        batch->length_class_count,
+        tjb_count,
+        batch->device_tjb);
+    CUDA_TRY_FUSED(cudaGetLastError());
+  } else {
+    CUDA_TRY_FUSED(cudaMemcpy(batch->device_tjb,
+                              batch->host_tjb,
+                              tjb_count,
+                              cudaMemcpyHostToDevice));
+  }
   CUDA_TRY_FUSED(cudaMemset(batch->device_candidate_words,
                             0,
                             candidate_word_bytes));
@@ -2651,6 +2793,13 @@ sequence_batch_f1_mask_many_impl(
                               cudaMemcpyDeviceToHost));
   batch->cached_f1_profile_count = profile_count;
   batch->f1_cache_valid = 1;
+  if (use_length_classes) {
+    ++batch->f1_length_class_run_count;
+    batch->f1_length_class_value_count += batch->length_class_count;
+    batch->f1_length_compact_h2d_bytes += compact_tjb_count;
+    batch->f1_length_dense_h2d_bytes_avoided += tjb_count;
+    batch->f1_length_dense_materialized_bytes += tjb_count;
+  }
 #undef CUDA_TRY_FUSED
   return 0;
 }
