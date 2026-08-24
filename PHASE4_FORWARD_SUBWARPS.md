@@ -63,11 +63,63 @@ launches only 32 CTAs, leaving much of the H200 grid under-subscribed; width 2
 launches 128 CTAs.  Mixed target lengths also penalize the widest warp because
 all subwarps remain occupied until the longest candidate in the warp finishes.
 
-## Decision
+## Production policy v1
 
-Retain the four exact specializations and diagnostic harness.  Do not change
-the production width yet.  The evidence supports a small shape policy rather
-than a fixed width: preserve width 1 for sparse work, prefer width 4 for dense
-short/medium or length-compatible rows, and consider width 2 for long rows
-unless the candidate count provides enough CTAs.  Length cohorts should be
-tested before width 8 is considered for production.
+The follow-up candidate-count sweep showed that wider is not monotonically
+better.  Once XMX/DP traffic substantially exceeds cache, the larger supply of
+independent width-1 warps can hide memory latency better.  The initial
+production policy therefore uses the largest physical tile, not total request
+size, and is deliberately bounded by both CTA coverage and working-set size.
+
+Definitions:
+
+- minimum coverage is `ceil(3 * SM_count / 4)` CTAs;
+- a long row set has average exact `M * L >= 131,072` cells/candidate;
+- high length divergence means `max(L) > 2 * average(L)`;
+- the width-4 short/medium working-set limit is the device L2 size;
+- the packed long-row working-set limit is twice the device L2 size.
+
+Dispatch:
+
+1. If width 2 cannot provide minimum CTA coverage, use width 1.
+2. For short/medium work, use width 4 when it has minimum coverage and the
+   tile XMX allocation fits in L2.  If width 4 lacks coverage and target
+   lengths are highly divergent, use width 1.  Otherwise use width 2.
+3. For long work whose XMX allocation fits in twice L2, use width 4 when it
+   has minimum coverage, otherwise width 2.  If it exceeds twice L2, use
+   width 1.
+4. Width 8 is never selected automatically.
+
+The private debug override accepts forced widths 1, 2, 4, and 8.  Auto is
+encoded as zero.  Additive counters expose the request and selected width,
+reason code, SM/L2 inputs, M/L sums and maxima, average work, XMX bytes, CTA
+counts for widths 1/2/4, launches, and active/issued lane slots.
+
+H200 policy job 1182708 used 132 SMs and 60 MiB L2.  Auto output was identical
+to every forced exact output and selected the measured winner in all four
+representative cases:
+
+| Workload | Auto width | Auto median | Speedup vs width 1 |
+|---|---:|---:|---:|
+| M87, L64, 8,192 candidates | 4 | 1.424 ms | 1.311x |
+| M243, L256, 8,192 candidates | 4 | 15.106 ms | 1.170x |
+| M400, L1024, 2,048 candidates | 2 | 33.899 ms | 1.025x |
+| M262, L31-1024, 4,096 candidates | 4 | 20.968 ms | 1.154x |
+
+The exact report SHA-256 is
+`813cce619f03a9decf13ab6e54ad6a88d46bde26e2a4893f78cb0e3a211df593`.
+
+H200 boundary job 1182710 then exercised the remaining routes with exact
+forced-width comparison: divergent sparse width 1, short/medium width 2,
+long width 4, and long working-set-saturated width 1.  Across the twelve
+boundary workloads the selected-policy timing ranged from 0.993x (noise-level
+for the same forced width-1 kernel) to 1.485x versus width 1.  Its scale
+0.5/2/4 report hashes are, respectively:
+
+- `25548ef53ef8074b3ea2676126c6fe1449d853a14a2bda50f9db8e58daffc89d`
+- `12d95f0c4a32b79c1edbd0e62ded990e3c22878810c0a98971e3809fed5c24b6`
+- `33a4dfb0cfd9db7e1699617af47e6103cd7c3fd6e7b727a05736db9d87179ed6`
+
+Decision: promote policy v1 while retaining the force/debug path.  Revisit the
+thresholds only with a broader workload matrix; length cohorts remain the
+prerequisite for considering width 8.

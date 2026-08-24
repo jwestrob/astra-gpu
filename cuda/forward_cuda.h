@@ -46,6 +46,18 @@ enum plan7_forward_call_reason_fact {
   PLAN7_FORWARD_CALL_REASON_CONTRACT_FALLBACK = UINT8_C(0x01)
 };
 
+enum plan7_forward_subwarp_policy_reason {
+  PLAN7_FORWARD_SUBWARP_POLICY_NO_KERNEL = 0,
+  PLAN7_FORWARD_SUBWARP_POLICY_FORCED = 1,
+  PLAN7_FORWARD_SUBWARP_POLICY_SPARSE_WIDTH1 = 2,
+  PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH4 = 3,
+  PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH2 = 4,
+  PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH4 = 5,
+  PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH2 = 6,
+  PLAN7_FORWARD_SUBWARP_POLICY_LONG_SATURATED_WIDTH1 = 7,
+  PLAN7_FORWARD_SUBWARP_POLICY_DIVERGENT_WIDTH1 = 8
+};
+
 /* One record is returned for every input F2 survivor, in input order.
  * Special-state rows are returned only for DEFINITE_PASS records. */
 typedef struct plan7_forward_result {
@@ -192,8 +204,29 @@ typedef struct plan7_forward_residency_statistics {
  * experiment.  It deliberately stays outside plan7_forward_statistics and
  * the sealed result/provenance ABIs. */
 typedef struct plan7_forward_subwarp_statistics {
+  uint32_t policy_version;
+  uint32_t requested_candidates_per_warp;
   uint32_t candidates_per_warp;
+  uint32_t policy_reason;
+  uint32_t multiprocessor_count;
   uint32_t reserved;
+  uint64_t l2_cache_bytes;
+  uint64_t policy_tile_candidate_count;
+  uint64_t model_length_sum;
+  uint64_t target_length_sum;
+  uint64_t average_model_length;
+  uint64_t average_target_length;
+  uint64_t maximum_model_length;
+  uint64_t maximum_target_length;
+  uint64_t maximum_candidate_work_cells;
+  uint64_t average_work_cells;
+  uint64_t short_width4_workspace_limit_bytes;
+  uint64_t long_packed_workspace_limit_bytes;
+  uint64_t policy_xmx_workspace_bytes;
+  uint64_t minimum_cta_count;
+  uint64_t width1_cta_count;
+  uint64_t width2_cta_count;
+  uint64_t width4_cta_count;
   uint64_t kernel_launch_count;
   uint64_t scheduled_warp_count;
   uint64_t candidate_subwarp_count;

@@ -117,6 +117,16 @@ def run_exact_oracle():
                 )
                 for width in WIDTHS
             }
+            automatic = run_forward(
+                batch,
+                resident,
+                profiles,
+                candidate_offsets,
+                candidate_indices,
+                filters,
+                1.0,
+                0,
+            )
 
     reference_payload, reference_seal = exact_payload(outputs[1])
     variants = {}
@@ -135,6 +145,9 @@ def run_exact_oracle():
             "active_lane_slots": stats["active_lane_slots"],
             "issued_lane_slots": stats["issued_lane_slots"],
         }
+    automatic_payload, automatic_seal = exact_payload(automatic)
+    if automatic_payload != reference_payload or automatic_seal != reference_seal:
+        raise RuntimeError("automatic Forward policy changed exact output")
     return {
         "profile_model_lengths": [profile.M for profile in profiles],
         "profile_q": [(profile.M + 3) // 4 for profile in profiles],
@@ -143,6 +156,23 @@ def run_exact_oracle():
         "candidate_count": len(candidate_indices),
         "payload_sha256": hashlib.sha256(reference_payload).hexdigest(),
         "provenance": reference_seal,
+        "automatic_policy": {
+            key: automatic[3][key]
+            for key in (
+                "requested_candidates_per_warp",
+                "candidates_per_warp",
+                "subwarp_policy_reason",
+                "multiprocessor_count",
+                "l2_cache_bytes",
+                "policy_tile_candidate_count",
+                "average_work_cells",
+                "policy_xmx_workspace_bytes",
+                "minimum_cta_count",
+                "width1_cta_count",
+                "width2_cta_count",
+                "width4_cta_count",
+            )
+        },
         "variants": variants,
     }
 
@@ -156,6 +186,7 @@ def benchmark_case(name, hmm_name, lengths, repeats):
     # reject at f3=0, avoiding survivor gather traffic in this kernel study.
     filters = array("f", [1.0e4]) * candidate_count
     samples = {width: [] for width in WIDTHS}
+    policy_samples = []
     counters = {}
 
     with make_batch(profile.alphabet, lengths) as batch:
@@ -192,6 +223,40 @@ def benchmark_case(name, hmm_name, lengths, repeats):
                     )
                 }
 
+            automatic = run_forward(
+                batch, resident, [profile], offsets, indices, filters, 0.0, 0
+            )
+            payload, seal = exact_payload(automatic)
+            if payload != reference_payload or seal != reference_seal:
+                raise RuntimeError(f"{name}: automatic policy changed exact output")
+            policy = {
+                key: automatic[3][key]
+                for key in (
+                    "subwarp_policy_version",
+                    "requested_candidates_per_warp",
+                    "candidates_per_warp",
+                    "subwarp_policy_reason",
+                    "multiprocessor_count",
+                    "l2_cache_bytes",
+                    "policy_tile_candidate_count",
+                    "model_length_sum",
+                    "target_length_sum",
+                    "average_model_length",
+                    "average_target_length",
+                    "maximum_model_length",
+                    "maximum_target_length",
+                    "maximum_candidate_work_cells",
+                    "average_work_cells",
+                    "short_width4_workspace_limit_bytes",
+                    "long_packed_workspace_limit_bytes",
+                    "policy_xmx_workspace_bytes",
+                    "minimum_cta_count",
+                    "width1_cta_count",
+                    "width2_cta_count",
+                    "width4_cta_count",
+                )
+            }
+
             for repeat in range(repeats):
                 order = WIDTHS[repeat % len(WIDTHS) :] + WIDTHS[: repeat % len(WIDTHS)]
                 for width in order:
@@ -211,9 +276,23 @@ def benchmark_case(name, hmm_name, lengths, repeats):
                             f"{name}: Forward width {width} changed exact output"
                         )
                     samples[width].append(output[3]["kernel_ms"])
+                automatic = run_forward(
+                    batch, resident, [profile], offsets, indices, filters, 0.0, 0
+                )
+                payload, seal = exact_payload(automatic)
+                if payload != reference_payload or seal != reference_seal:
+                    raise RuntimeError(
+                        f"{name}: automatic policy changed exact timed output"
+                    )
+                if automatic[3]["candidates_per_warp"] != policy[
+                    "candidates_per_warp"
+                ]:
+                    raise RuntimeError(f"{name}: automatic policy is not deterministic")
+                policy_samples.append(automatic[3]["kernel_ms"])
 
     medians = {width: statistics.median(samples[width]) for width in WIDTHS}
     reference_ms = medians[1]
+    policy_median = statistics.median(policy_samples)
     return {
         "name": name,
         "hmm": hmm_name,
@@ -225,6 +304,12 @@ def benchmark_case(name, hmm_name, lengths, repeats):
         "target_length_mean": sum(lengths) / candidate_count,
         "work_cells": sum(profile.M * length for length in lengths),
         "exact_payload_sha256": hashlib.sha256(reference_payload).hexdigest(),
+        "automatic_policy": {
+            **policy,
+            "kernel_ms_samples": policy_samples,
+            "kernel_ms_median": policy_median,
+            "speedup_vs_width1": reference_ms / policy_median,
+        },
         "variants": {
             str(width): {
                 "kernel_ms_samples": samples[width],

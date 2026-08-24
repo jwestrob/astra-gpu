@@ -863,6 +863,17 @@ cdef extern from "forward_cuda.h" nogil:
     cdef enum plan7_forward_call_reason_fact:
         PLAN7_FORWARD_CALL_REASON_CONTRACT_FALLBACK
 
+    cdef enum plan7_forward_subwarp_policy_reason:
+        PLAN7_FORWARD_SUBWARP_POLICY_NO_KERNEL
+        PLAN7_FORWARD_SUBWARP_POLICY_FORCED
+        PLAN7_FORWARD_SUBWARP_POLICY_SPARSE_WIDTH1
+        PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH4
+        PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH2
+        PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH4
+        PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH2
+        PLAN7_FORWARD_SUBWARP_POLICY_LONG_SATURATED_WIDTH1
+        PLAN7_FORWARD_SUBWARP_POLICY_DIVERGENT_WIDTH1
+
     ctypedef struct plan7_forward_result:
         uint32_t sequence_index
         float fwdsc
@@ -922,8 +933,29 @@ cdef extern from "forward_cuda.h" nogil:
         float materialization_milliseconds
 
     ctypedef struct plan7_forward_subwarp_statistics:
+        uint32_t policy_version
+        uint32_t requested_candidates_per_warp
         uint32_t candidates_per_warp
+        uint32_t policy_reason
+        uint32_t multiprocessor_count
         uint32_t reserved
+        uint64_t l2_cache_bytes
+        uint64_t policy_tile_candidate_count
+        uint64_t model_length_sum
+        uint64_t target_length_sum
+        uint64_t average_model_length
+        uint64_t average_target_length
+        uint64_t maximum_model_length
+        uint64_t maximum_target_length
+        uint64_t maximum_candidate_work_cells
+        uint64_t average_work_cells
+        uint64_t short_width4_workspace_limit_bytes
+        uint64_t long_packed_workspace_limit_bytes
+        uint64_t policy_xmx_workspace_bytes
+        uint64_t minimum_cta_count
+        uint64_t width1_cta_count
+        uint64_t width2_cta_count
+        uint64_t width4_cta_count
         uint64_t kernel_launch_count
         uint64_t scheduled_warp_count
         uint64_t candidate_subwarp_count
@@ -6088,7 +6120,7 @@ cdef class SequenceBatch:
         ForwardProfiles forward_profiles,
         uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
         bint _f3_audit=False,
-        int _candidates_per_warp=1,
+        int _candidates_per_warp=0,
     ):
         """Classify F3 and return only passing parser special-state rows."""
         cdef char error[512]
@@ -6156,11 +6188,13 @@ cdef class SequenceBatch:
             raise RuntimeError("array('f') is not native float32")
         if sizeof(plan7_forward_result) != PLAN7_FORWARD_RECORD_SIZE:
             raise RuntimeError("Forward result ABI size mismatch")
-        if _candidates_per_warp not in (1, 2, 4, 8):
-            raise ValueError("Forward candidates per warp must be 1, 2, 4, or 8")
-        if _f3_audit and _candidates_per_warp != 1:
+        if _candidates_per_warp not in (0, 1, 2, 4, 8):
             raise ValueError(
-                "Forward F3 audit currently requires one candidate per warp"
+                "Forward candidates per warp must be auto, 1, 2, 4, or 8"
+            )
+        if _f3_audit and _candidates_per_warp != 0:
+            raise ValueError(
+                "Forward F3 audit requires automatic subwarp selection"
             )
 
         error[0] = 0
@@ -6181,7 +6215,7 @@ cdef class SequenceBatch:
                 error,
                 sizeof(error),
             )
-        elif _candidates_per_warp == 1:
+        elif _candidates_per_warp == 0:
             status = plan7_forward_run_batch_workspace(
                 forward_profiles._database,
                 self._batch,
@@ -6301,9 +6335,60 @@ cdef class SequenceBatch:
                 "gather_ms": native_statistics.gather_milliseconds,
                 "download_ms": native_statistics.download_milliseconds,
                 "total_ms": native_statistics.total_milliseconds,
+                "subwarp_policy_version": (
+                    native_subwarp_statistics.policy_version
+                ),
+                "requested_candidates_per_warp": (
+                    native_subwarp_statistics.requested_candidates_per_warp
+                ),
                 "candidates_per_warp": (
                     native_subwarp_statistics.candidates_per_warp
                 ),
+                "subwarp_policy_reason": (
+                    native_subwarp_statistics.policy_reason
+                ),
+                "multiprocessor_count": (
+                    native_subwarp_statistics.multiprocessor_count
+                ),
+                "l2_cache_bytes": native_subwarp_statistics.l2_cache_bytes,
+                "policy_tile_candidate_count": (
+                    native_subwarp_statistics.policy_tile_candidate_count
+                ),
+                "model_length_sum": native_subwarp_statistics.model_length_sum,
+                "target_length_sum": native_subwarp_statistics.target_length_sum,
+                "average_model_length": (
+                    native_subwarp_statistics.average_model_length
+                ),
+                "average_target_length": (
+                    native_subwarp_statistics.average_target_length
+                ),
+                "maximum_model_length": (
+                    native_subwarp_statistics.maximum_model_length
+                ),
+                "maximum_target_length": (
+                    native_subwarp_statistics.maximum_target_length
+                ),
+                "maximum_candidate_work_cells": (
+                    native_subwarp_statistics.maximum_candidate_work_cells
+                ),
+                "average_work_cells": (
+                    native_subwarp_statistics.average_work_cells
+                ),
+                "short_width4_workspace_limit_bytes": (
+                    native_subwarp_statistics.short_width4_workspace_limit_bytes
+                ),
+                "long_packed_workspace_limit_bytes": (
+                    native_subwarp_statistics.long_packed_workspace_limit_bytes
+                ),
+                "policy_xmx_workspace_bytes": (
+                    native_subwarp_statistics.policy_xmx_workspace_bytes
+                ),
+                "minimum_cta_count": (
+                    native_subwarp_statistics.minimum_cta_count
+                ),
+                "width1_cta_count": native_subwarp_statistics.width1_cta_count,
+                "width2_cta_count": native_subwarp_statistics.width2_cta_count,
+                "width4_cta_count": native_subwarp_statistics.width4_cta_count,
                 "kernel_launch_count": (
                     native_subwarp_statistics.kernel_launch_count
                 ),
@@ -9438,6 +9523,29 @@ FORWARD_STATUS_OK = PLAN7_FORWARD_OK
 FORWARD_STATUS_ERANGE = PLAN7_FORWARD_ERANGE
 FORWARD_STATUS_ENORESULT = PLAN7_FORWARD_ENORESULT
 FORWARD_STATUS_EMPTY = PLAN7_FORWARD_EMPTY
+FORWARD_SUBWARP_POLICY_NO_KERNEL = PLAN7_FORWARD_SUBWARP_POLICY_NO_KERNEL
+FORWARD_SUBWARP_POLICY_FORCED = PLAN7_FORWARD_SUBWARP_POLICY_FORCED
+FORWARD_SUBWARP_POLICY_SPARSE_WIDTH1 = (
+    PLAN7_FORWARD_SUBWARP_POLICY_SPARSE_WIDTH1
+)
+FORWARD_SUBWARP_POLICY_SHORT_WIDTH4 = (
+    PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH4
+)
+FORWARD_SUBWARP_POLICY_SHORT_WIDTH2 = (
+    PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH2
+)
+FORWARD_SUBWARP_POLICY_LONG_WIDTH4 = (
+    PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH4
+)
+FORWARD_SUBWARP_POLICY_LONG_WIDTH2 = (
+    PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH2
+)
+FORWARD_SUBWARP_POLICY_LONG_SATURATED_WIDTH1 = (
+    PLAN7_FORWARD_SUBWARP_POLICY_LONG_SATURATED_WIDTH1
+)
+FORWARD_SUBWARP_POLICY_DIVERGENT_WIDTH1 = (
+    PLAN7_FORWARD_SUBWARP_POLICY_DIVERGENT_WIDTH1
+)
 BACKWARD_DOMAIN_RECORD_VERSION = PLAN7_BACKWARD_DOMAIN_RECORD_VERSION
 BACKWARD_DOMAIN_RESULT_SIZE = sizeof(plan7_backward_domain_result)
 BACKWARD_DOMAIN_POSTERIOR_SIZE = sizeof(plan7_domain_posterior)

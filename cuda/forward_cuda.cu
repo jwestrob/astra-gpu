@@ -55,6 +55,10 @@ constexpr int kThreads = 256;
 constexpr int kSubwarp = 4;
 constexpr int kDefaultCandidatesPerWarp = 1;
 constexpr int kWarpsPerBlock = kThreads / 32;
+constexpr uint32_t kSubwarpPolicyVersion = 1;
+constexpr uint64_t kLongAverageWorkCells = UINT64_C(1) << 17;
+constexpr uint64_t kMinimumCtaCoverageNumerator = 3;
+constexpr uint64_t kMinimumCtaCoverageDenominator = 4;
 constexpr int kGatherThreads = 256;
 constexpr uint64_t kMaximumModelLength = 100000;
 constexpr uint64_t kDpWorkspaceByteLimit = UINT64_C(256) << 20;
@@ -174,6 +178,111 @@ bool checked_bytes(size_t count, size_t item_size, size_t *bytes) {
   if (item_size != 0 && count > SIZE_MAX / item_size) return false;
   *bytes = count * item_size;
   return true;
+}
+
+uint64_t ceiling_divide(uint64_t numerator, uint64_t denominator) {
+  return numerator / denominator + (numerator % denominator != 0);
+}
+
+int select_forward_candidates_per_warp(
+    int requested_candidates_per_warp, size_t tile_candidate_count,
+    uint64_t work_cells, uint64_t xmx_workspace_bytes,
+    int multiprocessor_count, int l2_cache_bytes,
+    plan7_forward_subwarp_statistics *statistics) {
+  statistics->policy_version = kSubwarpPolicyVersion;
+  statistics->requested_candidates_per_warp =
+      static_cast<uint32_t>(requested_candidates_per_warp);
+  statistics->multiprocessor_count =
+      static_cast<uint32_t>(multiprocessor_count);
+  statistics->l2_cache_bytes = static_cast<uint64_t>(l2_cache_bytes);
+  statistics->policy_tile_candidate_count = tile_candidate_count;
+  statistics->policy_xmx_workspace_bytes = xmx_workspace_bytes;
+  statistics->average_work_cells = tile_candidate_count == 0
+      ? 0 : work_cells / statistics->candidate_subwarp_count;
+  statistics->average_model_length = tile_candidate_count == 0
+      ? 0 : statistics->model_length_sum /
+          statistics->candidate_subwarp_count;
+  statistics->average_target_length = tile_candidate_count == 0
+      ? 0 : statistics->target_length_sum /
+          statistics->candidate_subwarp_count;
+  statistics->short_width4_workspace_limit_bytes =
+      statistics->l2_cache_bytes;
+  statistics->long_packed_workspace_limit_bytes =
+      statistics->l2_cache_bytes > UINT64_MAX / 2
+          ? UINT64_MAX : 2 * statistics->l2_cache_bytes;
+  statistics->minimum_cta_count = ceiling_divide(
+      static_cast<uint64_t>(multiprocessor_count) *
+          kMinimumCtaCoverageNumerator,
+      kMinimumCtaCoverageDenominator);
+  statistics->width1_cta_count = ceiling_divide(
+      tile_candidate_count,
+      static_cast<uint64_t>(kWarpsPerBlock));
+  statistics->width2_cta_count = ceiling_divide(
+      tile_candidate_count,
+      static_cast<uint64_t>(2 * kWarpsPerBlock));
+  statistics->width4_cta_count = ceiling_divide(
+      tile_candidate_count,
+      static_cast<uint64_t>(4 * kWarpsPerBlock));
+
+  if (tile_candidate_count == 0) {
+    statistics->candidates_per_warp = kDefaultCandidatesPerWarp;
+    statistics->policy_reason = PLAN7_FORWARD_SUBWARP_POLICY_NO_KERNEL;
+    return kDefaultCandidatesPerWarp;
+  }
+  if (requested_candidates_per_warp != 0) {
+    statistics->candidates_per_warp =
+        static_cast<uint32_t>(requested_candidates_per_warp);
+    statistics->policy_reason = PLAN7_FORWARD_SUBWARP_POLICY_FORCED;
+    return requested_candidates_per_warp;
+  }
+
+  const bool width2_has_coverage =
+      statistics->width2_cta_count >= statistics->minimum_cta_count;
+  const bool width4_has_coverage =
+      statistics->width4_cta_count >= statistics->minimum_cta_count;
+  const bool long_rows =
+      statistics->average_work_cells >= kLongAverageWorkCells;
+  const bool divergent_lengths =
+      statistics->maximum_target_length >
+          2 * statistics->average_target_length;
+  if (!width2_has_coverage) {
+    statistics->candidates_per_warp = 1;
+    statistics->policy_reason = PLAN7_FORWARD_SUBWARP_POLICY_SPARSE_WIDTH1;
+    return 1;
+  }
+  if (!long_rows) {
+    if (width4_has_coverage &&
+        xmx_workspace_bytes <=
+            statistics->short_width4_workspace_limit_bytes) {
+      statistics->candidates_per_warp = 4;
+      statistics->policy_reason = PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH4;
+      return 4;
+    }
+    if (divergent_lengths && !width4_has_coverage) {
+      statistics->candidates_per_warp = 1;
+      statistics->policy_reason =
+          PLAN7_FORWARD_SUBWARP_POLICY_DIVERGENT_WIDTH1;
+      return 1;
+    }
+    statistics->candidates_per_warp = 2;
+    statistics->policy_reason = PLAN7_FORWARD_SUBWARP_POLICY_SHORT_WIDTH2;
+    return 2;
+  }
+  if (xmx_workspace_bytes <=
+      statistics->long_packed_workspace_limit_bytes) {
+    if (width4_has_coverage) {
+      statistics->candidates_per_warp = 4;
+      statistics->policy_reason = PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH4;
+      return 4;
+    }
+    statistics->candidates_per_warp = 2;
+    statistics->policy_reason = PLAN7_FORWARD_SUBWARP_POLICY_LONG_WIDTH2;
+    return 2;
+  }
+  statistics->candidates_per_warp = 1;
+  statistics->policy_reason =
+      PLAN7_FORWARD_SUBWARP_POLICY_LONG_SATURATED_WIDTH1;
+  return 1;
 }
 
 bool aligned_vector_address(const void *allocation, uintptr_t *address) {
@@ -1548,9 +1657,11 @@ static int forward_run_with_workspace_impl(
     const float *filter_scores, size_t candidate_count, double f3,
     uint64_t gathered_byte_budget,
     plan7_forward_output **output, bool collect_reason_facts,
-    bool retain_device_specials, bool audit_f3, int candidates_per_warp,
+    bool retain_device_specials, bool audit_f3,
+    int requested_candidates_per_warp,
     char *error, size_t error_size) {
   const auto call_begin = std::chrono::steady_clock::now();
+  int candidates_per_warp = kDefaultCandidatesPerWarp;
   if (output == nullptr || *output != nullptr || workspace == nullptr ||
       database == nullptr || batch == nullptr ||
       (profile_count != 0 &&
@@ -1562,8 +1673,11 @@ static int forward_run_with_workspace_impl(
     set_error(error, error_size, "invalid Forward run arguments");
     return -1;
   }
-  if (candidates_per_warp != 1 && candidates_per_warp != 2 &&
-      candidates_per_warp != 4 && candidates_per_warp != 8) {
+  if (requested_candidates_per_warp != 0 &&
+      requested_candidates_per_warp != 1 &&
+      requested_candidates_per_warp != 2 &&
+      requested_candidates_per_warp != 4 &&
+      requested_candidates_per_warp != 8) {
     set_error(error, error_size,
               "Forward candidates per warp must be 1, 2, 4, or 8");
     return -1;
@@ -1683,8 +1797,11 @@ static int forward_run_with_workspace_impl(
   }
   created->statistics = {};
   created->f3_device_statistics = {};
+  created->subwarp_statistics.policy_version = kSubwarpPolicyVersion;
+  created->subwarp_statistics.requested_candidates_per_warp =
+      static_cast<uint32_t>(requested_candidates_per_warp);
   created->subwarp_statistics.candidates_per_warp =
-      static_cast<uint32_t>(candidates_per_warp);
+      kDefaultCandidatesPerWarp;
   DoubleBits generation_f3{};
   generation_f3.value = f3;
   const uint64_t output_byte_limit =
@@ -1752,6 +1869,11 @@ static int forward_run_with_workspace_impl(
   std::vector<size_t> &tile_boundaries = workspace->tile_boundaries;
   uint64_t maximum_dp_cells = 0;
   uint64_t maximum_x_cells = 0;
+  uint64_t model_length_sum = 0;
+  uint64_t target_length_sum = 0;
+  uint64_t maximum_model_length = 0;
+  uint64_t maximum_target_length = 0;
+  uint64_t maximum_candidate_work = 0;
   size_t maximum_tile_count = 0;
   try {
     host_candidate_profiles.resize(candidate_count);
@@ -1800,6 +1922,9 @@ static int forward_run_with_workspace_impl(
           !checked_multiply(length + 1, p7X_NXCELLS, &x_cells) ||
           !checked_multiply(descriptor.model_length, length,
                             &candidate_work) ||
+          !checked_add(model_length_sum, descriptor.model_length,
+                       &model_length_sum) ||
+          !checked_add(target_length_sum, length, &target_length_sum) ||
           !checked_add(host_dp_offsets[candidate], dp_cells,
                        &host_dp_offsets[candidate + 1]) ||
           !checked_add(host_x_offsets[candidate], x_cells,
@@ -1812,9 +1937,22 @@ static int forward_run_with_workspace_impl(
       host_candidate_sequences[candidate] = sequence;
       host_length_transitions[candidate] = length_transitions_for(
           descriptor, static_cast<int>(length));
+      maximum_model_length = std::max(
+          maximum_model_length,
+          static_cast<uint64_t>(descriptor.model_length));
+      maximum_target_length = std::max(maximum_target_length, length);
+      maximum_candidate_work = std::max(
+          maximum_candidate_work, candidate_work);
     }
   }
   created->statistics.work_cells = work_cells;
+  created->subwarp_statistics.candidate_subwarp_count = candidate_count;
+  created->subwarp_statistics.model_length_sum = model_length_sum;
+  created->subwarp_statistics.target_length_sum = target_length_sum;
+  created->subwarp_statistics.maximum_model_length = maximum_model_length;
+  created->subwarp_statistics.maximum_target_length = maximum_target_length;
+  created->subwarp_statistics.maximum_candidate_work_cells =
+      maximum_candidate_work;
 
   const uint64_t dp_cell_limit =
       kDpWorkspaceByteLimit / sizeof(float);
@@ -1899,6 +2037,32 @@ static int forward_run_with_workspace_impl(
                    "cudaDeviceGetAttribute(maximum grid x)", status);
     return -1;
   }
+  int multiprocessor_count = 0;
+  status = cudaDeviceGetAttribute(
+      &multiprocessor_count, cudaDevAttrMultiProcessorCount, current_device);
+  if (status != cudaSuccess || multiprocessor_count <= 0) {
+    if (status != cudaSuccess)
+      set_cuda_error(error, error_size,
+                     "cudaDeviceGetAttribute(multiprocessor count)", status);
+    else
+      set_error(error, error_size, "CUDA multiprocessor count is invalid");
+    return -1;
+  }
+  int l2_cache_bytes = 0;
+  status = cudaDeviceGetAttribute(
+      &l2_cache_bytes, cudaDevAttrL2CacheSize, current_device);
+  if (status != cudaSuccess || l2_cache_bytes <= 0) {
+    if (status != cudaSuccess)
+      set_cuda_error(error, error_size,
+                     "cudaDeviceGetAttribute(L2 cache size)", status);
+    else
+      set_error(error, error_size, "CUDA L2 cache size is invalid");
+    return -1;
+  }
+  candidates_per_warp = select_forward_candidates_per_warp(
+      requested_candidates_per_warp, maximum_tile_count, work_cells,
+      maximum_x_cells * sizeof(float), multiprocessor_count, l2_cache_bytes,
+      &created->subwarp_statistics);
 
   RunBuffers &buffers = workspace->buffers;
 #define CUDA_RUN(call)                                                        \
@@ -2108,7 +2272,6 @@ static int forward_run_with_workspace_impl(
     ++created->subwarp_statistics.kernel_launch_count;
     created->subwarp_statistics.scheduled_warp_count +=
         static_cast<uint64_t>(blocks) * kWarpsPerBlock;
-    created->subwarp_statistics.candidate_subwarp_count += tile_count;
     created->subwarp_statistics.active_lane_slots +=
         static_cast<uint64_t>(tile_count) * kSubwarp;
     created->subwarp_statistics.issued_lane_slots +=
@@ -2378,7 +2541,7 @@ extern "C" int plan7_forward_run_with_workspace(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, false, false,
-      kDefaultCandidatesPerWarp, error, error_size);
+      0, error, error_size);
 }
 
 extern "C" int plan7_forward_run(
@@ -2460,7 +2623,7 @@ extern "C" int plan7_forward_run_batch_workspace_reason_facts(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, true, false, false,
-      kDefaultCandidatesPerWarp, error, error_size);
+      0, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident(
@@ -2479,7 +2642,7 @@ extern "C" int plan7_forward_run_batch_workspace_resident(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, true, false,
-      kDefaultCandidatesPerWarp, error, error_size);
+      0, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
@@ -2498,7 +2661,7 @@ extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, true, true, false,
-      kDefaultCandidatesPerWarp, error, error_size);
+      0, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_f3_audit(
@@ -2517,7 +2680,7 @@ extern "C" int plan7_forward_run_batch_workspace_f3_audit(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, false, true,
-      kDefaultCandidatesPerWarp, error, error_size);
+      0, error, error_size);
 }
 
 extern "C" int plan7_forward_output_destroy(
