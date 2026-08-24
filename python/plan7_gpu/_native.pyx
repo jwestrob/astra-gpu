@@ -170,6 +170,9 @@ _DEVICE_CAPACITY_NAMES = (
     "candidate_word_offsets",
     "candidate_profile_offsets",
     "candidate_scan_workspace",
+    "f1_profile_packed_scores",
+    "f1_profile_packed_quartets",
+    "f1_scalar_profile_indices",
 )
 
 
@@ -380,6 +383,11 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t f1_host_expansion_run_count
         uint64_t f1_candidate_upload_count
         uint64_t f1_candidate_upload_avoided_count
+        uint64_t f1_profile_packed_run_count
+        uint64_t f1_profile_packed_quartet_count
+        uint64_t f1_profile_packed_profile_count
+        uint64_t f1_profile_scalar_profile_count
+        uint64_t f1_profile_packed_score_bytes
         uint64_t postfilter_device_bytes
         uint64_t postfilter_dp_capacity_bytes
         uint64_t postfilter_growth_count
@@ -420,7 +428,7 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t cuda_free_bytes
         uint64_t cuda_total_bytes
         uint64_t persistent_device_bytes
-        uint64_t device_capacity_bytes[39]
+        uint64_t device_capacity_bytes[44]
 
     ctypedef struct plan7_ssv_f1_candidate_view:
         size_t profile_count
@@ -5460,6 +5468,21 @@ cdef class SequenceBatch:
             "f1_candidate_upload_count": statistics.f1_candidate_upload_count,
             "f1_candidate_upload_avoided_count": (
                 statistics.f1_candidate_upload_avoided_count
+            ),
+            "f1_profile_packed_run_count": (
+                statistics.f1_profile_packed_run_count
+            ),
+            "f1_profile_packed_quartet_count": (
+                statistics.f1_profile_packed_quartet_count
+            ),
+            "f1_profile_packed_profile_count": (
+                statistics.f1_profile_packed_profile_count
+            ),
+            "f1_profile_scalar_profile_count": (
+                statistics.f1_profile_scalar_profile_count
+            ),
+            "f1_profile_packed_score_bytes": (
+                statistics.f1_profile_packed_score_bytes
             ),
             "postfilter_device_bytes": statistics.postfilter_device_bytes,
             "postfilter_dp_capacity_bytes": (

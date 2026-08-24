@@ -5,7 +5,9 @@
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
+#include <vector>
 
 extern "C" {
 #include <easel.h>
@@ -60,6 +62,12 @@ struct plan7_ssv_sequence_batch {
   size_t device_profile_capacity;
   plan7_ssv_f1_profile *device_f1_profiles;
   size_t device_f1_profile_capacity;
+  uint32_t *device_f1_profile_packed_scores;
+  size_t device_f1_profile_packed_score_capacity;
+  void *device_f1_profile_packed_quartets;
+  size_t device_f1_profile_packed_quartet_capacity;
+  uint32_t *device_f1_scalar_profile_indices;
+  size_t device_f1_scalar_profile_index_capacity;
   uint32_t *device_candidate_words;
   size_t device_candidate_word_capacity;
   uint64_t *device_candidate_word_counts;
@@ -93,6 +101,11 @@ struct plan7_ssv_sequence_batch {
   uint64_t f1_host_expansion_run_count;
   uint64_t f1_candidate_upload_count;
   uint64_t f1_candidate_upload_avoided_count;
+  uint64_t f1_profile_packed_run_count;
+  uint64_t f1_profile_packed_quartet_count;
+  uint64_t f1_profile_packed_profile_count;
+  uint64_t f1_profile_scalar_profile_count;
+  uint64_t f1_profile_packed_score_bytes;
 };
 
 namespace {
@@ -136,6 +149,17 @@ constexpr int kExtraScoreVectors = 17;
 constexpr uint64_t kMaximumTargetLength = 100000;
 constexpr uint64_t kMaximumModelLength = 100000;
 constexpr float kEvparamUnset = -99999.0f;
+constexpr size_t kProfilePackedMinimumProfiles = 32;
+constexpr int kProfilesPerPackedWord = 4;
+
+struct ProfilePackedQuartet {
+  uint64_t score_word_offset;
+  uint32_t maximum_model_length;
+  uint32_t profile_indices[kProfilesPerPackedWord];
+};
+
+static_assert(sizeof(ProfilePackedQuartet) == 32,
+              "profile-packed quartet layout changed");
 
 /* Exact requested device bytes for the current amino-profile packers. The
  * descriptor and row constants mirror private structs/layouts in
@@ -406,6 +430,254 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
     if (threadIdx.x == 0 &&
         f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
       const size_t word = profile * words_per_profile + sequence / 32;
+      atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void
+pack_profile_quartet_scores_kernel(
+  const uint8_t *scalar_scores,
+  const plan7_ssv_f1_profile *profiles,
+  const ProfilePackedQuartet *quartets,
+  uint32_t *quartet_scores)
+{
+  const size_t quartet_index = static_cast<size_t>(blockIdx.y);
+  const ProfilePackedQuartet quartet = quartets[quartet_index];
+  const size_t word_count =
+    static_cast<size_t>(quartet.maximum_model_length) * 29;
+  for (size_t word = static_cast<size_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+       word < word_count;
+       word += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const size_t model_position = word / 29;
+    const size_t residue = word % 29;
+    uint32_t packed = 0;
+#pragma unroll
+    for (int lane = 0; lane < kProfilesPerPackedWord; ++lane) {
+      const uint32_t profile_index = quartet.profile_indices[lane];
+      const plan7_ssv_profile profile = profiles[profile_index].profile;
+      uint8_t cost = UINT8_C(0x80);
+      if (model_position < static_cast<size_t>(profile.model_length))
+        cost = scalar_scores[
+          profile.score_offset + model_position * profile.score_stride +
+          residue];
+      packed |= static_cast<uint32_t>(cost) << (lane * 8);
+    }
+    quartet_scores[quartet.score_word_offset + word] = packed;
+  }
+}
+
+__device__ __forceinline__ void
+ssv_profile_packed_filter_block(
+  const uint32_t *scores,
+  const ProfilePackedQuartet quartet,
+  const plan7_ssv_f1_profile *profiles,
+  const uint8_t *residues,
+  const uint64_t *offsets,
+  size_t sequence,
+  const uint8_t *tjb,
+  plan7_ssv_result *results,
+  unsigned *maxima)
+{
+  const uint64_t start = offsets[sequence];
+  const int length = static_cast<int>(offsets[sequence + 1] - start);
+  if (length == 0) {
+    if (threadIdx.x == 0) {
+#pragma unroll
+      for (int lane = 0; lane < kProfilesPerPackedWord; ++lane) {
+        const uint32_t profile_index = quartet.profile_indices[lane];
+        results[lane] = {
+          128, PLAN7_SSV_EMPTY,
+          tjb[profiles[profile_index].tjb_offset + sequence], 0, 0};
+      }
+    }
+    return;
+  }
+
+  uint32_t local_maximum = UINT32_C(0x80808080);
+  const int diagonal_count = quartet.maximum_model_length + length - 1;
+  for (int diagonal = threadIdx.x; diagonal < diagonal_count;
+       diagonal += blockDim.x) {
+    const int delta = diagonal - (length - 1);
+    int i = delta < 0 ? -delta : 0;
+    int k = i + delta;
+    uint32_t value = UINT32_C(0x80808080);
+    while (i < length && k < static_cast<int>(quartet.maximum_model_length)) {
+      const unsigned residue = residues[start + static_cast<uint64_t>(i)];
+      const uint32_t cost = scores[
+        quartet.score_word_offset + static_cast<size_t>(k) * 29 + residue];
+      uint32_t active = 0;
+#pragma unroll
+      for (int lane = 0; lane < kProfilesPerPackedWord; ++lane) {
+        const uint32_t profile_index = quartet.profile_indices[lane];
+        if (k < profiles[profile_index].profile.model_length)
+          active |= UINT32_C(0xff) << (lane * 8);
+      }
+      const uint32_t next = __vsubss4(value, cost);
+      value = (next & active) | (value & ~active);
+      local_maximum = __vmaxu4(local_maximum, value);
+      ++i;
+      ++k;
+    }
+  }
+
+  for (int width = 16; width > 0; width >>= 1)
+    local_maximum = __vmaxu4(
+      local_maximum,
+      __shfl_down_sync(UINT32_MAX, local_maximum, width));
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  if (lane == 0) maxima[warp] = local_maximum;
+  __syncthreads();
+  if (warp == 0) {
+    local_maximum = lane < blockDim.x / 32
+      ? maxima[lane] : UINT32_C(0x80808080);
+    for (int width = 16; width > 0; width >>= 1)
+      local_maximum = __vmaxu4(
+        local_maximum,
+        __shfl_down_sync(UINT32_MAX, local_maximum, width));
+    if (lane == 0) maxima[0] = local_maximum;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int packed_lane = 0; packed_lane < kProfilesPerPackedWord;
+         ++packed_lane) {
+      const uint32_t profile_index = quartet.profile_indices[packed_lane];
+      const plan7_ssv_profile profile = profiles[profile_index].profile;
+      const uint8_t length_tjb = tjb[
+        profiles[profile_index].tjb_offset + sequence];
+      const unsigned raw_xE =
+        (maxima[0] >> (packed_lane * 8)) & UINT32_C(0xff);
+      plan7_ssv_result result = {
+        static_cast<uint8_t>(raw_xE), PLAN7_SSV_OK, length_tjb, 0, 0};
+      if (static_cast<unsigned>(length_tjb) + profile.tbm + profile.tec +
+            profile.bias >= 127U) {
+        result.status = PLAN7_SSV_ENORESULT;
+      } else if (raw_xE >= 255U - profile.bias) {
+        result.status =
+          static_cast<int>(profile.base) - static_cast<int>(length_tjb) -
+                static_cast<int>(profile.tbm) < 128
+            ? PLAN7_SSV_ENORESULT : PLAN7_SSV_ERANGE;
+      } else {
+        unsigned adjusted = raw_xE + profile.base - length_tjb - profile.tbm;
+        adjusted -= 128;
+        if (adjusted >= 255U - profile.bias) {
+          result.status = PLAN7_SSV_ERANGE;
+        } else {
+          const unsigned xJ = adjusted - profile.tec;
+          if (xJ > profile.base) {
+            result.status = PLAN7_SSV_ENORESULT;
+          } else {
+            result.numerator = static_cast<int16_t>(
+              static_cast<int>(xJ) - static_cast<int>(length_tjb) -
+              static_cast<int>(profile.base));
+          }
+        }
+      }
+      results[packed_lane] = result;
+    }
+  }
+}
+
+__global__ void
+ssv_f1_mask_profile_packed_kernel(
+  const uint32_t *quartet_scores,
+  const ProfilePackedQuartet *quartets,
+  const plan7_ssv_f1_profile *profiles,
+  size_t sequence_count,
+  const uint8_t *residues,
+  const uint64_t *offsets,
+  const float *null_scores,
+  const uint8_t *tjb,
+  size_t words_per_profile,
+  uint32_t *candidate_words)
+{
+  __shared__ unsigned maxima[kThreads];
+  __shared__ ProfilePackedQuartet quartet;
+  __shared__ plan7_ssv_result results[kProfilesPerPackedWord];
+  if (threadIdx.x == 0) quartet = quartets[blockIdx.y];
+  __syncthreads();
+
+  const size_t first_sequence =
+    static_cast<size_t>(blockIdx.x) * kSequencesPerBlock;
+  for (int iteration = 0; iteration < kSequencesPerBlock; ++iteration) {
+    const size_t sequence = first_sequence + static_cast<size_t>(iteration);
+    if (sequence >= sequence_count) break;
+    ssv_profile_packed_filter_block(
+      quartet_scores, quartet, profiles, residues, offsets, sequence, tjb,
+      results, maxima);
+    if (threadIdx.x == 0) {
+#pragma unroll
+      for (int lane = 0; lane < kProfilesPerPackedWord; ++lane) {
+        const uint32_t profile_index = quartet.profile_indices[lane];
+        if (f1_requires_cpu(results[lane], null_scores[sequence],
+                            profiles[profile_index])) {
+          const size_t word =
+            static_cast<size_t>(profile_index) * words_per_profile +
+            sequence / 32;
+          atomicOr(&candidate_words[word],
+                   UINT32_C(1) << (sequence % 32));
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void
+ssv_f1_mask_indexed_kernel(const uint8_t *packed_scores,
+                           const plan7_ssv_f1_profile *profiles,
+                           const uint32_t *profile_indices,
+                           size_t sequence_count,
+                           const uint8_t *residues,
+                           const uint64_t *offsets,
+                           const float *null_scores,
+                           const uint8_t *tjb,
+                           size_t words_per_profile,
+                           uint32_t *candidate_words)
+{
+  __shared__ unsigned maxima[kThreads];
+  __shared__ plan7_ssv_f1_profile profile_descriptor;
+  __shared__ uint32_t profile_index;
+  if (threadIdx.x == 0) {
+    profile_index = profile_indices[blockIdx.y];
+    profile_descriptor = profiles[profile_index];
+  }
+  __syncthreads();
+
+  const size_t first_sequence =
+    static_cast<size_t>(blockIdx.x) * kSequencesPerBlock;
+  for (int iteration = 0; iteration < kSequencesPerBlock; ++iteration) {
+    const size_t sequence = first_sequence + static_cast<size_t>(iteration);
+    if (sequence >= sequence_count) break;
+    if (profile_descriptor.cutoff_mode == PLAN7_F1_CUTOFF_INVALID ||
+        profile_descriptor.cutoff_mode == PLAN7_F1_CUTOFF_ALWAYS_CPU) {
+      if (threadIdx.x == 0) {
+        const size_t word =
+          static_cast<size_t>(profile_index) * words_per_profile +
+          sequence / 32;
+        atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+      }
+      continue;
+    }
+    plan7_ssv_result result;
+    ssv_filter_block<true>(
+      packed_scores + profile_descriptor.profile.score_offset,
+      profile_descriptor.profile.score_stride,
+      profile_descriptor.profile.model_length,
+      residues, offsets, sequence,
+      tjb[profile_descriptor.tjb_offset + sequence],
+      profile_descriptor.profile.tbm, profile_descriptor.profile.tec,
+      profile_descriptor.profile.base, profile_descriptor.profile.bias,
+      &result, maxima);
+    if (threadIdx.x == 0 &&
+        f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
+      const size_t word =
+        static_cast<size_t>(profile_index) * words_per_profile + sequence / 32;
       atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
     }
     __syncthreads();
@@ -953,6 +1225,9 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   CUDA_FREE(batch->device_scores);
   CUDA_FREE(batch->device_profiles);
   CUDA_FREE(batch->device_f1_profiles);
+  CUDA_FREE(batch->device_f1_profile_packed_scores);
+  CUDA_FREE(batch->device_f1_profile_packed_quartets);
+  CUDA_FREE(batch->device_f1_scalar_profile_indices);
   CUDA_FREE(batch->device_candidate_words);
   CUDA_FREE(batch->device_candidate_word_counts);
   CUDA_FREE(batch->device_candidate_word_offsets);
@@ -1512,6 +1787,16 @@ plan7_ssv_sequence_batch_get_workspace_statistics(
   statistics->f1_candidate_upload_count = batch->f1_candidate_upload_count;
   statistics->f1_candidate_upload_avoided_count =
     batch->f1_candidate_upload_avoided_count;
+  statistics->f1_profile_packed_run_count =
+    batch->f1_profile_packed_run_count;
+  statistics->f1_profile_packed_quartet_count =
+    batch->f1_profile_packed_quartet_count;
+  statistics->f1_profile_packed_profile_count =
+    batch->f1_profile_packed_profile_count;
+  statistics->f1_profile_scalar_profile_count =
+    batch->f1_profile_scalar_profile_count;
+  statistics->f1_profile_packed_score_bytes =
+    batch->f1_profile_packed_score_bytes;
   if (batch->postfilter_workspace != nullptr) {
     plan7_postfilter_workspace_statistics postfilter{};
     if (plan7_postfilter_workspace_get_statistics(
@@ -1599,6 +1884,14 @@ plan7_ssv_sequence_batch_get_memory_snapshot(
       static_cast<uint64_t>(batch->device_candidate_profile_offset_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_CANDIDATE_SCAN_WORKSPACE] =
       static_cast<uint64_t>(batch->device_candidate_scan_workspace_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_F1_PROFILE_PACKED_SCORES] =
+      static_cast<uint64_t>(batch->device_f1_profile_packed_score_capacity);
+  snapshot->device_capacity_bytes[
+      PLAN7_SSV_CAPACITY_F1_PROFILE_PACKED_QUARTETS] =
+      static_cast<uint64_t>(batch->device_f1_profile_packed_quartet_capacity);
+  snapshot->device_capacity_bytes[
+      PLAN7_SSV_CAPACITY_F1_SCALAR_PROFILE_INDICES] =
+      static_cast<uint64_t>(batch->device_f1_scalar_profile_index_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_PROFILES] =
       static_cast<uint64_t>(batch->device_bias_profile_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_CANDIDATES] =
@@ -1961,6 +2254,13 @@ sequence_batch_f1_mask_many_impl(
   size_t f1_profile_bytes;
   size_t unique_tjb_rows = 0;
   size_t tjb_count;
+  size_t packed_score_word_count = 0;
+  size_t packed_score_bytes = 0;
+  size_t packed_quartet_bytes = 0;
+  size_t scalar_profile_index_bytes = 0;
+  size_t maximum_quartet_score_words = 0;
+  std::vector<ProfilePackedQuartet> profile_quartets;
+  std::vector<uint32_t> scalar_profile_indices;
   int current_device;
   int maximum_grid_x;
   int maximum_grid_y;
@@ -2093,6 +2393,86 @@ sequence_batch_f1_mask_many_impl(
     }
     f1_profile->tjb_offset = tjb_offset;
   }
+
+  const char *profile_policy = getenv("PLAN7_GPU_SSV_PROFILE_POLICY");
+  const bool profile_packing_enabled =
+    profile_policy == nullptr || strcmp(profile_policy, "scalar") != 0;
+  if (profile_packing_enabled &&
+      profile_count >= kProfilePackedMinimumProfiles) {
+    std::vector<uint32_t> eligible;
+    try {
+      eligible.reserve(profile_count);
+      scalar_profile_indices.reserve(profile_count);
+      profile_quartets.reserve(profile_count / kProfilesPerPackedWord);
+      for (size_t profile = 0; profile < profile_count; ++profile) {
+        const int mode = batch->host_f1_profiles[profile].cutoff_mode;
+        if (mode == PLAN7_F1_CUTOFF_SCORE ||
+            mode == PLAN7_F1_CUTOFF_ALWAYS_REJECT)
+          eligible.push_back(static_cast<uint32_t>(profile));
+        else
+          scalar_profile_indices.push_back(static_cast<uint32_t>(profile));
+      }
+      std::stable_sort(
+        eligible.begin(), eligible.end(),
+        [batch](uint32_t left, uint32_t right) {
+          return batch->host_f1_profiles[left].profile.model_length <
+                 batch->host_f1_profiles[right].profile.model_length;
+        });
+      size_t cursor = 0;
+      while (cursor < eligible.size()) {
+        if (eligible.size() - cursor >= kProfilesPerPackedWord) {
+          const int minimum_model_length =
+            batch->host_f1_profiles[eligible[cursor]].profile.model_length;
+          const int maximum_model_length =
+            batch->host_f1_profiles[
+              eligible[cursor + kProfilesPerPackedWord - 1]]
+              .profile.model_length;
+          const int tolerated_spread =
+            std::max(16, minimum_model_length / 4);
+          if (maximum_model_length <=
+              minimum_model_length + tolerated_spread) {
+            ProfilePackedQuartet quartet{};
+            quartet.score_word_offset = packed_score_word_count;
+            quartet.maximum_model_length =
+              static_cast<uint32_t>(maximum_model_length);
+            for (int lane = 0; lane < kProfilesPerPackedWord; ++lane)
+              quartet.profile_indices[lane] = eligible[cursor + lane];
+            size_t quartet_words;
+            if (!checked_product(
+                  static_cast<size_t>(maximum_model_length), 29,
+                  &quartet_words) ||
+                quartet_words > SIZE_MAX - packed_score_word_count) {
+              set_error(error, error_size,
+                        "profile-packed F1 score size overflow");
+              return -1;
+            }
+            packed_score_word_count += quartet_words;
+            maximum_quartet_score_words =
+              std::max(maximum_quartet_score_words, quartet_words);
+            profile_quartets.push_back(quartet);
+            cursor += kProfilesPerPackedWord;
+            continue;
+          }
+        }
+        scalar_profile_indices.push_back(eligible[cursor]);
+        ++cursor;
+      }
+    } catch (...) {
+      set_error(error, error_size,
+                "profile-packed F1 execution plan allocation failed");
+      return -1;
+    }
+  }
+  if (profile_quartets.empty()) scalar_profile_indices.clear();
+  if (!checked_product(packed_score_word_count, sizeof(uint32_t),
+                       &packed_score_bytes) ||
+      !checked_product(profile_quartets.size(), sizeof(ProfilePackedQuartet),
+                       &packed_quartet_bytes) ||
+      !checked_product(scalar_profile_indices.size(), sizeof(uint32_t),
+                       &scalar_profile_index_bytes)) {
+    set_error(error, error_size, "profile-packed F1 allocation size overflow");
+    return -1;
+  }
   if (!checked_product(unique_tjb_rows, batch->sequence_count, &tjb_count)) {
     set_error(error, error_size, "fused F1 transition size overflow");
     return -1;
@@ -2140,6 +2520,27 @@ sequence_batch_f1_mask_many_impl(
                          "cudaFree(fused F1 profiles)",
                          error,
                          error_size) != 0 ||
+      grow_device_buffer(&batch->device_f1_profile_packed_scores,
+                         &batch->device_f1_profile_packed_score_capacity,
+                         packed_score_bytes,
+                         "cudaMalloc(profile-packed F1 scores)",
+                         "cudaFree(profile-packed F1 scores)",
+                         error,
+                         error_size) != 0 ||
+      grow_device_buffer(&batch->device_f1_profile_packed_quartets,
+                         &batch->device_f1_profile_packed_quartet_capacity,
+                         packed_quartet_bytes,
+                         "cudaMalloc(profile-packed F1 quartets)",
+                         "cudaFree(profile-packed F1 quartets)",
+                         error,
+                         error_size) != 0 ||
+      grow_device_buffer(&batch->device_f1_scalar_profile_indices,
+                         &batch->device_f1_scalar_profile_index_capacity,
+                         scalar_profile_index_bytes,
+                         "cudaMalloc(profile-packed F1 scalar indexes)",
+                         "cudaFree(profile-packed F1 scalar indexes)",
+                         error,
+                         error_size) != 0 ||
       grow_device_buffer(&batch->device_tjb,
                          &batch->device_tjb_capacity,
                          tjb_count,
@@ -2173,6 +2574,15 @@ sequence_batch_f1_mask_many_impl(
                             batch->host_f1_profiles,
                             f1_profile_bytes,
                             cudaMemcpyHostToDevice));
+  if (packed_quartet_bytes != 0)
+    CUDA_TRY_FUSED(cudaMemcpy(
+      batch->device_f1_profile_packed_quartets,
+      profile_quartets.data(), packed_quartet_bytes, cudaMemcpyHostToDevice));
+  if (scalar_profile_index_bytes != 0)
+    CUDA_TRY_FUSED(cudaMemcpy(
+      batch->device_f1_scalar_profile_indices,
+      scalar_profile_indices.data(), scalar_profile_index_bytes,
+      cudaMemcpyHostToDevice));
   CUDA_TRY_FUSED(cudaMemcpy(batch->device_tjb,
                             batch->host_tjb,
                             tjb_count,
@@ -2181,21 +2591,59 @@ sequence_batch_f1_mask_many_impl(
                             0,
                             candidate_word_bytes));
 
-  const dim3 grid(static_cast<unsigned>(
-                    (batch->sequence_count + kSequencesPerBlock - 1) /
-                    kSequencesPerBlock),
-                  static_cast<unsigned>(profile_count));
-  ssv_f1_mask_many_kernel<<<grid, kThreads>>>(
-    batch->device_scores,
-    batch->device_f1_profiles,
-    batch->sequence_count,
-    batch->device_residues,
-    batch->device_offsets,
-    batch->device_null_scores,
-    batch->device_tjb,
-    words_per_profile,
-    batch->device_candidate_words);
-  CUDA_TRY_FUSED(cudaGetLastError());
+  const unsigned sequence_blocks = static_cast<unsigned>(
+    (batch->sequence_count + kSequencesPerBlock - 1) /
+    kSequencesPerBlock);
+  if (profile_quartets.empty()) {
+    const dim3 grid(sequence_blocks, static_cast<unsigned>(profile_count));
+    ssv_f1_mask_many_kernel<<<grid, kThreads>>>(
+      batch->device_scores, batch->device_f1_profiles,
+      batch->sequence_count, batch->device_residues, batch->device_offsets,
+      batch->device_null_scores, batch->device_tjb, words_per_profile,
+      batch->device_candidate_words);
+    CUDA_TRY_FUSED(cudaGetLastError());
+  } else {
+    const size_t requested_pack_blocks =
+      (maximum_quartet_score_words + kThreads - 1) / kThreads;
+    const unsigned pack_blocks = static_cast<unsigned>(std::min(
+      requested_pack_blocks, static_cast<size_t>(maximum_grid_x)));
+    const auto *device_quartets =
+      static_cast<const ProfilePackedQuartet *>(
+        batch->device_f1_profile_packed_quartets);
+    pack_profile_quartet_scores_kernel<<<
+      dim3(pack_blocks, static_cast<unsigned>(profile_quartets.size())),
+      kThreads>>>(
+        batch->device_scores, batch->device_f1_profiles, device_quartets,
+        batch->device_f1_profile_packed_scores);
+    CUDA_TRY_FUSED(cudaGetLastError());
+    ssv_f1_mask_profile_packed_kernel<<<
+      dim3(sequence_blocks, static_cast<unsigned>(profile_quartets.size())),
+      kThreads>>>(
+        batch->device_f1_profile_packed_scores, device_quartets,
+        batch->device_f1_profiles, batch->sequence_count,
+        batch->device_residues, batch->device_offsets,
+        batch->device_null_scores, batch->device_tjb, words_per_profile,
+        batch->device_candidate_words);
+    CUDA_TRY_FUSED(cudaGetLastError());
+    if (!scalar_profile_indices.empty()) {
+      ssv_f1_mask_indexed_kernel<<<
+        dim3(sequence_blocks,
+             static_cast<unsigned>(scalar_profile_indices.size())),
+        kThreads>>>(
+          batch->device_scores, batch->device_f1_profiles,
+          batch->device_f1_scalar_profile_indices, batch->sequence_count,
+          batch->device_residues, batch->device_offsets,
+          batch->device_null_scores, batch->device_tjb, words_per_profile,
+          batch->device_candidate_words);
+      CUDA_TRY_FUSED(cudaGetLastError());
+    }
+    ++batch->f1_profile_packed_run_count;
+    batch->f1_profile_packed_quartet_count += profile_quartets.size();
+    batch->f1_profile_packed_profile_count +=
+      profile_quartets.size() * kProfilesPerPackedWord;
+    batch->f1_profile_scalar_profile_count += scalar_profile_indices.size();
+    batch->f1_profile_packed_score_bytes += packed_score_bytes;
+  }
   if (copy_candidate_words)
     CUDA_TRY_FUSED(cudaMemcpy(profile_major_candidate_words,
                               batch->device_candidate_words,
