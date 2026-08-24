@@ -13,7 +13,7 @@ from pathlib import Path
 import pyhmmer
 
 from plan7_gpu import ProfileSession, SequenceBatch, load_pressed_profiles
-from plan7_gpu import _native
+from plan7_gpu import _native, _pipeline
 from plan7_gpu.adapter import _candidate_state, _sequence_state
 
 
@@ -111,14 +111,18 @@ def audit() -> dict[str, object]:
         ):
             native = _sequence_state(batch).native
             before = dict(native.workspace_statistics)
-            os.environ["PLAN7_GPU_SSV_PROFILE_POLICY"] = "scalar"
+            seal_factory = _pipeline._seal_postfilter_batch_bound
+            _pipeline._seal_postfilter_batch_bound = None
             try:
+                os.environ["PLAN7_GPU_SSV_PROFILE_POLICY"] = "scalar"
                 scalar = batch.postfilter_selection(selection, F1=F1)
+                os.environ.pop("PLAN7_GPU_SSV_PROFILE_POLICY", None)
+                after_scalar = dict(native.workspace_statistics)
+                packed = batch.postfilter_selection(selection, F1=F1)
+                after_packed = dict(native.workspace_statistics)
             finally:
                 os.environ.pop("PLAN7_GPU_SSV_PROFILE_POLICY", None)
-            after_scalar = dict(native.workspace_statistics)
-            packed = batch.postfilter_selection(selection, F1=F1)
-            after_packed = dict(native.workspace_statistics)
+                _pipeline._seal_postfilter_batch_bound = seal_factory
 
             scalar_state = _candidate_state(scalar)
             packed_state = _candidate_state(packed)
