@@ -186,3 +186,14 @@ Phase 2, request wall improved by 4.546 seconds (0.844%) and generation wall by
 439.13 ms to 49.16 ms, and aggregate Backward wall fell from 26.880 seconds to
 24.853 seconds. This slice is retained; Phase 3 remains active for persistent
 workspaces and Backward-to-rescore residency.
+
+## Phase 4 Forward subwarp result
+
+Widths 1/2/4/8 were exact in focused H200 tests, but the microbenchmark-derived
+automatic policy did not survive the full workload. Job `1182718` reproduced
+the exact 39,010,327-byte output while selecting width 2 for all 83 chunks.
+Forward kernels took 33.892 seconds versus 32.823 seconds for width 1, and
+request wall took 539.052 seconds versus 535.213 seconds (+0.72%). The policy
+is rejected and production is restored to width 1. Wider Forward and Backward
+variants remain private diagnostics only; Phase 5 proceeds from the stable
+width-1 production path.

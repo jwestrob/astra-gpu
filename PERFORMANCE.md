@@ -76,6 +76,16 @@ time fell from 439.13 ms to 49.16 ms and aggregate Backward wall fell from
 26.880 seconds to 24.853 seconds. Request wall improved by 4.546 seconds
 (0.844%) versus Phase 2, so this first residency slice is retained.
 
+The combined Phase 3 path (resident Forward-to-Backward and
+Backward-to-rescore plus authoritative compiled F3 decisions) completed in
+535.213 seconds in job `1182713`. Phase 4 then tested automatic packed Forward
+subwarps on the same full workload in job `1182718`. Output remained exactly
+identical, but the policy selected width 2 for all 83 chunks and regressed
+Forward kernel time from 32.823 to 33.892 seconds (+3.26%) and request wall
+from 535.213 to 539.052 seconds (+0.72%). Automatic promotion is rejected;
+production remains fixed at one four-lane candidate per warp. Wider variants
+remain diagnostic-only.
+
 ## GPU request-stage ledger
 
 The measured 546.220704615 s request decomposed as follows:

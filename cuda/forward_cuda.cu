@@ -2541,7 +2541,7 @@ extern "C" int plan7_forward_run_with_workspace(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, false, false,
-      0, error, error_size);
+      1, error, error_size);
 }
 
 extern "C" int plan7_forward_run(
@@ -2623,7 +2623,7 @@ extern "C" int plan7_forward_run_batch_workspace_reason_facts(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, true, false, false,
-      0, error, error_size);
+      1, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident(
@@ -2642,7 +2642,7 @@ extern "C" int plan7_forward_run_batch_workspace_resident(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, true, false,
-      0, error, error_size);
+      1, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
@@ -2661,7 +2661,7 @@ extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, true, true, false,
-      0, error, error_size);
+      1, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_f3_audit(
@@ -2680,7 +2680,7 @@ extern "C" int plan7_forward_run_batch_workspace_f3_audit(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, false, true,
-      0, error, error_size);
+      1, error, error_size);
 }
 
 extern "C" int plan7_forward_output_destroy(

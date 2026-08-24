@@ -120,6 +120,30 @@ for the same forced width-1 kernel) to 1.485x versus width 1.  Its scale
 - `12d95f0c4a32b79c1edbd0e62ded990e3c22878810c0a98971e3809fed5c24b6`
 - `33a4dfb0cfd9db7e1699617af47e6103cd7c3fd6e7b727a05736db9d87179ed6`
 
-Decision: promote policy v1 while retaining the force/debug path.  Revisit the
-thresholds only with a broader workload matrix; length cohorts remain the
-prerequisite for considering width 8.
+That microbenchmark-only promotion decision was provisional and is superseded
+by the full-workload result below.
+
+## Full-workload result and final decision
+
+H200 job `1182718` ran the complete 300,186-target by 27,481-profile workload.
+It reproduced the established CPU64 output exactly: SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
+39,010,327 bytes, and 383,235 lines.  Policy v1 selected width 2 for all 83
+full-workload chunks.
+
+The policy was slower than the otherwise identical combined Phase 3 run:
+
+| Measurement | Phase 3 width 1 | Policy v1 | Change |
+|---|---:|---:|---:|
+| Forward kernel total | 32.823 s | 33.892 s | +1.069 s / +3.26% |
+| Generation | 463.471 s | 469.576 s | +6.105 s / +1.32% |
+| Request wall | 535.213 s | 539.052 s | +3.839 s / +0.72% |
+
+The full-workload evidence rejects automatic promotion.  Ordinary production
+entry points are fixed at width 1 again.  Widths 2/4/8 and the policy selector
+remain available only through the private diagnostic variant for future
+length-cohort research; width 1 is the retained production implementation.
+
+The full worker and raw-validation SHA-256 values are, respectively,
+`cd59de5ffed5a5f3c4622844adea9504b96421c767ba9b152e62ca7cdca565e3`
+and `62df054b02c81475af43e03960a4f9163df01239463af003bfdd64b393878bb5`.

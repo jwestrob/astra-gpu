@@ -6325,7 +6325,7 @@ cdef class SequenceBatch:
                 sizeof(error),
             )
         elif _candidates_per_warp == 0:
-            status = plan7_forward_run_batch_workspace(
+            status = plan7_forward_run_batch_workspace_variant(
                 forward_profiles._database,
                 self._batch,
                 source_pointers.data() if source_pointers.size() else NULL,
@@ -6336,6 +6336,7 @@ cdef class SequenceBatch:
                 candidate_count,
                 f3,
                 gathered_byte_budget,
+                0,
                 &output,
                 error,
                 sizeof(error),
