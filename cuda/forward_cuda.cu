@@ -53,10 +53,8 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kSubwarp = 4;
-constexpr int kCandidatesPerWarp = 1;
+constexpr int kDefaultCandidatesPerWarp = 1;
 constexpr int kWarpsPerBlock = kThreads / 32;
-constexpr int kCandidatesPerBlock =
-    kCandidatesPerWarp * kWarpsPerBlock;
 constexpr int kGatherThreads = 256;
 constexpr uint64_t kMaximumModelLength = 100000;
 constexpr uint64_t kDpWorkspaceByteLimit = UINT64_C(256) << 20;
@@ -286,6 +284,7 @@ __device__ __forceinline__ float sse_horizontal_sum(float value,
   return __shfl_sync(mask, value, 0, kSubwarp);
 }
 
+template<int CandidatesPerWarp>
 __global__ void forward_kernel(
     const uint8_t *residues, const uint64_t *sequence_offsets,
     const plan7_forward_device_profile *profiles, const float *emissions,
@@ -301,10 +300,15 @@ __global__ void forward_kernel(
   const int warp_in_block = threadIdx.x >> 5;
   const int candidate_in_warp = lane >> 2;
   const int sublane = lane & 3;
-  if (candidate_in_warp >= kCandidatesPerWarp) return;
+  static_assert(CandidatesPerWarp == 1 || CandidatesPerWarp == 2 ||
+                CandidatesPerWarp == 4 || CandidatesPerWarp == 8,
+                "unsupported Forward candidates-per-warp specialization");
+  if (candidate_in_warp >= CandidatesPerWarp) return;
+  constexpr int candidates_per_block =
+      CandidatesPerWarp * kWarpsPerBlock;
   const size_t tile_candidate =
-      static_cast<size_t>(blockIdx.x) * kCandidatesPerBlock +
-      warp_in_block * kCandidatesPerWarp + candidate_in_warp;
+      static_cast<size_t>(blockIdx.x) * candidates_per_block +
+      warp_in_block * CandidatesPerWarp + candidate_in_warp;
   if (tile_candidate >= tile_count) return;
   const size_t candidate = candidate_begin + tile_candidate;
   const unsigned subwarp_mask = 0xFU << (candidate_in_warp * kSubwarp);
@@ -672,6 +676,7 @@ struct plan7_forward_output {
   plan7_forward_provenance provenance;
   ResidentForwardSpecials resident_specials;
   plan7_forward_residency_statistics residency_statistics{};
+  plan7_forward_subwarp_statistics subwarp_statistics{};
   float upload_milliseconds;
   float total_milliseconds;
   bool contract_fallback = false;
@@ -1543,7 +1548,7 @@ static int forward_run_with_workspace_impl(
     const float *filter_scores, size_t candidate_count, double f3,
     uint64_t gathered_byte_budget,
     plan7_forward_output **output, bool collect_reason_facts,
-    bool retain_device_specials, bool audit_f3,
+    bool retain_device_specials, bool audit_f3, int candidates_per_warp,
     char *error, size_t error_size) {
   const auto call_begin = std::chrono::steady_clock::now();
   if (output == nullptr || *output != nullptr || workspace == nullptr ||
@@ -1555,6 +1560,12 @@ static int forward_run_with_workspace_impl(
        (candidate_indices == nullptr || filter_scores == nullptr)) ||
       database->host_profiles.size() != profile_count) {
     set_error(error, error_size, "invalid Forward run arguments");
+    return -1;
+  }
+  if (candidates_per_warp != 1 && candidates_per_warp != 2 &&
+      candidates_per_warp != 4 && candidates_per_warp != 8) {
+    set_error(error, error_size,
+              "Forward candidates per warp must be 1, 2, 4, or 8");
     return -1;
   }
   if (profile_count == 0 && candidate_count != 0) {
@@ -1672,6 +1683,8 @@ static int forward_run_with_workspace_impl(
   }
   created->statistics = {};
   created->f3_device_statistics = {};
+  created->subwarp_statistics.candidates_per_warp =
+      static_cast<uint32_t>(candidates_per_warp);
   DoubleBits generation_f3{};
   generation_f3.value = f3;
   const uint64_t output_byte_limit =
@@ -2055,22 +2068,36 @@ static int forward_run_with_workspace_impl(
     const size_t begin = tile_boundaries[tile];
     const size_t end = tile_boundaries[tile + 1];
     const size_t tile_count = end - begin;
+    const size_t candidates_per_block =
+        static_cast<size_t>(candidates_per_warp) * kWarpsPerBlock;
     const size_t blocks =
-        (tile_count + kCandidatesPerBlock - 1) / kCandidatesPerBlock;
+        (tile_count + candidates_per_block - 1) / candidates_per_block;
     if (blocks > static_cast<size_t>(maximum_grid_x)) {
       set_error(error, error_size, "Forward candidate grid is too large");
       return -1;
     }
     CUDA_RUN(cudaEventRecord(buffers.begin_event));
-    forward_kernel<<<static_cast<unsigned>(blocks), kThreads>>>(
-        batch_view.device_residues, batch_view.device_offsets,
-        database->device_profiles, database->device_emissions,
-        database->device_transitions, buffers.candidate_profiles,
-        buffers.candidate_sequences, buffers.filter_scores,
-        buffers.f3_threshold_bits,
-        buffers.length_transitions, buffers.dp_offsets, buffers.x_offsets,
-        begin, tile_count, host_dp_offsets[begin], host_x_offsets[begin],
-        buffers.dp, buffers.xmx, buffers.results);
+#define LAUNCH_FORWARD(candidates)                                             \
+    forward_kernel<candidates><<<static_cast<unsigned>(blocks), kThreads>>>(  \
+        batch_view.device_residues, batch_view.device_offsets,                \
+        database->device_profiles, database->device_emissions,                \
+        database->device_transitions, buffers.candidate_profiles,             \
+        buffers.candidate_sequences, buffers.filter_scores,                   \
+        buffers.f3_threshold_bits, buffers.length_transitions,                \
+        buffers.dp_offsets, buffers.x_offsets, begin, tile_count,             \
+        host_dp_offsets[begin], host_x_offsets[begin], buffers.dp,             \
+        buffers.xmx, buffers.results)
+    switch (candidates_per_warp) {
+      case 1: LAUNCH_FORWARD(1); break;
+      case 2: LAUNCH_FORWARD(2); break;
+      case 4: LAUNCH_FORWARD(4); break;
+      case 8: LAUNCH_FORWARD(8); break;
+      default:
+        set_error(error, error_size,
+                  "invalid Forward candidates-per-warp dispatch");
+        return -1;
+    }
+#undef LAUNCH_FORWARD
     CUDA_RUN(cudaGetLastError());
     CUDA_RUN(cudaEventRecord(buffers.end_event));
     CUDA_RUN(cudaEventSynchronize(buffers.end_event));
@@ -2078,6 +2105,14 @@ static int forward_run_with_workspace_impl(
     CUDA_RUN(cudaEventElapsedTime(
         &elapsed, buffers.begin_event, buffers.end_event));
     created->statistics.kernel_milliseconds += elapsed;
+    ++created->subwarp_statistics.kernel_launch_count;
+    created->subwarp_statistics.scheduled_warp_count +=
+        static_cast<uint64_t>(blocks) * kWarpsPerBlock;
+    created->subwarp_statistics.candidate_subwarp_count += tile_count;
+    created->subwarp_statistics.active_lane_slots +=
+        static_cast<uint64_t>(tile_count) * kSubwarp;
+    created->subwarp_statistics.issued_lane_slots +=
+        static_cast<uint64_t>(blocks) * kThreads;
 
     const auto download_begin = std::chrono::steady_clock::now();
     CUDA_RUN(cudaMemcpy(host_kernel_results.data() + begin,
@@ -2342,8 +2377,8 @@ extern "C" int plan7_forward_run_with_workspace(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, false, false, false, error,
-      error_size);
+      f3, gathered_byte_budget, output, false, false, false,
+      kDefaultCandidatesPerWarp, error, error_size);
 }
 
 extern "C" int plan7_forward_run(
@@ -2390,6 +2425,25 @@ extern "C" int plan7_forward_run_batch_workspace(
       f3, gathered_byte_budget, output, error, error_size);
 }
 
+extern "C" int plan7_forward_run_batch_workspace_variant(
+    const plan7_forward_database *database,
+    plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count, double f3,
+    uint64_t gathered_byte_budget, int candidates_per_warp,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  plan7_forward_workspace *workspace = nullptr;
+  if (plan7_ssv_sequence_batch_get_forward_workspace(
+          batch, &workspace, error, error_size) != 0)
+    return -1;
+  return forward_run_with_workspace_impl(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, false, false, false,
+      candidates_per_warp, error, error_size);
+}
+
 extern "C" int plan7_forward_run_batch_workspace_reason_facts(
     const plan7_forward_database *database,
     plan7_ssv_sequence_batch *batch,
@@ -2405,8 +2459,8 @@ extern "C" int plan7_forward_run_batch_workspace_reason_facts(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, true, false, false, error,
-      error_size);
+      f3, gathered_byte_budget, output, true, false, false,
+      kDefaultCandidatesPerWarp, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident(
@@ -2424,8 +2478,8 @@ extern "C" int plan7_forward_run_batch_workspace_resident(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, false, true, false, error,
-      error_size);
+      f3, gathered_byte_budget, output, false, true, false,
+      kDefaultCandidatesPerWarp, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
@@ -2443,8 +2497,8 @@ extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, true, true, false, error,
-      error_size);
+      f3, gathered_byte_budget, output, true, true, false,
+      kDefaultCandidatesPerWarp, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_f3_audit(
@@ -2462,8 +2516,8 @@ extern "C" int plan7_forward_run_batch_workspace_f3_audit(
   return forward_run_with_workspace_impl(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
-      f3, gathered_byte_budget, output, false, false, true, error,
-      error_size);
+      f3, gathered_byte_budget, output, false, false, true,
+      kDefaultCandidatesPerWarp, error, error_size);
 }
 
 extern "C" int plan7_forward_output_destroy(
@@ -2525,6 +2579,12 @@ extern "C" const plan7_forward_residency_statistics *
 plan7_forward_output_residency_statistics(
     const plan7_forward_output *output) {
   return output == nullptr ? nullptr : &output->residency_statistics;
+}
+
+extern "C" const plan7_forward_subwarp_statistics *
+plan7_forward_output_subwarp_statistics(
+    const plan7_forward_output *output) {
+  return output == nullptr ? nullptr : &output->subwarp_statistics;
 }
 
 extern "C" int plan7_forward_output_get_resident_view(

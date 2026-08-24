@@ -921,6 +921,15 @@ cdef extern from "forward_cuda.h" nogil:
         float allocation_milliseconds
         float materialization_milliseconds
 
+    ctypedef struct plan7_forward_subwarp_statistics:
+        uint32_t candidates_per_warp
+        uint32_t reserved
+        uint64_t kernel_launch_count
+        uint64_t scheduled_warp_count
+        uint64_t candidate_subwarp_count
+        uint64_t active_lane_slots
+        uint64_t issued_lane_slots
+
     ctypedef struct plan7_forward_resident_view:
         uint64_t database_generation
         uint64_t batch_generation
@@ -1010,6 +1019,23 @@ cdef extern from "forward_cuda.h" nogil:
         size_t candidate_count,
         double f3,
         uint64_t gathered_byte_budget,
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_forward_run_batch_workspace_variant(
+        const plan7_forward_database *database,
+        plan7_ssv_sequence_batch *batch,
+        const uintptr_t *source_profile_pointers,
+        size_t profile_count,
+        const uint64_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        const float *filter_scores,
+        size_t candidate_count,
+        double f3,
+        uint64_t gathered_byte_budget,
+        int candidates_per_warp,
         plan7_forward_output **output,
         char *error,
         size_t error_size,
@@ -1118,6 +1144,10 @@ cdef extern from "forward_cuda.h" nogil:
     )
 
     const plan7_forward_residency_statistics *plan7_forward_output_residency_statistics(
+        const plan7_forward_output *output,
+    )
+
+    const plan7_forward_subwarp_statistics *plan7_forward_output_subwarp_statistics(
         const plan7_forward_output *output,
     )
 
@@ -6058,6 +6088,7 @@ cdef class SequenceBatch:
         ForwardProfiles forward_profiles,
         uint64_t gathered_byte_budget=PLAN7_FORWARD_MAX_GATHERED_BYTES,
         bint _f3_audit=False,
+        int _candidates_per_warp=1,
     ):
         """Classify F3 and return only passing parser special-state rows."""
         cdef char error[512]
@@ -6081,6 +6112,7 @@ cdef class SequenceBatch:
         cdef const uint64_t *native_offsets
         cdef const float *native_specials
         cdef const plan7_forward_statistics *native_statistics
+        cdef const plan7_forward_subwarp_statistics *native_subwarp_statistics
         cdef bytes records
         cdef bytes offset_storage
         cdef bytes special_storage
@@ -6124,6 +6156,12 @@ cdef class SequenceBatch:
             raise RuntimeError("array('f') is not native float32")
         if sizeof(plan7_forward_result) != PLAN7_FORWARD_RECORD_SIZE:
             raise RuntimeError("Forward result ABI size mismatch")
+        if _candidates_per_warp not in (1, 2, 4, 8):
+            raise ValueError("Forward candidates per warp must be 1, 2, 4, or 8")
+        if _f3_audit and _candidates_per_warp != 1:
+            raise ValueError(
+                "Forward F3 audit currently requires one candidate per warp"
+            )
 
         error[0] = 0
         # Keep the GIL while native code validates live private profile arrays.
@@ -6143,7 +6181,7 @@ cdef class SequenceBatch:
                 error,
                 sizeof(error),
             )
-        else:
+        elif _candidates_per_warp == 1:
             status = plan7_forward_run_batch_workspace(
                 forward_profiles._database,
                 self._batch,
@@ -6155,6 +6193,23 @@ cdef class SequenceBatch:
                 candidate_count,
                 f3,
                 gathered_byte_budget,
+                &output,
+                error,
+                sizeof(error),
+            )
+        else:
+            status = plan7_forward_run_batch_workspace_variant(
+                forward_profiles._database,
+                self._batch,
+                source_pointers.data() if source_pointers.size() else NULL,
+                profile_count,
+                &candidate_offsets[0],
+                &candidate_indices[0] if candidate_count else NULL,
+                &filter_scores[0] if candidate_count else NULL,
+                candidate_count,
+                f3,
+                gathered_byte_budget,
+                _candidates_per_warp,
                 &output,
                 error,
                 sizeof(error),
@@ -6219,6 +6274,11 @@ cdef class SequenceBatch:
             native_statistics = plan7_forward_output_statistics(output)
             if native_statistics == NULL:
                 raise RuntimeError("Forward statistics are null")
+            native_subwarp_statistics = (
+                plan7_forward_output_subwarp_statistics(output)
+            )
+            if native_subwarp_statistics == NULL:
+                raise RuntimeError("Forward subwarp statistics are null")
             statistics = {
                 "generation_f3_bits": native_statistics.generation_f3_bits,
                 "candidate_count": native_statistics.candidate_count,
@@ -6241,6 +6301,24 @@ cdef class SequenceBatch:
                 "gather_ms": native_statistics.gather_milliseconds,
                 "download_ms": native_statistics.download_milliseconds,
                 "total_ms": native_statistics.total_milliseconds,
+                "candidates_per_warp": (
+                    native_subwarp_statistics.candidates_per_warp
+                ),
+                "kernel_launch_count": (
+                    native_subwarp_statistics.kernel_launch_count
+                ),
+                "scheduled_warp_count": (
+                    native_subwarp_statistics.scheduled_warp_count
+                ),
+                "candidate_subwarp_count": (
+                    native_subwarp_statistics.candidate_subwarp_count
+                ),
+                "active_lane_slots": (
+                    native_subwarp_statistics.active_lane_slots
+                ),
+                "issued_lane_slots": (
+                    native_subwarp_statistics.issued_lane_slots
+                ),
             }
             statistics.update(_forward_f3_device_statistics_from_output(output))
             provenance = _forward_provenance_from_output(output)

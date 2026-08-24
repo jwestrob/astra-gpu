@@ -188,6 +188,19 @@ typedef struct plan7_forward_residency_statistics {
   float materialization_milliseconds;
 } plan7_forward_residency_statistics;
 
+/* Additive instrumentation for the isolated multi-candidate subwarp
+ * experiment.  It deliberately stays outside plan7_forward_statistics and
+ * the sealed result/provenance ABIs. */
+typedef struct plan7_forward_subwarp_statistics {
+  uint32_t candidates_per_warp;
+  uint32_t reserved;
+  uint64_t kernel_launch_count;
+  uint64_t scheduled_warp_count;
+  uint64_t candidate_subwarp_count;
+  uint64_t active_lane_slots;
+  uint64_t issued_lane_slots;
+} plan7_forward_subwarp_statistics;
+
 /* Read-only internal view consumed by the next native CUDA stage.  The
  * pointer is generation-owned by plan7_forward_output and is valid only until
  * that output is destroyed.  Public callers must treat it as opaque device
@@ -320,6 +333,25 @@ int plan7_forward_run_batch_workspace(
   char *error,
   size_t error_size);
 
+/* Diagnostic-only forced-kernel twin used by the Phase 4 exact oracle and
+ * microbenchmark.  The production entry point above remains fixed at one
+ * four-lane candidate per warp until a policy is validated. */
+int plan7_forward_run_batch_workspace_variant(
+  const plan7_forward_database *database,
+  plan7_ssv_sequence_batch *batch,
+  const uintptr_t *source_profile_pointers,
+  size_t profile_count,
+  const uint64_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  const float *filter_scores,
+  size_t candidate_count,
+  double f3,
+  uint64_t gathered_byte_budget,
+  int candidates_per_warp,
+  plan7_forward_output **output,
+  char *error,
+  size_t error_size);
+
 /* Opt-in diagnostic twin. The ordinary result/statistics/provenance ABIs and
  * the default entry point above are unchanged. */
 int plan7_forward_run_batch_workspace_reason_facts(
@@ -410,6 +442,9 @@ const plan7_forward_statistics *plan7_forward_output_statistics(
   const plan7_forward_output *output);
 const plan7_forward_residency_statistics *
 plan7_forward_output_residency_statistics(
+  const plan7_forward_output *output);
+const plan7_forward_subwarp_statistics *
+plan7_forward_output_subwarp_statistics(
   const plan7_forward_output *output);
 
 /* Returns 1 when a complete resident view is available, 0 for the ordinary
