@@ -90,6 +90,10 @@ typedef struct plan7_ssv_workspace_statistics {
   uint64_t full_msv_launch_candidate_count;
   uint64_t full_msv_launch_candidate_avoided_count;
   uint64_t full_msv_index_d2h_bytes;
+  uint64_t full_msv_packed_run_count;
+  uint64_t full_msv_packed_group_count;
+  uint64_t full_msv_packed_candidate_count;
+  uint64_t full_msv_scalar_candidate_count;
   uint64_t forward_device_bytes;
   uint64_t forward_dp_capacity_bytes;
   uint64_t forward_xmx_capacity_bytes;

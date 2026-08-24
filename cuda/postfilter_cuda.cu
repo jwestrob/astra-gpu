@@ -49,6 +49,7 @@ constexpr int kThreads = kWarpSize * kWarpsPerBlock;
 constexpr int kNegInf = -32768;
 constexpr uint64_t kDpByteLimit = UINT64_C(256) << 20;
 constexpr size_t kFullMsvCompactSourceChunk = UINT64_C(4) << 20;
+constexpr size_t kMaximumTargetLength = 100000;
 constexpr double kLog2 = 0.69314718055994529;
 
 enum CandidateState : uint8_t {
@@ -431,6 +432,179 @@ __global__ void full_msv_kernel(
     msv_results[candidate] = {
       static_cast<int16_t>(numerator), PLAN7_SSV_OK, 0
     };
+  }
+}
+
+__device__ __forceinline__ uint32_t pack_u8x4(const unsigned values[4]) {
+  return (values[0] & UINT32_C(0xff)) |
+         ((values[1] & UINT32_C(0xff)) << 8) |
+         ((values[2] & UINT32_C(0xff)) << 16) |
+         ((values[3] & UINT32_C(0xff)) << 24);
+}
+
+__device__ __forceinline__ uint32_t warp_max_u8x4(uint32_t value) {
+  for (int delta = 16; delta != 0; delta >>= 1)
+    value = __vmaxu4(value,
+                     __shfl_xor_sync(UINT32_MAX, value, delta));
+  return value;
+}
+
+/* Execute four independent, same-profile/same-length MSV recurrences in the
+ * four bytes of each uint32 lane. The host planner guarantees the grouping;
+ * the kernel rechecks it and leaves ENORESULT intact on any disagreement so
+ * downstream processing conservatively falls back to the CPU. */
+__global__ void full_msv_packed_kernel(
+    const uint8_t *residues, const uint64_t *sequence_offsets,
+    const uint8_t *compact_scores, const uint8_t *exact_rbv,
+    const plan7_ssv_f1_profile *msv_profiles,
+    const VitProfile *vit_profiles, const uint8_t *tjb,
+    const plan7_bias_candidate *candidates,
+    const uint32_t *candidate_indices, const uint64_t *dp_offsets,
+    size_t group_begin, size_t tile_count, uint64_t tile_dp_begin,
+    uint8_t *dp_storage, plan7_bias_ssv_input *msv_results) {
+  const int warp_in_block = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const size_t tile_group =
+      static_cast<size_t>(blockIdx.x) * kWarpsPerBlock + warp_in_block;
+  if (tile_group >= tile_count) return;
+  const size_t group = group_begin + tile_group;
+
+  size_t candidate_index[4];
+  plan7_bias_candidate mapping[4];
+  uint64_t sequence_start[4];
+  unsigned candidate_tjb[4];
+#pragma unroll
+  for (int packed_lane = 0; packed_lane < 4; ++packed_lane) {
+    candidate_index[packed_lane] = static_cast<size_t>(
+        candidate_indices[group * 4 + packed_lane]);
+    if (msv_results[candidate_index[packed_lane]].status !=
+        PLAN7_SSV_ENORESULT)
+      return;
+    mapping[packed_lane] = candidates[candidate_index[packed_lane]];
+    sequence_start[packed_lane] =
+        sequence_offsets[mapping[packed_lane].sequence_index];
+    candidate_tjb[packed_lane] =
+        tjb[msv_profiles[mapping[packed_lane].profile_index].tjb_offset +
+            mapping[packed_lane].sequence_index];
+  }
+  const plan7_ssv_f1_profile profile =
+      msv_profiles[mapping[0].profile_index];
+  const VitProfile vit_profile = vit_profiles[mapping[0].profile_index];
+  const int sequence_length = static_cast<int>(
+      sequence_offsets[mapping[0].sequence_index + 1] - sequence_start[0]);
+#pragma unroll
+  for (int packed_lane = 1; packed_lane < 4; ++packed_lane) {
+    const int packed_length = static_cast<int>(
+        sequence_offsets[mapping[packed_lane].sequence_index + 1] -
+        sequence_start[packed_lane]);
+    if (mapping[packed_lane].profile_index != mapping[0].profile_index ||
+        packed_length != sequence_length)
+      return;
+  }
+
+  const int q_count = static_cast<int>(vit_profile.q);
+  uint32_t *dp = reinterpret_cast<uint32_t *>(
+      dp_storage + dp_offsets[group] - tile_dp_begin);
+  for (int q = 0; q < q_count; ++q)
+    dp[q * kWarpSize + lane] = 0;
+
+  unsigned tjbm_bytes[4];
+#pragma unroll
+  for (int packed_lane = 0; packed_lane < 4; ++packed_lane) {
+    const int signed_tjb = candidate_tjb[packed_lane] < 128
+        ? static_cast<int>(candidate_tjb[packed_lane])
+        : static_cast<int>(candidate_tjb[packed_lane]) - 256;
+    const int signed_tbm = profile.profile.tbm < 128
+        ? static_cast<int>(profile.profile.tbm)
+        : static_cast<int>(profile.profile.tbm) - 256;
+    tjbm_bytes[packed_lane] =
+        static_cast<unsigned>(signed_tjb + signed_tbm) & UINT32_C(0xff);
+  }
+  const uint32_t packed_tjbm = pack_u8x4(tjbm_bytes);
+  const uint32_t packed_bias =
+      static_cast<uint32_t>(profile.profile.bias) * UINT32_C(0x01010101);
+  const uint32_t packed_base =
+      static_cast<uint32_t>(profile.profile.base) * UINT32_C(0x01010101);
+  const uint32_t packed_tec =
+      static_cast<uint32_t>(profile.profile.tec) * UINT32_C(0x01010101);
+  uint32_t xJ = 0;
+  uint32_t xB = __vsubus4(packed_base, packed_tjbm);
+  unsigned active_mask = UINT32_C(0x0f);
+
+  for (int i = 0; i < sequence_length; ++i) {
+    unsigned residue[4];
+#pragma unroll
+    for (int packed_lane = 0; packed_lane < 4; ++packed_lane)
+      residue[packed_lane] =
+          residues[sequence_start[packed_lane] + static_cast<uint64_t>(i)];
+    uint32_t xE = 0;
+    uint32_t mpv = previous_lane(
+        dp[(q_count - 1) * kWarpSize + lane], lane, UINT32_C(0));
+    for (int q = 0; q < q_count; ++q) {
+      uint32_t score = __vmaxu4(mpv, xB);
+      score = __vaddus4(score, packed_bias);
+      const int model_position = q + q_count * lane;
+      unsigned cost_bytes[4] = {
+          UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX};
+      if (model_position < profile.profile.model_length) {
+#pragma unroll
+        for (int packed_lane = 0; packed_lane < 4; ++packed_lane) {
+          if (vit_profile.rbv_offset != UINT64_MAX) {
+            cost_bytes[packed_lane] = exact_rbv[
+                vit_profile.rbv_offset +
+                static_cast<uint64_t>(model_position) * 29 +
+                residue[packed_lane]];
+          } else if (residue[packed_lane] != 20 &&
+                     residue[packed_lane] != 27 &&
+                     residue[packed_lane] != 28) {
+            const unsigned raw = compact_scores[
+                profile.profile.score_offset +
+                static_cast<uint64_t>(model_position) *
+                    profile.profile.score_stride + residue[packed_lane]];
+            const int signed_score = raw < 128 ? static_cast<int>(raw)
+                                               : static_cast<int>(raw) - 256;
+            const int decoded =
+                signed_score + static_cast<int>(profile.profile.bias);
+            cost_bytes[packed_lane] = static_cast<unsigned>(
+                decoded < 0 ? 0 : (decoded > 255 ? 255 : decoded));
+          }
+        }
+      }
+      score = __vsubus4(score, pack_u8x4(cost_bytes));
+      xE = __vmaxu4(xE, score);
+      const uint32_t old = dp[q * kWarpSize + lane];
+      dp[q * kWarpSize + lane] = score;
+      mpv = old;
+    }
+    xE = warp_max_u8x4(xE);
+    const uint32_t saturated = __vaddus4(xE, packed_bias);
+#pragma unroll
+    for (int packed_lane = 0; packed_lane < 4; ++packed_lane) {
+      const unsigned bit = 1U << packed_lane;
+      if ((active_mask & bit) != 0 &&
+          ((saturated >> (packed_lane * 8)) & UINT32_C(0xff)) == UINT8_MAX) {
+        if (lane == 0)
+          msv_results[candidate_index[packed_lane]] = {
+              0, PLAN7_SSV_ERANGE, 0};
+        active_mask &= ~bit;
+      }
+    }
+    if (active_mask == 0) return;
+    xE = __vsubus4(xE, packed_tec);
+    xJ = __vmaxu4(xJ, xE);
+    xB = __vsubus4(__vmaxu4(packed_base, xJ), packed_tjbm);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int packed_lane = 0; packed_lane < 4; ++packed_lane) {
+      if ((active_mask & (1U << packed_lane)) == 0) continue;
+      const int numerator =
+          static_cast<int>((xJ >> (packed_lane * 8)) & UINT32_C(0xff)) -
+          static_cast<int>(candidate_tjb[packed_lane]) -
+          static_cast<int>(profile.profile.base);
+      msv_results[candidate_index[packed_lane]] = {
+          static_cast<int16_t>(numerator), PLAN7_SSV_OK, 0};
+    }
   }
 }
 
@@ -1327,6 +1501,12 @@ struct plan7_postfilter_workspace {
   int device_ordinal;
   std::vector<uint64_t> host_msv_offsets;
   std::vector<uint32_t> host_msv_candidate_indices;
+  std::vector<uint32_t> host_msv_execution_indices;
+  std::vector<uint32_t> host_msv_length_to_class;
+  std::vector<std::vector<uint32_t>> host_msv_length_buckets;
+  std::vector<uint32_t> host_msv_touched_length_classes;
+  const uint64_t *host_msv_length_source;
+  size_t host_msv_length_source_count;
   std::vector<uint64_t> host_vit_offsets;
   std::vector<VitLengthTransitions> host_moves;
   std::vector<size_t> msv_tiles;
@@ -1359,6 +1539,10 @@ struct plan7_postfilter_workspace {
   uint64_t full_msv_launch_candidate_count;
   uint64_t full_msv_launch_candidate_avoided_count;
   uint64_t full_msv_index_d2h_bytes;
+  uint64_t full_msv_packed_run_count;
+  uint64_t full_msv_packed_group_count;
+  uint64_t full_msv_packed_candidate_count;
+  uint64_t full_msv_scalar_candidate_count;
 };
 
 namespace {
@@ -2268,6 +2452,14 @@ extern "C" int plan7_postfilter_workspace_get_statistics(
       workspace->full_msv_launch_candidate_avoided_count;
   statistics->full_msv_index_d2h_bytes =
       workspace->full_msv_index_d2h_bytes;
+  statistics->full_msv_packed_run_count =
+      workspace->full_msv_packed_run_count;
+  statistics->full_msv_packed_group_count =
+      workspace->full_msv_packed_group_count;
+  statistics->full_msv_packed_candidate_count =
+      workspace->full_msv_packed_candidate_count;
+  statistics->full_msv_scalar_candidate_count =
+      workspace->full_msv_scalar_candidate_count;
   const size_t capacities[PLAN7_POSTFILTER_CAPACITY_COUNT] = {
       workspace->states_capacity,
       workspace->bias_inputs_capacity,
@@ -2407,9 +2599,18 @@ int postfilter_candidates_device_with_workspace_impl(
   const bool compact_full_msv =
       !force_legacy_full_msv && candidate_count <= UINT32_MAX &&
       (force_compact_full_msv || candidate_count >= 65536);
+  const char *full_msv_arithmetic =
+      std::getenv("PLAN7_GPU_FULL_MSV_ARITHMETIC");
+  const bool force_scalar_full_msv =
+      full_msv_arithmetic != nullptr &&
+      std::strcmp(full_msv_arithmetic, "scalar") == 0;
+  const bool allow_packed_full_msv =
+      compact_full_msv && !force_scalar_full_msv;
   std::vector<uint64_t> &host_msv_offsets = workspace->host_msv_offsets;
   std::vector<uint32_t> &host_msv_candidate_indices =
       workspace->host_msv_candidate_indices;
+  std::vector<uint32_t> &host_msv_execution_indices =
+      workspace->host_msv_execution_indices;
   std::vector<uint64_t> &host_vit_offsets = workspace->host_vit_offsets;
   std::vector<VitLengthTransitions> &host_moves = workspace->host_moves;
   std::vector<size_t> &msv_tiles = workspace->msv_tiles;
@@ -2421,6 +2622,7 @@ int postfilter_candidates_device_with_workspace_impl(
     if (compact_full_msv) {
       host_msv_offsets.clear();
       host_msv_candidate_indices.clear();
+      host_msv_execution_indices.clear();
     } else {
       host_msv_offsets.assign(candidate_count + 1, 0);
     }
@@ -2624,6 +2826,41 @@ int postfilter_candidates_device_with_workspace_impl(
     ++workspace->full_msv_compaction_run_count;
     saturating_counter_add(candidate_count,
                            &workspace->full_msv_compaction_source_count);
+    if (allow_packed_full_msv &&
+        (workspace->host_msv_length_source != host_sequence_lengths ||
+         workspace->host_msv_length_source_count != sequence_count)) {
+      try {
+        workspace->host_msv_length_to_class.assign(
+            kMaximumTargetLength + 1, UINT32_MAX);
+        workspace->host_msv_length_buckets.clear();
+        for (size_t sequence = 0; sequence < sequence_count; ++sequence) {
+          const uint64_t length = host_sequence_lengths[sequence];
+          if (length > kMaximumTargetLength) {
+            set_error(error, error_size,
+                      "packed full-MSV target length is invalid");
+            return -1;
+          }
+          uint32_t &length_class =
+              workspace->host_msv_length_to_class[length];
+          if (length_class == UINT32_MAX) {
+            if (workspace->host_msv_length_buckets.size() >= UINT32_MAX) {
+              set_error(error, error_size,
+                        "packed full-MSV length-class count overflow");
+              return -1;
+            }
+            length_class = static_cast<uint32_t>(
+                workspace->host_msv_length_buckets.size());
+            workspace->host_msv_length_buckets.emplace_back();
+          }
+        }
+        workspace->host_msv_length_source = host_sequence_lengths;
+        workspace->host_msv_length_source_count = sequence_count;
+      } catch (...) {
+        set_error(error, error_size,
+                  "packed full-MSV length-class allocation failed");
+        return -1;
+      }
+    }
     for (size_t source_begin = 0; source_begin < candidate_count;) {
       const size_t source_count = std::min(
           kFullMsvCompactSourceChunk, candidate_count - source_begin);
@@ -2728,46 +2965,141 @@ int postfilter_candidates_device_with_workspace_impl(
         }
       }
 
+      size_t packed_group_count = 0;
+      size_t packed_candidate_count = 0;
+      size_t scalar_candidate_count = selected_count;
       uint64_t chunk_maximum_msv_bytes = 0;
       try {
-        host_msv_offsets.assign(selected_count + 1, 0);
-        msv_tiles.clear();
-        msv_tiles.push_back(0);
+        host_msv_execution_indices.clear();
+        host_msv_execution_indices.reserve(selected_count);
+        if (allow_packed_full_msv) {
+          for (auto &bucket : workspace->host_msv_length_buckets)
+            bucket.clear();
+          size_t scalar_write = 0;
+          for (size_t profile_begin = 0;
+               profile_begin < selected_count;) {
+            const uint32_t profile_index = host_candidates[
+                host_msv_candidate_indices[profile_begin]].profile_index;
+            size_t profile_end = profile_begin + 1;
+            while (profile_end < selected_count &&
+                   host_candidates[host_msv_candidate_indices[profile_end]].
+                           profile_index == profile_index)
+              ++profile_end;
+            workspace->host_msv_touched_length_classes.clear();
+            for (size_t selected = profile_begin;
+                 selected < profile_end; ++selected) {
+              const uint32_t candidate =
+                  host_msv_candidate_indices[selected];
+              const plan7_bias_candidate mapping = host_candidates[candidate];
+              const uint64_t length =
+                  host_sequence_lengths[mapping.sequence_index];
+              const uint32_t length_class =
+                  workspace->host_msv_length_to_class[length];
+              if (length_class >=
+                  workspace->host_msv_length_buckets.size()) {
+                set_error(error, error_size,
+                          "packed full-MSV length class is invalid");
+                return -1;
+              }
+              auto &bucket =
+                  workspace->host_msv_length_buckets[length_class];
+              if (bucket.empty())
+                workspace->host_msv_touched_length_classes.push_back(
+                    length_class);
+              bucket.push_back(candidate);
+            }
+            for (const uint32_t length_class :
+                 workspace->host_msv_touched_length_classes) {
+              auto &bucket =
+                  workspace->host_msv_length_buckets[length_class];
+              const size_t groupable = (bucket.size() / 4) * 4;
+              host_msv_execution_indices.insert(
+                  host_msv_execution_indices.end(), bucket.begin(),
+                  bucket.begin() + groupable);
+              for (size_t scalar = groupable; scalar < bucket.size();
+                   ++scalar)
+                host_msv_candidate_indices[scalar_write++] = bucket[scalar];
+              bucket.clear();
+            }
+            profile_begin = profile_end;
+          }
+          packed_candidate_count = host_msv_execution_indices.size();
+          packed_group_count = packed_candidate_count / 4;
+          scalar_candidate_count = scalar_write;
+          host_msv_execution_indices.insert(
+              host_msv_execution_indices.end(),
+              host_msv_candidate_indices.begin(),
+              host_msv_candidate_indices.begin() + scalar_write);
+        } else {
+          host_msv_execution_indices.assign(
+              host_msv_candidate_indices.begin(),
+              host_msv_candidate_indices.end());
+        }
+        if (host_msv_execution_indices.size() != selected_count) {
+          set_error(error, error_size,
+                    "packed full-MSV candidate partition is invalid");
+          return -1;
+        }
+
+        const size_t work_unit_count =
+            packed_group_count + scalar_candidate_count;
+        host_msv_offsets.assign(work_unit_count + 1, 0);
         const auto &profiles = database_host_profiles(database);
-        for (size_t selected = 0; selected < selected_count; ++selected) {
-          const size_t candidate = host_msv_candidate_indices[selected];
+        for (size_t work = 0; work < work_unit_count; ++work) {
+          const bool packed = work < packed_group_count;
+          const size_t execution_position = packed
+              ? work * 4
+              : packed_candidate_count + work - packed_group_count;
+          const size_t candidate =
+              host_msv_execution_indices[execution_position];
           const plan7_bias_candidate mapping = host_candidates[candidate];
-          const uint64_t msv_cells =
+          uint64_t msv_bytes =
               static_cast<uint64_t>(profiles[mapping.profile_index].q) *
               kWarpSize;
-          if (!checked_add(host_msv_offsets[selected], msv_cells,
-                           &host_msv_offsets[selected + 1])) {
+          if (packed && !checked_multiply(msv_bytes, 4, &msv_bytes)) {
+            set_error(error, error_size,
+                      "packed full-MSV DP size overflow");
+            return -1;
+          }
+          if (!checked_add(host_msv_offsets[work], msv_bytes,
+                           &host_msv_offsets[work + 1])) {
             set_error(error, error_size,
                       "compact full-MSV DP offset overflow");
             return -1;
           }
         }
-        for (size_t begin = 0; begin < selected_count;) {
-          size_t end = begin + 1;
-          while (end < selected_count &&
-                 host_msv_offsets[end + 1] - host_msv_offsets[begin] <=
-                     kDpByteLimit)
-            ++end;
-          chunk_maximum_msv_bytes = std::max(
-              chunk_maximum_msv_bytes,
-              host_msv_offsets[end] - host_msv_offsets[begin]);
-          msv_tiles.push_back(end);
-          begin = end;
-        }
+        msv_tiles.clear();
+        msv_tiles.push_back(0);
+        const auto append_tiles = [&](size_t range_begin,
+                                      size_t range_end) {
+          for (size_t begin = range_begin; begin < range_end;) {
+            size_t end = begin + 1;
+            while (end < range_end &&
+                   host_msv_offsets[end + 1] - host_msv_offsets[begin] <=
+                       kDpByteLimit)
+              ++end;
+            chunk_maximum_msv_bytes = std::max(
+                chunk_maximum_msv_bytes,
+                host_msv_offsets[end] - host_msv_offsets[begin]);
+            msv_tiles.push_back(end);
+            begin = end;
+          }
+        };
+        append_tiles(0, packed_group_count);
+        if (msv_tiles.back() != packed_group_count)
+          msv_tiles.push_back(packed_group_count);
+        append_tiles(packed_group_count, work_unit_count);
       } catch (...) {
         set_error(error, error_size,
                   "compact full-MSV execution plan allocation failed");
         return -1;
       }
+      const size_t work_unit_count =
+          packed_group_count + scalar_candidate_count;
       size_t selected_offset_bytes;
       if (chunk_maximum_msv_bytes > kDpByteLimit ||
           chunk_maximum_msv_bytes > SIZE_MAX ||
-          !checked_bytes(selected_count + 1, sizeof(uint64_t),
+          !checked_bytes(work_unit_count + 1, sizeof(uint64_t),
                          &selected_offset_bytes) ||
           selected_offset_bytes > offset_capacity_bytes) {
         set_error(error, error_size,
@@ -2783,20 +3115,50 @@ int postfilter_candidates_device_with_workspace_impl(
         return -1;
       auto *device_selected_offsets = reinterpret_cast<uint64_t *>(
           msv_storage + offset_start);
+      CUDA_RUN(cudaMemcpy(device_selected,
+                          host_msv_execution_indices.data(),
+                          selected_index_bytes, cudaMemcpyHostToDevice));
       CUDA_RUN(cudaMemcpy(device_selected_offsets, host_msv_offsets.data(),
                           selected_offset_bytes, cudaMemcpyHostToDevice));
+      if (packed_group_count != 0) {
+        ++workspace->full_msv_packed_run_count;
+        saturating_counter_add(packed_group_count,
+                               &workspace->full_msv_packed_group_count);
+        saturating_counter_add(packed_candidate_count,
+                               &workspace->full_msv_packed_candidate_count);
+      }
+      saturating_counter_add(scalar_candidate_count,
+                             &workspace->full_msv_scalar_candidate_count);
       for (size_t tile = 0; tile + 1 < msv_tiles.size(); ++tile) {
         const size_t tile_begin = msv_tiles[tile];
         const size_t tile_count = msv_tiles[tile + 1] - tile_begin;
-        full_msv_kernel<<<
-            static_cast<unsigned>((tile_count - 1) / kWarpsPerBlock + 1),
-            kThreads>>>(
-            device_residues, device_sequence_offsets, device_compact_scores,
-            database->device_exact_rbv, device_f1_profiles,
-            database->device_profiles, device_tjb, device_candidates,
-            device_selected, device_selected_offsets, tile_begin, tile_count,
-            host_msv_offsets[tile_begin],
-            static_cast<uint8_t *>(workspace->device_dp), device_msv_inputs);
+        if (tile_count == 0) continue;
+        if (tile_begin < packed_group_count) {
+          full_msv_packed_kernel<<<
+              static_cast<unsigned>((tile_count - 1) / kWarpsPerBlock + 1),
+              kThreads>>>(
+              device_residues, device_sequence_offsets,
+              device_compact_scores, database->device_exact_rbv,
+              device_f1_profiles, database->device_profiles, device_tjb,
+              device_candidates, device_selected, device_selected_offsets,
+              tile_begin, tile_count, host_msv_offsets[tile_begin],
+              static_cast<uint8_t *>(workspace->device_dp),
+              device_msv_inputs);
+        } else {
+          const size_t scalar_begin = tile_begin - packed_group_count;
+          full_msv_kernel<<<
+              static_cast<unsigned>((tile_count - 1) / kWarpsPerBlock + 1),
+              kThreads>>>(
+              device_residues, device_sequence_offsets,
+              device_compact_scores, database->device_exact_rbv,
+              device_f1_profiles, database->device_profiles, device_tjb,
+              device_candidates,
+              device_selected + packed_candidate_count,
+              device_selected_offsets + packed_group_count, scalar_begin,
+              tile_count, host_msv_offsets[tile_begin],
+              static_cast<uint8_t *>(workspace->device_dp),
+              device_msv_inputs);
+        }
         CUDA_RUN(cudaGetLastError());
       }
     }

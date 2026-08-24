@@ -298,6 +298,52 @@ class CudaPostfilterTests(unittest.TestCase):
             4 * compact["full_msv_compaction_selected_count"],
         )
 
+    def test_packed_full_msv_matches_scalar_rows_exactly(self):
+        with pyhmmer.plan7.HMMFile(HMM_20AA) as hmm_file:
+            hmm = hmm_file.read()
+        background = pyhmmer.plan7.Background(hmm.alphabet)
+        profile = hmm.to_profile(background, L=5).to_optimized()
+        sequences = digitize(profile, ["ACDEX"] * 8 + ["ACDEX" * 3] * 5)
+        packed = _pack_profiles([profile])
+        packed_bias, mu, lambda_ = bias_inputs(background, [profile], 1.0)
+
+        def run(arithmetic):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PLAN7_GPU_FULL_MSV_POLICY": "compact",
+                    "PLAN7_GPU_FULL_MSV_ARITHMETIC": arithmetic,
+                },
+            ):
+                with _native.ViterbiProfiles([profile]) as resident:
+                    with native_batch(sequences) as batch:
+                        records, offsets = (
+                            batch.postfilter_candidates_many_csr_raw(
+                                *packed,
+                                mu,
+                                lambda_,
+                                1.0,
+                                packed_bias,
+                                [profile],
+                                resident,
+                            )
+                        )
+                        statistics = dict(batch.workspace_statistics)
+            return bytes(records), list(offsets), statistics
+
+        scalar_records, scalar_offsets, scalar = run("scalar")
+        packed_records, packed_offsets, packed_stats = run("packed")
+        self.assertEqual(packed_offsets, scalar_offsets)
+        self.assertEqual(packed_records, scalar_records)
+        selected = packed_stats["full_msv_compaction_selected_count"]
+        self.assertEqual(selected, 13)
+        self.assertEqual(scalar["full_msv_packed_run_count"], 0)
+        self.assertEqual(scalar["full_msv_scalar_candidate_count"], selected)
+        self.assertEqual(packed_stats["full_msv_packed_run_count"], 1)
+        self.assertEqual(packed_stats["full_msv_packed_group_count"], 3)
+        self.assertEqual(packed_stats["full_msv_packed_candidate_count"], 12)
+        self.assertEqual(packed_stats["full_msv_scalar_candidate_count"], 1)
+
     def test_versioned_abi_and_direct_prefix(self):
         self.assertEqual(_native.POSTFILTER_RECORD_VERSION, 1)
         self.assertEqual(_native.POSTFILTER_RESULT_SIZE, 16)

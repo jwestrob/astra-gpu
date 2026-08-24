@@ -1903,6 +1903,14 @@ plan7_ssv_sequence_batch_get_workspace_statistics(
       postfilter.full_msv_launch_candidate_avoided_count;
     statistics->full_msv_index_d2h_bytes =
       postfilter.full_msv_index_d2h_bytes;
+    statistics->full_msv_packed_run_count =
+      postfilter.full_msv_packed_run_count;
+    statistics->full_msv_packed_group_count =
+      postfilter.full_msv_packed_group_count;
+    statistics->full_msv_packed_candidate_count =
+      postfilter.full_msv_packed_candidate_count;
+    statistics->full_msv_scalar_candidate_count =
+      postfilter.full_msv_scalar_candidate_count;
   }
   if (batch->forward_workspace != nullptr) {
     plan7_forward_workspace_statistics forward{};
