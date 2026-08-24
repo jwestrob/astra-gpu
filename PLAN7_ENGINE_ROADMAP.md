@@ -46,11 +46,17 @@ the complete oracle suite and representative end-to-end workloads.
 | 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | complete; production performance rejected | through `039c092` | exact full job 1182349 was 3.82% slower despite 41.35% fewer packet bytes |
 | 1B | Produce sparse certificate before dense host materialization | complete; retained opt-in | through `87727cd` | jobs 1182389/1182391 exact; one-pass wall 536.168 s, 1.84% faster than dense, zero dense-v2 retention |
 | 2 | Device-side stable F1 candidate compaction | complete; retained | through `959cdf6` | job 1182619 exact; 83 device compactions, zero host expansions/uploads; no standalone speedup claim |
-| 3 | Device-resident Forward -> Backward/domain -> rescore chain | active; first slice retained | through `c24697a` | job 1182690 exact; resident Forward-to-Backward handoff saved 4.546 s versus Phase 2 |
-| 4 | Forward/Backward/rescore candidates-per-warp variants | blocked on 3 | pending | pending |
-| 5+ | Profile-axis SSV, cohorts, packed integer DP, certified F0/GA/index research | deferred | pending | pending |
+| 3 | Device-resident Forward -> Backward/domain -> rescore chain | partial; validated residency slices retained | through `171d544` | jobs 1182690/1182713 exact; redundant Forward and region replay removed, compiled F3 authoritative |
+| 4 | Forward/Backward/rescore candidates-per-warp variants | complete; automatic promotion rejected | through `a8932dd` | exact, but full job 1182718 regressed 0.72%; production restored to width 1 |
+| 5 | Profile-axis packed SSV | complete; retained | through `9730f39` | exact job 1182734: 455.026 s, 14.98% faster than retained Phase 3 |
+| 6 | Length-cohort decision metadata | complete; retained | through `cfd756c` | exact job 1182743: 454.247 s; transition H2D reduced 24.92 MB -> 0.12 MB |
+| 7 | Packed integer MSV/Viterbi | MSV retained; Viterbi rejected | through `f5ac24a` | packed MSV exact/flat at 454.007 s; packed Viterbi exact but slower and larger, so excluded from `main` |
+| 8 | Certified reduced-alphabet F0 | active; evaluator only | pending | prove zero false negatives and measure selectivity/cost before any production integration |
+| 9 | GA-specialized certified pruning | pending research | pending | source proof and reject census required before implementation |
+| 10 | Mandatory-seed/global-profile index | pending research | pending | optional/cached only; formal sensitivity proof required |
+| 11 | Internal GPU execution policy | pending | pending | deterministic policy only after multiple retained GPU algorithms exist |
 
-## Active work: Phase 0
+## Phase 0 design and result
 
 ### Hypothesis
 
@@ -78,7 +84,7 @@ reason-by-row counts, reason-by-work estimates, and attributable CPU wall time.
   source transition; unknown cases fail closed into an explicit `other` bucket.
 - Unit and CUDA-hidden integration tests pass before any GPU benchmark launch.
 
-## Next work: Phase 1A
+## Phase 1A design and result
 
 ### Hypothesis
 
@@ -254,6 +260,36 @@ Job `1182771` reproduced the exact 39,010,327-byte output. It packed
 matched quartets and retained 16,601,562 scalar leftovers. Request wall was
 454.007 seconds, 0.391% faster than the unpacked compaction run and effectively
 tied with Phase 6. The packed implementation is retained as exact,
-non-regressing infrastructure. Phase 7 now targets Viterbi, which executed
-202,849,174 rows on the sealed workload and therefore offers substantially
-more arithmetic work to densify.
+non-regressing infrastructure.
+
+## Phase 7 packed Viterbi result: rejected
+
+Job `1182783` reproduced the exact 39,010,327-byte output, but it completed in
+454.963 seconds versus 454.007 seconds for packed full MSV: 0.957 seconds
+(0.211%) slower. Peak sampled H200 memory remained 3,390 MiB, while maximum
+RSS increased by 94,836 KiB to 13,340,692 KiB. The packed path handled
+191,687,950 candidates and left 11,983,159 scalar, but it also uploaded
+814,684,436 bytes of execution-index metadata.
+
+The experiment is rejected. Its implementation commit, `61c3545`, is kept on
+an isolated branch for evidence and is deliberately not an ancestor of
+`main`. Phase 8 starts from retained commit `f5ac24a`, before packed Viterbi.
+The immutable run evidence is under
+`build/h200-phase7-packed-viterbi-20260824/attempt-03-full/runs/h200-full`.
+
+## Remaining implementation order
+
+1. Phase 8: evaluate certified reduced-alphabet F0 offline. Integrate only if
+   the proof is exact, false negatives are zero, and saved SSV work clearly
+   exceeds added runtime and memory.
+2. Phase 9: census GA-specialized early rejects only after proving a valid
+   upper bound from exact HMMER scoring semantics.
+3. Phase 10: keep mandatory-seed/global-profile indexing as an optional
+   research path with a formal sensitivity proof and no small-workload tax.
+4. Phase 11: add a deterministic internal GPU policy only for validated GPU
+   algorithms; retain force-policy controls and the simple path.
+
+Every retained full-workload result will continue to report exact output
+identity, request/generation/continuation/overlap timing, peak H200 memory,
+maximum RSS, and material workspace or transfer changes. Flat runtime with a
+real memory reduction is a positive result and will be recorded as such.
