@@ -52,7 +52,10 @@ def sha256(value: bytes) -> str:
 
 def git_output(*arguments: str) -> str:
     return subprocess.check_output(
-        ("git", *arguments), text=True, stderr=subprocess.DEVNULL
+        ("git", *arguments),
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        stderr=subprocess.DEVNULL,
     ).strip()
 
 
