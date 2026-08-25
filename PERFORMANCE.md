@@ -4,7 +4,11 @@ This file is the compact, source-controlled performance record for external revi
 
 ## Exact implementation under review
 
-- Native `plan7_gpu`: commit `614161a4d24c05564b863a0d1b67f0b2f26aeaf1`, tree `cf2eab3a8b50ba989132110003d482b9e6b5924f`.
+- Native `plan7_gpu` retained source: commit
+  `2fc2a927aa19a9a72feb30d03809924068d0eb5b`, tree
+  `70c1944ae6a170b22a24038004ac59ba111dc735`.  The original sealed
+  architectural baseline remains commit
+  `614161a4d24c05564b863a0d1b67f0b2f26aeaf1`.
 - Astra persistent profile cache and weighted ready queue: commit `3996a60e765315ad9286ffab14ae67141ab19762`, tree `bba6afeb56af6c0568e07f0310508b78353770db`, included under `integrations/astra/`.
 - The byte-bounded queue requires the native `CandidateBatch.resident_bytes` API introduced at native commit `614161a`.
 - Private patched-PyHMMER ABI: `d4867ff865e9b8a7acdbbf9106e3d7e1223336d374cb0f46d7e352427b990689`.
@@ -37,6 +41,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, Phase 6 length-class metadata | 64 host workers | **454.247490 s** | 13,305,384 KiB | **exact; 1.5472x faster than Astra CPU64** |
 | Astra GPU, H200, Phase 7 packed full MSV | 64 host workers | **454.006856 s** | 13,245,856 KiB | exact; effectively tied with Phase 6 |
 | Astra GPU, H200, Phase 9 certified GA pruning | 64 host workers | **449.104112 s** | 13,159,348 KiB | **exact; 1.5649x faster than Astra CPU64; new best** |
+| Astra GPU, H200, Phase 11 automatic policy | 64 host workers | 451.083043 s | 13,380,000 KiB | exact; 0.441% slower than Phase 9, with 22 MiB less sampled H200 memory |
 | Rejected experiment: packed Viterbi | 64 host workers | 454.963381 s | 13,340,692 KiB | exact, but 0.211% slower and 94,836 KiB larger; excluded from `main` |
 
 Additional GPU timing layers:
@@ -168,6 +173,28 @@ enumeration cap; incomplete samples extrapolate to at least 65.6 GiB across
 Pfam before index overhead. Production integration is rejected; runtime and
 production memory remain unchanged.
 
+Phase 11 H200 job `1183478` validated the deterministic internal GPU policy
+across six workload shapes and three policy modes.  Every mode produced
+byte-identical complete postfilter records and offsets; the checked first and
+last profiles also produced byte-identical HMMER target/domain output.
+Automatic dispatch selected only the retained profile-packing, length-class,
+and full-MSV-compaction paths and kept Forward at width 1.  On the 512-profile
+x 4,096-target shape, warm generation was 240.914 ms under `auto` versus
+267.299 ms under `simple` (9.871% faster), with 379,930,221 versus 371,639,229
+persistent device bytes (8,290,992 bytes / 2.231% more).  One- and ten-profile
+workloads were effectively flat and added only eight bytes under `auto`.
+Complete cold/warm timing and persistent-memory results are recorded in
+`PHASE11_EXECUTION_POLICY.md`.
+
+Phase 11 full H200 job `1183483` reproduced the exact 39,010,327-byte output
+in 451.083 seconds: 340.362 seconds generation, 443.659 seconds pipeline wall,
+400.408 seconds continuation/output, and 297.237 seconds overlap.  This was
+1.979 seconds (0.441%) slower than the Phase 9 best, so no full-workload speed
+claim is made.  Maximum RSS was 13,380,000 KiB (+1.677%), while peak sampled
+H200 memory was 3,370 MiB, 22 MiB lower than Phase 9.  The execution policy is
+retained for deterministic workload-shape selection and small-workload
+protection; Phase 9 remains the fastest full run.
+
 ## GPU request-stage ledger
 
 The measured 546.220704615 s request decomposed as follows:
@@ -246,6 +273,8 @@ These paths exist in the development workspace and are excluded from Git because
 - Phase 8 reduced-alphabet F0 census: `build/phase8-f0-evaluator-h200-20260824/attempt-02/result.json`, SHA-256 `071822c93880ad98a190e0fdd2593c14c514acb786c1968b41a5b1dd7afc960d`.
 - Phase 9 certified-GA-pruning full run: `build/h200-phase9-ga-pruning-20260824/attempt-01-full/runs/h200-full`; worker SHA-256 `e7930b72344676ca96d5d43fc97daa45fd8c6b2e066a8588efe732d199ab9320`, raw-validation SHA-256 `4c71eab4bd7eac4359f434baf0fcdf688e82b00c62872c607b771e86ced53245`.
 - Phase 10 mandatory-seed census: `build/phase10-mandatory-seed-h200-20260825/attempt-01/result.json`, SHA-256 `d3ee2d8b1db0f62c78c0af0ba268829d33c3b661d62e2e499b8ca98d8c1ce61d`.
+- Phase 11 execution-policy matrix: `build/phase11-execution-policy-h200-20260825/attempt-03/result.json`, SHA-256 `337a225ec8e0faaf8252eebcf1d9d2c6df1514f762aa87ff8e748ed0d06a2ca4`.
+- Phase 11 exact full run: `build/h200-phase11-policy-full-20260825/attempt-03-full/runs/h200-full`; worker SHA-256 `97a86813e92dc0404b2bd9efca9bfe77eb2b009166520c1012ccdb897a7ea0e7`, raw-validation SHA-256 `a0dcdb393aea7f6f598e0931ed24eeb549b54b7ee36a4839c8689c35ad5a0d3f`.
 - CPU48 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu48/artifact.sha256`, manifest SHA-256 `9e6d4d96073c565a9b61fac5b804f98dd5f7ec57dd67af07c5a289b198dadd42`.
 - CPU64 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu64/artifact.sha256`, manifest SHA-256 `e3a2e4cd5674addfe347aa8c4604571a5bdc38f14b8e9fdade60f71cf5f35b46`.
 - CPU semantic normalization report: `build/astra-full-plm-pfam-cpu-comparison-20260817/runs/validation-01/comparison.json`, SHA-256 `78bee4fd2d03c2658d0779345893f89e6dc3777f1a380123a85c25c9a9b2525`.

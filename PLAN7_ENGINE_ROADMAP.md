@@ -53,8 +53,8 @@ the complete oracle suite and representative end-to-end workloads.
 | 7 | Packed integer MSV/Viterbi | MSV retained; Viterbi rejected | through `f5ac24a` | packed MSV exact/flat at 454.007 s; packed Viterbi exact but slower and larger, so excluded from `main` |
 | 8 | Certified reduced-alphabet F0 | complete; production rejected | through `913be5d` | exact job 1182800: best codebook certified only 0.145% of cells while F0 cost about 1.9x exact packed F1 |
 | 9 | GA-specialized certified pruning | complete; retained for gathering cutoffs | through `c5eec74` | exact job 1182813: 449.104 s, 1.08% faster than prior best, 117,545 target rows certified |
-| 10 | Mandatory-seed/global-profile index | complete; production rejected | `8380af4` | exact job 1183467: zero false rejects, but best bound certified only 0.494% of cells and cost 5.85x exact F1 |
-| 11 | Internal GPU execution policy | pending | pending | deterministic policy only after multiple retained GPU algorithms exist |
+| 10 | Mandatory-seed/global-profile index | complete; production rejected | `786d1a6` | exact job 1183467: zero false rejects, but best bound certified only 0.494% of cells and cost 5.85x exact F1 |
+| 11 | Internal GPU execution policy | complete; retained | `2fc2a92` | exact six-shape H200 job 1183478: large-by-large auto policy was 9.871% faster than simple with 2.231% more persistent device memory |
 
 ## Phase 0 design and result
 
@@ -309,10 +309,54 @@ hit their enumeration caps; their incomplete payload extrapolates to at least
 Production integration is rejected. The exact proof and evaluator are retained
 as evidence; no index build or scan cost is imposed on any workload.
 
-## Remaining implementation order
+## Phase 11 deterministic execution-policy result
 
-1. Phase 11: add a deterministic internal GPU policy only for validated GPU
-   algorithms; retain force-policy controls and the simple path.
+Every `SequenceBatch` now owns an immutable `auto`, `simple`, or diagnostic
+`throughput` GPU policy.  `auto` chooses only retained exact algorithms using
+small, inspectable workload-shape thresholds; hardware selection remains the
+caller's responsibility.  Rejected Forward widths, packed Viterbi, F0, and
+mandatory-seed experiments cannot be selected.  Force-policy controls and the
+unchanged scalar/query-major route remain available for audit and small work.
+
+H200 job `1183478` ran the required tiny, one-profile/large-target,
+ten-profile/large-target, hundred-profile/medium-target,
+large-profile/small-target, and large-by-large matrix.  All three policies
+produced identical complete postfilter records/offsets and identical HMMER
+target/domain output on the checked boundary profiles.  Automatic route
+counters matched every declared threshold and kept Forward at width 1.
+
+Warm large-by-large generation was 240.914 ms under `auto` versus 267.299 ms
+under `simple`, a 9.871% improvement, while persistent H200 allocation rose
+8,290,992 bytes (2.231%).  One- and ten-profile cases were effectively flat
+with only eight additional bytes.  The 512-profile x 16-target case was also
+flat in runtime and paid a bounded 3.19 MiB packed-profile cache cost.  Phase
+11 is retained.  Exact cold/warm timings and memory for all 18 arms are in
+`PHASE11_EXECUTION_POLICY.md`.
+
+Full H200 job `1183483` confirmed exact production behavior across the full
+Pfam workload.  Request wall was 451.083 seconds, 0.441% slower than the Phase
+9 best, while sampled H200 memory fell 22 MiB to 3,370 MiB.  This is a flat
+end-to-end result rather than an additional speedup; Phase 9 remains the best
+full-workload measurement.  The policy is retained because it chooses among
+validated GPU algorithms without burdening the one/few-profile paths.
+
+## Roadmap status
+
+All numbered implementation and research phases have now produced an exact
+oracle result and an explicit retain/reject decision.  This closes the numbered
+experiment sequence, but not the primary device-resident architecture: Phase
+3 remains deliberately marked partial in the ledger.  Production still
+downloads full postfilter results before Forward selection, preserves host
+Forward and Backward materializations for the sparse journal, and allocates
+Backward/rescore workspaces per generation.  Those remaining host boundaries
+must be removed or explicitly rejected by measurement before the overall
+engine objective can be called complete.
+
+The retained production line contains only strategies that preserved HMMER
+semantics and survived their stated gates; rejected strategies remain
+audit-only or isolated.  The next engineering work returns to the unfinished
+Phase 3 boundary while retaining the Phase 11 policy as its workload-shape
+dispatcher.
 
 Every retained full-workload result will continue to report exact output
 identity, request/generation/continuation/overlap timing, peak H200 memory,

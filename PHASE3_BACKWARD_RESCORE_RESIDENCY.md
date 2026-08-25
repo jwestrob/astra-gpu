@@ -48,6 +48,9 @@ slice is promoted.
 
 ## Status
 
-Provisionally retained for H200 validation.  This does not remove the host
+Retained after the combined exact H200 full-workload job `1182713`, recorded
+in `PHASE3_EXACT_F3_THRESHOLD.md`.  All 83 chunks used the resident rescore
+handoff with zero legacy upstream H2D bytes and zero allocation fallbacks;
+21,425,952 bytes of replay were eliminated.  This does not remove the host
 Backward journal, move rescore cap planning to the device, retain rescore
 outputs for final egress, or introduce a persistent workspace.
