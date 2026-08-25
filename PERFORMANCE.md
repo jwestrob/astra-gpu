@@ -158,6 +158,16 @@ packed-MSV run, request wall improved by 4.903 seconds (1.080%) and maximum RSS
 fell 86,508 KiB (0.65%) to 13,159,348 KiB. Peak sampled H200 memory was
 effectively flat at 3,392 MiB. The exact GA-pruning path is retained.
 
+Phase 10 H200 job `1183467` evaluated a formally exact mandatory-word/global-
+index certificate across all 27,481 Pfam profiles and the immutable first
+1,000 targets. Word lengths 1/2/4/8/16/32 all retained the same 879,857 exact
+F1 candidates with zero false rejects. The best 32-residue bound certified
+only 0.493672% of logical SSV cells and its 3.977-second kernel cost 5.85 times
+the 0.680-second exact packed F1 generation. Every sampled dictionary hit its
+enumeration cap; incomplete samples extrapolate to at least 65.6 GiB across
+Pfam before index overhead. Production integration is rejected; runtime and
+production memory remain unchanged.
+
 ## GPU request-stage ledger
 
 The measured 546.220704615 s request decomposed as follows:
@@ -235,6 +245,7 @@ These paths exist in the development workspace and are excluded from Git because
 - Rejected packed-Viterbi full run: `build/h200-phase7-packed-viterbi-20260824/attempt-03-full/runs/h200-full`; worker SHA-256 `3f47ae09605d23dce158e5a0d6ebe7606221ee2ab7c08e9840aa6c5c94daf10d`, raw-validation SHA-256 `2192571756e5dda6daef9c4b42bc310ef05cfac961d86c9aa6ebdd25489e13c6`.
 - Phase 8 reduced-alphabet F0 census: `build/phase8-f0-evaluator-h200-20260824/attempt-02/result.json`, SHA-256 `071822c93880ad98a190e0fdd2593c14c514acb786c1968b41a5b1dd7afc960d`.
 - Phase 9 certified-GA-pruning full run: `build/h200-phase9-ga-pruning-20260824/attempt-01-full/runs/h200-full`; worker SHA-256 `e7930b72344676ca96d5d43fc97daa45fd8c6b2e066a8588efe732d199ab9320`, raw-validation SHA-256 `4c71eab4bd7eac4359f434baf0fcdf688e82b00c62872c607b771e86ced53245`.
+- Phase 10 mandatory-seed census: `build/phase10-mandatory-seed-h200-20260825/attempt-01/result.json`, SHA-256 `d3ee2d8b1db0f62c78c0af0ba268829d33c3b661d62e2e499b8ca98d8c1ce61d`.
 - CPU48 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu48/artifact.sha256`, manifest SHA-256 `9e6d4d96073c565a9b61fac5b804f98dd5f7ec57dd67af07c5a289b198dadd42`.
 - CPU64 raw manifest: `build/astra-full-plm-pfam-slurm-20260817/attempt-02-reviewed-retry/runs/cpu64/artifact.sha256`, manifest SHA-256 `e3a2e4cd5674addfe347aa8c4604571a5bdc38f14b8e9fdade60f71cf5f35b46`.
 - CPU semantic normalization report: `build/astra-full-plm-pfam-cpu-comparison-20260817/runs/validation-01/comparison.json`, SHA-256 `78bee4fd2d03c2658d0779345893f89e6dc3777f1a380123a85c25c9a9b2525`.

@@ -68,8 +68,10 @@ word of length `1..K` that reaches this threshold is therefore also exact.
 The census evaluates several `K` values; small thresholds are expected to
 produce common words and are an explicit negative-result condition.
 
-Only the 20 canonical protein residues are indexed initially.  A target with
-any degenerate/noncanonical code is unresolved and runs exact SSV.  Enumeration
+The CUDA census includes the complete 29-code HMMER amino alphabet. The
+dictionary-size probe deliberately uses only the 20 canonical residues, so it
+is a lower bound; a production index would also need explicit degenerate/stop
+handling or would fail those affected targets open to exact SSV. Enumeration
 limits likewise fail open for the entire profile/length cohort.
 
 ## Evaluator gate
@@ -88,3 +90,39 @@ Production integration requires zero false negatives and a convincing
 reduction after index-build, scan, candidate deduplication, and exact-SSV costs.
 If the mandatory dictionary or emitted candidate set is too large, record the
 negative result and leave the production path unchanged.
+
+## H200 result and decision
+
+Job `1183467` evaluated word lengths 1/2/4/8/16/32 across all 27,481 Pfam
+profiles and the immutable first 1,000 targets (27,481,000 logical pairs and
+1,182,809,892,909 logical SSV cells). Every arm retained all 879,857 exact F1
+candidates with zero false rejects and zero unsupported pairs, proving the
+compiled threshold and bounded-window certificate on the real workload.
+
+The bound is too weak to use:
+
+| Maximum word | Certified pairs | Pair fraction | Certified cells | Cell fraction | Seed kernel | Exact packed F1 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0 | 0% | 0 | 0% | 1.255 s | 0.756 s |
+| 2 | 0 | 0% | 0 | 0% | 1.418 s | 0.652 s |
+| 4 | 130 | 0.000473% | 122,321 | 0.000010% | 1.840 s | 0.652 s |
+| 8 | 6,451 | 0.023474% | 12,552,237 | 0.001061% | 1.893 s | 0.680 s |
+| 16 | 89,216 | 0.324646% | 307,230,432 | 0.025975% | 2.696 s | 0.689 s |
+| 32 | 870,272 | 3.166813% | 5,839,203,942 | 0.493672% | 3.977 s | 0.680 s |
+
+Even the best 32-residue condition leaves 99.506% of exact SSV cells and its
+diagnostic recurrence costs 5.85 times the packed exact F1 kernel. The global
+dictionary is worse: every one of 16 evenly sampled profiles hit the 100,000
+association or 1,000,000 enumeration-node cap. Those incomplete samples
+already contain 855,218 entries and 41,007,823 bytes of minimum word/metadata
+payload. Linear extrapolation is a lower bound of 1.47 billion entries and
+65.6 GiB for Pfam, before trie/hash overhead and before completing any capped
+profile.
+
+Decision: **reject production mandatory-seed/global-index integration**. Keep
+the proof and evaluator as negative research evidence. Phase 10 is complete;
+Phase 11 may use only the GPU strategies already validated and retained.
+
+Evidence: `build/phase10-mandatory-seed-h200-20260825/attempt-01/result.json`,
+SHA-256 `d3ee2d8b1db0f62c78c0af0ba268829d33c3b661d62e2e499b8ca98d8c1ce61d`;
+job `1183467`, `COMPLETED 0:0`, empty stderr.

@@ -53,7 +53,7 @@ the complete oracle suite and representative end-to-end workloads.
 | 7 | Packed integer MSV/Viterbi | MSV retained; Viterbi rejected | through `f5ac24a` | packed MSV exact/flat at 454.007 s; packed Viterbi exact but slower and larger, so excluded from `main` |
 | 8 | Certified reduced-alphabet F0 | complete; production rejected | through `913be5d` | exact job 1182800: best codebook certified only 0.145% of cells while F0 cost about 1.9x exact packed F1 |
 | 9 | GA-specialized certified pruning | complete; retained for gathering cutoffs | through `c5eec74` | exact job 1182813: 449.104 s, 1.08% faster than prior best, 117,545 target rows certified |
-| 10 | Mandatory-seed/global-profile index | pending research | pending | optional/cached only; formal sensitivity proof required |
+| 10 | Mandatory-seed/global-profile index | complete; production rejected | `8380af4` | exact job 1183467: zero false rejects, but best bound certified only 0.494% of cells and cost 5.85x exact F1 |
 | 11 | Internal GPU execution policy | pending | pending | deterministic policy only after multiple retained GPU algorithms exist |
 
 ## Phase 0 design and result
@@ -290,11 +290,28 @@ H200 memory remained effectively flat. The path is retained for compatible
 gathering-cutoff searches; the ordinary path remains the non-GA and audit
 fallback.
 
+## Phase 10 mandatory-seed/global-index result: rejected
+
+The exact SSV source yields a formal integer certificate: any F1 survivor or
+SSV-uncertain pair must contain a contiguous diagonal segment whose gain
+reaches a compiled threshold. Partitioning that segment into bounded words
+therefore guarantees one word with a profile/length-specific minimum gain.
+The offline evaluator exhaustively retained all exact candidates for maximum
+word lengths 1/2/4/8/16/32.
+
+H200 job `1183467` evaluated all 27,481 Pfam profiles against the first 1,000
+targets. Every arm had zero false rejects, but the best 32-residue arm
+certified only 0.493672% of logical SSV cells while its scan took 3.977 seconds
+versus 0.680 seconds for packed exact F1. All 16 sampled profile dictionaries
+hit their enumeration caps; their incomplete payload extrapolates to at least
+1.47 billion associations / 65.6 GiB across Pfam before index overhead.
+
+Production integration is rejected. The exact proof and evaluator are retained
+as evidence; no index build or scan cost is imposed on any workload.
+
 ## Remaining implementation order
 
-1. Phase 10: keep mandatory-seed/global-profile indexing as an optional
-   research path with a formal sensitivity proof and no small-workload tax.
-2. Phase 11: add a deterministic internal GPU policy only for validated GPU
+1. Phase 11: add a deterministic internal GPU policy only for validated GPU
    algorithms; retain force-policy controls and the simple path.
 
 Every retained full-workload result will continue to report exact output

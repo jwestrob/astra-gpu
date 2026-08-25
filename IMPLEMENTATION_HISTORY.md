@@ -29,6 +29,7 @@ hashes live in `PERFORMANCE.md`.
 | 7 | `f5ac24a` | Full-MSV compaction and exact packed full MSV retained; request 454.007 s. |
 | 8 | `913be5d` | Certified F0 evaluator retained as evidence; production F0 rejected after exact H200 census. |
 | 9 | `50f762c` | Certified gathering-cutoff GA pruning retained; exact request 449.104 s, 1.08% faster than the prior best. |
+| 10 | `8380af4` | Exact mandatory-seed evaluator retained as evidence; production index rejected after certifying only 0.494% of cells. |
 
 ## Rejected or non-production experiments
 
@@ -43,13 +44,16 @@ hashes live in `PERFORMANCE.md`.
 - Reduced-alphabet F0: zero false rejects, but the best 32-partition codebook
   certified only 0.145% of SSV cells while F0 itself cost about 1.9x exact
   packed F1. The offline evaluator remains; production integration is rejected.
+- Mandatory-seed/global-profile indexing: zero false rejects, but its best
+  32-residue certificate removed only 0.494% of exact SSV cells and cost 5.85x
+  packed exact F1. Incomplete dictionary samples already imply at least 65.6
+  GiB across Pfam, so no production index is built.
 
 ## Work now in progress
 
-Phase 9 is complete. Phase 10 now investigates an optional mandatory-seed /
-global-profile index with a formal zero-false-negative proof and no tax on
-small searches. Phase 11 remains the final deterministic GPU execution-policy
-step listed in `PLAN7_ENGINE_ROADMAP.md`.
+Phase 10 is complete and rejected for production after exact H200 measurement.
+Phase 11 is the remaining deterministic GPU execution-policy step listed in
+`PLAN7_ENGINE_ROADMAP.md`.
 
 For the complete commit-by-commit history, run:
 
