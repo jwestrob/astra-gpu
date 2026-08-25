@@ -5,11 +5,14 @@ This file is the compact, source-controlled performance record for external revi
 ## Exact implementation under review
 
 - Native `plan7_gpu` retained source: commit
-  `2fc2a927aa19a9a72feb30d03809924068d0eb5b`, tree
-  `70c1944ae6a170b22a24038004ac59ba111dc735`.  The original sealed
+  `348f2774f696f1a7697f93fa56e507f3ebed95fd`, tree
+  `1ee529ef6df3b3926f268ea9d0c00613d7993a24`. The original sealed
   architectural baseline remains commit
   `614161a4d24c05564b863a0d1b67f0b2f26aeaf1`.
-- Astra persistent profile cache and weighted ready queue: commit `3996a60e765315ad9286ffab14ae67141ab19762`, tree `bba6afeb56af6c0568e07f0310508b78353770db`, included under `integrations/astra/`.
+- Astra companion used by the retained GA/full-workload path: commit
+  `c7654aa2641a66c3af6a47c7d9bf8b29a82fb954`, tree
+  `45546a5b52b8b32b705ee1a8c6b8da9ae806b65d`, maintained in the separate
+  Astra source repository/worktree.
 - The byte-bounded queue requires the native `CandidateBatch.resident_bytes` API introduced at native commit `614161a`.
 - Private patched-PyHMMER ABI: `d4867ff865e9b8a7acdbbf9106e3d7e1223336d374cb0f46d7e352427b990689`.
 
@@ -45,6 +48,9 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, resident F2→Forward handoff | 64 host workers | **448.140781 s** | 13,195,416 KiB | **exact; 0.2145% faster than Phase 9; new best** |
 | Rejected experiment: packed Viterbi | 64 host workers | 454.963381 s | 13,340,692 KiB | exact, but 0.211% slower and 94,836 KiB larger; excluded from `main` |
 | Rejected experiment: external multidomain continuation | 64 host workers | 480.258523 s | 13,080,804 KiB | exact, but 7.167% slower; implementation excluded from `main` |
+| Rejected experiment: bounded Backward waves | 64 host workers | 479.533852 s | 13,028,936 KiB | exact; removed all Backward work-cap fallbacks, but 7.005% slower |
+| Rejected experiment: bounded Backward + rescore waves | 64 host workers | 482.477600 s | 12,744,140 KiB | exact; nearly removed both cap families, but 7.662% slower |
+| Rejected experiment: zero threshold guard | 64 host workers | 486.204557 s | 13,137,688 KiB | exact upper bound; removed 34,485 threshold-only CPU rows, but 8.494% slower |
 
 Additional GPU timing layers:
 
@@ -212,6 +218,27 @@ H200 memory only 8 MiB. The implementation is rejected; exact route, timing,
 memory, and provenance evidence is recorded in
 `PHASE3_MULTIDOMAIN_CONTINUATION.md`.
 
+Two bounded-wave experiments then tested the cap-driven tail directly. Job
+`1183521` reset the existing Backward work/workspace budgets across stable
+waves and reduced work-cap fallbacks from 366,939 to zero. Job `1183524`
+extended the same scheme through isolated-domain rescore and reduced 568,120
+rescore cap fallbacks exposed by the first experiment to 9,998. Both outputs
+were byte-identical, and peak H200 memory stayed below the accepted run, but
+request wall rose to 479.533852 and 482.477600 seconds respectively. The newly
+admitted exact GPU work cost more than the existing CPU continuation, so both
+implementations are rejected.
+
+Finally, job `1183528` set the threshold guard to zero as an experiment-only
+upper bound. It removed all 34,485 threshold-only CPU rows without charging
+any retry-DP work, yet request wall rose to 486.204557 seconds. Any formal
+exact retry can resolve no more rows and must add work, so threshold retry is
+also closed as a material optimization for the current architecture.
+
+Together these full exact runs cover the dominant measured continuation
+causes. The retained 448.140781-second engine remains the production winner;
+the consolidated route, timing, and memory decision is in
+`CPU_CONTINUATION_TAIL_RESULTS.md`.
+
 ## GPU request-stage ledger
 
 The measured 546.220704615 s request decomposed as follows:
@@ -299,7 +326,9 @@ These paths exist in the development workspace and are excluded from Git because
 ## Review cautions
 
 - This is source and performance-evidence packaging, not a release artifact.
-- `integrations/astra/` preserves the exact Astra source snapshot and history for review; it is not installed by the root build.
+- The matching Astra application changes are maintained in the separate Astra
+  repository/worktree at the exact companion revision recorded above; they are
+  not installed by this root build.
 - The production path currently depends on a matching private-ABI PyHMMER build and exact native extension pair.
 - The Makefile/runtime packaging still needs relocatable library paths and explicit third-party license/notice handling before binary distribution.
 - Do not infer a queue-depth speedup from the host tests; the H200 sweep remains unmeasured.

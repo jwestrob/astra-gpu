@@ -7,10 +7,17 @@ or a plausible design is not enough.
 
 ## Overall verdict
 
-The numbered Phase 0--11 experiment sequence is complete, and every experiment
-has an explicit exact retain/reject decision.  The broader heterogeneous Plan7
-engine objective is **not yet complete** because the original Phase 3
-device-resident-chain requirement remains only partially implemented.
+The numbered Phase 0--11 sequence and the subsequent bottleneck-focused Phase
+3 work are complete under the roadmap's measured stop condition. Every
+retained change and every rejected tail experiment has an exact full-workload
+result. The retained implementation remains job `1183504` at 448.140781
+seconds with byte-identical HMMER/Astra output.
+
+The aspirational single-copy, fully opaque device-egress design is not claimed
+as literally complete: host-visible audit and sparse-egress representations
+remain. The active objective nevertheless closes because full exact experiments
+show that the scoped cap, threshold, and multidomain reductions all make the
+critical path materially slower.
 
 ## Requirement audit
 
@@ -26,7 +33,7 @@ device-resident-chain requirement remains only partially implemented.
 | Phase 2 device-side stable F1 compaction | complete; retained | `PHASE2_DEVICE_COMPACTION.md`; full job `1182619`; 83 device compactions, zero host expansions and candidate uploads |
 | Phase 3 exact F3 decision compilation | complete; retained | `PHASE3_EXACT_F3_THRESHOLD.md`; exhaustive/adversarial boundary oracle and exact full job `1182713` |
 | Phase 3 Forward-to-Backward and Backward-to-rescore residency | complete for the two implemented handoffs | `PHASE3_FORWARD_BACKWARD_RESIDENCY.md`, `PHASE3_BACKWARD_RESCORE_RESIDENCY.md`; full jobs `1182690` and `1182713`; zero legacy handoff H2D and zero fallbacks |
-| Phase 3 fully device-resident postfilter-to-final-egress chain and persistent chunk workspace | **incomplete** | Current production still performs postfilter result D2H, Forward input/result transfers, host journal materialization, and per-generation Backward/rescore allocation.  The Phase 3 notes explicitly preserve these boundaries. |
+| Phase 3 fully opaque postfilter-to-final-egress transport and persistent chunk workspace | partially realized; closed by measured stop condition | Resident F2-to-Forward, Forward-to-Backward, and Backward-to-rescore handoffs are retained. Host-visible audit/egress materialization remains. Exact jobs `1183518`, `1183521`, `1183524`, and `1183528` reduced every dominant measured tail route but regressed request wall by 7.005%--8.494%, so no remaining scoped change is promoted. |
 | Phase 4 candidates-per-warp experiment | complete; production promotion rejected | `PHASE4_FORWARD_SUBWARPS.md`; exact full job `1182718` regressed 0.72%, so production is width 1 |
 | Phase 5 profile-axis packed SSV | complete; retained | `PHASE5_PROFILE_PACKED_SSV.md`; exact job `1182734`, 455.026 s and 14.982% faster than retained Phase 3 |
 | Phase 6 length-cohort/compiled target metadata | complete for the evidence-supported representation | `PHASE6_LENGTH_CLASS_METADATA.md`; exact job `1182743`; transition H2D reduced from 24,915,438 to 121,595 bytes without physical sequence reordering |
@@ -45,26 +52,27 @@ device-resident-chain requirement remains only partially implemented.
 - Current CUDA-hidden suite: 356 tests passed, with 123 expected GPU skips,
   under private PyHMMER ABI
   `d4867ff865e9b8a7acdbbf9106e3d7e1223336d374cb0f46d7e352427b990689`.
-- Phase 11 full Pfam x metagenome job `1183483`: exact output SHA-256
+- Retained full Pfam x metagenome job `1183504`: exact output SHA-256
   `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
-  39,010,327 bytes, 383,235 lines; 451.083043 seconds request wall; worker and
-  raw-validation status `PASS_FOR_EXECUTION`; complete artifact manifest
-  rehash passed.
+  39,010,327 bytes, 383,235 lines; 448.140781 seconds request wall;
+  333.993605 seconds generation; 400.083104 seconds continuation/output;
+  293.693784 seconds overlap.
+- Exact rejected full runs: external multidomain job `1183518` at 480.258523
+  seconds, bounded Backward job `1183521` at 479.533852 seconds, bounded
+  Backward/rescore job `1183524` at 482.477600 seconds, and zero-threshold
+  upper-bound job `1183528` at 486.204557 seconds. All four reproduced the
+  same output SHA, byte count, and line count.
 
-## Remaining completion gate
+## Goal disposition
 
-The next architectural work returns to Phase 3.  Completion requires all of
-the following while preserving the existing dense audit path:
+There is no remaining gate under the current bottleneck-focused objective.
+The retained computational handoffs passed the exact full oracle, and faithful
+full experiments explicitly rejected the remaining scoped route/cap changes.
+The production line therefore stops at `348f277` plus its documentation.
 
-1. keep postfilter/F2/Forward survivor state resident through Backward and
-   rescore in production, copying only semantically necessary exception/final
-   payloads;
-2. replace per-generation Backward/rescore allocation with a bounded,
-   exactly-accounted reusable workspace or record a measured rejection;
-3. demonstrate that targeted D2H/H2D and host-materialization counters fall
-   rather than move to another stage;
-4. pass the exact focused H200 oracle, first-1,000 gate, six-shape workload
-   matrix, and full-output SHA comparison.
-
-Until those gates are proved or explicitly rejected by a faithful experiment,
-the active implementation goal remains open.
+Future work should begin as a new objective only if it proposes a materially
+different exact domain/rescore/multidomain algorithm. Merely increasing caps,
+resetting them across waves, removing the threshold guard, or rerouting the
+existing CPU semantics has already been measured and rejected. Consolidated
+timing, route, memory, branch, and evidence details are in
+`CPU_CONTINUATION_TAIL_RESULTS.md`.

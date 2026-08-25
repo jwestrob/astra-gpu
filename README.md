@@ -16,20 +16,31 @@ threshold logic, downstream HMMER pipeline, or result formatting.
 
 ## Status
 
-The first CUDA SSV kernel matches HMMER's public status and score on 21,000
-real profile/sequence pairs and passes CUDA memory checking. Direct Astra
-measurements put stage one at about 45% of wall time for the PFAM pilot but
-only 26% for HydDB, so GPU use must be workload-selective. Host packing and
-target upload can now be reused across profiles, and the native adapter returns
-only pairs that direct SSV cannot safely reject at HMMER's exact F1 decision.
-Profiles can now be evaluated in batches rather than one kernel launch apiece.
-The batched kernel applies the exact binary32 F1 cutoff on-device and returns
-an ordered candidate bitmask instead of a dense score table.
-Candidate rows are now immutably bound to verified pressed profiles, copied
-targets, and F1. The ABI-pinned CPU handoff skips definite rejects while
-preserving HMMER accounting and exact `TopHits`; all 21,000 real pilot pairs
-match ordinary PyHMMER end to end. An opt-in Astra integration is validated on
-an isolated branch; there is no performance claim yet.
+The backend now implements exact GPU SSV/MSV, bias correction, Viterbi,
+Forward, Backward/domain decoding, isolated-domain rescoring, stable device
+compaction, sparse ordered continuation, and resident interstage handoffs. The
+original query-major/audit paths remain available.
+
+The retained full H200 run searched 27,481 Pfam profiles against 300,186
+proteins (8.249 billion logical pairs) in **448.140781 seconds**, versus
+702.79 seconds for Astra CPU64. Its 39,010,327-byte output was byte-identical
+to the CPU oracle (SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`).
+
+Full exact experiments subsequently attacked every dominant measured CPU-tail
+reason. Multidomain rerouting, bounded Backward/rescore waves, and a zero-cost
+threshold upper bound all reduced their target fallback counts but regressed
+request wall by 7.005%--8.494%. They remain isolated experiments; the
+448.140781-second path is the retained production winner.
+
+The durable engineering record is in:
+
+- `PLAN7_ENGINE_ROADMAP.md` -- original plan and phase decisions;
+- `IMPLEMENTATION_HISTORY.md` -- retained and rejected source sequence;
+- `PERFORMANCE.md` -- exact full-workload measurements and evidence hashes;
+- `CPU_CONTINUATION_TAIL_RESULTS.md` -- final bottleneck experiments and stop
+  decision;
+- `ROADMAP_COMPLETION_AUDIT.md` -- requirement-by-requirement disposition.
 
 ## Layout
 

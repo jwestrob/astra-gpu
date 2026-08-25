@@ -46,7 +46,7 @@ the complete oracle suite and representative end-to-end workloads.
 | 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | complete; production performance rejected | through `039c092` | exact full job 1182349 was 3.82% slower despite 41.35% fewer packet bytes |
 | 1B | Produce sparse certificate before dense host materialization | complete; retained opt-in | through `87727cd` | jobs 1182389/1182391 exact; one-pass wall 536.168 s, 1.84% faster than dense, zero dense-v2 retention |
 | 2 | Device-side stable F1 candidate compaction | complete; retained | through `959cdf6` | job 1182619 exact; 83 device compactions, zero host expansions/uploads; no standalone speedup claim |
-| 3 | Device-resident postfilter/F2 -> Forward -> Backward/domain -> rescore chain | partial; validated residency slices retained | through `737523c` | jobs 1182690/1182713/1183504 exact; redundant F2 candidate, Forward-special, and region replay removed; compiled F3 authoritative |
+| 3 | Device-resident postfilter/F2 -> Forward -> Backward/domain -> rescore chain | closed by measured stop condition; retained handoffs, tail extensions rejected | through `348f277` | job 1183504 exact at 448.141 s; jobs 1183518/1183521/1183524/1183528 exactly tested and rejected multidomain, cap, and threshold tail moves |
 | 4 | Forward/Backward/rescore candidates-per-warp variants | complete; automatic promotion rejected | through `a8932dd` | exact, but full job 1182718 regressed 0.72%; production restored to width 1 |
 | 5 | Profile-axis packed SSV | complete; retained | through `9730f39` | exact job 1182734: 455.026 s, 14.98% faster than retained Phase 3 |
 | 6 | Length-cohort decision metadata | complete; retained | through `cfd756c` | exact job 1182743: 454.247 s; transition H2D reduced 24.92 MB -> 0.12 MB |
@@ -190,8 +190,8 @@ The request ran in 534.276 seconds, including 464.689 seconds of generation,
 Phase 2, request wall improved by 4.546 seconds (0.844%) and generation wall by
 3.554 seconds (0.759%). Forward-special upload time inside Backward fell from
 439.13 ms to 49.16 ms, and aggregate Backward wall fell from 26.880 seconds to
-24.853 seconds. This slice is retained; Phase 3 remains active for persistent
-workspaces and Backward-to-rescore residency.
+24.853 seconds. This slice was retained, and Phase 3 then continued with
+persistent workspaces and Backward-to-rescore residency.
 
 The next Phase 3 slice compiled the exact F2 Gumbel boundary, classified and
 stably compacted all postfilter rows on-device, and passed the resident F2
@@ -212,6 +212,23 @@ work remained on the CPU and became more expensive through the new seam. The
 prototype is rejected and remains only on its experiment branch; Phase 3 must
 next address cap- and threshold-driven fallback by eliminating work, not merely
 rerouting the same CPU semantics.
+
+The remaining two source causes were then tested directly. Bounded
+Backward/domain waves in job `1183521` eliminated all 366,939 cumulative
+work-cap fallbacks while keeping peak H200 memory slightly below the accepted
+run, but request wall regressed 7.005%. Extending bounded waves through rescore
+in job `1183524` reduced the newly exposed 568,120 rescore cap fallbacks to
+9,998, but regressed request wall 7.662%. An experiment-only zero threshold
+guard in job `1183528` removed the maximum 34,485 threshold-only CPU rows with
+no retry-DP charge and still regressed 8.494%. Every run reproduced the full
+output byte-for-byte.
+
+Phase 3 is therefore closed for the current algorithms. The production path
+retains the resident chain and the 448.140781-second result. The exact tail
+experiments prove that merely admitting or rerouting more rows makes the
+critical path worse; a future material gain requires fundamentally faster
+exact domain/rescore/multidomain algorithms. Full measurements and branch
+disposition are recorded in `CPU_CONTINUATION_TAIL_RESULTS.md`.
 
 ## Phase 4 Forward subwarp result
 
@@ -362,21 +379,20 @@ validated GPU algorithms without burdening the one/few-profile paths.
 
 ## Roadmap status
 
-All numbered implementation and research phases have now produced an exact
-oracle result and an explicit retain/reject decision.  This closes the numbered
-experiment sequence, but not the primary device-resident architecture: Phase
-3 remains deliberately marked partial in the ledger.  Production still
-downloads full postfilter results before Forward selection, preserves host
-Forward and Backward materializations for the sparse journal, and allocates
-Backward/rescore workspaces per generation.  Those remaining host boundaries
-must be removed or explicitly rejected by measurement before the overall
-engine objective can be called complete.
+All numbered phases and the final bottleneck-directed continuation experiments
+now have exact oracle results and explicit retain/reject decisions. The
+retained production line implements the resident computational handoffs and
+keeps only strategies that survived their end-to-end gates. Rejected
+strategies remain audit-only or isolated.
 
-The retained production line contains only strategies that preserved HMMER
-semantics and survived their stated gates; rejected strategies remain
-audit-only or isolated.  The next engineering work returns to the unfinished
-Phase 3 boundary while retaining the Phase 11 policy as its workload-shape
-dispatcher.
+The accepted full-workload result is 448.140781 seconds with byte-identical
+HMMER/Astra output. Multidomain rerouting, bounded Backward waves, bounded
+rescore waves, and the zero-cost threshold upper bound all reduced their target
+route counts but regressed request wall by 7.005% to 8.494%. The measured stop
+condition is therefore met: the remaining exact tail is not materially
+reducible by the scoped architecture changes. Future work should resume only
+with a genuinely faster exact domain/rescore/multidomain algorithm, not another
+cap increase or route transfer.
 
 Every retained full-workload result will continue to report exact output
 identity, request/generation/continuation/overlap timing, peak H200 memory,
