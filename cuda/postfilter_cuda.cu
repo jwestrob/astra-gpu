@@ -2547,6 +2547,7 @@ int postfilter_candidates_device_with_workspace_impl(
     plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
     plan7_postfilter_result *host_results, uint16_t *host_reason_facts,
     plan7_postfilter_reason_statistics *reason_statistics,
+    int execution_policy,
     char *error, size_t error_size) {
   if (workspace == nullptr || database == nullptr || device_residues == nullptr ||
       device_sequence_offsets == nullptr || host_sequence_lengths == nullptr ||
@@ -2584,13 +2585,20 @@ int postfilter_candidates_device_with_workspace_impl(
     set_error(error, error_size, "post-filter candidate count overflow");
     return -1;
   }
+  if (execution_policy < PLAN7_GPU_EXECUTION_POLICY_AUTO ||
+      execution_policy > PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT) {
+    set_error(error, error_size, "invalid post-filter execution policy");
+    return -1;
+  }
   const char *full_msv_policy = std::getenv("PLAN7_GPU_FULL_MSV_POLICY");
   const bool force_legacy_full_msv =
-      full_msv_policy != nullptr &&
-      std::strcmp(full_msv_policy, "legacy") == 0;
+      (full_msv_policy != nullptr &&
+       std::strcmp(full_msv_policy, "legacy") == 0) ||
+      execution_policy == PLAN7_GPU_EXECUTION_POLICY_SIMPLE;
   const bool force_compact_full_msv =
-      full_msv_policy != nullptr &&
-      std::strcmp(full_msv_policy, "compact") == 0;
+      (full_msv_policy != nullptr &&
+       std::strcmp(full_msv_policy, "compact") == 0) ||
+      execution_policy == PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT;
   if (force_compact_full_msv && candidate_count > UINT32_MAX) {
     set_error(error, error_size,
               "compact full-MSV candidate count exceeds uint32 range");
@@ -2602,8 +2610,9 @@ int postfilter_candidates_device_with_workspace_impl(
   const char *full_msv_arithmetic =
       std::getenv("PLAN7_GPU_FULL_MSV_ARITHMETIC");
   const bool force_scalar_full_msv =
-      full_msv_arithmetic != nullptr &&
-      std::strcmp(full_msv_arithmetic, "scalar") == 0;
+      (full_msv_arithmetic != nullptr &&
+       std::strcmp(full_msv_arithmetic, "scalar") == 0) ||
+      execution_policy == PLAN7_GPU_EXECUTION_POLICY_SIMPLE;
   const bool allow_packed_full_msv =
       compact_full_msv && !force_scalar_full_msv;
   std::vector<uint64_t> &host_msv_offsets = workspace->host_msv_offsets;
@@ -3288,7 +3297,8 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace(
       device_compact_scores, device_f1_profiles, device_tjb,
       device_length_logp, device_length_log1mp, device_bias_profiles,
       device_candidates, host_candidates, device_msv_inputs, candidate_count,
-      host_results, nullptr, nullptr, error, error_size);
+      host_results, nullptr, nullptr, PLAN7_GPU_EXECUTION_POLICY_AUTO,
+      error, error_size);
 }
 
 extern "C" int plan7_postfilter_candidates_device_with_workspace_reason_facts(
@@ -3317,7 +3327,63 @@ extern "C" int plan7_postfilter_candidates_device_with_workspace_reason_facts(
       device_compact_scores, device_f1_profiles, device_tjb,
       device_length_logp, device_length_log1mp, device_bias_profiles,
       device_candidates, host_candidates, device_msv_inputs, candidate_count,
-      host_results, reason_facts, reason_statistics, error, error_size);
+      host_results, reason_facts, reason_statistics,
+      PLAN7_GPU_EXECUTION_POLICY_AUTO, error, error_size);
+}
+
+extern "C" int plan7_postfilter_candidates_device_with_workspace_policy(
+    plan7_postfilter_workspace *workspace,
+    const plan7_viterbi_database *database, const uint8_t *device_residues,
+    const uint64_t *device_sequence_offsets,
+    const uint64_t *host_sequence_lengths, size_t sequence_count,
+    const float *device_null_scores, const uint8_t *device_compact_scores,
+    const plan7_ssv_f1_profile *device_f1_profiles,
+    const uint8_t *device_tjb, const float *device_length_logp,
+    const float *device_length_log1mp,
+    const plan7_bias_profile *device_bias_profiles,
+    const plan7_bias_candidate *device_candidates,
+    const plan7_bias_candidate *host_candidates,
+    plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
+    plan7_postfilter_result *host_results, int execution_policy,
+    char *error, size_t error_size) {
+  return postfilter_candidates_device_with_workspace_impl(
+      workspace, database, device_residues, device_sequence_offsets,
+      host_sequence_lengths, sequence_count, device_null_scores,
+      device_compact_scores, device_f1_profiles, device_tjb,
+      device_length_logp, device_length_log1mp, device_bias_profiles,
+      device_candidates, host_candidates, device_msv_inputs, candidate_count,
+      host_results, nullptr, nullptr, execution_policy, error, error_size);
+}
+
+extern "C" int
+plan7_postfilter_candidates_device_with_workspace_reason_facts_policy(
+    plan7_postfilter_workspace *workspace,
+    const plan7_viterbi_database *database, const uint8_t *device_residues,
+    const uint64_t *device_sequence_offsets,
+    const uint64_t *host_sequence_lengths, size_t sequence_count,
+    const float *device_null_scores, const uint8_t *device_compact_scores,
+    const plan7_ssv_f1_profile *device_f1_profiles,
+    const uint8_t *device_tjb, const float *device_length_logp,
+    const float *device_length_log1mp,
+    const plan7_bias_profile *device_bias_profiles,
+    const plan7_bias_candidate *device_candidates,
+    const plan7_bias_candidate *host_candidates,
+    plan7_bias_ssv_input *device_msv_inputs, size_t candidate_count,
+    plan7_postfilter_result *host_results, uint16_t *reason_facts,
+    plan7_postfilter_reason_statistics *reason_statistics,
+    int execution_policy, char *error, size_t error_size) {
+  if (reason_facts == nullptr || reason_statistics == nullptr) {
+    set_error(error, error_size, "post-filter reason output is null");
+    return -1;
+  }
+  return postfilter_candidates_device_with_workspace_impl(
+      workspace, database, device_residues, device_sequence_offsets,
+      host_sequence_lengths, sequence_count, device_null_scores,
+      device_compact_scores, device_f1_profiles, device_tjb,
+      device_length_logp, device_length_log1mp, device_bias_profiles,
+      device_candidates, host_candidates, device_msv_inputs, candidate_count,
+      host_results, reason_facts, reason_statistics, execution_policy,
+      error, error_size);
 }
 
 extern "C" int plan7_postfilter_candidates_device(

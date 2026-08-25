@@ -328,6 +328,56 @@ int plan7_postfilter_candidates_device_with_workspace_reason_facts(
   char *error,
   size_t error_size);
 
+/* Request-scoped policy twins used by SequenceBatch.  The legacy entry
+ * points above remain AUTO for ABI compatibility. */
+int plan7_postfilter_candidates_device_with_workspace_policy(
+  plan7_postfilter_workspace *workspace,
+  const plan7_viterbi_database *database,
+  const uint8_t *device_residues,
+  const uint64_t *device_sequence_offsets,
+  const uint64_t *host_sequence_lengths,
+  size_t sequence_count,
+  const float *device_null_scores,
+  const uint8_t *device_compact_scores,
+  const plan7_ssv_f1_profile *device_f1_profiles,
+  const uint8_t *device_tjb,
+  const float *device_length_logp,
+  const float *device_length_log1mp,
+  const plan7_bias_profile *device_bias_profiles,
+  const plan7_bias_candidate *device_candidates,
+  const plan7_bias_candidate *host_candidates,
+  plan7_bias_ssv_input *device_msv_inputs,
+  size_t candidate_count,
+  plan7_postfilter_result *host_results,
+  int execution_policy,
+  char *error,
+  size_t error_size);
+
+int plan7_postfilter_candidates_device_with_workspace_reason_facts_policy(
+  plan7_postfilter_workspace *workspace,
+  const plan7_viterbi_database *database,
+  const uint8_t *device_residues,
+  const uint64_t *device_sequence_offsets,
+  const uint64_t *host_sequence_lengths,
+  size_t sequence_count,
+  const float *device_null_scores,
+  const uint8_t *device_compact_scores,
+  const plan7_ssv_f1_profile *device_f1_profiles,
+  const uint8_t *device_tjb,
+  const float *device_length_logp,
+  const float *device_length_log1mp,
+  const plan7_bias_profile *device_bias_profiles,
+  const plan7_bias_candidate *device_candidates,
+  const plan7_bias_candidate *host_candidates,
+  plan7_bias_ssv_input *device_msv_inputs,
+  size_t candidate_count,
+  plan7_postfilter_result *host_results,
+  uint16_t *reason_facts,
+  plan7_postfilter_reason_statistics *reason_statistics,
+  int execution_policy,
+  char *error,
+  size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif

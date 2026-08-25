@@ -26,6 +26,8 @@ struct plan7_ssv_sequence_batch {
   uint64_t generation_id;
   int device_ordinal;
   int alphabet_size;
+  int execution_policy_mode;
+  int execution_policy_locked;
   size_t sequence_count;
   uint64_t *host_lengths;
   float *host_null_scores;
@@ -119,6 +121,7 @@ struct plan7_ssv_sequence_batch {
   uint64_t f1_length_compact_h2d_bytes;
   uint64_t f1_length_dense_h2d_bytes_avoided;
   uint64_t f1_length_dense_materialized_bytes;
+  uint64_t execution_policy_f1_run_count;
 };
 
 namespace {
@@ -2159,6 +2162,52 @@ plan7_ssv_sequence_batch_destroy(plan7_ssv_sequence_batch **batch_out,
 }
 
 extern "C" int
+plan7_ssv_sequence_batch_set_execution_policy(
+  plan7_ssv_sequence_batch *batch,
+  int policy,
+  char *error,
+  size_t error_size)
+{
+  if (batch == nullptr) {
+    set_error(error, error_size, "sequence batch is null");
+    return -1;
+  }
+  if (policy < PLAN7_GPU_EXECUTION_POLICY_AUTO ||
+      policy > PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT) {
+    set_error(error, error_size, "invalid GPU execution policy");
+    return -1;
+  }
+  if (batch->execution_policy_locked) {
+    set_error(error, error_size, "GPU execution policy is already in use");
+    return -1;
+  }
+  batch->execution_policy_mode = policy;
+  return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_get_execution_policy_statistics(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_gpu_execution_policy_statistics *statistics,
+  char *error,
+  size_t error_size)
+{
+  if (batch == nullptr || statistics == nullptr) {
+    set_error(error, error_size, "invalid GPU execution policy statistics");
+    return -1;
+  }
+  memset(statistics, 0, sizeof(*statistics));
+  statistics->version = PLAN7_GPU_EXECUTION_POLICY_VERSION;
+  statistics->mode = static_cast<uint32_t>(batch->execution_policy_mode);
+  statistics->target_count = batch->sequence_count;
+  statistics->length_class_count = batch->length_class_count;
+  statistics->f1_run_count = batch->execution_policy_f1_run_count;
+  statistics->forward_candidates_per_warp =
+    PLAN7_GPU_EXECUTION_POLICY_FORWARD_CANDIDATES_PER_WARP;
+  return 0;
+}
+
+extern "C" int
 plan7_ssv_sequence_batch_get_view(const plan7_ssv_sequence_batch *batch,
                                   plan7_ssv_sequence_batch_view *view,
                                   char *error,
@@ -2759,6 +2808,8 @@ sequence_batch_f1_mask_many_impl(
     set_error(error, error_size, "sequence batch is null");
     return -1;
   }
+  batch->execution_policy_locked = 1;
+  ++batch->execution_policy_f1_run_count;
   invalidate_f1_cache(batch);
   status = cudaGetDevice(&current_device);
   if (status != cudaSuccess) {
@@ -2886,9 +2937,13 @@ sequence_batch_f1_mask_many_impl(
 
   const char *profile_policy = getenv("PLAN7_GPU_SSV_PROFILE_POLICY");
   const bool profile_packing_enabled =
-    profile_policy == nullptr || strcmp(profile_policy, "scalar") != 0;
+    (profile_policy == nullptr || strcmp(profile_policy, "scalar") != 0) &&
+    batch->execution_policy_mode != PLAN7_GPU_EXECUTION_POLICY_SIMPLE;
+  const size_t profile_packed_minimum =
+    batch->execution_policy_mode == PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT
+      ? kProfilesPerPackedWord : kProfilePackedMinimumProfiles;
   if (profile_packing_enabled &&
-      profile_count >= kProfilePackedMinimumProfiles) {
+      profile_count >= profile_packed_minimum) {
     std::vector<uint32_t> eligible;
     try {
       eligible.reserve(profile_count);
@@ -2984,8 +3039,10 @@ sequence_batch_f1_mask_many_impl(
     batch->length_class_count != 0 &&
     expansion_blocks <= static_cast<size_t>(maximum_grid_x) &&
     (force_length_classes ||
+     batch->execution_policy_mode == PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT ||
      (batch->sequence_count >= kLengthClassMinimumSequences &&
-      batch->length_class_count <= batch->sequence_count / 2));
+      batch->length_class_count <= batch->sequence_count / 2)) &&
+    batch->execution_policy_mode != PLAN7_GPU_EXECUTION_POLICY_SIMPLE;
   host_tjb_count = use_length_classes ? compact_tjb_count : tjb_count;
   if (host_tjb_count > batch->host_tjb_capacity) {
     void *replacement = realloc(batch->host_tjb, host_tjb_count);
@@ -4571,7 +4628,7 @@ sequence_batch_postfilter_candidates_many_impl(
         &batch->postfilter_workspace, error, error_size) != 0)
     return -1;
   const int postfilter_status = reason_facts == nullptr
-      ? plan7_postfilter_candidates_device_with_workspace(
+      ? plan7_postfilter_candidates_device_with_workspace_policy(
           batch->postfilter_workspace, viterbi_database,
           batch->device_residues, batch->device_offsets, batch->host_lengths,
           batch->sequence_count, batch->device_null_scores,
@@ -4579,8 +4636,9 @@ sequence_batch_postfilter_candidates_many_impl(
           batch->device_bias_logp, batch->device_bias_log1mp,
           batch->device_bias_profiles, batch->device_bias_candidates,
           batch->host_bias_candidates, batch->device_bias_ssv_inputs,
-          candidate_count, results, error, error_size)
-      : plan7_postfilter_candidates_device_with_workspace_reason_facts(
+          candidate_count, results, batch->execution_policy_mode,
+          error, error_size)
+      : plan7_postfilter_candidates_device_with_workspace_reason_facts_policy(
           batch->postfilter_workspace, viterbi_database,
           batch->device_residues, batch->device_offsets, batch->host_lengths,
           batch->sequence_count, batch->device_null_scores,
@@ -4589,7 +4647,7 @@ sequence_batch_postfilter_candidates_many_impl(
           batch->device_bias_profiles, batch->device_bias_candidates,
           batch->host_bias_candidates, batch->device_bias_ssv_inputs,
           candidate_count, results, reason_facts, reason_statistics,
-          error, error_size);
+          batch->execution_policy_mode, error, error_size);
   if (postfilter_status != 0)
     return -1;
 #undef CUDA_TRY_POSTFILTER

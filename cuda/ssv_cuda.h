@@ -63,6 +63,29 @@ typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 struct plan7_postfilter_reason_statistics;
 struct plan7_forward_workspace;
 
+/* Version-1 request-scoped GPU execution policy.  This selects only among
+ * exact GPU implementations that have already passed their semantic gates;
+ * it never routes work to the CPU or enables an experimental filter. */
+enum plan7_gpu_execution_policy {
+  PLAN7_GPU_EXECUTION_POLICY_AUTO = 0,
+  PLAN7_GPU_EXECUTION_POLICY_SIMPLE = 1,
+  PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT = 2
+};
+
+enum plan7_gpu_execution_policy_abi {
+  PLAN7_GPU_EXECUTION_POLICY_VERSION = 1,
+  PLAN7_GPU_EXECUTION_POLICY_FORWARD_CANDIDATES_PER_WARP = 1
+};
+
+typedef struct plan7_gpu_execution_policy_statistics {
+  uint32_t version;
+  uint32_t mode;
+  uint64_t target_count;
+  uint64_t length_class_count;
+  uint64_t f1_run_count;
+  uint64_t forward_candidates_per_warp;
+} plan7_gpu_execution_policy_statistics;
+
 typedef struct plan7_ssv_workspace_statistics {
   uint64_t f1_device_compaction_run_count;
   uint64_t f1_host_expansion_run_count;
@@ -341,6 +364,20 @@ int plan7_ssv_sequence_batch_create(const uint8_t *residues,
 int plan7_ssv_sequence_batch_destroy(plan7_ssv_sequence_batch **batch,
                                      char *error,
                                      size_t error_size);
+
+/* Configure the immutable policy before the first fused F1 operation.  The
+ * ordinary constructor leaves AUTO selected for ABI compatibility. */
+int plan7_ssv_sequence_batch_set_execution_policy(
+  plan7_ssv_sequence_batch *batch,
+  int policy,
+  char *error,
+  size_t error_size);
+
+int plan7_ssv_sequence_batch_get_execution_policy_statistics(
+  const plan7_ssv_sequence_batch *batch,
+  plan7_gpu_execution_policy_statistics *statistics,
+  char *error,
+  size_t error_size);
 
 int plan7_ssv_sequence_batch_get_view(
   const plan7_ssv_sequence_batch *batch,

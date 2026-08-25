@@ -348,6 +348,15 @@ cdef extern from "ssv_cuda.h" nogil:
         PLAN7_F1_CUTOFF_ALWAYS_REJECT
         PLAN7_F1_CUTOFF_ALWAYS_CPU
 
+    cdef enum plan7_gpu_execution_policy:
+        PLAN7_GPU_EXECUTION_POLICY_AUTO
+        PLAN7_GPU_EXECUTION_POLICY_SIMPLE
+        PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT
+
+    cdef enum plan7_gpu_execution_policy_abi:
+        PLAN7_GPU_EXECUTION_POLICY_VERSION
+        PLAN7_GPU_EXECUTION_POLICY_FORWARD_CANDIDATES_PER_WARP
+
     ctypedef struct plan7_ssv_result:
         uint8_t xE
         uint8_t status
@@ -418,6 +427,14 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t forward_growth_count
         uint64_t forward_event_create_count
         uint64_t forward_run_count
+
+    ctypedef struct plan7_gpu_execution_policy_statistics:
+        uint32_t version
+        uint32_t mode
+        uint64_t target_count
+        uint64_t length_class_count
+        uint64_t f1_run_count
+        uint64_t forward_candidates_per_warp
 
     ctypedef struct plan7_profile_footprint:
         uint64_t profile_count
@@ -590,6 +607,20 @@ cdef extern from "ssv_cuda.h" nogil:
 
     int plan7_ssv_sequence_batch_destroy(
         plan7_ssv_sequence_batch **batch,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_set_execution_policy(
+        plan7_ssv_sequence_batch *batch,
+        int policy,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_get_execution_policy_statistics(
+        const plan7_ssv_sequence_batch *batch,
+        plan7_gpu_execution_policy_statistics *statistics,
         char *error,
         size_t error_size,
     )
@@ -5561,6 +5592,7 @@ cdef class SequenceBatch:
         const uint8_t[::1] residues,
         const uint64_t[::1] offsets,
         int alphabet_size,
+        int _execution_policy=PLAN7_GPU_EXECUTION_POLICY_AUTO,
     ):
         cdef char error[512]
         cdef int status
@@ -5574,6 +5606,12 @@ cdef class SequenceBatch:
             raise ValueError("offsets must contain an initial zero")
         if alphabet_size < 1:
             raise ValueError("alphabet size must be positive")
+        if _execution_policy not in (
+            PLAN7_GPU_EXECUTION_POLICY_AUTO,
+            PLAN7_GPU_EXECUTION_POLICY_SIMPLE,
+            PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT,
+        ):
+            raise ValueError("invalid GPU execution policy")
         self._content_fingerprint = _sequence_content_fingerprint(
             alphabet_size, residues, offsets
         )
@@ -5592,6 +5630,16 @@ cdef class SequenceBatch:
                 sizeof(error),
             )
         if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        error[0] = 0
+        status = plan7_ssv_sequence_batch_set_execution_policy(
+            self._batch,
+            _execution_policy,
+            error,
+            sizeof(error),
+        )
+        if status != 0:
+            plan7_ssv_sequence_batch_destroy(&self._batch, NULL, 0)
             raise RuntimeError(error.decode("utf-8", "replace"))
         self._sequence_count = <size_t> offsets.shape[0] - 1
         self._results.resize(self._sequence_count)
@@ -5632,6 +5680,7 @@ cdef class SequenceBatch:
         These values exclude the batch's input, SSV, and bias allocations.
         """
         cdef plan7_ssv_workspace_statistics statistics
+        cdef plan7_gpu_execution_policy_statistics policy_statistics
         cdef char error[512]
         cdef int status
         if self._batch == NULL:
@@ -5639,6 +5688,12 @@ cdef class SequenceBatch:
         error[0] = 0
         status = plan7_ssv_sequence_batch_get_workspace_statistics(
             self._batch, &statistics, error, sizeof(error)
+        )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        error[0] = 0
+        status = plan7_ssv_sequence_batch_get_execution_policy_statistics(
+            self._batch, &policy_statistics, error, sizeof(error)
         )
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
@@ -5724,6 +5779,20 @@ cdef class SequenceBatch:
             "forward_growth_count": statistics.forward_growth_count,
             "forward_event_create_count": statistics.forward_event_create_count,
             "forward_run_count": statistics.forward_run_count,
+            "execution_policy_version": policy_statistics.version,
+            "execution_policy_mode": policy_statistics.mode,
+            "execution_policy_target_count": (
+                policy_statistics.target_count
+            ),
+            "execution_policy_length_class_count": (
+                policy_statistics.length_class_count
+            ),
+            "execution_policy_f1_run_count": (
+                policy_statistics.f1_run_count
+            ),
+            "execution_policy_forward_candidates_per_warp": (
+                policy_statistics.forward_candidates_per_warp
+            ),
         }
 
     @property
@@ -10198,6 +10267,13 @@ F1_CUTOFF_INVALID = PLAN7_F1_CUTOFF_INVALID
 F1_CUTOFF_SCORE = PLAN7_F1_CUTOFF_SCORE
 F1_CUTOFF_ALWAYS_REJECT = PLAN7_F1_CUTOFF_ALWAYS_REJECT
 F1_CUTOFF_ALWAYS_CPU = PLAN7_F1_CUTOFF_ALWAYS_CPU
+EXECUTION_POLICY_VERSION = PLAN7_GPU_EXECUTION_POLICY_VERSION
+EXECUTION_POLICY_AUTO = PLAN7_GPU_EXECUTION_POLICY_AUTO
+EXECUTION_POLICY_SIMPLE = PLAN7_GPU_EXECUTION_POLICY_SIMPLE
+EXECUTION_POLICY_THROUGHPUT = PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT
+EXECUTION_POLICY_FORWARD_CANDIDATES_PER_WARP = (
+    PLAN7_GPU_EXECUTION_POLICY_FORWARD_CANDIDATES_PER_WARP
+)
 BIAS_CPU_REQUIRED = PLAN7_BIAS_CPU_REQUIRED
 BIAS_DEFINITE_REJECT = PLAN7_BIAS_DEFINITE_REJECT
 BIAS_DEFINITE_PASS = PLAN7_BIAS_DEFINITE_PASS

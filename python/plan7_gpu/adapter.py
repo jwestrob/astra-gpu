@@ -26,6 +26,19 @@ from ._fingerprint import (
 _MISSING = object()
 _PIPELINE_LEASES_LOCK = Lock()
 _FORWARD_SPECIAL_BYTE_BUDGET = 384 << 20
+_EXECUTION_POLICY_CODES = {
+    "auto": _native.EXECUTION_POLICY_AUTO,
+    "simple": _native.EXECUTION_POLICY_SIMPLE,
+    "throughput": _native.EXECUTION_POLICY_THROUGHPUT,
+}
+
+
+def _normalize_execution_policy(value: Any) -> tuple[str, int]:
+    if type(value) is not str or value not in _EXECUTION_POLICY_CODES:
+        raise ValueError(
+            "execution_policy must be 'auto', 'simple', or 'throughput'"
+        )
+    return value, _EXECUTION_POLICY_CODES[value]
 
 
 class _PipelineLease:
@@ -1292,6 +1305,7 @@ class _SequenceState:
         "residue_offsets",
         "native_generation",
         "content_fingerprint",
+        "execution_policy",
     )
 
     def __init__(
@@ -1302,6 +1316,7 @@ class _SequenceState:
         residue_offsets: bytes,
         native_generation: int,
         content_fingerprint: bytes,
+        execution_policy: str,
     ) -> None:
         self.alphabet = alphabet
         self.native = native
@@ -1310,6 +1325,7 @@ class _SequenceState:
         self.residue_offsets = residue_offsets
         self.native_generation = native_generation
         self.content_fingerprint = content_fingerprint
+        self.execution_policy = execution_policy
 
 
 _SEQUENCE_STATES: WeakKeyDictionary[Any, _SequenceState] = WeakKeyDictionary()
@@ -1332,7 +1348,14 @@ class SequenceBatch:
 
     __slots__ = ("__weakref__",)
 
-    def __init__(self, sequences: Iterable[Any], *, alphabet: Any | None = None):
+    def __init__(
+        self,
+        sequences: Iterable[Any],
+        *,
+        alphabet: Any | None = None,
+        execution_policy: str = "auto",
+    ):
+        policy_name, policy_code = _normalize_execution_policy(execution_policy)
         inherited_alphabet = getattr(sequences, "alphabet", None)
         sequence_list = list(sequences)
         if alphabet is None:
@@ -1367,7 +1390,12 @@ class SequenceBatch:
         )
         if sequence_block_content_fingerprint(targets) != content_fingerprint:
             raise RuntimeError("copied target content fingerprint changed")
-        native = _native.SequenceBatch(residues, offsets, alphabet.Kp)
+        native = _native.SequenceBatch(
+            residues,
+            offsets,
+            alphabet.Kp,
+            policy_code,
+        )
         native_generation, native_content_fingerprint = (
             native._generation_and_content_for_seal()
         )
@@ -1381,6 +1409,7 @@ class SequenceBatch:
             offsets.tobytes(),
             native_generation,
             content_fingerprint,
+            policy_name,
         )
 
     @property
@@ -1395,6 +1424,50 @@ class SequenceBatch:
         state = _sequence_state(self)
         with state.lock:
             return bool(state.native.closed)
+
+    @property
+    def execution_policy(self) -> str:
+        """Return the immutable request-scoped GPU execution policy."""
+        return _sequence_state(self).execution_policy
+
+    @property
+    def execution_policy_statistics(self) -> dict[str, int | str]:
+        """Return exact cumulative choices made by the GPU policy."""
+        state = _sequence_state(self)
+        with state.lock:
+            statistics = state.native.workspace_statistics
+        return {
+            "schema_version": statistics["execution_policy_version"],
+            "mode": state.execution_policy,
+            "mode_code": statistics["execution_policy_mode"],
+            "target_count": statistics["execution_policy_target_count"],
+            "length_class_count": statistics[
+                "execution_policy_length_class_count"
+            ],
+            "f1_run_count": statistics["execution_policy_f1_run_count"],
+            "profile_packed_run_count": statistics[
+                "f1_profile_packed_run_count"
+            ],
+            "profile_packed_profile_count": statistics[
+                "f1_profile_packed_profile_count"
+            ],
+            "profile_scalar_profile_count": statistics[
+                "f1_profile_scalar_profile_count"
+            ],
+            "length_class_run_count": statistics["f1_length_class_run_count"],
+            "full_msv_compaction_run_count": statistics[
+                "full_msv_compaction_run_count"
+            ],
+            "full_msv_legacy_run_count": statistics[
+                "full_msv_legacy_run_count"
+            ],
+            "full_msv_packed_run_count": statistics[
+                "full_msv_packed_run_count"
+            ],
+            "forward_candidates_per_warp": statistics[
+                "execution_policy_forward_candidates_per_warp"
+            ],
+        }
 
     @property
     def memory_snapshot(self) -> dict[str, Any]:
