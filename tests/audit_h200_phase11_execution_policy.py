@@ -56,6 +56,11 @@ def git_output(*arguments: str) -> str:
     ).strip()
 
 
+def module_identity(module) -> dict[str, str]:
+    path = Path(module.__file__).resolve()
+    return {"path": str(path), "sha256": sha256(path.read_bytes())}
+
+
 def mutate_copy(hmm: pyhmmer.plan7.HMM, ordinal: int):
     result = hmm.copy()
     result.name = f"phase11-{ordinal:04d}".encode()
@@ -209,6 +214,17 @@ def audit() -> dict[str, object]:
             seal_factory = _pipeline._seal_postfilter_batch_bound
             _pipeline._seal_postfilter_batch_bound = None
             try:
+                warm_targets = pyhmmer.easel.DigitalSequenceBlock(
+                    pairs[0].hmm.alphabet, sequences[:1]
+                )
+                with (
+                    session.select(range(1)) as warm_selection,
+                    SequenceBatch(
+                        warm_targets, execution_policy="simple"
+                    ) as warm_batch,
+                ):
+                    warm_batch.postfilter_selection(warm_selection, F1=F1)
+                gc.collect()
                 for shape_index, (name, profile_count, target_count) in enumerate(SHAPES):
                     targets = pyhmmer.easel.DigitalSequenceBlock(
                         pairs[0].hmm.alphabet,
@@ -237,6 +253,10 @@ def audit() -> dict[str, object]:
         "tree": git_output("rev-parse", "HEAD^{tree}"),
         "dirty": bool(git_output("status", "--porcelain")),
         "device": provenance,
+        "modules": {
+            "native": module_identity(_native),
+            "pipeline": module_identity(_pipeline),
+        },
         "policy_version": _native.EXECUTION_POLICY_VERSION,
         "shapes": shape_results,
     }
