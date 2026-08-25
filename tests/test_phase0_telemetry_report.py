@@ -47,6 +47,7 @@ def generation_statistics():
             0,
             0,
             0,
+            0,
         )
         reasons = []
         cells = []
@@ -112,7 +113,7 @@ def continuation_statistics(local_index, wall_ns):
 
 
 def journal_generation_statistics(*, forward_reject=False):
-    from tests.test_phase0_route_telemetry import valid_transport
+    from test_phase0_route_telemetry import valid_transport
 
     records, native = valid_transport()
     if forward_reject:

@@ -50,6 +50,7 @@ def valid_transport():
         0,  # rescore CPU
         1,  # rescore device
         1,  # rescore regions
+        0,  # rescore certified GA rejects
     )
     postfilter = [0] * 16
     postfilter[0] = 1
@@ -64,7 +65,7 @@ def valid_transport():
     forward[8] = 1
     backward = [0] * 18
     backward[14] = 1
-    rescore = [0] * 25
+    rescore = [0] * len(_telemetry._REASON_FACTS["rescore"])
     rescore[21] = 1
 
     postfilter_cells = [0] * 16
@@ -78,7 +79,7 @@ def valid_transport():
     forward_cells[8] = 50
     backward_cells = [0] * 18
     backward_cells[14] = 50
-    rescore_cells = [0] * 25
+    rescore_cells = [0] * len(_telemetry._REASON_FACTS["rescore"])
     rescore_cells[21] = 20
 
     profile_records = (
@@ -125,6 +126,10 @@ def valid_transport():
             "region_count": 1,
             "device_result_count": 1,
             "cpu_required_count": 0,
+            "certified_ga_region_count": 0,
+            "certified_ga_row_count": 0,
+            "certified_ga_skipped_work_cells": 0,
+            "ga_classification_ms": 0.0,
             "work_cells": 20,
         },
     }
@@ -316,11 +321,11 @@ class GenerationTelemetryTests(unittest.TestCase):
         reasons = list(records[0][1])
         reasons[2] = (0,) * 10
         reasons[3] = (0,) * 18
-        reasons[4] = (0,) * 25
+        reasons[4] = (0,) * len(_telemetry._REASON_FACTS["rescore"])
         reason_cells = list(records[0][2])
         reason_cells[2] = (0,) * 10
         reason_cells[3] = (0,) * 18
-        reason_cells[4] = (0,) * 25
+        reason_cells[4] = (0,) * len(_telemetry._REASON_FACTS["rescore"])
         native = {
             "postfilter": native["postfilter"],
             "forward": {
@@ -628,7 +633,8 @@ class DisabledShapeAndSearchTelemetryTests(unittest.TestCase):
             backward_source,
         )
         self.assertIn(
-            "matrix_byte_budget, trace_byte_budget, false,\n        output",
+            "matrix_byte_budget, trace_byte_budget, false,\n"
+            "        nullptr, 0, nullptr, 0,\n        output",
             rescore_source,
         )
 
