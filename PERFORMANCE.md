@@ -42,6 +42,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, Phase 7 packed full MSV | 64 host workers | **454.006856 s** | 13,245,856 KiB | exact; effectively tied with Phase 6 |
 | Astra GPU, H200, Phase 9 certified GA pruning | 64 host workers | **449.104112 s** | 13,159,348 KiB | **exact; 1.5649x faster than Astra CPU64; new best** |
 | Astra GPU, H200, Phase 11 automatic policy | 64 host workers | 451.083043 s | 13,380,000 KiB | exact; 0.441% slower than Phase 9, with 22 MiB less sampled H200 memory |
+| Astra GPU, H200, resident F2→Forward handoff | 64 host workers | **448.140781 s** | 13,195,416 KiB | **exact; 0.2145% faster than Phase 9; new best** |
 | Rejected experiment: packed Viterbi | 64 host workers | 454.963381 s | 13,340,692 KiB | exact, but 0.211% slower and 94,836 KiB larger; excluded from `main` |
 
 Additional GPU timing layers:

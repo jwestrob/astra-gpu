@@ -46,7 +46,7 @@ the complete oracle suite and representative end-to-end workloads.
 | 1A | Host-side sparse-accounting journal v3 plus dense/sparse dual oracle | complete; production performance rejected | through `039c092` | exact full job 1182349 was 3.82% slower despite 41.35% fewer packet bytes |
 | 1B | Produce sparse certificate before dense host materialization | complete; retained opt-in | through `87727cd` | jobs 1182389/1182391 exact; one-pass wall 536.168 s, 1.84% faster than dense, zero dense-v2 retention |
 | 2 | Device-side stable F1 candidate compaction | complete; retained | through `959cdf6` | job 1182619 exact; 83 device compactions, zero host expansions/uploads; no standalone speedup claim |
-| 3 | Device-resident Forward -> Backward/domain -> rescore chain | partial; validated residency slices retained | through `171d544` | jobs 1182690/1182713 exact; redundant Forward and region replay removed, compiled F3 authoritative |
+| 3 | Device-resident postfilter/F2 -> Forward -> Backward/domain -> rescore chain | partial; validated residency slices retained | through `737523c` | jobs 1182690/1182713/1183504 exact; redundant F2 candidate, Forward-special, and region replay removed; compiled F3 authoritative |
 | 4 | Forward/Backward/rescore candidates-per-warp variants | complete; automatic promotion rejected | through `a8932dd` | exact, but full job 1182718 regressed 0.72%; production restored to width 1 |
 | 5 | Profile-axis packed SSV | complete; retained | through `9730f39` | exact job 1182734: 455.026 s, 14.98% faster than retained Phase 3 |
 | 6 | Length-cohort decision metadata | complete; retained | through `cfd756c` | exact job 1182743: 454.247 s; transition H2D reduced 24.92 MB -> 0.12 MB |
@@ -192,6 +192,16 @@ Phase 2, request wall improved by 4.546 seconds (0.844%) and generation wall by
 439.13 ms to 49.16 ms, and aggregate Backward wall fell from 26.880 seconds to
 24.853 seconds. This slice is retained; Phase 3 remains active for persistent
 workspaces and Backward-to-rescore residency.
+
+The next Phase 3 slice compiled the exact F2 Gumbel boundary, classified and
+stably compacted all postfilter rows on-device, and passed the resident F2
+survivor mapping directly into Forward. Full H200 job `1183504` reproduced the
+same exact output and set a new best of 448.140781 seconds. Generation improved
+6.111472 seconds versus Phase 9, all 203,671,109 postfilter rows were supported,
+and 145,458,480 candidate H2D bytes were eliminated. CPU continuation/output
+remained dominant at 400.083104 seconds, so Phase 3 now turns to exact reduction
+of multidomain and cap-driven CPU continuation rather than further filter-lane
+micro-optimization.
 
 ## Phase 4 Forward subwarp result
 

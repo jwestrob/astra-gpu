@@ -36,12 +36,33 @@ selected-source host vector and its exact downloaded bytes are reported.
 The exact d486 private-ABI sm75/sm90 build passes.  The focused host boundary
 oracle checks adversarial binary32 values around every compiled boundary and
 all 63,490 non-NaN binary16 values promoted to binary32 against the linked
-Gumbel predicate.  A focused H200 old-versus-new fused-generation oracle is
-the promotion gate; its result is pending in this implementation commit.
+Gumbel predicate.  Focused H200 job `1183491` compared the old and resident
+paths and matched all three complete TopHits rows exactly.  It exercised 12
+postfilter inputs, selected 11 F2 survivors in stable order, and reported one
+resident Forward call with zero unsupported profiles.
 
 ## Benchmark decision
 
-Pending the exact H200 gate and representative/full timing.  Production must
-retain the old host decision/upload path when compilation is unsupported, and
-the change will be rejected if it changes any complete HMMER output or merely
-moves the eliminated transfer into another buffer.
+Full H200 job `1183504` searched 27,481 Pfam profiles against all 300,186
+targets.  Its output is byte-identical to the CPU64 and prior GPU oracle:
+SHA-256 `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
+39,010,327 bytes, and 383,235 lines.
+
+The request completed in **448.140781 seconds**, 0.963331 seconds (0.2145%)
+faster than the prior Phase 9 best.  Generation fell from 340.105077 to
+333.993605 seconds (6.111472 seconds, 1.797%), while CPU continuation/output
+remained the critical lane at 400.083104 seconds.  All 203,671,109 postfilter
+rows were device-classified with zero unsupported profiles; 12,121,540 F2
+survivors were transferred as 48,486,160 bytes of source ordinals, and
+145,458,480 bytes of Forward candidate H2D were eliminated.  The added F2
+compile/kernel/scan/download path totaled 76.684 ms across 83 chunks.
+
+Memory was effectively flat: sampled H200 peak was 3,388 MiB (4 MiB below
+Phase 9), while maximum RSS rose 36,068 KiB (0.274%) to 13,195,416 KiB.
+Because the exact full request improved and the fallback path remains intact,
+the optimization is retained.  Evidence lives under
+`build/h200-phase3-f2-resident-full-20260825/attempt-01-full/runs/h200-full`;
+`worker.json` SHA-256 is
+`6053612b5e01d1b7f940e7650666839bf169ada3a640e13b48508ed8afbc913e`
+and `raw-validation.json` SHA-256 is
+`06b07e0f4007c68488a1d88e5bb582652066969dd26b6ba2af109d2cc8fc6c28`.
