@@ -483,6 +483,33 @@ cdef extern from "ssv_cuda.h" nogil:
         double coarse_kernel_milliseconds
         double analysis_milliseconds
 
+    ctypedef struct plan7_seed_profile_statistics:
+        uint64_t logical_pair_count
+        uint64_t exact_candidate_count
+        uint64_t seed_candidate_count
+        uint64_t certified_reject_count
+        uint64_t false_reject_count
+        uint64_t unsupported_pair_count
+        uint64_t logical_cell_count
+        uint64_t survivor_exact_cell_count
+
+    ctypedef struct plan7_seed_evaluation_statistics:
+        uint64_t profile_count
+        uint64_t sequence_count
+        uint64_t maximum_word_length
+        uint64_t logical_pair_count
+        uint64_t exact_candidate_count
+        uint64_t seed_candidate_count
+        uint64_t certified_reject_count
+        uint64_t false_reject_count
+        uint64_t unsupported_pair_count
+        uint64_t logical_cell_count
+        uint64_t survivor_exact_cell_count
+        uint64_t temporary_device_bytes
+        double exact_generation_milliseconds
+        double seed_kernel_milliseconds
+        double analysis_milliseconds
+
     int plan7_cuda_device_count(char *error, size_t error_size)
     int plan7_cuda_memory_info(
         int *device_ordinal,
@@ -685,6 +712,24 @@ cdef extern from "ssv_cuda.h" nogil:
         plan7_f0_profile_statistics *profile_statistics,
         size_t profile_statistics_count,
         plan7_f0_evaluation_statistics *statistics,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_evaluate_seed_many(
+        plan7_ssv_sequence_batch *batch,
+        const uint8_t *packed_scores,
+        size_t packed_score_count,
+        const plan7_ssv_profile *profiles,
+        size_t profile_count,
+        const float *m_mu,
+        const float *m_lambda,
+        double f1,
+        size_t maximum_word_length,
+        size_t indexed_alphabet_size,
+        plan7_seed_profile_statistics *profile_statistics,
+        size_t profile_statistics_count,
+        plan7_seed_evaluation_statistics *statistics,
         char *error,
         size_t error_size,
     )
@@ -6272,6 +6317,108 @@ cdef class SequenceBatch:
             ),
             "coarse_upload_milliseconds": summary.coarse_upload_milliseconds,
             "coarse_kernel_milliseconds": summary.coarse_kernel_milliseconds,
+            "analysis_milliseconds": summary.analysis_milliseconds,
+            "profiles": profiles,
+        }
+
+    def evaluate_mandatory_seed_many_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+        int maximum_word_length,
+        int indexed_alphabet_size=20,
+    ):
+        """Evaluate the certified bounded-word index outside production."""
+        cdef size_t profile_count = <size_t> score_offsets.shape[0]
+        cdef size_t profile_index
+        cdef int status
+        cdef char error[512]
+        cdef vector[plan7_seed_profile_statistics] rows
+        cdef plan7_seed_profile_statistics row
+        cdef plan7_seed_evaluation_statistics summary
+        cdef list profiles = []
+
+        if (
+            <size_t> m_mu.shape[0] != profile_count
+            or <size_t> m_lambda.shape[0] != profile_count
+        ):
+            raise ValueError("e-value parameter lengths differ")
+        if maximum_word_length not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("maximum seed word length must be 1/2/4/8/16/32")
+        if indexed_alphabet_size <= 0:
+            raise ValueError("indexed alphabet size must be positive")
+        profile_count = self._prepare_profiles(
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+        )
+        rows.resize(profile_count)
+        error[0] = 0
+        with nogil:
+            status = plan7_ssv_sequence_batch_evaluate_seed_many(
+                self._batch,
+                &packed_scores[0] if packed_scores.shape[0] else NULL,
+                <size_t> packed_scores.shape[0],
+                self._profiles.data() if profile_count else NULL,
+                profile_count,
+                &m_mu[0] if profile_count else NULL,
+                &m_lambda[0] if profile_count else NULL,
+                f1,
+                <size_t> maximum_word_length,
+                <size_t> indexed_alphabet_size,
+                rows.data() if profile_count else NULL,
+                profile_count,
+                &summary,
+                error,
+                sizeof(error),
+            )
+        if status != 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        for profile_index in range(profile_count):
+            row = rows[profile_index]
+            profiles.append(
+                {
+                    "profile_index": profile_index,
+                    "logical_pair_count": row.logical_pair_count,
+                    "exact_candidate_count": row.exact_candidate_count,
+                    "seed_candidate_count": row.seed_candidate_count,
+                    "certified_reject_count": row.certified_reject_count,
+                    "false_reject_count": row.false_reject_count,
+                    "unsupported_pair_count": row.unsupported_pair_count,
+                    "logical_cell_count": row.logical_cell_count,
+                    "survivor_exact_cell_count": row.survivor_exact_cell_count,
+                }
+            )
+        return {
+            "schema": "plan7_gpu.phase10_mandatory_seed_evaluation.v1",
+            "profile_count": summary.profile_count,
+            "sequence_count": summary.sequence_count,
+            "maximum_word_length": summary.maximum_word_length,
+            "indexed_alphabet_size": indexed_alphabet_size,
+            "logical_pair_count": summary.logical_pair_count,
+            "exact_candidate_count": summary.exact_candidate_count,
+            "seed_candidate_count": summary.seed_candidate_count,
+            "certified_reject_count": summary.certified_reject_count,
+            "false_reject_count": summary.false_reject_count,
+            "unsupported_pair_count": summary.unsupported_pair_count,
+            "logical_cell_count": summary.logical_cell_count,
+            "survivor_exact_cell_count": summary.survivor_exact_cell_count,
+            "temporary_device_bytes": summary.temporary_device_bytes,
+            "exact_generation_milliseconds": (
+                summary.exact_generation_milliseconds
+            ),
+            "seed_kernel_milliseconds": summary.seed_kernel_milliseconds,
             "analysis_milliseconds": summary.analysis_milliseconds,
             "profiles": profiles,
         }

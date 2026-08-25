@@ -630,6 +630,204 @@ ssv_f0_mask_many_kernel(const uint8_t *coarse_scores,
   }
 }
 
+__device__ __forceinline__ plan7_ssv_result
+ssv_result_for_local_gain(unsigned gain,
+                          uint8_t length_tjb,
+                          const plan7_ssv_profile profile)
+{
+  const unsigned raw_xE = 128U + gain;
+  plan7_ssv_result result = {
+    static_cast<uint8_t>(raw_xE), PLAN7_SSV_OK, length_tjb, 0, 0};
+  if (static_cast<unsigned>(length_tjb) + profile.tbm + profile.tec +
+        profile.bias >= 127U) {
+    result.status = PLAN7_SSV_ENORESULT;
+  } else if (raw_xE >= 255U - profile.bias) {
+    result.status =
+      static_cast<int>(profile.base) - static_cast<int>(length_tjb) -
+          static_cast<int>(profile.tbm) < 128
+        ? PLAN7_SSV_ENORESULT : PLAN7_SSV_ERANGE;
+  } else {
+    unsigned adjusted = raw_xE + profile.base - length_tjb - profile.tbm;
+    adjusted -= 128U;
+    if (adjusted >= 255U - profile.bias) {
+      result.status = PLAN7_SSV_ERANGE;
+    } else {
+      const unsigned xJ = adjusted - profile.tec;
+      if (xJ > profile.base) {
+        result.status = PLAN7_SSV_ENORESULT;
+      } else {
+        result.numerator = static_cast<int16_t>(
+          static_cast<int>(xJ) - static_cast<int>(length_tjb) -
+          static_cast<int>(profile.base));
+      }
+    }
+  }
+  return result;
+}
+
+/* Return the first pre-wrap integer gain that the exact F1 decision cannot
+ * reject. Zero means that this pair is unsupported/unconditional. */
+__device__ __forceinline__ int
+compile_seed_required_gain(float null_score,
+                           uint8_t length_tjb,
+                           const plan7_ssv_f1_profile profile)
+{
+  if (profile.cutoff_mode == PLAN7_F1_CUTOFF_INVALID ||
+      profile.cutoff_mode == PLAN7_F1_CUTOFF_ALWAYS_CPU ||
+      !isfinite(null_score) ||
+      static_cast<unsigned>(profile.profile.base) <
+        static_cast<unsigned>(length_tjb) + profile.profile.tbm +
+          profile.profile.tec)
+    return 0;
+
+  int first_required = -1;
+  for (int gain = 0; gain < 128; ++gain) {
+    const plan7_ssv_result result = ssv_result_for_local_gain(
+      static_cast<unsigned>(gain), length_tjb, profile.profile);
+    const bool required = f1_requires_cpu(result, null_score, profile);
+    if (required && first_required < 0)
+      first_required = gain;
+    else if (!required && first_required >= 0)
+      return 0;
+  }
+  return first_required > 0 ? first_required : 0;
+}
+
+template<int MaximumWordLength>
+__device__ __forceinline__ bool
+ssv_has_bounded_seed(const uint8_t *scores,
+                     int score_stride,
+                     int model_length,
+                     const uint8_t *residues,
+                     const uint64_t *offsets,
+                     size_t sequence,
+                     int threshold)
+{
+  const uint64_t start = offsets[sequence];
+  const int length = static_cast<int>(offsets[sequence + 1] - start);
+  const int diagonal_count = model_length + length - 1;
+  bool found = false;
+
+  for (int diagonal = threadIdx.x;
+       diagonal < diagonal_count && !found;
+       diagonal += blockDim.x) {
+    const int delta = diagonal - (length - 1);
+    int i = delta < 0 ? -delta : 0;
+    int k = i + delta;
+    int prefix = 0;
+    int queue_values[MaximumWordLength + 1];
+    int queue_indices[MaximumWordLength + 1];
+    int head = 0;
+    int tail = 1;
+    int step = 0;
+    queue_values[0] = 0;
+    queue_indices[0] = 0;
+
+    while (i < length && k < model_length) {
+      ++step;
+      const unsigned residue = residues[start + static_cast<uint64_t>(i)];
+      const unsigned raw_cost = scores[
+        static_cast<size_t>(k) * score_stride + residue];
+      const int cost = raw_cost < 128 ? static_cast<int>(raw_cost)
+                                     : static_cast<int>(raw_cost) - 256;
+      prefix -= cost;
+
+      while (head < tail &&
+             queue_indices[head % (MaximumWordLength + 1)] <
+               step - MaximumWordLength)
+        ++head;
+      if (head < tail &&
+          prefix - queue_values[head % (MaximumWordLength + 1)] >= threshold) {
+        found = true;
+        break;
+      }
+      while (head < tail &&
+             queue_values[(tail - 1) % (MaximumWordLength + 1)] >= prefix)
+        --tail;
+      queue_values[tail % (MaximumWordLength + 1)] = prefix;
+      queue_indices[tail % (MaximumWordLength + 1)] = step;
+      ++tail;
+      ++i;
+      ++k;
+    }
+  }
+  return found;
+}
+
+template<int MaximumWordLength>
+__global__ void
+ssv_seed_mask_many_kernel(const uint8_t *packed_scores,
+                          const plan7_ssv_f1_profile *profiles,
+                          size_t sequence_count,
+                          const uint8_t *residues,
+                          const uint64_t *offsets,
+                          const float *null_scores,
+                          const uint8_t *tjb,
+                          size_t indexed_alphabet_size,
+                          size_t words_per_profile,
+                          uint32_t *candidate_words,
+                          uint32_t *unsupported_words)
+{
+  __shared__ plan7_ssv_f1_profile profile_descriptor;
+  __shared__ int required_gain;
+  __shared__ int seed_threshold;
+  const size_t profile = static_cast<size_t>(blockIdx.y);
+  if (threadIdx.x == 0) profile_descriptor = profiles[profile];
+  __syncthreads();
+
+  const size_t first_sequence =
+    static_cast<size_t>(blockIdx.x) * kSequencesPerBlock;
+  for (int iteration = 0; iteration < kSequencesPerBlock; ++iteration) {
+    const size_t sequence = first_sequence + static_cast<size_t>(iteration);
+    if (sequence >= sequence_count) break;
+    const uint64_t target_start = offsets[sequence];
+    const uint64_t target_stop = offsets[sequence + 1];
+    bool noncanonical = target_start == target_stop;
+    for (uint64_t index = target_start + threadIdx.x;
+         index < target_stop;
+         index += blockDim.x)
+      noncanonical = noncanonical || residues[index] >= indexed_alphabet_size;
+    const int unsupported = __syncthreads_or(noncanonical);
+
+    if (threadIdx.x == 0) {
+      required_gain = unsupported ? 0 : compile_seed_required_gain(
+        null_scores[sequence],
+        tjb[profile_descriptor.tjb_offset + sequence],
+        profile_descriptor);
+      if (required_gain > 0) {
+        const uint64_t target_length = target_stop - target_start;
+        const uint64_t maximum_alignment = min(
+          target_length,
+          static_cast<uint64_t>(profile_descriptor.profile.model_length));
+        const uint64_t chunks =
+          (maximum_alignment + MaximumWordLength - 1) / MaximumWordLength;
+        seed_threshold = static_cast<int>(
+          (static_cast<uint64_t>(required_gain) + chunks - 1) / chunks);
+      } else {
+        seed_threshold = 0;
+      }
+    }
+    __syncthreads();
+
+    bool found = required_gain <= 0;
+    if (!found) {
+      found = ssv_has_bounded_seed<MaximumWordLength>(
+        packed_scores + profile_descriptor.profile.score_offset,
+        profile_descriptor.profile.score_stride,
+        profile_descriptor.profile.model_length,
+        residues, offsets, sequence, seed_threshold);
+      found = __syncthreads_or(found);
+    }
+    if (threadIdx.x == 0 && found) {
+      const size_t word = profile * words_per_profile + sequence / 32;
+      const uint32_t bit = UINT32_C(1) << (sequence % 32);
+      atomicOr(&candidate_words[word], bit);
+      if (required_gain <= 0) atomicOr(&unsupported_words[word], bit);
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void
 pack_profile_quartet_scores_kernel(
   const uint8_t *scalar_scores,
@@ -3559,6 +3757,259 @@ cleanup:
   if (device_residue_classes != nullptr) cudaFree(device_residue_classes);
   if (device_coarse_scores != nullptr) cudaFree(device_coarse_scores);
 #undef CUDA_TRY_F0
+  return rc;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_evaluate_seed_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  const float *m_mu,
+  const float *m_lambda,
+  double f1,
+  size_t maximum_word_length,
+  size_t indexed_alphabet_size,
+  plan7_seed_profile_statistics *profile_statistics,
+  size_t profile_statistics_count,
+  plan7_seed_evaluation_statistics *statistics,
+  char *error,
+  size_t error_size)
+{
+  using Clock = std::chrono::steady_clock;
+  uint32_t *device_seed_words = nullptr;
+  uint32_t *device_unsupported_words = nullptr;
+  cudaEvent_t kernel_start = nullptr;
+  cudaEvent_t kernel_stop = nullptr;
+  cudaError_t status = cudaSuccess;
+  std::vector<uint32_t> exact_words;
+  std::vector<uint32_t> seed_words;
+  std::vector<uint32_t> unsupported_words;
+  size_t words_per_profile = 0;
+  size_t word_count = 0;
+  size_t word_bytes = 0;
+  uint64_t residue_total = 0;
+  int rc = -1;
+
+  if (statistics == nullptr || batch == nullptr ||
+      (profile_count != 0 &&
+       (profile_statistics == nullptr || profiles == nullptr ||
+        packed_scores == nullptr || m_mu == nullptr || m_lambda == nullptr)) ||
+      profile_statistics_count != profile_count ||
+      indexed_alphabet_size == 0 ||
+      indexed_alphabet_size > static_cast<size_t>(batch->alphabet_size) ||
+      (maximum_word_length != 1 && maximum_word_length != 2 &&
+       maximum_word_length != 4 && maximum_word_length != 8 &&
+       maximum_word_length != 16 && maximum_word_length != 32)) {
+    set_error(error, error_size, "invalid mandatory-seed evaluator arguments");
+    return -1;
+  }
+  memset(statistics, 0, sizeof(*statistics));
+  if (profile_count != 0)
+    memset(profile_statistics, 0,
+           profile_count * sizeof(*profile_statistics));
+  statistics->profile_count = profile_count;
+  statistics->sequence_count = batch->sequence_count;
+  statistics->maximum_word_length = maximum_word_length;
+
+  try {
+    if (batch->sequence_count > SIZE_MAX - 31 ||
+        !checked_product(profile_count,
+                         (batch->sequence_count + 31) / 32,
+                         &word_count) ||
+        !checked_product(word_count, sizeof(uint32_t), &word_bytes)) {
+      set_error(error, error_size, "mandatory-seed mask size overflow");
+      return -1;
+    }
+    words_per_profile = (batch->sequence_count + 31) / 32;
+    exact_words.resize(word_count);
+    seed_words.resize(word_count);
+    unsupported_words.resize(word_count);
+  } catch (...) {
+    set_error(error, error_size, "mandatory-seed host allocation failed");
+    return -1;
+  }
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    const plan7_ssv_profile &descriptor = profiles[profile];
+    for (int position = 0; position < descriptor.model_length; ++position) {
+      for (int residue = 0; residue < batch->alphabet_size; ++residue) {
+        const uint8_t raw = packed_scores[
+          descriptor.score_offset +
+          static_cast<size_t>(position) * descriptor.score_stride + residue];
+        const int cost = raw < 128 ? static_cast<int>(raw)
+                                   : static_cast<int>(raw) - 256;
+        if (cost < -static_cast<int>(descriptor.bias)) {
+          set_error(error, error_size,
+                    "mandatory-seed score violates the HMMER bias bound");
+          return -1;
+        }
+      }
+    }
+  }
+
+  {
+    const auto start = Clock::now();
+    if (sequence_batch_f1_mask_many_impl(
+          batch, packed_scores, packed_score_count, profiles, profile_count,
+          m_mu, m_lambda, f1, nullptr, 0, false, error, error_size) != 0)
+      goto cleanup_seed;
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size,
+                     "mandatory-seed exact F1 synchronization", status);
+      goto cleanup_seed;
+    }
+    statistics->exact_generation_milliseconds =
+      std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  }
+  if (profile_count == 0 || batch->sequence_count == 0) {
+    rc = 0;
+    goto cleanup_seed;
+  }
+
+#define CUDA_TRY_SEED(call, label)                                           \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      set_cuda_error(error, error_size, label, status);                       \
+      goto cleanup_seed;                                                      \
+    }                                                                         \
+  } while (0)
+
+  CUDA_TRY_SEED(cudaEventCreate(&kernel_start),
+                "mandatory-seed kernel event create");
+  CUDA_TRY_SEED(cudaEventCreate(&kernel_stop),
+                "mandatory-seed kernel event create");
+  CUDA_TRY_SEED(cudaMalloc(&device_seed_words, word_bytes),
+                "cudaMalloc(mandatory-seed mask)");
+  CUDA_TRY_SEED(cudaMalloc(&device_unsupported_words, word_bytes),
+                "cudaMalloc(mandatory-seed unsupported mask)");
+  CUDA_TRY_SEED(cudaMemset(device_seed_words, 0, word_bytes),
+                "cudaMemset(mandatory-seed mask)");
+  CUDA_TRY_SEED(cudaMemset(device_unsupported_words, 0, word_bytes),
+                "cudaMemset(mandatory-seed unsupported mask)");
+  CUDA_TRY_SEED(cudaEventRecord(kernel_start),
+                "mandatory-seed kernel event record");
+  {
+    const dim3 grid(
+      static_cast<unsigned>((batch->sequence_count + kSequencesPerBlock - 1) /
+                            kSequencesPerBlock),
+      static_cast<unsigned>(profile_count));
+#define LAUNCH_SEED(length)                                                   \
+    ssv_seed_mask_many_kernel<length><<<grid, kThreads>>>(                    \
+      batch->device_scores, batch->device_f1_profiles,                        \
+      batch->sequence_count, batch->device_residues, batch->device_offsets,   \
+      batch->device_null_scores, batch->device_tjb, indexed_alphabet_size,    \
+      words_per_profile, device_seed_words, device_unsupported_words)
+    switch (maximum_word_length) {
+      case 1: LAUNCH_SEED(1); break;
+      case 2: LAUNCH_SEED(2); break;
+      case 4: LAUNCH_SEED(4); break;
+      case 8: LAUNCH_SEED(8); break;
+      case 16: LAUNCH_SEED(16); break;
+      case 32: LAUNCH_SEED(32); break;
+      default: break;
+    }
+#undef LAUNCH_SEED
+  }
+  CUDA_TRY_SEED(cudaGetLastError(), "mandatory-seed kernel launch");
+  CUDA_TRY_SEED(cudaEventRecord(kernel_stop),
+                "mandatory-seed kernel event record");
+  CUDA_TRY_SEED(cudaEventSynchronize(kernel_stop),
+                "mandatory-seed kernel synchronize");
+  {
+    float milliseconds = 0.0f;
+    CUDA_TRY_SEED(cudaEventElapsedTime(&milliseconds, kernel_start, kernel_stop),
+                  "mandatory-seed kernel event elapsed");
+    statistics->seed_kernel_milliseconds = milliseconds;
+  }
+  CUDA_TRY_SEED(cudaMemcpy(exact_words.data(), batch->device_candidate_words,
+                           word_bytes, cudaMemcpyDeviceToHost),
+                "cudaMemcpy(exact F1 mask for mandatory-seed)");
+  CUDA_TRY_SEED(cudaMemcpy(seed_words.data(), device_seed_words,
+                           word_bytes, cudaMemcpyDeviceToHost),
+                "cudaMemcpy(mandatory-seed mask)");
+  CUDA_TRY_SEED(cudaMemcpy(unsupported_words.data(), device_unsupported_words,
+                           word_bytes, cudaMemcpyDeviceToHost),
+                "cudaMemcpy(mandatory-seed unsupported mask)");
+
+  {
+    const auto start = Clock::now();
+    for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence) {
+      if (batch->host_lengths[sequence] > UINT64_MAX - residue_total) {
+        set_error(error, error_size, "mandatory-seed residue total overflow");
+        goto cleanup_seed;
+      }
+      residue_total += batch->host_lengths[sequence];
+    }
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      plan7_seed_profile_statistics &row = profile_statistics[profile];
+      const uint64_t model_length = static_cast<uint64_t>(
+        profiles[profile].model_length);
+      row.logical_pair_count = batch->sequence_count;
+      if (!checked_product_u64(model_length, residue_total,
+                               &row.logical_cell_count)) {
+        set_error(error, error_size,
+                  "mandatory-seed logical cell count overflow");
+        goto cleanup_seed;
+      }
+      for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence) {
+        const size_t word = profile * words_per_profile + sequence / 32;
+        const uint32_t bit = UINT32_C(1) << (sequence % 32);
+        const bool exact = (exact_words[word] & bit) != 0;
+        const bool seed = (seed_words[word] & bit) != 0;
+        const bool unsupported = (unsupported_words[word] & bit) != 0;
+        row.exact_candidate_count += exact;
+        row.seed_candidate_count += seed;
+        row.certified_reject_count += !seed;
+        row.false_reject_count += exact && !seed;
+        row.unsupported_pair_count += unsupported;
+        if (seed) {
+          uint64_t cells;
+          if (!checked_product_u64(model_length,
+                                   batch->host_lengths[sequence], &cells) ||
+              !checked_add_u64(row.survivor_exact_cell_count, cells,
+                               &row.survivor_exact_cell_count)) {
+            set_error(error, error_size,
+                      "mandatory-seed survivor cell count overflow");
+            goto cleanup_seed;
+          }
+        }
+      }
+#define ADD_SEED_FIELD(field)                                                 \
+      if (!checked_add_u64(statistics->field, row.field, &statistics->field)) {\
+        set_error(error, error_size,                                          \
+                  "mandatory-seed aggregate count overflow");                \
+        goto cleanup_seed;                                                    \
+      }
+      ADD_SEED_FIELD(logical_pair_count);
+      ADD_SEED_FIELD(exact_candidate_count);
+      ADD_SEED_FIELD(seed_candidate_count);
+      ADD_SEED_FIELD(certified_reject_count);
+      ADD_SEED_FIELD(false_reject_count);
+      ADD_SEED_FIELD(unsupported_pair_count);
+      ADD_SEED_FIELD(logical_cell_count);
+      ADD_SEED_FIELD(survivor_exact_cell_count);
+#undef ADD_SEED_FIELD
+    }
+    statistics->analysis_milliseconds =
+      std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  }
+  if (word_bytes > UINT64_MAX / 2) {
+    set_error(error, error_size, "mandatory-seed temporary byte overflow");
+    goto cleanup_seed;
+  }
+  statistics->temporary_device_bytes = static_cast<uint64_t>(word_bytes) * 2;
+  rc = 0;
+
+cleanup_seed:
+  if (kernel_stop != nullptr) cudaEventDestroy(kernel_stop);
+  if (kernel_start != nullptr) cudaEventDestroy(kernel_start);
+  if (device_unsupported_words != nullptr) cudaFree(device_unsupported_words);
+  if (device_seed_words != nullptr) cudaFree(device_seed_words);
+#undef CUDA_TRY_SEED
   return rc;
 }
 

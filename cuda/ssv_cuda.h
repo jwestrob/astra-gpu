@@ -242,6 +242,38 @@ typedef struct plan7_f0_evaluation_statistics {
   double analysis_milliseconds;
 } plan7_f0_evaluation_statistics;
 
+/* Experimental Phase-10 census only. A seed candidate is unresolved and
+ * still executes exact SSV. A certified reject contains no mandatory word
+ * under the bounded-window theorem. */
+typedef struct plan7_seed_profile_statistics {
+  uint64_t logical_pair_count;
+  uint64_t exact_candidate_count;
+  uint64_t seed_candidate_count;
+  uint64_t certified_reject_count;
+  uint64_t false_reject_count;
+  uint64_t unsupported_pair_count;
+  uint64_t logical_cell_count;
+  uint64_t survivor_exact_cell_count;
+} plan7_seed_profile_statistics;
+
+typedef struct plan7_seed_evaluation_statistics {
+  uint64_t profile_count;
+  uint64_t sequence_count;
+  uint64_t maximum_word_length;
+  uint64_t logical_pair_count;
+  uint64_t exact_candidate_count;
+  uint64_t seed_candidate_count;
+  uint64_t certified_reject_count;
+  uint64_t false_reject_count;
+  uint64_t unsupported_pair_count;
+  uint64_t logical_cell_count;
+  uint64_t survivor_exact_cell_count;
+  uint64_t temporary_device_bytes;
+  double exact_generation_milliseconds;
+  double seed_kernel_milliseconds;
+  double analysis_milliseconds;
+} plan7_seed_evaluation_statistics;
+
 int plan7_cuda_device_count(char *error, size_t error_size);
 int plan7_cuda_memory_info(int *device_ordinal,
                            uint64_t *free_bytes,
@@ -434,6 +466,26 @@ int plan7_ssv_sequence_batch_evaluate_f0_many(
   plan7_f0_profile_statistics *profile_statistics,
   size_t profile_statistics_count,
   plan7_f0_evaluation_statistics *statistics,
+  char *error,
+  size_t error_size);
+
+/* Offline evaluator for the certified mandatory-word hypothesis. It compares
+ * a bounded-window seed mask with the ordinary exact F1 mask. This function
+ * is diagnostic-only and never participates in production dispatch. */
+int plan7_ssv_sequence_batch_evaluate_seed_many(
+  plan7_ssv_sequence_batch *batch,
+  const uint8_t *packed_scores,
+  size_t packed_score_count,
+  const plan7_ssv_profile *profiles,
+  size_t profile_count,
+  const float *m_mu,
+  const float *m_lambda,
+  double f1,
+  size_t maximum_word_length,
+  size_t indexed_alphabet_size,
+  plan7_seed_profile_statistics *profile_statistics,
+  size_t profile_statistics_count,
+  plan7_seed_evaluation_statistics *statistics,
   char *error,
   size_t error_size);
 
