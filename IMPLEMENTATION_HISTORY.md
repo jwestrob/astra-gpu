@@ -8,7 +8,8 @@ hashes live in `PERFORMANCE.md`.
 ## Canonical line
 
 - Review baseline: `5ffe5d43cf4177493b72f24b0fb96c00276c96ab`.
-- Current retained implementation before this record: `f5ac24a576803ab36e7f02688fb0a749c4cb5acd`.
+- Current retained implementation: `50f762c` (certified Phase 9 GA pruning),
+  with result/history record `531b188`.
 - Exact full-output oracle: SHA-256
   `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
   39,010,327 bytes, 383,235 lines.
@@ -27,6 +28,7 @@ hashes live in `PERFORMANCE.md`.
 | 6 | `cfd756c` | Target-length metadata retained; transition H2D fell from 24.92 MB to 0.12 MB. |
 | 7 | `f5ac24a` | Full-MSV compaction and exact packed full MSV retained; request 454.007 s. |
 | 8 | `913be5d` | Certified F0 evaluator retained as evidence; production F0 rejected after exact H200 census. |
+| 9 | `50f762c` | Certified gathering-cutoff GA pruning retained; exact request 449.104 s, 1.08% faster than the prior best. |
 
 ## Rejected or non-production experiments
 
@@ -44,11 +46,10 @@ hashes live in `PERFORMANCE.md`.
 
 ## Work now in progress
 
-Phase 9 now investigates GA-specialized certified pruning. It must first prove
-an exact upper bound from HMMER's source formulas and measure the possible
-reject census; no hot-path code is justified before both are positive. Phases
-10-11 remain ordered research and policy work as listed in
-`PLAN7_ENGINE_ROADMAP.md`.
+Phase 9 is complete. Phase 10 now investigates an optional mandatory-seed /
+global-profile index with a formal zero-false-negative proof and no tax on
+small searches. Phase 11 remains the final deterministic GPU execution-policy
+step listed in `PLAN7_ENGINE_ROADMAP.md`.
 
 For the complete commit-by-commit history, run:
 
