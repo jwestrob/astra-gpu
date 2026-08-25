@@ -60,6 +60,22 @@ cdef uint64_t _direct_v3_eliminated_v2_bytes = 0
 cdef uint64_t _direct_v3_staging_payload_bytes = 0
 cdef uint64_t _direct_v3_staging_build_ns = 0
 cdef uint64_t _direct_v3_source_validation_ns = 0
+cdef uint64_t _resident_f2_compaction_run_count = 0
+cdef uint64_t _resident_f2_source_count = 0
+cdef uint64_t _resident_f2_selected_count = 0
+cdef uint64_t _resident_f2_compiled_profile_count = 0
+cdef uint64_t _resident_f2_unsupported_profile_count = 0
+cdef uint64_t _resident_f2_selected_d2h_bytes = 0
+cdef double _resident_f2_compile_milliseconds = 0.0
+cdef double _resident_f2_upload_milliseconds = 0.0
+cdef double _resident_f2_kernel_milliseconds = 0.0
+cdef double _resident_f2_scan_milliseconds = 0.0
+cdef double _resident_f2_download_milliseconds = 0.0
+cdef double _resident_f2_total_milliseconds = 0.0
+cdef uint64_t _resident_forward_f2_call_count = 0
+cdef uint64_t _resident_forward_f2_candidate_count = 0
+cdef uint64_t _resident_forward_f2_eliminated_h2d_bytes = 0
+cdef double _resident_forward_f2_gather_milliseconds = 0.0
 cdef uint64_t _resident_forward_call_count = 0
 cdef uint64_t _resident_forward_requested_bytes = 0
 cdef uint64_t _resident_forward_allocated_bytes = 0
@@ -792,6 +808,46 @@ cdef extern from "postfilter_cuda.h" nogil:
         uint8_t action
         float vfsc
 
+    cdef enum plan7_postfilter_f2_fact:
+        PLAN7_POSTFILTER_F2_NOT_PASS_OR_UNATTESTED
+        PLAN7_POSTFILTER_F2_INPUT_INVALID
+        PLAN7_POSTFILTER_F2_MSV_THRESHOLD_EXCEEDED
+        PLAN7_POSTFILTER_F2_VITERBI_THRESHOLD_EXCEEDED
+        PLAN7_POSTFILTER_F2_PASS
+
+    ctypedef struct plan7_postfilter_f2_statistics:
+        uint64_t source_count
+        uint64_t selected_count
+        uint64_t compiled_profile_count
+        uint64_t unsupported_profile_count
+        uint64_t mask_word_count
+        uint64_t selected_d2h_bytes
+        uint64_t run_count
+        float compile_milliseconds
+        float upload_milliseconds
+        float kernel_milliseconds
+        float scan_milliseconds
+        float download_milliseconds
+        float total_milliseconds
+
+    ctypedef struct plan7_postfilter_f2_resident_view:
+        uint64_t batch_generation
+        uint64_t workspace_generation
+        uint64_t selected_source_hash
+        int32_t device_ordinal
+        uint32_t supported
+        size_t profile_count
+        size_t source_count
+        size_t selected_count
+        const uint32_t *host_selected_sources
+        const plan7_bias_candidate *host_candidates
+        const plan7_postfilter_result *host_results
+        const plan7_bias_candidate *device_candidates
+        const plan7_postfilter_result *device_results
+        const uint32_t *device_selected_sources
+        const void *owner
+        plan7_postfilter_f2_statistics statistics
+
     cdef enum plan7_postfilter_reason_fact:
         PLAN7_POSTFILTER_REASON_RAW_F1_REJECT
         PLAN7_POSTFILTER_REASON_MSV_RANGE_STATE
@@ -978,6 +1034,20 @@ cdef extern from "postfilter_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_ssv_sequence_batch_compact_postfilter_f2(
+        plan7_ssv_sequence_batch *batch,
+        const plan7_ssv_profile *profiles,
+        const float *m_mu,
+        const float *m_lambda,
+        const float *v_mu,
+        const float *v_lambda,
+        size_t profile_count,
+        double f2,
+        plan7_postfilter_f2_resident_view *view,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_ssv_filter_cuda(
         const uint8_t *striped_scores,
         size_t striped_score_count,
@@ -1101,6 +1171,12 @@ cdef extern from "forward_cuda.h" nogil:
         uint64_t allocation_fallback_count
         float allocation_milliseconds
         float materialization_milliseconds
+
+    ctypedef struct plan7_forward_input_residency_statistics:
+        uint64_t resident_f2_call_count
+        uint64_t resident_f2_candidate_count
+        uint64_t eliminated_candidate_h2d_bytes
+        float gather_milliseconds
 
     ctypedef struct plan7_forward_subwarp_statistics:
         uint32_t policy_version
@@ -1291,6 +1367,24 @@ cdef extern from "forward_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_forward_run_batch_workspace_postfilter_resident(
+        const plan7_forward_database *database,
+        plan7_ssv_sequence_batch *batch,
+        const uintptr_t *source_profile_pointers,
+        size_t profile_count,
+        const uint64_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        const float *filter_scores,
+        size_t candidate_count,
+        const plan7_postfilter_f2_resident_view *postfilter_view,
+        double f3,
+        uint64_t gathered_byte_budget,
+        int collect_reason_facts,
+        plan7_forward_output **output,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_forward_run_batch_workspace_f3_audit(
         const plan7_forward_database *database,
         plan7_ssv_sequence_batch *batch,
@@ -1346,6 +1440,10 @@ cdef extern from "forward_cuda.h" nogil:
     )
 
     const plan7_forward_residency_statistics *plan7_forward_output_residency_statistics(
+        const plan7_forward_output *output,
+    )
+
+    const plan7_forward_input_residency_statistics *plan7_forward_output_input_residency_statistics(
         const plan7_forward_output *output,
     )
 
@@ -1408,6 +1506,26 @@ cdef extern from "f3_threshold.h" nogil:
         uint8_t nan_requires_fallback
         uint8_t reserved
 
+    ctypedef struct plan7_f2_threshold:
+        uint32_t mu_bits
+        uint32_t lambda_bits
+        uint64_t f2_bits
+        uint32_t threshold_bits
+        uint32_t predecessor_bits
+        uint32_t successor_bits
+        uint8_t supported
+        uint8_t reason
+        uint8_t has_predecessor
+        uint8_t has_successor
+        uint8_t negative_infinity_pass
+        uint8_t predecessor_pass
+        uint8_t threshold_pass
+        uint8_t successor_pass
+        uint8_t positive_infinity_pass
+        uint8_t quiet_nan_oracle_pass
+        uint8_t nan_requires_fallback
+        uint8_t reserved
+
     int plan7_forward_compile_f3_threshold(
         float tau,
         float lambda_,
@@ -1420,6 +1538,20 @@ cdef extern from "f3_threshold.h" nogil:
         float tau,
         float lambda_,
         double f3,
+    )
+
+    int plan7_postfilter_compile_f2_threshold(
+        float mu,
+        float lambda_,
+        double f2,
+        plan7_f2_threshold *result,
+    )
+
+    int plan7_postfilter_f2_oracle_pass_bits(
+        uint32_t bit_score_bits,
+        float mu,
+        float lambda_,
+        double f2,
     )
 
 
@@ -3487,6 +3619,60 @@ def f3_oracle_pass_bits_for_test(
     ) != 0
 
 
+def compile_f2_threshold_for_test(float mu, float lambda_, double f2):
+    """Compile the exact non-NaN binary32 HMMER Gumbel/F2 boundary."""
+    cdef plan7_f2_threshold threshold
+    cdef int status = plan7_postfilter_compile_f2_threshold(
+        mu, lambda_, f2, &threshold
+    )
+    if status != 0:
+        raise RuntimeError("F2 threshold compiler rejected its output buffer")
+    return {
+        "supported": threshold.supported != 0,
+        "reason": threshold.reason,
+        "mu_bits": threshold.mu_bits,
+        "lambda_bits": threshold.lambda_bits,
+        "f2_bits": threshold.f2_bits,
+        "threshold_bits": (
+            threshold.threshold_bits if threshold.supported else None
+        ),
+        "predecessor_bits": (
+            threshold.predecessor_bits
+            if threshold.supported and threshold.has_predecessor
+            else None
+        ),
+        "successor_bits": (
+            threshold.successor_bits
+            if threshold.supported and threshold.has_successor
+            else None
+        ),
+        "negative_infinity_pass": threshold.negative_infinity_pass != 0,
+        "predecessor_pass": (
+            threshold.predecessor_pass != 0
+            if threshold.has_predecessor
+            else None
+        ),
+        "threshold_pass": threshold.threshold_pass != 0,
+        "successor_pass": (
+            threshold.successor_pass != 0
+            if threshold.has_successor
+            else None
+        ),
+        "positive_infinity_pass": threshold.positive_infinity_pass != 0,
+        "quiet_nan_oracle_pass": threshold.quiet_nan_oracle_pass != 0,
+        "nan_requires_fallback": threshold.nan_requires_fallback != 0,
+    }
+
+
+def f2_oracle_pass_bits_for_test(
+    uint32_t bit_score_bits, float mu, float lambda_, double f2,
+):
+    """Evaluate HMMER's exact host F2 predicate for raw binary32 bits."""
+    return plan7_postfilter_f2_oracle_pass_bits(
+        bit_score_bits, mu, lambda_, f2
+    ) != 0
+
+
 cdef inline void _count_forward_reason(
     vector[uint64_t]& counts, size_t base, uint16_t facts,
 ) noexcept nogil:
@@ -3904,6 +4090,88 @@ def _forward_backward_residency_statistics():
         ),
         "rescore_prepare_ms": _resident_rescore_prepare_milliseconds,
     }
+
+
+def _postfilter_forward_residency_statistics():
+    """Return cumulative exact F2 compaction and resident-input counters."""
+    return {
+        "f2_compaction_run_count": _resident_f2_compaction_run_count,
+        "f2_source_count": _resident_f2_source_count,
+        "f2_selected_count": _resident_f2_selected_count,
+        "f2_compiled_profile_count": _resident_f2_compiled_profile_count,
+        "f2_unsupported_profile_count": (
+            _resident_f2_unsupported_profile_count
+        ),
+        "f2_selected_d2h_bytes": _resident_f2_selected_d2h_bytes,
+        "f2_compile_ms": _resident_f2_compile_milliseconds,
+        "f2_upload_ms": _resident_f2_upload_milliseconds,
+        "f2_kernel_ms": _resident_f2_kernel_milliseconds,
+        "f2_scan_ms": _resident_f2_scan_milliseconds,
+        "f2_download_ms": _resident_f2_download_milliseconds,
+        "f2_total_ms": _resident_f2_total_milliseconds,
+        "forward_resident_f2_call_count": _resident_forward_f2_call_count,
+        "forward_resident_f2_candidate_count": (
+            _resident_forward_f2_candidate_count
+        ),
+        "forward_eliminated_candidate_h2d_bytes": (
+            _resident_forward_f2_eliminated_h2d_bytes
+        ),
+        "forward_resident_f2_gather_ms": (
+            _resident_forward_f2_gather_milliseconds
+        ),
+    }
+
+
+cdef void _accumulate_postfilter_f2_statistics(
+    const plan7_postfilter_f2_statistics *statistics,
+) noexcept:
+    global _resident_f2_compaction_run_count
+    global _resident_f2_source_count
+    global _resident_f2_selected_count
+    global _resident_f2_compiled_profile_count
+    global _resident_f2_unsupported_profile_count
+    global _resident_f2_selected_d2h_bytes
+    global _resident_f2_compile_milliseconds
+    global _resident_f2_upload_milliseconds
+    global _resident_f2_kernel_milliseconds
+    global _resident_f2_scan_milliseconds
+    global _resident_f2_download_milliseconds
+    global _resident_f2_total_milliseconds
+    if statistics == NULL:
+        return
+    _resident_f2_compaction_run_count += statistics.run_count
+    _resident_f2_source_count += statistics.source_count
+    _resident_f2_selected_count += statistics.selected_count
+    _resident_f2_compiled_profile_count += statistics.compiled_profile_count
+    _resident_f2_unsupported_profile_count += (
+        statistics.unsupported_profile_count
+    )
+    _resident_f2_selected_d2h_bytes += statistics.selected_d2h_bytes
+    _resident_f2_compile_milliseconds += statistics.compile_milliseconds
+    _resident_f2_upload_milliseconds += statistics.upload_milliseconds
+    _resident_f2_kernel_milliseconds += statistics.kernel_milliseconds
+    _resident_f2_scan_milliseconds += statistics.scan_milliseconds
+    _resident_f2_download_milliseconds += statistics.download_milliseconds
+    _resident_f2_total_milliseconds += statistics.total_milliseconds
+
+
+cdef void _accumulate_forward_input_residency_statistics(
+    const plan7_forward_input_residency_statistics *statistics,
+) noexcept:
+    global _resident_forward_f2_call_count
+    global _resident_forward_f2_candidate_count
+    global _resident_forward_f2_eliminated_h2d_bytes
+    global _resident_forward_f2_gather_milliseconds
+    if statistics == NULL:
+        return
+    _resident_forward_f2_call_count += statistics.resident_f2_call_count
+    _resident_forward_f2_candidate_count += (
+        statistics.resident_f2_candidate_count
+    )
+    _resident_forward_f2_eliminated_h2d_bytes += (
+        statistics.eliminated_candidate_h2d_bytes
+    )
+    _resident_forward_f2_gather_milliseconds += statistics.gather_milliseconds
 
 
 cdef void _accumulate_forward_f3_device_statistics(
@@ -7392,6 +7660,9 @@ cdef class SequenceBatch:
         cdef uint32_t previous
         cdef bint have_previous
         cdef bint host_attested
+        cdef bint use_resident_f2 = False
+        cdef bint resident_f2_pass = False
+        cdef bint host_f2_pass = False
         cdef size_t profile_count = view.profile_count
         cdef size_t profile_index
         cdef size_t cursor
@@ -7403,6 +7674,7 @@ cdef class SequenceBatch:
         cdef plan7_forward_database *database = NULL
         cdef plan7_forward_output *output = NULL
         cdef plan7_forward_resident_view resident_view
+        cdef plan7_postfilter_f2_resident_view f2_resident_view
         cdef plan7_backward_domain_output *domain_output = NULL
         cdef plan7_domain_rescore_output *rescore_output = NULL
         cdef const plan7_forward_result *native_results
@@ -7411,6 +7683,7 @@ cdef class SequenceBatch:
         cdef const plan7_forward_provenance *native_provenance
         cdef const plan7_forward_statistics *native_statistics
         cdef const plan7_forward_residency_statistics *native_residency_statistics
+        cdef const plan7_forward_input_residency_statistics *native_input_residency_statistics
         cdef const plan7_backward_domain_statistics *native_domain_statistics
         cdef const plan7_backward_domain_residency_statistics *native_domain_residency_statistics
         cdef const plan7_domain_rescore_statistics *native_rescore_statistics
@@ -7438,6 +7711,8 @@ cdef class SequenceBatch:
         cdef size_t region
         cdef size_t row
         cdef size_t reason_base = 0
+        cdef size_t resident_f2_cursor = 0
+        cdef size_t resident_f2_source = 0
         cdef uint64_t total_target_residues = 0
         cdef uint64_t journal_total_bytes = 0
         cdef uint64_t logical_cells
@@ -7498,6 +7773,7 @@ cdef class SequenceBatch:
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
+        memset(&f2_resident_view, 0, sizeof(f2_resident_view))
         if ga_pruning:
             if not sealed_domain_journal or not direct_sparse_v3:
                 raise ValueError(
@@ -7654,6 +7930,33 @@ cdef class SequenceBatch:
                 )
 
         host_attested = plan7_bias_host_environment_attested() == 1
+        if sealed_domain_journal:
+            error[0] = 0
+            with nogil:
+                status = plan7_ssv_sequence_batch_compact_postfilter_f2(
+                    self._batch,
+                    view.profiles,
+                    view.m_mu,
+                    view.m_lambda,
+                    view.v_mu,
+                    view.v_lambda,
+                    profile_count,
+                    f2,
+                    &f2_resident_view,
+                    error,
+                    sizeof(error),
+                )
+            if status != 0:
+                raise RuntimeError(error.decode("utf-8", "replace"))
+            _accumulate_postfilter_f2_statistics(
+                &f2_resident_view.statistics
+            )
+            use_resident_f2 = f2_resident_view.supported == 1
+            if (
+                use_resident_f2
+                and f2_resident_view.source_count != record_count
+            ):
+                raise RuntimeError("resident F2 source count changed")
         candidate_offsets.reserve(profile_count + 1)
         candidate_offsets.push_back(0)
         for profile_index in range(profile_count):
@@ -7674,6 +7977,19 @@ cdef class SequenceBatch:
             previous = 0
             have_previous = False
             for cursor in range(start, stop):
+                resident_f2_pass = False
+                if use_resident_f2:
+                    if resident_f2_cursor < f2_resident_view.selected_count:
+                        resident_f2_source = (
+                            f2_resident_view.host_selected_sources[
+                                resident_f2_cursor
+                            ]
+                        )
+                        if resident_f2_source < cursor:
+                            raise RuntimeError(
+                                "resident F2 sources are not increasing"
+                            )
+                        resident_f2_pass = resident_f2_source == cursor
                 memcpy(
                     &record,
                     &postfilter_records[cursor * sizeof(plan7_postfilter_result)],
@@ -7763,6 +8079,10 @@ cdef class SequenceBatch:
                             profile_index * GENERATION_POSTFILTER_REASON_COUNT + 15
                         ] += postfilter_base_cells
                 if not host_attested or record.action != PLAN7_BIAS_DEFINITE_PASS:
+                    if resident_f2_pass:
+                        raise RuntimeError(
+                            "resident F2 selected an ineligible post-filter row"
+                        )
                     if collect_generation_telemetry:
                         f2_reason_counts[
                             profile_index * GENERATION_F2_REASON_COUNT
@@ -7792,6 +8112,10 @@ cdef class SequenceBatch:
                     or not isfinite(view.profiles[profile_index].scale)
                     or view.profiles[profile_index].scale <= 0.0
                 ):
+                    if resident_f2_pass:
+                        raise RuntimeError(
+                            "resident F2 selected an invalid post-filter row"
+                        )
                     if collect_generation_telemetry:
                         f2_reason_counts[
                             profile_index * GENERATION_F2_REASON_COUNT + 1
@@ -7813,41 +8137,61 @@ cdef class SequenceBatch:
                 usc = <float> record.msv_numerator
                 usc = usc / view.profiles[profile_index].scale
                 usc = usc - <float> 3.0
-                bit_score = <float> ((usc - record.filtersc) / eslCONST_LOG2)
-                probability = esl_gumbel_surv(
-                    bit_score,
-                    view.m_mu[profile_index],
-                    view.m_lambda[profile_index],
-                )
-                if probability > f2:
-                    if collect_generation_telemetry:
-                        f2_reason_counts[
-                            profile_index * GENERATION_F2_REASON_COUNT + 2
-                        ] += 1
+                host_f2_pass = True
+                if collect_generation_telemetry or not use_resident_f2:
                     bit_score = <float> (
-                        (record.vfsc - record.filtersc) / eslCONST_LOG2
+                        (usc - record.filtersc) / eslCONST_LOG2
                     )
                     probability = esl_gumbel_surv(
                         bit_score,
-                        view.v_mu[profile_index],
-                        view.v_lambda[profile_index],
+                        view.m_mu[profile_index],
+                        view.m_lambda[profile_index],
                     )
                     if probability > f2:
                         if collect_generation_telemetry:
                             f2_reason_counts[
-                                profile_index * GENERATION_F2_REASON_COUNT + 3
+                                profile_index * GENERATION_F2_REASON_COUNT + 2
                             ] += 1
-                        if direct_sparse_v3:
-                            _direct_v3_plan_initial(
-                                direct_decisions,
-                                cursor,
-                                _direct_v3_decision(
-                                    PLAN7_CONTINUATION_V3_F2_REJECT, 0
-                                ),
-                                &direct_decision_terms,
-                                &direct_exception_count,
-                            )
-                        continue
+                        bit_score = <float> (
+                            (record.vfsc - record.filtersc) / eslCONST_LOG2
+                        )
+                        probability = esl_gumbel_surv(
+                            bit_score,
+                            view.v_mu[profile_index],
+                            view.v_lambda[profile_index],
+                        )
+                        if probability > f2:
+                            host_f2_pass = False
+                            if collect_generation_telemetry:
+                                f2_reason_counts[
+                                    profile_index
+                                    * GENERATION_F2_REASON_COUNT + 3
+                                ] += 1
+                if (
+                    use_resident_f2
+                    and collect_generation_telemetry
+                    and resident_f2_pass != host_f2_pass
+                ):
+                    raise RuntimeError(
+                        "resident F2 decision differs from the host oracle"
+                    )
+                if (
+                    (use_resident_f2 and not resident_f2_pass)
+                    or (not use_resident_f2 and not host_f2_pass)
+                ):
+                    if direct_sparse_v3:
+                        _direct_v3_plan_initial(
+                            direct_decisions,
+                            cursor,
+                            _direct_v3_decision(
+                                PLAN7_CONTINUATION_V3_F2_REJECT, 0
+                            ),
+                            &direct_decision_terms,
+                            &direct_exception_count,
+                        )
+                    continue
+                if use_resident_f2:
+                    resident_f2_cursor += 1
                 if residue_offsets[record.sequence_index + 1] < (
                     residue_offsets[record.sequence_index]
                 ):
@@ -7884,6 +8228,12 @@ cdef class SequenceBatch:
                     ] += 1
             candidate_offsets.push_back(candidate_indices.size())
 
+        if (
+            use_resident_f2
+            and resident_f2_cursor != f2_resident_view.selected_count
+        ):
+            raise RuntimeError("resident F2 sources do not span the selection")
+
         candidate_count = candidate_indices.size()
         row_offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
         for profile_index in range(profile_count + 1):
@@ -7911,7 +8261,26 @@ cdef class SequenceBatch:
                     )
                 if status != 0:
                     break
-        if status == 0 and collect_generation_telemetry:
+        if status == 0 and use_resident_f2:
+            with nogil:
+                status = plan7_forward_run_batch_workspace_postfilter_resident(
+                    database,
+                    self._batch,
+                    view.identity_tokens,
+                    profile_count,
+                    candidate_offsets.data(),
+                    candidate_indices.data(),
+                    filter_scores.data(),
+                    candidate_count,
+                    &f2_resident_view,
+                    f3,
+                    gathered_byte_budget,
+                    1 if collect_generation_telemetry else 0,
+                    &output,
+                    error,
+                    sizeof(error),
+                )
+        elif status == 0 and collect_generation_telemetry:
             if sealed_domain_journal:
                 with nogil:
                     status = (
@@ -9096,6 +9465,9 @@ cdef class SequenceBatch:
                 native_residency_statistics = (
                     plan7_forward_output_residency_statistics(output)
                 )
+                native_input_residency_statistics = (
+                    plan7_forward_output_input_residency_statistics(output)
+                )
                 native_domain_statistics = (
                     plan7_backward_domain_output_statistics(domain_output)
                 )
@@ -9119,6 +9491,7 @@ cdef class SequenceBatch:
                 if (
                     native_statistics == NULL
                     or native_residency_statistics == NULL
+                    or native_input_residency_statistics == NULL
                     or native_domain_statistics == NULL
                     or native_domain_residency_statistics == NULL
                     or (
@@ -9136,6 +9509,9 @@ cdef class SequenceBatch:
                     native_residency_statistics,
                     native_domain_residency_statistics,
                     native_rescore_residency_statistics,
+                )
+                _accumulate_forward_input_residency_statistics(
+                    native_input_residency_statistics
                 )
                 _accumulate_forward_f3_device_statistics(
                     plan7_forward_output_f3_device_statistics(output)

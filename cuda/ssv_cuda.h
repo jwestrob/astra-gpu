@@ -61,6 +61,7 @@ struct plan7_postfilter_result;
 
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 struct plan7_postfilter_reason_statistics;
+struct plan7_postfilter_f2_resident_view;
 struct plan7_forward_workspace;
 
 /* Version-1 request-scoped GPU execution policy.  This selects only among
@@ -568,6 +569,23 @@ int plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
   uint16_t *reason_facts,
   size_t reason_count,
   struct plan7_postfilter_reason_statistics *reason_statistics,
+  char *error,
+  size_t error_size);
+
+/* Compile exact F2 boundaries and stably compact the just-produced resident
+ * postfilter rows.  The view remains valid only until the next serialized
+ * operation on batch.  Unsupported profile parameters return a valid view
+ * with supported=0 so callers can use the unchanged host path. */
+int plan7_ssv_sequence_batch_compact_postfilter_f2(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_ssv_profile *profiles,
+  const float *m_mu,
+  const float *m_lambda,
+  const float *v_mu,
+  const float *v_lambda,
+  size_t profile_count,
+  double f2,
+  struct plan7_postfilter_f2_resident_view *view,
   char *error,
   size_t error_size);
 

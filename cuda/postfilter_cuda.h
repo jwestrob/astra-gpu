@@ -72,6 +72,52 @@ typedef struct plan7_postfilter_result {
   float vfsc;
 } plan7_postfilter_result;
 
+enum plan7_postfilter_f2_fact {
+  PLAN7_POSTFILTER_F2_NOT_PASS_OR_UNATTESTED = UINT8_C(0x01),
+  PLAN7_POSTFILTER_F2_INPUT_INVALID = UINT8_C(0x02),
+  PLAN7_POSTFILTER_F2_MSV_THRESHOLD_EXCEEDED = UINT8_C(0x04),
+  PLAN7_POSTFILTER_F2_VITERBI_THRESHOLD_EXCEEDED = UINT8_C(0x08),
+  PLAN7_POSTFILTER_F2_PASS = UINT8_C(0x10)
+};
+
+typedef struct plan7_postfilter_f2_statistics {
+  uint64_t source_count;
+  uint64_t selected_count;
+  uint64_t compiled_profile_count;
+  uint64_t unsupported_profile_count;
+  uint64_t mask_word_count;
+  uint64_t selected_d2h_bytes;
+  uint64_t run_count;
+  float compile_milliseconds;
+  float upload_milliseconds;
+  float kernel_milliseconds;
+  float scan_milliseconds;
+  float download_milliseconds;
+  float total_milliseconds;
+} plan7_postfilter_f2_statistics;
+
+/* Immutable read-only view over one exact, stable F2 compaction.  Device
+ * pointers alias scratch owned by the postfilter workspace; host source
+ * indexes are a byte-exact mirror used to reconstruct journal ordinals. */
+typedef struct plan7_postfilter_f2_resident_view {
+  uint64_t batch_generation;
+  uint64_t workspace_generation;
+  uint64_t selected_source_hash;
+  int32_t device_ordinal;
+  uint32_t supported;
+  size_t profile_count;
+  size_t source_count;
+  size_t selected_count;
+  const uint32_t *host_selected_sources;
+  const plan7_bias_candidate *host_candidates;
+  const plan7_postfilter_result *host_results;
+  const plan7_bias_candidate *device_candidates;
+  const plan7_postfilter_result *device_results;
+  const uint32_t *device_selected_sources;
+  const struct plan7_postfilter_workspace *owner;
+  plan7_postfilter_f2_statistics statistics;
+} plan7_postfilter_f2_resident_view;
+
 typedef struct plan7_viterbi_database plan7_viterbi_database;
 typedef struct plan7_postfilter_workspace plan7_postfilter_workspace;
 typedef struct plan7_profile_session plan7_profile_session;
@@ -252,6 +298,26 @@ int plan7_postfilter_workspace_destroy(plan7_postfilter_workspace **workspace,
 int plan7_postfilter_workspace_get_statistics(
   const plan7_postfilter_workspace *workspace,
   plan7_postfilter_workspace_statistics *statistics,
+  char *error,
+  size_t error_size);
+
+int plan7_postfilter_workspace_compact_f2(
+  plan7_postfilter_workspace *workspace,
+  uint64_t batch_generation,
+  const plan7_ssv_profile *profiles,
+  const float *m_mu,
+  const float *m_lambda,
+  const float *v_mu,
+  const float *v_lambda,
+  size_t profile_count,
+  double f2,
+  int host_environment_attested,
+  plan7_postfilter_f2_resident_view *view,
+  char *error,
+  size_t error_size);
+
+int plan7_postfilter_f2_resident_view_validate(
+  const plan7_postfilter_f2_resident_view *view,
   char *error,
   size_t error_size);
 

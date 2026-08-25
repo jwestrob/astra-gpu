@@ -4708,6 +4708,26 @@ plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
       error, error_size);
 }
 
+extern "C" int plan7_ssv_sequence_batch_compact_postfilter_f2(
+    plan7_ssv_sequence_batch *batch, const plan7_ssv_profile *profiles,
+    const float *m_mu, const float *m_lambda, const float *v_mu,
+    const float *v_lambda, size_t profile_count, double f2,
+    plan7_postfilter_f2_resident_view *view,
+    char *error, size_t error_size) {
+  if (batch == nullptr || view == nullptr) {
+    set_error(error, error_size, "invalid sequence-batch F2 compaction");
+    return -1;
+  }
+  if (batch->postfilter_workspace == nullptr) {
+    set_error(error, error_size, "post-filter workspace is unavailable");
+    return -1;
+  }
+  return plan7_postfilter_workspace_compact_f2(
+      batch->postfilter_workspace, batch->generation_id, profiles,
+      m_mu, m_lambda, v_mu, v_lambda, profile_count, f2,
+      batch->host_float_environment_valid, view, error, error_size);
+}
+
 extern "C" int
 plan7_ssv_sequence_batch_f1_candidates_many(
   const plan7_ssv_sequence_batch *batch,

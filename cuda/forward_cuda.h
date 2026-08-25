@@ -124,6 +124,7 @@ typedef struct plan7_forward_database plan7_forward_database;
 typedef struct plan7_ssv_sequence_batch plan7_ssv_sequence_batch;
 typedef struct plan7_forward_output plan7_forward_output;
 typedef struct plan7_forward_workspace plan7_forward_workspace;
+struct plan7_postfilter_f2_resident_view;
 
 /* Pointer-free immutable host representation used by ProfileSelection. */
 typedef struct plan7_forward_snapshot_profile {
@@ -199,6 +200,13 @@ typedef struct plan7_forward_residency_statistics {
   float allocation_milliseconds;
   float materialization_milliseconds;
 } plan7_forward_residency_statistics;
+
+typedef struct plan7_forward_input_residency_statistics {
+  uint64_t resident_f2_call_count;
+  uint64_t resident_f2_candidate_count;
+  uint64_t eliminated_candidate_h2d_bytes;
+  float gather_milliseconds;
+} plan7_forward_input_residency_statistics;
 
 /* Additive instrumentation for the isolated multi-candidate subwarp
  * experiment.  It deliberately stays outside plan7_forward_statistics and
@@ -437,6 +445,26 @@ int plan7_forward_run_batch_workspace_resident_reason_facts(
   char *error,
   size_t error_size);
 
+/* Production fused handoff: consume the exact stable F2 selection directly
+ * from the postfilter workspace while retaining host arrays solely for
+ * provenance/journal validation. */
+int plan7_forward_run_batch_workspace_postfilter_resident(
+  const plan7_forward_database *database,
+  plan7_ssv_sequence_batch *batch,
+  const uintptr_t *source_profile_pointers,
+  size_t profile_count,
+  const uint64_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  const float *filter_scores,
+  size_t candidate_count,
+  const struct plan7_postfilter_f2_resident_view *postfilter_view,
+  double f3,
+  uint64_t gathered_byte_budget,
+  int collect_reason_facts,
+  plan7_forward_output **output,
+  char *error,
+  size_t error_size);
+
 /* Exact diagnostic twin of the production decision path. Supported profiles
  * still consume the authenticated device decision, but the linked host HMMER
  * predicate is also evaluated and any disagreement fails the call. Unsupported
@@ -475,6 +503,9 @@ const plan7_forward_statistics *plan7_forward_output_statistics(
   const plan7_forward_output *output);
 const plan7_forward_residency_statistics *
 plan7_forward_output_residency_statistics(
+  const plan7_forward_output *output);
+const plan7_forward_input_residency_statistics *
+plan7_forward_output_input_residency_statistics(
   const plan7_forward_output *output);
 const plan7_forward_subwarp_statistics *
 plan7_forward_output_subwarp_statistics(

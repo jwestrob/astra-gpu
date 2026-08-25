@@ -158,6 +158,7 @@ $(BIAS_CUDA_OBJ): cuda/bias_cuda.cu cuda/bias_cuda.h
 
 $(POSTFILTER_CUDA_OBJ): cuda/postfilter_cuda.cu cuda/postfilter_cuda.h \
 		cuda/ssv_cuda.h cuda/bias_cuda.h cuda/forward_cuda.h \
+		cuda/f3_threshold.h \
 		$(PYHMMER_INCLUDE)/libhmmer/hmmer.h \
 		$(PYHMMER_INCLUDE)/libhmmer/impl_sse/impl_sse.h
 	mkdir -p $(@D)
@@ -179,7 +180,8 @@ $(FORWARD_CUDA_OBJ): cuda/forward_cuda.cu cuda/forward_cuda.h \
 		-c -o $@ $<
 
 $(F3_THRESHOLD_OBJ): cuda/f3_threshold.cc cuda/f3_threshold.h \
-		$(PYHMMER_EASEL_INCLUDE)/esl_exponential.h
+		$(PYHMMER_EASEL_INCLUDE)/esl_exponential.h \
+		$(PYHMMER_EASEL_INCLUDE)/esl_gumbel.h
 	mkdir -p $(@D)
 	$(CXX) -O3 -g -std=c++17 -fPIC -Wall -Wextra \
 		-Icuda -I$(PYHMMER_EASEL_INCLUDE) -c -o $@ $<

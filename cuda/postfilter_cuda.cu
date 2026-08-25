@@ -1,8 +1,10 @@
 #include "postfilter_cuda.h"
 #include "forward_cuda.h"
+#include "f3_threshold.h"
 
 #include <cuda_runtime.h>
 #include <cub/device/device_select.cuh>
+#include <cub/device/device_scan.cuh>
 #include <cub/iterator/counting_input_iterator.cuh>
 
 extern "C" {
@@ -13,6 +15,7 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -109,6 +112,107 @@ union FloatBits {
   float value;
   uint32_t bits;
 };
+
+struct F2DeviceProfile {
+  float scale;
+  uint32_t msv_threshold_bits;
+  uint32_t viterbi_threshold_bits;
+};
+
+static_assert(sizeof(F2DeviceProfile) == 12,
+              "F2 device profile layout changed");
+
+__device__ __forceinline__ bool f2_threshold_pass(
+    float bit_score, uint32_t threshold_bits) {
+  FloatBits threshold{};
+  threshold.bits = threshold_bits;
+  return !isnan(bit_score) && bit_score >= threshold.value;
+}
+
+__device__ __forceinline__ bool exact_f2_pass(
+    const plan7_postfilter_result &result,
+    const F2DeviceProfile &profile) {
+  FloatBits vfsc{};
+  vfsc.value = result.vfsc;
+  if (result.action != PLAN7_BIAS_DEFINITE_PASS ||
+      result.msv_status != PLAN7_SSV_OK || !isfinite(result.filtersc) ||
+      (!isfinite(result.vfsc) && vfsc.bits != UINT32_C(0x7f800000)) ||
+      !isfinite(profile.scale) || profile.scale <= 0.0f)
+    return false;
+
+  float usc = __int2float_rn(static_cast<int>(result.msv_numerator));
+  usc = __fdiv_rn(usc, profile.scale);
+  usc = __fsub_rn(usc, 3.0f);
+  const float msv_bit_score = __double2float_rn(__ddiv_rn(
+      static_cast<double>(__fsub_rn(usc, result.filtersc)), kLog2));
+  if (f2_threshold_pass(msv_bit_score, profile.msv_threshold_bits))
+    return true;
+  const float viterbi_bit_score = __double2float_rn(__ddiv_rn(
+      static_cast<double>(__fsub_rn(result.vfsc, result.filtersc)), kLog2));
+  return f2_threshold_pass(
+      viterbi_bit_score, profile.viterbi_threshold_bits);
+}
+
+__global__ void classify_f2_words_kernel(
+    const plan7_bias_candidate *candidates,
+    const plan7_postfilter_result *results,
+    const F2DeviceProfile *profiles,
+    size_t profile_count,
+    size_t source_count,
+    size_t word_count,
+    uint32_t *masks,
+    uint64_t *counts) {
+  const size_t thread =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t word = thread / 32;
+  const unsigned lane = thread & 31U;
+  if (word >= word_count) return;
+  const size_t source = word * 32 + lane;
+  bool pass = false;
+  if (source < source_count) {
+    const plan7_bias_candidate mapping = candidates[source];
+    if (mapping.profile_index < profile_count)
+      pass = exact_f2_pass(results[source], profiles[mapping.profile_index]);
+  }
+  const uint32_t mask = __ballot_sync(UINT32_MAX, pass);
+  if (lane == 0) {
+    masks[word] = mask;
+    counts[word] = static_cast<uint64_t>(__popc(mask));
+    if (word + 1 == word_count) counts[word_count] = 0;
+  }
+}
+
+__global__ void scatter_f2_sources_kernel(
+    const uint32_t *masks,
+    const uint64_t *ranks,
+    size_t word_count,
+    uint32_t *selected_sources) {
+  const size_t word =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (word >= word_count) return;
+  uint32_t mask = masks[word];
+  uint64_t output = ranks[word];
+  while (mask != 0) {
+    const unsigned bit = static_cast<unsigned>(__ffs(mask) - 1);
+    selected_sources[output++] =
+        static_cast<uint32_t>(word * 32 + bit);
+    mask &= mask - 1;
+  }
+}
+
+uint64_t hash_selected_sources(const uint32_t *sources, size_t count) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t value = sources[i];
+    for (unsigned byte = 0; byte < sizeof(value); ++byte) {
+      hash ^= static_cast<uint8_t>(value >> (byte * 8));
+      hash *= UINT64_C(1099511628211);
+    }
+  }
+  hash ^= static_cast<uint64_t>(count);
+  hash *= UINT64_C(1099511628211);
+  return hash;
+}
 
 void set_error(char *error, size_t error_size, const char *message) {
   if (error != nullptr && error_size != 0)
@@ -1543,6 +1647,20 @@ struct plan7_postfilter_workspace {
   uint64_t full_msv_packed_group_count;
   uint64_t full_msv_packed_candidate_count;
   uint64_t full_msv_scalar_candidate_count;
+  const plan7_bias_candidate *resident_device_candidates;
+  const plan7_bias_candidate *resident_host_candidates;
+  const plan7_postfilter_result *resident_host_results;
+  size_t resident_source_count;
+  uint64_t resident_generation;
+  bool resident_results_valid;
+  bool f2_view_valid;
+  uint64_t f2_batch_generation;
+  size_t f2_profile_count;
+  size_t f2_selected_count;
+  uint64_t f2_selected_source_hash;
+  std::vector<F2DeviceProfile> host_f2_profiles;
+  std::vector<uint32_t> host_f2_selected_sources;
+  plan7_postfilter_f2_statistics f2_statistics;
 };
 
 namespace {
@@ -2562,7 +2680,22 @@ int postfilter_candidates_device_with_workspace_impl(
   }
   if (reason_statistics != nullptr)
     *reason_statistics = {};
-  if (candidate_count == 0) return 0;
+  workspace->resident_results_valid = false;
+  workspace->f2_view_valid = false;
+  if (candidate_count == 0) {
+    if (workspace->resident_generation == UINT64_MAX) {
+      set_error(error, error_size,
+                "post-filter resident generation overflow");
+      return -1;
+    }
+    ++workspace->resident_generation;
+    workspace->resident_device_candidates = device_candidates;
+    workspace->resident_host_candidates = host_candidates;
+    workspace->resident_host_results = host_results;
+    workspace->resident_source_count = 0;
+    workspace->resident_results_valid = true;
+    return 0;
+  }
   int current_device = -1;
   cudaError_t status = cudaGetDevice(&current_device);
   if (status != cudaSuccess) {
@@ -3271,11 +3404,373 @@ int postfilter_candidates_device_with_workspace_impl(
   }
   CUDA_RUN(cudaMemcpy(host_results, workspace->device_results, post_result_bytes,
                       cudaMemcpyDeviceToHost));
+  if (workspace->resident_generation == UINT64_MAX) {
+    set_error(error, error_size, "post-filter resident generation overflow");
+    return -1;
+  }
+  ++workspace->resident_generation;
+  workspace->resident_device_candidates = device_candidates;
+  workspace->resident_host_candidates = host_candidates;
+  workspace->resident_host_results = host_results;
+  workspace->resident_source_count = candidate_count;
+  workspace->resident_results_valid = true;
   return 0;
 #undef CUDA_RUN
 }
 
 }  // namespace
+
+extern "C" int plan7_postfilter_workspace_compact_f2(
+    plan7_postfilter_workspace *workspace, uint64_t batch_generation,
+    const plan7_ssv_profile *profiles, const float *m_mu, const float *m_lambda,
+    const float *v_mu, const float *v_lambda, size_t profile_count, double f2,
+    int host_environment_attested, plan7_postfilter_f2_resident_view *view,
+    char *error, size_t error_size) {
+  if (workspace == nullptr || view == nullptr || batch_generation == 0 ||
+      (profile_count != 0 &&
+       (profiles == nullptr || m_mu == nullptr || m_lambda == nullptr ||
+        v_mu == nullptr || v_lambda == nullptr)) ||
+      !std::isfinite(f2) || f2 < 0.0 || f2 > 1.0) {
+    set_error(error, error_size, "invalid resident F2 compaction request");
+    return -1;
+  }
+  std::memset(view, 0, sizeof(*view));
+  workspace->f2_view_valid = false;
+  const auto total_begin = std::chrono::steady_clock::now();
+  plan7_postfilter_f2_statistics statistics{};
+  statistics.source_count = workspace->resident_source_count;
+  statistics.run_count = 1;
+  if (!workspace->resident_results_valid) {
+    set_error(error, error_size, "resident post-filter results are unavailable");
+    return -1;
+  }
+  if (workspace->resident_source_count > UINT32_MAX) {
+    set_error(error, error_size, "resident F2 source count exceeds uint32");
+    return -1;
+  }
+  if (workspace->resident_source_count != 0 && profile_count == 0) {
+    set_error(error, error_size, "resident F2 sources have no profiles");
+    return -1;
+  }
+
+  int current_device = -1;
+  cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (current_device != workspace->device_ordinal) {
+    set_error(error, error_size,
+              "resident F2 workspace belongs to a different CUDA device");
+    return -1;
+  }
+
+  const auto compile_begin = std::chrono::steady_clock::now();
+  try {
+    workspace->host_f2_profiles.resize(profile_count);
+  } catch (...) {
+    set_error(error, error_size, "resident F2 profile allocation failed");
+    return -1;
+  }
+  bool supported = host_environment_attested == 1;
+  for (size_t profile = 0; profile < profile_count; ++profile) {
+    plan7_f2_threshold msv{};
+    plan7_f2_threshold viterbi{};
+    if (plan7_postfilter_compile_f2_threshold(
+            m_mu[profile], m_lambda[profile], f2, &msv) != 0 ||
+        plan7_postfilter_compile_f2_threshold(
+            v_mu[profile], v_lambda[profile], f2, &viterbi) != 0) {
+      set_error(error, error_size, "resident F2 threshold compilation failed");
+      return -1;
+    }
+    if (!std::isfinite(profiles[profile].scale) ||
+        profiles[profile].scale <= 0.0f || !msv.supported ||
+        !viterbi.supported) {
+      supported = false;
+      ++statistics.unsupported_profile_count;
+    } else {
+      ++statistics.compiled_profile_count;
+    }
+    workspace->host_f2_profiles[profile] = {
+        profiles[profile].scale, msv.threshold_bits,
+        viterbi.threshold_bits};
+  }
+  if (!host_environment_attested)
+    statistics.unsupported_profile_count = profile_count;
+  statistics.compile_milliseconds =
+      std::chrono::duration<float, std::milli>(
+          std::chrono::steady_clock::now() - compile_begin).count();
+
+  workspace->f2_batch_generation = batch_generation;
+  workspace->f2_profile_count = profile_count;
+  workspace->f2_selected_count = 0;
+  workspace->f2_selected_source_hash = hash_selected_sources(nullptr, 0);
+  workspace->host_f2_selected_sources.clear();
+  workspace->f2_statistics = statistics;
+  workspace->f2_view_valid = true;
+  if (!supported) {
+    workspace->f2_statistics.total_milliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - total_begin).count();
+    view->batch_generation = batch_generation;
+    view->workspace_generation = workspace->resident_generation;
+    view->device_ordinal = current_device;
+    view->supported = 0;
+    view->profile_count = profile_count;
+    view->source_count = workspace->resident_source_count;
+    view->host_candidates = workspace->resident_host_candidates;
+    view->host_results = workspace->resident_host_results;
+    view->device_candidates = workspace->resident_device_candidates;
+    view->device_results = workspace->device_results;
+    view->owner = workspace;
+    view->statistics = workspace->f2_statistics;
+    return 0;
+  }
+
+  const size_t source_count = workspace->resident_source_count;
+  const size_t word_count = (source_count + 31) / 32;
+  size_t profile_bytes = 0;
+  size_t mask_bytes = 0;
+  size_t rank_bytes = 0;
+  if (!checked_bytes(profile_count, sizeof(F2DeviceProfile), &profile_bytes) ||
+      !checked_bytes(word_count, sizeof(uint32_t), &mask_bytes) ||
+      !checked_bytes(word_count + 1, sizeof(uint64_t), &rank_bytes)) {
+    set_error(error, error_size, "resident F2 workspace size overflow");
+    return -1;
+  }
+  if (grow_workspace_buffer(
+          &workspace->device_moves, &workspace->moves_capacity,
+          profile_bytes, &workspace->growth_count,
+          "cudaMalloc(resident F2 profiles)", error, error_size) != 0 ||
+      grow_workspace_buffer(
+          &workspace->device_bias_inputs, &workspace->bias_inputs_capacity,
+          mask_bytes, &workspace->growth_count,
+          "cudaMalloc(resident F2 masks)", error, error_size) != 0 ||
+      grow_workspace_buffer(
+          &workspace->device_msv_offsets, &workspace->msv_offsets_capacity,
+          rank_bytes, &workspace->growth_count,
+          "cudaMalloc(resident F2 counts)", error, error_size) != 0 ||
+      grow_workspace_buffer(
+          &workspace->device_vit_offsets, &workspace->vit_offsets_capacity,
+          rank_bytes, &workspace->growth_count,
+          "cudaMalloc(resident F2 ranks)", error, error_size) != 0)
+    return -1;
+
+  auto *device_profiles =
+      reinterpret_cast<F2DeviceProfile *>(workspace->device_moves);
+  auto *device_masks =
+      reinterpret_cast<uint32_t *>(workspace->device_bias_inputs);
+  auto *device_counts = workspace->device_msv_offsets;
+  auto *device_ranks = workspace->device_vit_offsets;
+  const auto upload_begin = std::chrono::steady_clock::now();
+  if (profile_bytes != 0) {
+    status = cudaMemcpy(device_profiles, workspace->host_f2_profiles.data(),
+                        profile_bytes, cudaMemcpyHostToDevice);
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size, "upload resident F2 profiles", status);
+      return -1;
+    }
+  }
+  statistics.upload_milliseconds =
+      std::chrono::duration<float, std::milli>(
+          std::chrono::steady_clock::now() - upload_begin).count();
+
+  size_t scan_workspace_bytes = 0;
+  status = cub::DeviceScan::ExclusiveSum(
+      nullptr, scan_workspace_bytes, device_counts, device_ranks,
+      static_cast<int>(word_count + 1));
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "CUB resident F2 scan workspace query", status);
+    return -1;
+  }
+  if (grow_workspace_buffer(
+          &workspace->device_dp, &workspace->dp_capacity,
+          scan_workspace_bytes, &workspace->growth_count,
+          "cudaMalloc(resident F2 scan workspace)", error,
+          error_size) != 0)
+    return -1;
+
+  cudaEvent_t begin_event = nullptr;
+  cudaEvent_t classify_event = nullptr;
+  cudaEvent_t scan_event = nullptr;
+#define F2_CUDA(call, label)                                                  \
+  do {                                                                        \
+    status = (call);                                                          \
+    if (status != cudaSuccess) {                                              \
+      if (begin_event != nullptr) cudaEventDestroy(begin_event);              \
+      if (classify_event != nullptr) cudaEventDestroy(classify_event);        \
+      if (scan_event != nullptr) cudaEventDestroy(scan_event);                \
+      set_cuda_error(error, error_size, (label), status);                     \
+      workspace->f2_view_valid = false;                                      \
+      return -1;                                                              \
+    }                                                                         \
+  } while (0)
+  F2_CUDA(cudaEventCreate(&begin_event), "create resident F2 begin event");
+  F2_CUDA(cudaEventCreate(&classify_event),
+          "create resident F2 classify event");
+  F2_CUDA(cudaEventCreate(&scan_event), "create resident F2 scan event");
+  F2_CUDA(cudaEventRecord(begin_event), "record resident F2 begin event");
+  if (word_count != 0) {
+    const size_t thread_count = word_count * 32;
+    const size_t block_count = (thread_count + kThreads - 1) / kThreads;
+    classify_f2_words_kernel<<<static_cast<unsigned>(block_count), kThreads>>>(
+        workspace->resident_device_candidates, workspace->device_results,
+        device_profiles, profile_count, source_count, word_count, device_masks,
+        device_counts);
+    F2_CUDA(cudaGetLastError(), "launch resident F2 classification");
+  } else {
+    F2_CUDA(cudaMemset(device_counts, 0, sizeof(uint64_t)),
+            "initialize empty resident F2 count");
+  }
+  F2_CUDA(cudaEventRecord(classify_event),
+          "record resident F2 classify event");
+  F2_CUDA(cub::DeviceScan::ExclusiveSum(
+              workspace->device_dp, scan_workspace_bytes, device_counts,
+              device_ranks, static_cast<int>(word_count + 1)),
+          "scan resident F2 masks");
+  F2_CUDA(cudaEventRecord(scan_event), "record resident F2 scan event");
+  F2_CUDA(cudaEventSynchronize(scan_event),
+          "synchronize resident F2 scan event");
+  F2_CUDA(cudaEventElapsedTime(
+              &statistics.kernel_milliseconds, begin_event, classify_event),
+          "time resident F2 classification");
+  F2_CUDA(cudaEventElapsedTime(
+              &statistics.scan_milliseconds, classify_event, scan_event),
+          "time resident F2 scan");
+  cudaEventDestroy(begin_event);
+  cudaEventDestroy(classify_event);
+  cudaEventDestroy(scan_event);
+  begin_event = classify_event = scan_event = nullptr;
+
+  uint64_t selected_count64 = 0;
+  const auto count_download_begin = std::chrono::steady_clock::now();
+  status = cudaMemcpy(&selected_count64, device_ranks + word_count,
+                      sizeof(selected_count64), cudaMemcpyDeviceToHost);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "download resident F2 selected count", status);
+    workspace->f2_view_valid = false;
+    return -1;
+  }
+  if (selected_count64 > source_count || selected_count64 > UINT32_MAX) {
+    set_error(error, error_size, "resident F2 selected count is invalid");
+    workspace->f2_view_valid = false;
+    return -1;
+  }
+  const size_t selected_count = static_cast<size_t>(selected_count64);
+  size_t selected_bytes = 0;
+  if (!checked_bytes(selected_count, sizeof(uint32_t), &selected_bytes) ||
+      grow_workspace_buffer(
+          &workspace->device_vit_results, &workspace->vit_results_capacity,
+          selected_bytes, &workspace->growth_count,
+          "cudaMalloc(resident F2 selected sources)", error,
+          error_size) != 0) {
+    workspace->f2_view_valid = false;
+    return -1;
+  }
+  auto *device_selected_sources =
+      reinterpret_cast<uint32_t *>(workspace->device_vit_results);
+  if (word_count != 0) {
+    const size_t block_count = (word_count + kThreads - 1) / kThreads;
+    scatter_f2_sources_kernel<<<static_cast<unsigned>(block_count), kThreads>>>(
+        device_masks, device_ranks, word_count, device_selected_sources);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size,
+                     "launch resident F2 stable scatter", status);
+      workspace->f2_view_valid = false;
+      return -1;
+    }
+  }
+  try {
+    workspace->host_f2_selected_sources.resize(selected_count);
+  } catch (...) {
+    set_error(error, error_size,
+              "resident F2 host selection allocation failed");
+    workspace->f2_view_valid = false;
+    return -1;
+  }
+  if (selected_bytes != 0) {
+    status = cudaMemcpy(workspace->host_f2_selected_sources.data(),
+                        device_selected_sources, selected_bytes,
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size,
+                     "download resident F2 selected sources", status);
+      workspace->f2_view_valid = false;
+      return -1;
+    }
+  }
+  statistics.download_milliseconds =
+      std::chrono::duration<float, std::milli>(
+          std::chrono::steady_clock::now() - count_download_begin).count();
+  statistics.source_count = source_count;
+  statistics.selected_count = selected_count;
+  statistics.mask_word_count = word_count;
+  statistics.selected_d2h_bytes = selected_bytes;
+  statistics.total_milliseconds =
+      std::chrono::duration<float, std::milli>(
+          std::chrono::steady_clock::now() - total_begin).count();
+  workspace->f2_selected_count = selected_count;
+  workspace->f2_selected_source_hash = hash_selected_sources(
+      workspace->host_f2_selected_sources.data(), selected_count);
+  workspace->f2_statistics = statistics;
+  workspace->f2_view_valid = true;
+
+  view->batch_generation = batch_generation;
+  view->workspace_generation = workspace->resident_generation;
+  view->selected_source_hash = workspace->f2_selected_source_hash;
+  view->device_ordinal = current_device;
+  view->supported = 1;
+  view->profile_count = profile_count;
+  view->source_count = source_count;
+  view->selected_count = selected_count;
+  view->host_selected_sources =
+      workspace->host_f2_selected_sources.empty()
+          ? nullptr : workspace->host_f2_selected_sources.data();
+  view->host_candidates = workspace->resident_host_candidates;
+  view->host_results = workspace->resident_host_results;
+  view->device_candidates = workspace->resident_device_candidates;
+  view->device_results = workspace->device_results;
+  view->device_selected_sources =
+      selected_count == 0 ? nullptr : device_selected_sources;
+  view->owner = workspace;
+  view->statistics = statistics;
+#undef F2_CUDA
+  return 0;
+}
+
+extern "C" int plan7_postfilter_f2_resident_view_validate(
+    const plan7_postfilter_f2_resident_view *view,
+    char *error, size_t error_size) {
+  if (view == nullptr || view->owner == nullptr) {
+    set_error(error, error_size, "resident F2 view is null");
+    return -1;
+  }
+  const plan7_postfilter_workspace *workspace = view->owner;
+  if (!workspace->f2_view_valid || !workspace->resident_results_valid ||
+      view->workspace_generation != workspace->resident_generation ||
+      view->batch_generation != workspace->f2_batch_generation ||
+      view->device_ordinal != workspace->device_ordinal ||
+      view->profile_count != workspace->f2_profile_count ||
+      view->source_count != workspace->resident_source_count ||
+      view->selected_count != workspace->f2_selected_count ||
+      view->selected_source_hash != workspace->f2_selected_source_hash ||
+      view->host_candidates != workspace->resident_host_candidates ||
+      view->host_results != workspace->resident_host_results ||
+      view->device_candidates != workspace->resident_device_candidates ||
+      view->device_results != workspace->device_results ||
+      (view->selected_count != 0 &&
+       (view->host_selected_sources !=
+            workspace->host_f2_selected_sources.data() ||
+        view->device_selected_sources != reinterpret_cast<const uint32_t *>(
+            workspace->device_vit_results)))) {
+    set_error(error, error_size, "resident F2 view identity changed");
+    return -1;
+  }
+  return 0;
+}
 
 extern "C" int plan7_postfilter_candidates_device_with_workspace(
     plan7_postfilter_workspace *workspace,

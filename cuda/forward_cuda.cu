@@ -2,6 +2,7 @@
 
 #include "bias_cuda.h"
 #include "f3_threshold.h"
+#include "postfilter_cuda.h"
 #include "ssv_cuda.h"
 
 #include <cuda_runtime.h>
@@ -666,6 +667,24 @@ __global__ void scatter_f3_survivors_kernel(
         static_cast<uint32_t>(candidate);
 }
 
+__global__ void gather_resident_f2_inputs_kernel(
+    const plan7_bias_candidate *source_candidates,
+    const plan7_postfilter_result *source_results,
+    const uint32_t *selected_sources,
+    size_t selected_count,
+    uint32_t *candidate_profiles,
+    uint32_t *candidate_sequences,
+    float *filter_scores) {
+  const size_t candidate =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (candidate >= selected_count) return;
+  const uint32_t source = selected_sources[candidate];
+  const plan7_bias_candidate mapping = source_candidates[source];
+  candidate_profiles[candidate] = mapping.profile_index;
+  candidate_sequences[candidate] = mapping.sequence_index;
+  filter_scores[candidate] = source_results[source].filtersc;
+}
+
 __global__ void survivor_cell_counts_kernel(
     const uint32_t *survivor_candidates, size_t survivor_count,
     const uint64_t *global_x_offsets, uint64_t *survivor_offsets) {
@@ -785,6 +804,7 @@ struct plan7_forward_output {
   plan7_forward_provenance provenance;
   ResidentForwardSpecials resident_specials;
   plan7_forward_residency_statistics residency_statistics{};
+  plan7_forward_input_residency_statistics input_residency_statistics{};
   plan7_forward_subwarp_statistics subwarp_statistics{};
   float upload_milliseconds;
   float total_milliseconds;
@@ -1659,6 +1679,7 @@ static int forward_run_with_workspace_impl(
     plan7_forward_output **output, bool collect_reason_facts,
     bool retain_device_specials, bool audit_f3,
     int requested_candidates_per_warp,
+    const plan7_postfilter_f2_resident_view *postfilter_view,
     char *error, size_t error_size) {
   const auto call_begin = std::chrono::steady_clock::now();
   int candidates_per_warp = kDefaultCandidatesPerWarp;
@@ -1752,6 +1773,54 @@ static int forward_run_with_workspace_impl(
               "Forward workspace belongs to a different CUDA device");
     return -1;
   }
+  const bool resident_f2 = postfilter_view != nullptr;
+  if (resident_f2) {
+    if (plan7_postfilter_f2_resident_view_validate(
+            postfilter_view, error, error_size) != 0)
+      return -1;
+    if (!postfilter_view->supported ||
+        postfilter_view->batch_generation != batch_view.generation_id ||
+        postfilter_view->device_ordinal != current_device ||
+        postfilter_view->profile_count != profile_count ||
+        postfilter_view->selected_count != candidate_count ||
+        (candidate_count != 0 &&
+         (postfilter_view->host_selected_sources == nullptr ||
+          postfilter_view->host_candidates == nullptr ||
+          postfilter_view->host_results == nullptr ||
+          postfilter_view->device_candidates == nullptr ||
+          postfilter_view->device_results == nullptr ||
+          postfilter_view->device_selected_sources == nullptr))) {
+      set_error(error, error_size, "resident F2 view differs from Forward input");
+      return -1;
+    }
+    size_t expected_profile = 0;
+    for (size_t candidate = 0; candidate < candidate_count; ++candidate) {
+      while (expected_profile + 1 < profile_count &&
+             candidate >= candidate_offsets[expected_profile + 1])
+        ++expected_profile;
+      const uint32_t source = postfilter_view->host_selected_sources[candidate];
+      if (source >= postfilter_view->source_count) {
+        set_error(error, error_size,
+                  "resident F2 selected source is out of range");
+        return -1;
+      }
+      const plan7_bias_candidate mapping =
+          postfilter_view->host_candidates[source];
+      FloatBits resident_filter{};
+      FloatBits host_filter{};
+      resident_filter.value = postfilter_view->host_results[source].filtersc;
+      host_filter.value = filter_scores[candidate];
+      if (mapping.profile_index != expected_profile ||
+          mapping.sequence_index != candidate_indices[candidate] ||
+          postfilter_view->host_results[source].sequence_index !=
+              candidate_indices[candidate] ||
+          resident_filter.bits != host_filter.bits) {
+        set_error(error, error_size,
+                  "resident F2 selection differs from host provenance");
+        return -1;
+      }
+    }
+  }
   if ((profile_count != 0 &&
        (!device_allocation_on(database->device_profiles, current_device) ||
         !device_allocation_on(database->device_emissions, current_device) ||
@@ -1797,6 +1866,12 @@ static int forward_run_with_workspace_impl(
   }
   created->statistics = {};
   created->f3_device_statistics = {};
+  created->input_residency_statistics = {};
+  if (resident_f2) {
+    created->input_residency_statistics.resident_f2_call_count = 1;
+    created->input_residency_statistics.resident_f2_candidate_count =
+        candidate_count;
+  }
   created->subwarp_statistics.policy_version = kSubwarpPolicyVersion;
   created->subwarp_statistics.requested_candidates_per_warp =
       static_cast<uint32_t>(requested_candidates_per_warp);
@@ -2183,14 +2258,36 @@ static int forward_run_with_workspace_impl(
       static_cast<uint64_t>(gather_buffer_bytes) + survivor_candidate_bytes +
       survivor_offset_bytes;
   const auto input_upload_begin = std::chrono::steady_clock::now();
-  CUDA_RUN(cudaMemcpy(buffers.candidate_profiles,
-                      host_candidate_profiles.data(),
-                      candidate_bytes, cudaMemcpyHostToDevice));
-  CUDA_RUN(cudaMemcpy(buffers.candidate_sequences,
-                      host_candidate_sequences.data(),
-                      candidate_bytes, cudaMemcpyHostToDevice));
-  CUDA_RUN(cudaMemcpy(buffers.filter_scores, filter_scores,
-                      candidate_bytes, cudaMemcpyHostToDevice));
+  if (resident_f2) {
+    const auto gather_begin = std::chrono::steady_clock::now();
+    const size_t gather_blocks =
+        (candidate_count + kGatherThreads - 1) / kGatherThreads;
+    gather_resident_f2_inputs_kernel<<<
+        static_cast<unsigned>(gather_blocks), kGatherThreads>>>(
+        postfilter_view->device_candidates, postfilter_view->device_results,
+        postfilter_view->device_selected_sources, candidate_count,
+        buffers.candidate_profiles, buffers.candidate_sequences,
+        buffers.filter_scores);
+    CUDA_RUN(cudaGetLastError());
+    CUDA_RUN(cudaDeviceSynchronize());
+    created->input_residency_statistics.resident_f2_call_count = 1;
+    created->input_residency_statistics.resident_f2_candidate_count =
+        candidate_count;
+    created->input_residency_statistics.eliminated_candidate_h2d_bytes =
+        static_cast<uint64_t>(candidate_bytes) * 3;
+    created->input_residency_statistics.gather_milliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - gather_begin).count();
+  } else {
+    CUDA_RUN(cudaMemcpy(buffers.candidate_profiles,
+                        host_candidate_profiles.data(),
+                        candidate_bytes, cudaMemcpyHostToDevice));
+    CUDA_RUN(cudaMemcpy(buffers.candidate_sequences,
+                        host_candidate_sequences.data(),
+                        candidate_bytes, cudaMemcpyHostToDevice));
+    CUDA_RUN(cudaMemcpy(buffers.filter_scores, filter_scores,
+                        candidate_bytes, cudaMemcpyHostToDevice));
+  }
   CUDA_RUN(cudaMemcpy(buffers.f3_threshold_bits,
                       host_f3_threshold_bits.data(),
                       threshold_bytes, cudaMemcpyHostToDevice));
@@ -2541,7 +2638,7 @@ extern "C" int plan7_forward_run_with_workspace(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, false, false,
-      1, error, error_size);
+      1, nullptr, error, error_size);
 }
 
 extern "C" int plan7_forward_run(
@@ -2604,7 +2701,7 @@ extern "C" int plan7_forward_run_batch_workspace_variant(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, false, false,
-      candidates_per_warp, error, error_size);
+      candidates_per_warp, nullptr, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_reason_facts(
@@ -2623,7 +2720,7 @@ extern "C" int plan7_forward_run_batch_workspace_reason_facts(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, true, false, false,
-      1, error, error_size);
+      1, nullptr, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident(
@@ -2642,7 +2739,7 @@ extern "C" int plan7_forward_run_batch_workspace_resident(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, true, false,
-      1, error, error_size);
+      1, nullptr, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
@@ -2661,7 +2758,27 @@ extern "C" int plan7_forward_run_batch_workspace_resident_reason_facts(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, true, true, false,
-      1, error, error_size);
+      1, nullptr, error, error_size);
+}
+
+extern "C" int plan7_forward_run_batch_workspace_postfilter_resident(
+    const plan7_forward_database *database,
+    plan7_ssv_sequence_batch *batch,
+    const uintptr_t *source_profile_pointers, size_t profile_count,
+    const uint64_t *candidate_offsets, const uint32_t *candidate_indices,
+    const float *filter_scores, size_t candidate_count,
+    const plan7_postfilter_f2_resident_view *postfilter_view,
+    double f3, uint64_t gathered_byte_budget, int collect_reason_facts,
+    plan7_forward_output **output, char *error, size_t error_size) {
+  plan7_forward_workspace *workspace = nullptr;
+  if (plan7_ssv_sequence_batch_get_forward_workspace(
+          batch, &workspace, error, error_size) != 0)
+    return -1;
+  return forward_run_with_workspace_impl(
+      workspace, database, batch, source_profile_pointers, profile_count,
+      candidate_offsets, candidate_indices, filter_scores, candidate_count,
+      f3, gathered_byte_budget, output, collect_reason_facts != 0, true,
+      false, 1, postfilter_view, error, error_size);
 }
 
 extern "C" int plan7_forward_run_batch_workspace_f3_audit(
@@ -2680,7 +2797,7 @@ extern "C" int plan7_forward_run_batch_workspace_f3_audit(
       workspace, database, batch, source_profile_pointers, profile_count,
       candidate_offsets, candidate_indices, filter_scores, candidate_count,
       f3, gathered_byte_budget, output, false, false, true,
-      1, error, error_size);
+      1, nullptr, error, error_size);
 }
 
 extern "C" int plan7_forward_output_destroy(
@@ -2742,6 +2859,12 @@ extern "C" const plan7_forward_residency_statistics *
 plan7_forward_output_residency_statistics(
     const plan7_forward_output *output) {
   return output == nullptr ? nullptr : &output->residency_statistics;
+}
+
+extern "C" const plan7_forward_input_residency_statistics *
+plan7_forward_output_input_residency_statistics(
+    const plan7_forward_output *output) {
+  return output == nullptr ? nullptr : &output->input_residency_statistics;
 }
 
 extern "C" const plan7_forward_subwarp_statistics *
