@@ -44,6 +44,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, Phase 11 automatic policy | 64 host workers | 451.083043 s | 13,380,000 KiB | exact; 0.441% slower than Phase 9, with 22 MiB less sampled H200 memory |
 | Astra GPU, H200, resident F2→Forward handoff | 64 host workers | **448.140781 s** | 13,195,416 KiB | **exact; 0.2145% faster than Phase 9; new best** |
 | Rejected experiment: packed Viterbi | 64 host workers | 454.963381 s | 13,340,692 KiB | exact, but 0.211% slower and 94,836 KiB larger; excluded from `main` |
+| Rejected experiment: external multidomain continuation | 64 host workers | 480.258523 s | 13,080,804 KiB | exact, but 7.167% slower; implementation excluded from `main` |
 
 Additional GPU timing layers:
 
@@ -195,6 +196,21 @@ claim is made.  Maximum RSS was 13,380,000 KiB (+1.677%), while peak sampled
 H200 memory was 3,370 MiB, 22 MiB lower than Phase 9.  The execution policy is
 retained for deterministic workload-shape selection and small-workload
 protection; Phase 9 remains the fastest full run.
+
+The retained resident F2-to-Forward slice subsequently set the current best in
+full H200 job `1183504`: 448.140781 seconds with byte-identical output. Full
+details are in `PHASE3_POSTFILTER_FORWARD_RESIDENCY.md`.
+
+An exact external-multidomain continuation prototype then tested whether the
+dominant CPU tail could be reduced by transporting certain multidomain regions
+to a narrower HMMER seam. Full job `1183518` moved 132,654 rows off the old
+general CPU route and reduced `CPU_REQUIRED` by 24.015%, but request wall rose
+32.117742 seconds (7.167%) to 480.258523 seconds. Continuation itself rose
+31.783930 seconds, showing that the exact multihit/stochastic-trace/clustering
+work was shifted rather than eliminated. RSS fell only 114,612 KiB and sampled
+H200 memory only 8 MiB. The implementation is rejected; exact route, timing,
+memory, and provenance evidence is recorded in
+`PHASE3_MULTIDOMAIN_CONTINUATION.md`.
 
 ## GPU request-stage ledger
 

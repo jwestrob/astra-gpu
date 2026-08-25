@@ -203,6 +203,16 @@ remained dominant at 400.083104 seconds, so Phase 3 now turns to exact reduction
 of multidomain and cap-driven CPU continuation rather than further filter-lane
 micro-optimization.
 
+The first bottleneck-directed trial implemented an exact external-region
+multidomain seam. Full H200 job `1183518` preserved byte-identical output and
+reduced `CPU_REQUIRED` from 552,390 to 419,736 rows, but request wall regressed
+from 448.140781 to 480.258523 seconds (+7.167%) and continuation rose 31.783930
+seconds. The exact HMMER multihit, stochastic-trace, clustering, and rescore
+work remained on the CPU and became more expensive through the new seam. The
+prototype is rejected and remains only on its experiment branch; Phase 3 must
+next address cap- and threshold-driven fallback by eliminating work, not merely
+rerouting the same CPU semantics.
+
 ## Phase 4 Forward subwarp result
 
 Widths 1/2/4/8 were exact in focused H200 tests, but the microbenchmark-derived
