@@ -539,6 +539,23 @@ int plan7_ssv_sequence_batch_bias_candidates_many(
   char *error,
   size_t error_size);
 
+/* Diagnostic-only exact A/B entry point. `sequence_major == 0` times the
+ * retained candidate-major kernel; `sequence_major == 1` groups candidates
+ * by target on device and executes the experimental target-major kernel. */
+int plan7_ssv_sequence_batch_bias_candidates_many_experimental(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  plan7_bias_result *results,
+  size_t result_count,
+  int sequence_major,
+  plan7_bias_sequence_statistics *statistics,
+  char *error,
+  size_t error_size);
+
 int plan7_ssv_sequence_batch_postfilter_candidates_many(
   plan7_ssv_sequence_batch *batch,
   const plan7_bias_profile *bias_profiles,

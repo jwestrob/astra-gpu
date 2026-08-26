@@ -287,6 +287,17 @@ cdef extern from "bias_cuda.h" nogil:
         uint8_t ssv_status
         uint8_t action
 
+    ctypedef struct plan7_bias_sequence_statistics:
+        uint64_t candidate_count
+        uint64_t sequence_count
+        uint64_t temporary_device_bytes
+        uint64_t run_count
+        float grouping_milliseconds
+        float kernel_milliseconds
+        float total_milliseconds
+        uint32_t sequence_major
+        uint32_t reserved
+
     int plan7_bias_pack_amino_profile(
         const float *background,
         const float *composition,
@@ -790,6 +801,21 @@ cdef extern from "ssv_cuda.h" nogil:
         size_t candidate_count,
         plan7_bias_result *results,
         size_t result_count,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_ssv_sequence_batch_bias_candidates_many_experimental(
+        plan7_ssv_sequence_batch *batch,
+        const plan7_bias_profile *bias_profiles,
+        size_t profile_count,
+        const size_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        size_t candidate_count,
+        plan7_bias_result *results,
+        size_t result_count,
+        int sequence_major,
+        plan7_bias_sequence_statistics *statistics,
         char *error,
         size_t error_size,
     )
@@ -6828,6 +6854,8 @@ cdef class SequenceBatch:
         const float[::1] m_lambda,
         double f1,
         const uint8_t[::1] packed_bias_profiles,
+        int experimental_mode,
+        plan7_bias_sequence_statistics *experimental_statistics,
     ) except? 0:
         cdef char error[512]
         cdef size_t profile_count
@@ -6883,18 +6911,38 @@ cdef class SequenceBatch:
 
         error[0] = 0
         with nogil:
-            status = plan7_ssv_sequence_batch_bias_candidates_many(
-                self._batch,
-                self._bias_profiles.data(),
-                profile_count,
-                self._bias_candidate_offsets.data(),
-                self._candidate_indices.data() if candidate_count else NULL,
-                candidate_count,
-                self._bias_results.data() if candidate_count else NULL,
-                candidate_count,
-                error,
-                sizeof(error),
-            )
+            if experimental_mode >= 0:
+                status = (
+                    plan7_ssv_sequence_batch_bias_candidates_many_experimental(
+                        self._batch,
+                        self._bias_profiles.data(),
+                        profile_count,
+                        self._bias_candidate_offsets.data(),
+                        self._candidate_indices.data()
+                            if candidate_count else NULL,
+                        candidate_count,
+                        self._bias_results.data() if candidate_count else NULL,
+                        candidate_count,
+                        experimental_mode,
+                        experimental_statistics,
+                        error,
+                        sizeof(error),
+                    )
+                )
+            else:
+                status = plan7_ssv_sequence_batch_bias_candidates_many(
+                    self._batch,
+                    self._bias_profiles.data(),
+                    profile_count,
+                    self._bias_candidate_offsets.data(),
+                    self._candidate_indices.data()
+                        if candidate_count else NULL,
+                    candidate_count,
+                    self._bias_results.data() if candidate_count else NULL,
+                    candidate_count,
+                    error,
+                    sizeof(error),
+                )
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
         return profile_count
@@ -6934,6 +6982,8 @@ cdef class SequenceBatch:
             m_lambda,
             f1,
             packed_bias_profiles,
+            -1,
+            NULL,
         )
         for profile_index in range(profile_count):
             row = []
@@ -6995,6 +7045,8 @@ cdef class SequenceBatch:
             m_lambda,
             f1,
             packed_bias_profiles,
+            -1,
+            NULL,
         )
         candidate_count = self._bias_results.size()
         if candidate_count > (<size_t> -1) // sizeof(plan7_bias_result):
@@ -7010,6 +7062,73 @@ cdef class SequenceBatch:
                 self._bias_candidate_offsets[profile_index]
             )
         return records, offsets
+
+    def bias_candidates_many_experimental_csr_raw(
+        self,
+        const uint8_t[::1] packed_scores,
+        const uint64_t[::1] score_offsets,
+        const uint64_t[::1] score_counts,
+        const int32_t[::1] score_strides,
+        const int32_t[::1] model_lengths,
+        const uint8_t[::1] constants,
+        const float[::1] scales,
+        const float[::1] m_mu,
+        const float[::1] m_lambda,
+        double f1,
+        const uint8_t[::1] packed_bias_profiles,
+        bint sequence_major,
+    ):
+        """Run an exact diagnostic A/B of candidate- and sequence-major bias."""
+        cdef size_t profile_count
+        cdef size_t profile_index
+        cdef size_t candidate_count
+        cdef size_t result_bytes
+        cdef bytearray records
+        cdef uint8_t[::1] record_view
+        cdef carray offsets
+        cdef plan7_bias_sequence_statistics statistics
+
+        if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
+            raise RuntimeError("array('Q') is not native uint64")
+        memset(&statistics, 0, sizeof(statistics))
+        profile_count = self._run_bias_candidates_many(
+            packed_scores,
+            score_offsets,
+            score_counts,
+            score_strides,
+            model_lengths,
+            constants,
+            scales,
+            m_mu,
+            m_lambda,
+            f1,
+            packed_bias_profiles,
+            1 if sequence_major else 0,
+            &statistics,
+        )
+        candidate_count = self._bias_results.size()
+        if candidate_count > (<size_t> -1) // sizeof(plan7_bias_result):
+            raise OverflowError("bias result size overflows size_t")
+        result_bytes = candidate_count * sizeof(plan7_bias_result)
+        records = bytearray(result_bytes)
+        if result_bytes:
+            record_view = records
+            memcpy(&record_view[0], self._bias_results.data(), result_bytes)
+        offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
+        for profile_index in range(profile_count + 1):
+            offsets.data.as_ulonglongs[profile_index] = <uint64_t> (
+                self._bias_candidate_offsets[profile_index]
+            )
+        return records, offsets, {
+            "candidate_count": statistics.candidate_count,
+            "sequence_count": statistics.sequence_count,
+            "temporary_device_bytes": statistics.temporary_device_bytes,
+            "run_count": statistics.run_count,
+            "grouping_milliseconds": statistics.grouping_milliseconds,
+            "kernel_milliseconds": statistics.kernel_milliseconds,
+            "total_milliseconds": statistics.total_milliseconds,
+            "sequence_major": bool(statistics.sequence_major),
+        }
 
     def forward_candidates_many_raw(
         self,

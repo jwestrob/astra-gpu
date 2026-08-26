@@ -105,6 +105,20 @@ typedef struct {
   uint8_t action;
 } plan7_bias_result;
 
+typedef struct plan7_bias_sequence_workspace plan7_bias_sequence_workspace;
+
+typedef struct {
+  uint64_t candidate_count;
+  uint64_t sequence_count;
+  uint64_t temporary_device_bytes;
+  uint64_t run_count;
+  float grouping_milliseconds;
+  float kernel_milliseconds;
+  float total_milliseconds;
+  uint32_t sequence_major;
+  uint32_t reserved;
+} plan7_bias_sequence_statistics;
+
 int plan7_bias_pack_amino_profile(const float *background,
                                   const float *composition,
                                   int model_length,
@@ -180,6 +194,35 @@ int plan7_bias_filter_candidates_device(
   const plan7_bias_ssv_input *device_ssv_inputs,
   size_t candidate_count,
   plan7_bias_result *device_results,
+  char *error,
+  size_t error_size);
+
+/* Experimental exact sequence-major execution. The workspace is caller-owned
+ * and reusable; mode 0 profiles the retained candidate-major kernel, while
+ * mode 1 builds a dense sequence histogram/scan/scatter and executes one CTA
+ * per target with one independent profile candidate per lane. */
+int plan7_bias_sequence_workspace_create(
+  plan7_bias_sequence_workspace **workspace,
+  char *error,
+  size_t error_size);
+int plan7_bias_sequence_workspace_destroy(
+  plan7_bias_sequence_workspace **workspace,
+  char *error,
+  size_t error_size);
+int plan7_bias_filter_candidates_device_experimental(
+  plan7_bias_sequence_workspace *workspace,
+  const uint8_t *device_residues,
+  const uint64_t *device_offsets,
+  const float *device_length_logp,
+  const float *device_length_log1mp,
+  const plan7_bias_profile *device_profiles,
+  const plan7_bias_candidate *device_candidates,
+  const plan7_bias_ssv_input *device_ssv_inputs,
+  size_t candidate_count,
+  size_t sequence_count,
+  int sequence_major,
+  plan7_bias_result *device_results,
+  plan7_bias_sequence_statistics *statistics,
   char *error,
   size_t error_size);
 

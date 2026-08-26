@@ -582,6 +582,49 @@ class CudaBiasTests(unittest.TestCase):
             },
         )
 
+    def test_sequence_major_experiment_matches_candidate_major_bytes(self):
+        background, profiles = load_optimized(HMM_STRIPES)
+        with pyhmmer.easel.SequenceFile(
+            FASTA_FIRST1000,
+            digital=True,
+            alphabet=profiles[0].alphabet,
+        ) as sequence_file:
+            sequences = [next(sequence_file) for _ in range(256)]
+        packed_ssv = _pack_profiles(profiles)
+        packed_bias, m_mu, m_lambda = pack_bias_profiles(
+            background, profiles, 0.02
+        )
+        with native_batch(sequences) as batch:
+            retained, retained_offsets, retained_stats = (
+                batch.bias_candidates_many_experimental_csr_raw(
+                    *packed_ssv,
+                    m_mu,
+                    m_lambda,
+                    0.02,
+                    packed_bias,
+                    False,
+                )
+            )
+            experimental, experimental_offsets, experimental_stats = (
+                batch.bias_candidates_many_experimental_csr_raw(
+                    *packed_ssv,
+                    m_mu,
+                    m_lambda,
+                    0.02,
+                    packed_bias,
+                    True,
+                )
+            )
+        self.assertEqual(experimental, retained)
+        self.assertEqual(experimental_offsets, retained_offsets)
+        self.assertEqual(
+            experimental_stats["candidate_count"],
+            retained_stats["candidate_count"],
+        )
+        self.assertEqual(experimental_stats["sequence_count"], len(sequences))
+        self.assertTrue(experimental_stats["sequence_major"])
+        self.assertGreater(experimental_stats["temporary_device_bytes"], 0)
+
     def test_empty_and_uncertain_scores_fail_closed(self):
         background, profiles = load_optimized(HMM_GLOBINS)
         profile = profiles[0]

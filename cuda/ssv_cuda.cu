@@ -107,6 +107,7 @@ struct plan7_ssv_sequence_batch {
   uint64_t input_device_bytes;
   plan7_postfilter_workspace *postfilter_workspace;
   plan7_forward_workspace *forward_workspace;
+  plan7_bias_sequence_workspace *bias_sequence_workspace;
   uint64_t f1_device_compaction_run_count;
   uint64_t f1_host_expansion_run_count;
   uint64_t f1_candidate_upload_count;
@@ -1625,6 +1626,11 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
       device_ready = false;
     }
   }
+  if (device_ready && plan7_bias_sequence_workspace_destroy(
+        &batch->bias_sequence_workspace,
+        workspace_status == 0 ? error : nullptr,
+        workspace_status == 0 ? error_size : 0) != 0)
+    workspace_status = -1;
 
 #define CUDA_FREE(pointer)                                                    \
   do {                                                                        \
@@ -4070,8 +4076,8 @@ cleanup_seed:
   return rc;
 }
 
-extern "C" int
-plan7_ssv_sequence_batch_bias_candidates_many(
+static int
+sequence_batch_bias_candidates_many_impl(
   plan7_ssv_sequence_batch *batch,
   const plan7_bias_profile *bias_profiles,
   size_t profile_count,
@@ -4080,6 +4086,8 @@ plan7_ssv_sequence_batch_bias_candidates_many(
   size_t candidate_count,
   plan7_bias_result *results,
   size_t result_count,
+  int experimental_mode,
+  plan7_bias_sequence_statistics *experimental_statistics,
   char *error,
   size_t error_size)
 {
@@ -4092,6 +4100,20 @@ plan7_ssv_sequence_batch_bias_candidates_many(
   int current_device;
   int maximum_grid_x;
   bool use_cached_device_candidates;
+
+  if (experimental_mode >= 0) {
+    if (experimental_statistics == nullptr || experimental_mode > 1) {
+      set_error(error, error_size,
+                "invalid experimental bias execution mode");
+      return -1;
+    }
+    memset(experimental_statistics, 0, sizeof(*experimental_statistics));
+    experimental_statistics->candidate_count = candidate_count;
+    experimental_statistics->sequence_count =
+      batch != nullptr ? batch->sequence_count : 0;
+    experimental_statistics->sequence_major =
+      experimental_mode != 0 ? UINT32_C(1) : 0;
+  }
 
   if (batch == nullptr) {
     set_error(error, error_size, "sequence batch is null");
@@ -4333,25 +4355,87 @@ plan7_ssv_sequence_batch_bias_candidates_many(
     batch->device_bias_candidates,
     batch->device_bias_ssv_inputs);
   CUDA_TRY_BIAS(cudaGetLastError());
-  if (plan7_bias_filter_candidates_device(
-        batch->device_residues,
-        batch->device_offsets,
-        batch->device_bias_logp,
-        batch->device_bias_log1mp,
-        batch->device_bias_profiles,
-        batch->device_bias_candidates,
-        batch->device_bias_ssv_inputs,
-        candidate_count,
-        batch->device_bias_results,
-        error,
-        error_size) != 0)
+  if (experimental_mode >= 0) {
+    if (batch->bias_sequence_workspace == nullptr &&
+        plan7_bias_sequence_workspace_create(
+          &batch->bias_sequence_workspace, error, error_size) != 0)
+      return -1;
+    if (plan7_bias_filter_candidates_device_experimental(
+          batch->bias_sequence_workspace,
+          batch->device_residues,
+          batch->device_offsets,
+          batch->device_bias_logp,
+          batch->device_bias_log1mp,
+          batch->device_bias_profiles,
+          batch->device_bias_candidates,
+          batch->device_bias_ssv_inputs,
+          candidate_count,
+          batch->sequence_count,
+          experimental_mode,
+          batch->device_bias_results,
+          experimental_statistics,
+          error,
+          error_size) != 0)
+      return -1;
+  } else if (plan7_bias_filter_candidates_device(
+               batch->device_residues,
+               batch->device_offsets,
+               batch->device_bias_logp,
+               batch->device_bias_log1mp,
+               batch->device_bias_profiles,
+               batch->device_bias_candidates,
+               batch->device_bias_ssv_inputs,
+               candidate_count,
+               batch->device_bias_results,
+               error,
+               error_size) != 0) {
     return -1;
+  }
   CUDA_TRY_BIAS(cudaMemcpy(results,
                            batch->device_bias_results,
                            result_bytes,
                            cudaMemcpyDeviceToHost));
 #undef CUDA_TRY_BIAS
   return 0;
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_bias_candidates_many(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  plan7_bias_result *results,
+  size_t result_count,
+  char *error,
+  size_t error_size)
+{
+  return sequence_batch_bias_candidates_many_impl(
+    batch, bias_profiles, profile_count, candidate_offsets, candidate_indices,
+    candidate_count, results, result_count, -1, nullptr, error, error_size);
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_bias_candidates_many_experimental(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  plan7_bias_result *results,
+  size_t result_count,
+  int sequence_major,
+  plan7_bias_sequence_statistics *statistics,
+  char *error,
+  size_t error_size)
+{
+  return sequence_batch_bias_candidates_many_impl(
+    batch, bias_profiles, profile_count, candidate_offsets, candidate_indices,
+    candidate_count, results, result_count, sequence_major, statistics,
+    error, error_size);
 }
 
 static int

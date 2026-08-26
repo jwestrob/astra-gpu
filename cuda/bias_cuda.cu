@@ -1,6 +1,7 @@
 #include "bias_cuda.h"
 
 #include <cuda_runtime.h>
+#include <cub/device/device_scan.cuh>
 
 #include <fenv.h>
 #include <float.h>
@@ -9,6 +10,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <new>
 
 #include <dlfcn.h>
 
@@ -32,10 +35,32 @@ static_assert(sizeof(plan7_bias_cuda_identity) == 368,
               "plan7_bias_cuda_identity ABI size changed");
 static_assert(sizeof(plan7_bias_host_identity) == 44,
               "plan7_bias_host_identity ABI size changed");
+static_assert(sizeof(plan7_bias_sequence_statistics) == 56,
+              "plan7_bias_sequence_statistics ABI size changed");
+
+struct plan7_bias_sequence_workspace {
+  int device_ordinal;
+  uint32_t *device_counts;
+  uint32_t *device_offsets;
+  uint32_t *device_cursors;
+  uint32_t *device_source_indices;
+  void *device_scan_storage;
+  size_t counts_capacity;
+  size_t offsets_capacity;
+  size_t cursors_capacity;
+  size_t source_indices_capacity;
+  size_t scan_storage_capacity;
+  cudaEvent_t start_event;
+  cudaEvent_t grouping_event;
+  cudaEvent_t finish_event;
+  uint64_t run_count;
+};
 
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = kThreads / kWarpSize;
 constexpr uint64_t kMaximumTargetLength = 100000;
 constexpr double kLog2 = 0.69314718055994529;
 
@@ -60,6 +85,29 @@ uuid_is_zero(const uint8_t uuid[16])
   uint8_t combined = 0;
   for (size_t index = 0; index < 16; ++index) combined |= uuid[index];
   return combined == 0;
+}
+
+int
+grow_sequence_buffer(void **pointer, size_t *capacity, size_t bytes,
+                     const char *operation, char *error, size_t error_size)
+{
+  if (bytes <= *capacity) return 0;
+  void *replacement = nullptr;
+  cudaError_t status = cudaMalloc(&replacement, bytes);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, operation, status);
+    return -1;
+  }
+  status = cudaFree(*pointer);
+  if (status != cudaSuccess) {
+    cudaFree(replacement);
+    set_cuda_error(error, error_size, "cudaFree(sequence-major workspace)",
+                   status);
+    return -1;
+  }
+  *pointer = replacement;
+  *capacity = bytes;
+  return 0;
 }
 
 float
@@ -352,6 +400,171 @@ bias_candidates_kernel(const uint8_t *residues,
       break;
   }
   results[candidate_index] = result;
+}
+
+__global__ void
+bias_sequence_histogram_kernel(const plan7_bias_candidate *candidates,
+                               size_t candidate_count,
+                               uint32_t *counts)
+{
+  const size_t candidate =
+    static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (candidate < candidate_count)
+    atomicAdd(&counts[candidates[candidate].sequence_index], UINT32_C(1));
+}
+
+__global__ void
+bias_sequence_scatter_kernel(const plan7_bias_candidate *candidates,
+                             size_t candidate_count,
+                             uint32_t *cursors,
+                             uint32_t *source_indices)
+{
+  const size_t candidate =
+    static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (candidate >= candidate_count) return;
+  const uint32_t sequence = candidates[candidate].sequence_index;
+  const uint32_t destination = atomicAdd(&cursors[sequence], UINT32_C(1));
+  source_indices[destination] = static_cast<uint32_t>(candidate);
+}
+
+__global__ void
+bias_sequence_major_kernel(
+  const uint8_t *residues,
+  const uint64_t *residue_offsets,
+  const float *length_logp,
+  const float *length_log1mp,
+  const plan7_bias_profile *profiles,
+  const plan7_bias_candidate *candidates,
+  const plan7_bias_ssv_input *ssv_inputs,
+  const uint32_t *sequence_offsets,
+  const uint32_t *source_indices,
+  size_t sequence_count,
+  plan7_bias_result *results)
+{
+  const size_t sequence = static_cast<size_t>(blockIdx.x);
+  if (sequence >= sequence_count) return;
+  const uint32_t begin = sequence_offsets[sequence];
+  const uint32_t end = sequence_offsets[sequence + 1];
+  if (begin == end) return;
+  const unsigned lane = threadIdx.x & (kWarpSize - 1);
+  const unsigned warp = threadIdx.x / kWarpSize;
+  const uint64_t residue_begin = residue_offsets[sequence];
+  const uint64_t length_u64 = residue_offsets[sequence + 1] - residue_begin;
+
+  for (uint64_t group = warp;
+       static_cast<uint64_t>(begin) + group * kWarpSize < end;
+       group += kWarpsPerBlock) {
+    const uint64_t grouped = static_cast<uint64_t>(begin) +
+      group * kWarpSize + lane;
+    const bool valid = grouped < end;
+    const uint32_t source = valid ? source_indices[grouped] : 0;
+    plan7_bias_candidate candidate = {};
+    plan7_bias_ssv_input ssv = {0, UINT8_C(255), 0};
+    plan7_bias_result result = {};
+    const plan7_bias_profile *profile = nullptr;
+    bool active = false;
+    if (valid) {
+      candidate = candidates[source];
+      ssv = ssv_inputs[source];
+      result = {
+        candidate.sequence_index, NAN, ssv.numerator, ssv.status,
+        PLAN7_BIAS_CPU_REQUIRED
+      };
+      active = ssv.status == 0 && length_u64 != 0 &&
+               length_u64 <= kMaximumTargetLength;
+      if (active) profile = &profiles[candidate.profile_index];
+    }
+
+    const int length = length_u64 <= kMaximumTargetLength
+      ? static_cast<int>(length_u64) : 0;
+    const float length_f = __int2float_rn(length);
+    const float p1 = length != 0
+      ? device_div(length_f, __int2float_rn(length + 1)) : 0.0f;
+    const float t00 = p1;
+    const float t01 = __fsub_rn(1.0f, p1);
+    unsigned residue = lane == 0 && length != 0
+      ? residues[residue_begin] : 0;
+    residue = __shfl_sync(UINT32_MAX, residue, 0);
+    float d0 = 0.0f;
+    float d1 = 0.0f;
+    float score = 0.0f;
+    if (active) {
+      d0 = device_mul(profile->eo[residue][0], profile->pi0);
+      d1 = device_mul(profile->eo[residue][1], profile->pi1);
+      float maximum = d0 > 0.0f ? d0 : 0.0f;
+      maximum = d1 > maximum ? d1 : maximum;
+      if (!(maximum > 0.0f) || !isfinite(maximum)) {
+        active = false;
+      } else {
+        d0 = device_div(d0, maximum);
+        d1 = device_div(d1, maximum);
+        score = device_log_to_float(maximum);
+      }
+    }
+
+    for (int position = 1; position < length; ++position) {
+      residue = lane == 0
+        ? residues[residue_begin + static_cast<uint64_t>(position)] : 0;
+      residue = __shfl_sync(UINT32_MAX, residue, 0);
+      if (!active) continue;
+      float next0 = device_add(device_mul(d0, t00),
+                               device_mul(d1, profile->t10));
+      next0 = device_mul(next0, profile->eo[residue][0]);
+      float next1 = device_add(device_mul(d0, t01),
+                               device_mul(d1, profile->t11));
+      next1 = device_mul(next1, profile->eo[residue][1]);
+      float maximum = next0 > 0.0f ? next0 : 0.0f;
+      maximum = next1 > maximum ? next1 : maximum;
+      if (!(maximum > 0.0f) || !isfinite(maximum)) {
+        active = false;
+        continue;
+      }
+      d0 = device_div(next0, maximum);
+      d1 = device_div(next1, maximum);
+      score = device_add(score, device_log_to_float(maximum));
+    }
+
+    if (active) {
+      const float end_score = device_add(device_mul(d0, profile->t02),
+                                         device_mul(d1, profile->t12));
+      if (!(end_score > 0.0f) || !isfinite(end_score)) {
+        active = false;
+      } else {
+        score = device_add(score, device_log_to_float(end_score));
+        score = device_add(score, length_logp[sequence]);
+        score = device_add(score, length_log1mp[sequence]);
+        if (!isfinite(score)) active = false;
+      }
+    }
+    if (active) {
+      result.filtersc = score;
+      float usc = __int2float_rn(static_cast<int>(ssv.numerator));
+      usc = device_div(usc, profile->scale);
+      usc = __fsub_rn(usc, 3.0f);
+      const float delta = __fsub_rn(usc, score);
+      const float bit_score = __double2float_rn(
+        __ddiv_rn(static_cast<double>(delta), kLog2));
+      if (isfinite(usc) && isfinite(bit_score)) {
+        switch (profile->cutoff_mode) {
+          case PLAN7_BIAS_CUTOFF_SCORE:
+            if (isfinite(profile->cutoff_bit_score))
+              result.action = bit_score < profile->cutoff_bit_score
+                ? PLAN7_BIAS_DEFINITE_REJECT
+                : PLAN7_BIAS_DEFINITE_PASS;
+            break;
+          case PLAN7_BIAS_CUTOFF_ALWAYS_REJECT:
+            result.action = PLAN7_BIAS_DEFINITE_REJECT;
+            break;
+          case PLAN7_BIAS_CUTOFF_ALWAYS_PASS:
+            result.action = PLAN7_BIAS_DEFINITE_PASS;
+            break;
+          default:
+            break;
+        }
+      }
+    }
+    if (valid) results[source] = result;
+  }
 }
 
 }  // namespace
@@ -891,5 +1104,343 @@ plan7_bias_filter_candidates_device(
     set_cuda_error(error, error_size, "bias candidate kernel", status);
     return -1;
   }
+  return 0;
+}
+
+extern "C" int
+plan7_bias_sequence_workspace_create(
+  plan7_bias_sequence_workspace **workspace,
+  char *error,
+  size_t error_size)
+{
+  if (workspace == nullptr || *workspace != nullptr) {
+    set_error(error, error_size,
+              "invalid bias sequence-major workspace destination");
+    return -1;
+  }
+  plan7_bias_sequence_workspace *created =
+    new (std::nothrow) plan7_bias_sequence_workspace{};
+  if (created == nullptr) {
+    set_error(error, error_size,
+              "unable to allocate bias sequence-major workspace");
+    return -1;
+  }
+  cudaError_t status = cudaGetDevice(&created->device_ordinal);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    delete created;
+    return -1;
+  }
+  status = cudaEventCreate(&created->start_event);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaEventCreate(bias sequence start)", status);
+    delete created;
+    return -1;
+  }
+  status = cudaEventCreate(&created->grouping_event);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaEventCreate(bias sequence grouping)", status);
+    cudaEventDestroy(created->start_event);
+    delete created;
+    return -1;
+  }
+  status = cudaEventCreate(&created->finish_event);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaEventCreate(bias sequence finish)", status);
+    cudaEventDestroy(created->grouping_event);
+    cudaEventDestroy(created->start_event);
+    delete created;
+    return -1;
+  }
+  *workspace = created;
+  if (error != nullptr && error_size != 0) error[0] = '\0';
+  return 0;
+}
+
+extern "C" int
+plan7_bias_sequence_workspace_destroy(
+  plan7_bias_sequence_workspace **workspace,
+  char *error,
+  size_t error_size)
+{
+  if (workspace == nullptr) {
+    set_error(error, error_size,
+              "invalid bias sequence-major workspace pointer");
+    return -1;
+  }
+  plan7_bias_sequence_workspace *owned = *workspace;
+  if (owned == nullptr) return 0;
+  *workspace = nullptr;
+  cudaError_t first_status = cudaSuccess;
+  const char *first_operation = nullptr;
+#define PLAN7_BIAS_DESTROY(call, operation) do {                         \
+    const cudaError_t destroy_status = (call);                           \
+    if (first_status == cudaSuccess && destroy_status != cudaSuccess) {  \
+      first_status = destroy_status;                                     \
+      first_operation = (operation);                                     \
+    }                                                                    \
+  } while (0)
+  PLAN7_BIAS_DESTROY(cudaFree(owned->device_counts),
+                     "cudaFree(bias sequence counts)");
+  PLAN7_BIAS_DESTROY(cudaFree(owned->device_offsets),
+                     "cudaFree(bias sequence offsets)");
+  PLAN7_BIAS_DESTROY(cudaFree(owned->device_cursors),
+                     "cudaFree(bias sequence cursors)");
+  PLAN7_BIAS_DESTROY(cudaFree(owned->device_source_indices),
+                     "cudaFree(bias sequence sources)");
+  PLAN7_BIAS_DESTROY(cudaFree(owned->device_scan_storage),
+                     "cudaFree(bias sequence scan storage)");
+  PLAN7_BIAS_DESTROY(cudaEventDestroy(owned->finish_event),
+                     "cudaEventDestroy(bias sequence finish)");
+  PLAN7_BIAS_DESTROY(cudaEventDestroy(owned->grouping_event),
+                     "cudaEventDestroy(bias sequence grouping)");
+  PLAN7_BIAS_DESTROY(cudaEventDestroy(owned->start_event),
+                     "cudaEventDestroy(bias sequence start)");
+#undef PLAN7_BIAS_DESTROY
+  delete owned;
+  if (first_status != cudaSuccess) {
+    set_cuda_error(error, error_size, first_operation, first_status);
+    return -1;
+  }
+  if (error != nullptr && error_size != 0) error[0] = '\0';
+  return 0;
+}
+
+extern "C" int
+plan7_bias_filter_candidates_device_experimental(
+  plan7_bias_sequence_workspace *workspace,
+  const uint8_t *device_residues,
+  const uint64_t *device_offsets,
+  const float *device_length_logp,
+  const float *device_length_log1mp,
+  const plan7_bias_profile *device_profiles,
+  const plan7_bias_candidate *device_candidates,
+  const plan7_bias_ssv_input *device_ssv_inputs,
+  size_t candidate_count,
+  size_t sequence_count,
+  int sequence_major,
+  plan7_bias_result *device_results,
+  plan7_bias_sequence_statistics *statistics,
+  char *error,
+  size_t error_size)
+{
+  if (workspace == nullptr || statistics == nullptr) {
+    set_error(error, error_size,
+              "bias sequence-major workspace/statistics is null");
+    return -1;
+  }
+  memset(statistics, 0, sizeof(*statistics));
+  statistics->candidate_count = candidate_count;
+  statistics->sequence_count = sequence_count;
+  statistics->sequence_major = sequence_major != 0 ? UINT32_C(1) : 0;
+  if (candidate_count == 0) {
+    statistics->run_count = ++workspace->run_count;
+    return 0;
+  }
+  if (sequence_count == 0 || device_residues == nullptr ||
+      device_offsets == nullptr || device_length_logp == nullptr ||
+      device_length_log1mp == nullptr || device_profiles == nullptr ||
+      device_candidates == nullptr || device_ssv_inputs == nullptr ||
+      device_results == nullptr) {
+    set_error(error, error_size,
+              "invalid bias sequence-major device input");
+    return -1;
+  }
+  if (candidate_count > UINT32_MAX || sequence_count >= INT_MAX) {
+    set_error(error, error_size,
+              "bias sequence-major problem exceeds exact index range");
+    return -1;
+  }
+  int current_device = -1;
+  cudaError_t status = cudaGetDevice(&current_device);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "cudaGetDevice", status);
+    return -1;
+  }
+  if (current_device != workspace->device_ordinal) {
+    set_error(error, error_size,
+              "bias sequence-major workspace belongs to another device");
+    return -1;
+  }
+  if (plan7_bias_environment_attested(error, error_size) != 1) return -1;
+
+  status = cudaEventRecord(workspace->start_event);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaEventRecord(bias sequence start)", status);
+    return -1;
+  }
+
+  if (sequence_major == 0) {
+    if (candidate_count >
+        static_cast<size_t>(UINT_MAX) * static_cast<size_t>(kThreads)) {
+      set_error(error, error_size, "bias CUDA candidate grid is too large");
+      return -1;
+    }
+    const unsigned blocks = static_cast<unsigned>(
+      (candidate_count + kThreads - 1) / kThreads);
+    bias_candidates_kernel<<<blocks, kThreads>>>(
+      device_residues, device_offsets, device_length_logp,
+      device_length_log1mp, device_profiles, device_candidates,
+      device_ssv_inputs, candidate_count, device_results);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size, "bias candidate kernel", status);
+      return -1;
+    }
+    status = cudaEventRecord(workspace->finish_event);
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size,
+                     "cudaEventRecord(bias sequence finish)", status);
+      return -1;
+    }
+    status = cudaEventSynchronize(workspace->finish_event);
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size,
+                     "cudaEventSynchronize(bias sequence finish)", status);
+      return -1;
+    }
+    status = cudaEventElapsedTime(&statistics->kernel_milliseconds,
+                                  workspace->start_event,
+                                  workspace->finish_event);
+    if (status != cudaSuccess) {
+      set_cuda_error(error, error_size,
+                     "cudaEventElapsedTime(bias candidate)", status);
+      return -1;
+    }
+    statistics->total_milliseconds = statistics->kernel_milliseconds;
+    statistics->run_count = ++workspace->run_count;
+    if (error != nullptr && error_size != 0) error[0] = '\0';
+    return 0;
+  }
+
+  const size_t count_bytes = (sequence_count + 1) * sizeof(uint32_t);
+  const size_t cursor_bytes = sequence_count * sizeof(uint32_t);
+  const size_t source_bytes = candidate_count * sizeof(uint32_t);
+  if (grow_sequence_buffer(
+        reinterpret_cast<void **>(&workspace->device_counts),
+        &workspace->counts_capacity, count_bytes,
+        "cudaMalloc(bias sequence counts)", error, error_size) != 0 ||
+      grow_sequence_buffer(
+        reinterpret_cast<void **>(&workspace->device_offsets),
+        &workspace->offsets_capacity, count_bytes,
+        "cudaMalloc(bias sequence offsets)", error, error_size) != 0 ||
+      grow_sequence_buffer(
+        reinterpret_cast<void **>(&workspace->device_cursors),
+        &workspace->cursors_capacity, cursor_bytes,
+        "cudaMalloc(bias sequence cursors)", error, error_size) != 0 ||
+      grow_sequence_buffer(
+        reinterpret_cast<void **>(&workspace->device_source_indices),
+        &workspace->source_indices_capacity, source_bytes,
+        "cudaMalloc(bias sequence sources)", error, error_size) != 0)
+    return -1;
+
+  size_t scan_bytes = 0;
+  status = cub::DeviceScan::ExclusiveSum(
+    nullptr, scan_bytes, workspace->device_counts,
+    workspace->device_offsets, static_cast<int>(sequence_count + 1));
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "CUB bias sequence scan size", status);
+    return -1;
+  }
+  if (grow_sequence_buffer(&workspace->device_scan_storage,
+                           &workspace->scan_storage_capacity, scan_bytes,
+                           "cudaMalloc(bias sequence scan storage)",
+                           error, error_size) != 0)
+    return -1;
+
+  status = cudaMemset(workspace->device_counts, 0, count_bytes);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaMemset(bias sequence counts)", status);
+    return -1;
+  }
+  const unsigned candidate_blocks = static_cast<unsigned>(
+    (candidate_count + kThreads - 1) / kThreads);
+  bias_sequence_histogram_kernel<<<candidate_blocks, kThreads>>>(
+    device_candidates, candidate_count, workspace->device_counts);
+  status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "bias sequence histogram kernel", status);
+    return -1;
+  }
+  status = cub::DeviceScan::ExclusiveSum(
+    workspace->device_scan_storage, scan_bytes, workspace->device_counts,
+    workspace->device_offsets, static_cast<int>(sequence_count + 1));
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size, "CUB bias sequence scan", status);
+    return -1;
+  }
+  status = cudaMemcpy(workspace->device_cursors, workspace->device_offsets,
+                      cursor_bytes, cudaMemcpyDeviceToDevice);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaMemcpy(bias sequence cursors)", status);
+    return -1;
+  }
+  bias_sequence_scatter_kernel<<<candidate_blocks, kThreads>>>(
+    device_candidates, candidate_count, workspace->device_cursors,
+    workspace->device_source_indices);
+  status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "bias sequence scatter kernel", status);
+    return -1;
+  }
+  status = cudaEventRecord(workspace->grouping_event);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaEventRecord(bias sequence grouping)", status);
+    return -1;
+  }
+  bias_sequence_major_kernel<<<static_cast<unsigned>(sequence_count),
+                               kThreads>>>(
+    device_residues, device_offsets, device_length_logp,
+    device_length_log1mp, device_profiles, device_candidates,
+    device_ssv_inputs, workspace->device_offsets,
+    workspace->device_source_indices, sequence_count, device_results);
+  status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "bias sequence-major kernel", status);
+    return -1;
+  }
+  status = cudaEventRecord(workspace->finish_event);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaEventRecord(bias sequence finish)", status);
+    return -1;
+  }
+  status = cudaEventSynchronize(workspace->finish_event);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaEventSynchronize(bias sequence finish)", status);
+    return -1;
+  }
+  status = cudaEventElapsedTime(&statistics->grouping_milliseconds,
+                                workspace->start_event,
+                                workspace->grouping_event);
+  if (status == cudaSuccess)
+    status = cudaEventElapsedTime(&statistics->kernel_milliseconds,
+                                  workspace->grouping_event,
+                                  workspace->finish_event);
+  if (status == cudaSuccess)
+    status = cudaEventElapsedTime(&statistics->total_milliseconds,
+                                  workspace->start_event,
+                                  workspace->finish_event);
+  if (status != cudaSuccess) {
+    set_cuda_error(error, error_size,
+                   "cudaEventElapsedTime(bias sequence-major)", status);
+    return -1;
+  }
+  statistics->temporary_device_bytes =
+    count_bytes + count_bytes + cursor_bytes + source_bytes + scan_bytes;
+  statistics->run_count = ++workspace->run_count;
+  if (error != nullptr && error_size != 0) error[0] = '\0';
   return 0;
 }
