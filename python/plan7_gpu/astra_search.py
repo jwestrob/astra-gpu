@@ -10,20 +10,22 @@ A :class:`~plan7_gpu.adapter.SequenceBatch` is convenient when the caller
 wants this function to build the candidate rows.  Passing a precomputed
 :class:`~plan7_gpu.adapter.CandidateBatch` avoids filtering twice; its bound
 profile identities and F1 threshold are checked before any CPU search starts.
-Parallel searches use small contiguous row chunks, a two-chunks-per-worker
-reorder window, and one exclusively owned, exact-base PyHMMER ``Pipeline`` per
-worker thread.  The window keeps workers busy across query skew without
-retaining an unbounded number of completed ``TopHits`` objects behind one slow
-query.
+Parallel searches use small contiguous row chunks and one exclusively owned,
+exact-base PyHMMER ``Pipeline`` per worker thread. The retained scheduler has a
+strict two-chunks-per-worker window. An experimental completion-driven mode
+adds one equally bounded reorder window, refills on any completed task, and
+still yields or raises strictly in canonical task order.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import operator
-from threading import local
+import os
+from threading import Lock, local
+import time
 from typing import Any, TYPE_CHECKING
 
 import pyhmmer
@@ -41,6 +43,106 @@ if TYPE_CHECKING:
 
 _MAX_ROWS_PER_TASK = 8
 _TASKS_PER_WORKER_WINDOW = 2
+_COMPLETION_REORDER_WINDOWS = 1
+_CONTINUATION_SCHEDULER_ENV = "PLAN7_GPU_CONTINUATION_SCHEDULER"
+_CONTINUATION_PROFILE_ENV = "PLAN7_GPU_CONTINUATION_PROFILE"
+_SCHEDULER_OLDEST = "oldest"
+_SCHEDULER_COMPLETION = "completion"
+_scheduler_statistics_lock = Lock()
+_scheduler_statistics: dict[str, Any] = {
+    "schema_version": 1,
+    "call_count": 0,
+    "oldest_call_count": 0,
+    "completion_call_count": 0,
+    "task_count": 0,
+    "task_wall_ns": 0,
+    "scheduler_wait_ns": 0,
+    "oldest_pending_wait_ns": 0,
+    "maximum_pending_tasks": 0,
+    "maximum_completed_tasks": 0,
+    "maximum_active_workers": 0,
+    "task_records": [],
+}
+
+
+def _continuation_scheduler_mode() -> str:
+    mode = os.environ.get(_CONTINUATION_SCHEDULER_ENV, _SCHEDULER_OLDEST)
+    if mode not in (_SCHEDULER_OLDEST, _SCHEDULER_COMPLETION):
+        raise ValueError(
+            f"{_CONTINUATION_SCHEDULER_ENV} must be "
+            f"{_SCHEDULER_OLDEST!r} or {_SCHEDULER_COMPLETION!r}"
+        )
+    return mode
+
+
+def _continuation_profile_enabled() -> bool:
+    value = os.environ.get(_CONTINUATION_PROFILE_ENV)
+    return value is not None and value not in ("", "0", "false", "False")
+
+
+def _reset_continuation_scheduler_statistics() -> None:
+    """Reset private opt-in scheduler measurements."""
+    with _scheduler_statistics_lock:
+        _scheduler_statistics.update(
+            call_count=0,
+            oldest_call_count=0,
+            completion_call_count=0,
+            task_count=0,
+            task_wall_ns=0,
+            scheduler_wait_ns=0,
+            oldest_pending_wait_ns=0,
+            maximum_pending_tasks=0,
+            maximum_completed_tasks=0,
+            maximum_active_workers=0,
+            task_records=[],
+        )
+
+
+def _continuation_scheduler_statistics() -> dict[str, Any]:
+    """Return a defensive snapshot of private scheduler measurements."""
+    with _scheduler_statistics_lock:
+        snapshot = dict(_scheduler_statistics)
+        snapshot["task_records"] = tuple(
+            dict(record) for record in _scheduler_statistics["task_records"]
+        )
+    return snapshot
+
+
+def _record_continuation_scheduler_call(
+    *,
+    mode: str,
+    task_records: list[dict[str, int]],
+    scheduler_wait_ns: int,
+    oldest_pending_wait_ns: int,
+    maximum_pending_tasks: int,
+    maximum_completed_tasks: int,
+    maximum_active_workers: int,
+) -> None:
+    with _scheduler_statistics_lock:
+        _scheduler_statistics["call_count"] += 1
+        _scheduler_statistics[f"{mode}_call_count"] += 1
+        _scheduler_statistics["task_count"] += len(task_records)
+        _scheduler_statistics["task_wall_ns"] += sum(
+            record["finished_ns"] - record["started_ns"]
+            for record in task_records
+        )
+        _scheduler_statistics["scheduler_wait_ns"] += scheduler_wait_ns
+        _scheduler_statistics["oldest_pending_wait_ns"] += (
+            oldest_pending_wait_ns
+        )
+        _scheduler_statistics["maximum_pending_tasks"] = max(
+            _scheduler_statistics["maximum_pending_tasks"],
+            maximum_pending_tasks,
+        )
+        _scheduler_statistics["maximum_completed_tasks"] = max(
+            _scheduler_statistics["maximum_completed_tasks"],
+            maximum_completed_tasks,
+        )
+        _scheduler_statistics["maximum_active_workers"] = max(
+            _scheduler_statistics["maximum_active_workers"],
+            maximum_active_workers,
+        )
+        _scheduler_statistics["task_records"].extend(task_records)
 
 
 def _positive_cpus(value: Any) -> int:
@@ -248,6 +350,16 @@ def _threaded_hmmsearch(
         raise RuntimeError("collector search lacks profile ordinals")
     worker_count = min(cpus, len(candidates))
     worker_state = local()
+    scheduler_mode = _continuation_scheduler_mode()
+    collect_profile = _continuation_profile_enabled()
+    active_lock = Lock()
+    active_workers = 0
+    maximum_active_workers = 0
+    task_records: list[dict[str, int]] = []
+    scheduler_wait_ns = 0
+    oldest_pending_wait_ns = 0
+    maximum_pending_tasks = 0
+    maximum_completed_tasks = 0
 
     # Eight rows is enough to amortize Future creation for the many cheap
     # reject-only rows common after GPU filtering, while keeping retained
@@ -263,15 +375,28 @@ def _threaded_hmmsearch(
         ),
     )
 
-    def search_chunk(start: int, stop: int) -> tuple[list[Any], BaseException | None]:
-        pipeline = getattr(worker_state, "pipeline", None)
-        if pipeline is None:
-            pipeline = pyhmmer.plan7.Pipeline(**pipeline_options)
-            worker_state.pipeline = pipeline
-
+    def search_chunk(
+        task_ordinal: int,
+        start: int,
+        stop: int,
+        submitted_ns: int,
+    ) -> tuple[list[Any], BaseException | None, dict[str, int]]:
+        nonlocal active_workers, maximum_active_workers
+        started_ns = time.perf_counter_ns() if collect_profile else 0
+        if collect_profile:
+            with active_lock:
+                active_workers += 1
+                maximum_active_workers = max(
+                    maximum_active_workers, active_workers
+                )
         hits = []
-        for row in range(start, stop):
-            try:
+        error: BaseException | None = None
+        try:
+            pipeline = getattr(worker_state, "pipeline", None)
+            if pipeline is None:
+                pipeline = pyhmmer.plan7.Pipeline(**pipeline_options)
+                worker_state.pipeline = pipeline
+            for row in range(start, stop):
                 if collector is None:
                     hits.append(
                         _search_row(candidates, row, pipeline, telemetry)
@@ -287,54 +412,202 @@ def _threaded_hmmsearch(
                             profile_ordinals[row],
                         )
                     )
-            except BaseException as error:
-                # A task must preserve row-wise failure order: successful rows
-                # before the failing row are yielded before this exact error.
-                return hits, error
-        return hits, None
+        except BaseException as caught:
+            # A task preserves row-wise failure order: successful rows before
+            # the failing row are yielded before this exact error.
+            error = caught
+        finally:
+            finished_ns = time.perf_counter_ns() if collect_profile else 0
+            if collect_profile:
+                with active_lock:
+                    active_workers -= 1
+        return hits, error, {
+            "task_ordinal": task_ordinal,
+            "row_begin": start,
+            "row_end": stop,
+            "submitted_ns": submitted_ns,
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+        }
 
     executor = ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="plan7-gpu-astra",
     )
 
-    def submit(start: int) -> Future[Any]:
+    def submit(task_ordinal: int, start: int) -> tuple[Future[Any], tuple[int, ...]]:
         stop = min(start + chunk_size, len(candidates))
+        submitted_ns = time.perf_counter_ns() if collect_profile else 0
         try:
-            return executor.submit(search_chunk, start, stop)
+            future = executor.submit(
+                search_chunk, task_ordinal, start, stop, submitted_ns
+            )
         except BaseException as error:
             failed: Future[Any] = Future()
             failed.set_exception(error)
-            return failed
+            future = failed
+        return future, (task_ordinal, start, stop, submitted_ns)
 
-    pending: deque[Future[Any]] = deque()
-    next_row = 0
-    window_size = min(
-        len(candidates),
-        chunk_size * _TASKS_PER_WORKER_WINDOW * worker_count,
+    def collect_future(
+        future: Future[Any], metadata: tuple[int, ...]
+    ) -> tuple[list[Any], BaseException | None, dict[str, int]]:
+        task_ordinal, start, stop, submitted_ns = metadata
+        try:
+            return future.result()
+        except BaseException as error:
+            now_ns = time.perf_counter_ns() if collect_profile else 0
+            return [], error, {
+                "task_ordinal": task_ordinal,
+                "row_begin": start,
+                "row_end": stop,
+                "submitted_ns": submitted_ns,
+                "started_ns": now_ns,
+                "finished_ns": now_ns,
+            }
+
+    active_task_limit = min(
+        (len(candidates) + chunk_size - 1) // chunk_size,
+        _TASKS_PER_WORKER_WINDOW * worker_count,
     )
     try:
-        while next_row < window_size:
-            pending.append(submit(next_row))
-            next_row += chunk_size
-
-        while pending:
-            future = pending.popleft()
-            chunk_hits, error = future.result()
-            # Refill the strict chunk window before handing successful results
-            # to Astra, so workers keep running while Astra writes the hits.
-            # Do not schedule more work after a known row failure.
-            if error is None and next_row < len(candidates):
-                pending.append(submit(next_row))
+        if scheduler_mode == _SCHEDULER_OLDEST:
+            pending_oldest: deque[
+                tuple[Future[Any], tuple[int, ...]]
+            ] = deque()
+            next_row = 0
+            next_task_ordinal = 0
+            while len(pending_oldest) < active_task_limit:
+                pending_oldest.append(submit(next_task_ordinal, next_row))
+                next_task_ordinal += 1
                 next_row += chunk_size
-            for hits in chunk_hits:
-                yield hits
-            if error is not None:
-                raise error
+            maximum_pending_tasks = len(pending_oldest)
+
+            while pending_oldest:
+                future, metadata = pending_oldest.popleft()
+                was_pending = not future.done()
+                if collect_profile:
+                    wait_start_ns = time.perf_counter_ns()
+                    chunk_hits, error, record = collect_future(future, metadata)
+                    waited_ns = time.perf_counter_ns() - wait_start_ns
+                    scheduler_wait_ns += waited_ns
+                    if was_pending:
+                        oldest_pending_wait_ns += waited_ns
+                else:
+                    chunk_hits, error, record = collect_future(future, metadata)
+                if collect_profile:
+                    task_records.append(record)
+                # Refill before yielding, preserving the retained scheduler's
+                # exact failure and buffering behavior.
+                if error is None and next_row < len(candidates):
+                    pending_oldest.append(
+                        submit(next_task_ordinal, next_row)
+                    )
+                    next_task_ordinal += 1
+                    next_row += chunk_size
+                    maximum_pending_tasks = max(
+                        maximum_pending_tasks, len(pending_oldest)
+                    )
+                for hits in chunk_hits:
+                    yield hits
+                if error is not None:
+                    raise error
+        else:
+            pending_completion: dict[Future[Any], tuple[int, ...]] = {}
+            completed: dict[
+                int, tuple[list[Any], BaseException | None, dict[str, int]]
+            ] = {}
+            next_row = 0
+            next_task_ordinal = 0
+            next_yield_ordinal = 0
+            known_failure_ordinal: int | None = None
+            total_task_limit = active_task_limit * (
+                1 + _COMPLETION_REORDER_WINDOWS
+            )
+
+            def refill_completion() -> None:
+                nonlocal next_row, next_task_ordinal, maximum_pending_tasks
+                while (
+                    known_failure_ordinal is None
+                    and next_row < len(candidates)
+                    and len(pending_completion) < active_task_limit
+                    and len(pending_completion) + len(completed)
+                        < total_task_limit
+                ):
+                    future, metadata = submit(next_task_ordinal, next_row)
+                    pending_completion[future] = metadata
+                    next_task_ordinal += 1
+                    next_row += chunk_size
+                    maximum_pending_tasks = max(
+                        maximum_pending_tasks, len(pending_completion)
+                    )
+
+            refill_completion()
+            while pending_completion or completed:
+                ready = completed.pop(next_yield_ordinal, None)
+                if ready is not None:
+                    chunk_hits, error, _record = ready
+                    next_yield_ordinal += 1
+                    refill_completion()
+                    for hits in chunk_hits:
+                        yield hits
+                    if error is not None:
+                        raise error
+                    continue
+                if not pending_completion:
+                    raise RuntimeError(
+                        "completion scheduler lost canonical task order"
+                    )
+
+                wait_start_ns = (
+                    time.perf_counter_ns() if collect_profile else 0
+                )
+                done, _ = wait(
+                    tuple(pending_completion),
+                    return_when=FIRST_COMPLETED,
+                )
+                if collect_profile:
+                    scheduler_wait_ns += (
+                        time.perf_counter_ns() - wait_start_ns
+                    )
+                for future in sorted(
+                    done,
+                    key=lambda item: pending_completion[item][0],
+                ):
+                    metadata = pending_completion.pop(future)
+                    chunk_hits, error, record = collect_future(future, metadata)
+                    task_ordinal = metadata[0]
+                    completed[task_ordinal] = chunk_hits, error, record
+                    if collect_profile:
+                        task_records.append(record)
+                    if error is not None and (
+                        known_failure_ordinal is None
+                        or task_ordinal < known_failure_ordinal
+                    ):
+                        known_failure_ordinal = task_ordinal
+                maximum_completed_tasks = max(
+                    maximum_completed_tasks, len(completed)
+                )
+                refill_completion()
     finally:
-        for future in pending:
+        pending_to_cancel = (
+            pending_oldest
+            if scheduler_mode == _SCHEDULER_OLDEST
+            else pending_completion
+        )
+        for item in pending_to_cancel:
+            future = item[0] if scheduler_mode == _SCHEDULER_OLDEST else item
             future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
+        if collect_profile:
+            _record_continuation_scheduler_call(
+                mode=scheduler_mode,
+                task_records=task_records,
+                scheduler_wait_ns=scheduler_wait_ns,
+                oldest_pending_wait_ns=oldest_pending_wait_ns,
+                maximum_pending_tasks=maximum_pending_tasks,
+                maximum_completed_tasks=maximum_completed_tasks,
+                maximum_active_workers=maximum_active_workers,
+            )
 
 
 def hmmsearch(

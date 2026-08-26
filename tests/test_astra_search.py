@@ -1,4 +1,5 @@
 import io
+import os
 import random
 import struct
 import sys
@@ -24,6 +25,7 @@ try:
         _candidate_state,
         load_pressed_profiles,
     )
+    import plan7_gpu.astra_search as astra_search_module
     from plan7_gpu.astra_search import hmmsearch
 except ImportError:
     _native = None
@@ -32,6 +34,7 @@ except ImportError:
     SequenceBatch = None
     _candidate_state = None
     load_pressed_profiles = None
+    astra_search_module = None
     hmmsearch = None
 
 
@@ -404,7 +407,7 @@ class AstraSearchTests(unittest.TestCase):
 
             def submit(self, function, *args, **kwargs):
                 with lock:
-                    submitted_ranges.append(args)
+                    submitted_ranges.append(args[1:3])
                 return self._executor.submit(function, *args, **kwargs)
 
             def shutdown(self, *, wait=True, cancel_futures=False):
@@ -414,7 +417,7 @@ class AstraSearchTests(unittest.TestCase):
                     cancel_futures=cancel_futures,
                 )
 
-        def observed_search(candidate_batch, row, pipeline):
+        def observed_search(candidate_batch, row, pipeline, **kwargs):
             thread_id = threading.get_ident()
             pipeline_id = id(pipeline)
             with lock:
@@ -440,7 +443,7 @@ class AstraSearchTests(unittest.TestCase):
                     row_eight_started.set()
                 elif row == 32:
                     row_thirty_two_started.set()
-                return original_search(candidate_batch, row, pipeline)
+                return original_search(candidate_batch, row, pipeline, **kwargs)
             finally:
                 with lock:
                     completion_order.append(row)
@@ -510,24 +513,81 @@ class AstraSearchTests(unittest.TestCase):
         for expected_hits, actual_hits in zip(expected, actual, strict=True):
             self.assert_exact_hits(expected_hits, actual_hits)
 
+    def test_completion_scheduler_refills_behind_blocked_oldest_task(self):
+        pairs = self.pairs * 5
+        candidates = self.synthetic_batch.candidate_batch(pairs, F1=1.0)
+        expected = self.reference(pairs, self.synthetic_targets, cpus=2, F1=1.0)
+        original_search = CandidateBatch.search
+        release_row_zero = threading.Event()
+        row_thirty_two_started = threading.Event()
+
+        def observed_search(candidate_batch, row, pipeline, **kwargs):
+            if row == 0:
+                if not release_row_zero.wait(10):
+                    raise RuntimeError("test did not release row 0")
+            elif row == 32:
+                row_thirty_two_started.set()
+            return original_search(candidate_batch, row, pipeline, **kwargs)
+
+        actual = []
+        errors = []
+
+        def consume():
+            try:
+                actual.extend(hmmsearch(pairs, candidates, cpus=2))
+            except BaseException as error:
+                errors.append(error)
+
+        astra_search_module._reset_continuation_scheduler_statistics()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLAN7_GPU_CONTINUATION_SCHEDULER": "completion",
+                    "PLAN7_GPU_CONTINUATION_PROFILE": "1",
+                },
+            ),
+            mock.patch.object(CandidateBatch, "search", new=observed_search),
+        ):
+            consumer = threading.Thread(target=consume, name="astra-test-consumer")
+            consumer.start()
+            try:
+                self.assertTrue(
+                    row_thirty_two_started.wait(10),
+                    "completion-driven scheduler did not refill behind row 0",
+                )
+                self.assertEqual(actual, [])
+            finally:
+                release_row_zero.set()
+                consumer.join(10)
+
+        self.assertFalse(consumer.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(
+            [hits.query.name for hits in actual],
+            [pair.hmm.name for pair in pairs],
+        )
+        for expected_hits, actual_hits in zip(expected, actual, strict=True):
+            self.assert_exact_hits(expected_hits, actual_hits)
+        statistics = astra_search_module._continuation_scheduler_statistics()
+        self.assertEqual(statistics["completion_call_count"], 1)
+        self.assertEqual(statistics["oldest_call_count"], 0)
+        self.assertEqual(statistics["task_count"], 5)
+        self.assertEqual(statistics["maximum_active_workers"], 2)
+        self.assertGreaterEqual(statistics["maximum_completed_tasks"], 1)
+
     def test_threaded_yields_prior_row_then_propagates_pipeline_error(self):
         # Ten rows produce three-row tasks for two workers. The missing-cutoff
         # failure is inside the first task, so row 0 must still be yielded and
         # row 2 in that task must never run.
         pairs = (self.pairs[2], self.pairs[0]) + (self.pairs[2],) * 8
         candidates = self.synthetic_batch.candidate_batch(pairs, F1=1.0)
-        iterator = hmmsearch(
-            pairs,
-            candidates,
-            cpus=2,
-            bit_cutoffs="gathering",
-        )
         searched_rows = []
         original_search = CandidateBatch.search
 
-        def observed_search(candidate_batch, row, pipeline):
+        def observed_search(candidate_batch, row, pipeline, **kwargs):
             searched_rows.append(row)
-            return original_search(candidate_batch, row, pipeline)
+            return original_search(candidate_batch, row, pipeline, **kwargs)
 
         expected_first = self.reference(
             pairs[:1],
@@ -536,7 +596,19 @@ class AstraSearchTests(unittest.TestCase):
             F1=1.0,
             bit_cutoffs="gathering",
         )[0]
-        with mock.patch.object(CandidateBatch, "search", new=observed_search):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"PLAN7_GPU_CONTINUATION_SCHEDULER": "completion"},
+            ),
+            mock.patch.object(CandidateBatch, "search", new=observed_search),
+        ):
+            iterator = hmmsearch(
+                pairs,
+                candidates,
+                cpus=2,
+                bit_cutoffs="gathering",
+            )
             self.assert_exact_hits(expected_first, next(iterator))
             with self.assertRaises(MissingCutoffs) as actual_error:
                 next(iterator)
