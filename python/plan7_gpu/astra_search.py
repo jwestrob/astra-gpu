@@ -219,6 +219,93 @@ def _record_continuation_scheduler_call(
         _scheduler_statistics["task_records"].extend(task_records)
 
 
+class _ContinuationPool:
+    """Private request-scoped continuation workers reused across chunks.
+
+    Astra creates one pool for each immutable set of Pipeline options and closes
+    it after the last profile chunk. Calls are deliberately sequential: the GPU
+    producer may overlap a call, but two continuation calls may not share the
+    same worker Pipelines concurrently.
+    """
+
+    def __init__(self, cpus: int) -> None:
+        self.cpus = _positive_cpus(cpus)
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.cpus,
+            thread_name_prefix="plan7-gpu-astra",
+        )
+        self._worker_state = local()
+        self._lock = Lock()
+        self._statistics_lock = Lock()
+        self._pipeline_options: dict[str, Any] | None = None
+        self._active = False
+        self._closed = False
+        self._call_count = 0
+        self._pipeline_count = 0
+
+    def _acquire(self, cpus: int, pipeline_options: dict[str, Any]) -> None:
+        if cpus != self.cpus:
+            raise ValueError("continuation pool CPU count does not match search")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("continuation pool is closed")
+            if self._active:
+                raise RuntimeError("continuation pool is already in use")
+            if self._pipeline_options is None:
+                self._pipeline_options = dict(pipeline_options)
+            elif self._pipeline_options != pipeline_options:
+                raise ValueError(
+                    "continuation pool Pipeline options changed between chunks"
+                )
+            self._active = True
+            self._call_count += 1
+
+    def _release(self) -> None:
+        with self._lock:
+            self._active = False
+
+    def _pipeline(self, pipeline_options: dict[str, Any]) -> Any:
+        pipeline = getattr(self._worker_state, "pipeline", None)
+        if pipeline is None:
+            pipeline = pyhmmer.plan7.Pipeline(**pipeline_options)
+            self._worker_state.pipeline = pipeline
+            with self._statistics_lock:
+                self._pipeline_count += 1
+        return pipeline
+
+    @property
+    def statistics(self) -> dict[str, int | bool]:
+        with self._lock:
+            active = self._active
+            closed = self._closed
+            call_count = self._call_count
+        with self._statistics_lock:
+            pipeline_count = self._pipeline_count
+        return {
+            "schema_version": 1,
+            "cpus": self.cpus,
+            "call_count": call_count,
+            "pipeline_count": pipeline_count,
+            "active": active,
+            "closed": closed,
+        }
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if self._active:
+                raise RuntimeError("cannot close an active continuation pool")
+            self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> "_ContinuationPool":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+
 def _positive_cpus(value: Any) -> int:
     if isinstance(value, bool):
         raise TypeError("cpus must be a positive integer, not bool")
@@ -419,11 +506,15 @@ def _threaded_hmmsearch(
     telemetry: bool,
     collector: TelemetryCollector | None = None,
     profile_ordinals: tuple[int, ...] | None = None,
+    continuation_pool: _ContinuationPool | None = None,
 ) -> Iterator[Any]:
     if collector is not None and profile_ordinals is None:
         raise RuntimeError("collector search lacks profile ordinals")
     worker_count = min(cpus, len(candidates))
-    worker_state = local()
+    worker_state = local() if continuation_pool is None else None
+    owns_executor = continuation_pool is None
+    if continuation_pool is not None:
+        continuation_pool._acquire(cpus, pipeline_options)
     scheduler_mode = _continuation_scheduler_mode()
     task_policy = _continuation_task_policy()
     collect_profile = _continuation_profile_enabled()
@@ -468,13 +559,16 @@ def _threaded_hmmsearch(
                 maximum_active_workers = max(
                     maximum_active_workers, active_workers
                 )
-        hits = []
-        error: BaseException | None = None
-        try:
+        if continuation_pool is None:
             pipeline = getattr(worker_state, "pipeline", None)
             if pipeline is None:
                 pipeline = pyhmmer.plan7.Pipeline(**pipeline_options)
                 worker_state.pipeline = pipeline
+        else:
+            pipeline = continuation_pool._pipeline(pipeline_options)
+        hits = []
+        error: BaseException | None = None
+        try:
             for row in range(start, stop):
                 if collector is None:
                     hits.append(
@@ -510,9 +604,13 @@ def _threaded_hmmsearch(
             "finished_ns": finished_ns,
         }
 
-    executor = ThreadPoolExecutor(
-        max_workers=worker_count,
-        thread_name_prefix="plan7-gpu-astra",
+    executor = (
+        ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="plan7-gpu-astra",
+        )
+        if continuation_pool is None
+        else continuation_pool._executor
     )
 
     def submit(task_ordinal: int) -> tuple[Future[Any], tuple[int, ...]]:
@@ -677,7 +775,10 @@ def _threaded_hmmsearch(
         for item in pending_to_cancel:
             future = item[0] if scheduler_mode == _SCHEDULER_OLDEST else item
             future.cancel()
-        executor.shutdown(wait=True, cancel_futures=True)
+        if owns_executor:
+            executor.shutdown(wait=True, cancel_futures=True)
+        else:
+            continuation_pool._release()
         if collect_profile:
             _record_continuation_scheduler_call(
                 mode=scheduler_mode,
@@ -691,7 +792,7 @@ def _threaded_hmmsearch(
             )
 
 
-def hmmsearch(
+def _hmmsearch_impl(
     profile_pairs: Iterable[PressedProfilePair],
     batch: SequenceBatch | CandidateBatch,
     *,
@@ -701,6 +802,7 @@ def hmmsearch(
     telemetry_collector: TelemetryCollector | None = None,
     profile_ordinals: Iterable[int] | None = None,
     profile_keys: Iterable[str | None] | None = None,
+    _continuation_pool: _ContinuationPool | None = None,
     **pipeline_options: Any,
 ) -> Iterator[Any]:
     """Yield candidate-aware HMM searches in supplied query order.
@@ -730,6 +832,11 @@ def hmmsearch(
     ``(TopHits, evidence)`` opt-in shape.
     """
     worker_count = _positive_cpus(cpus)
+    if (
+        _continuation_pool is not None
+        and type(_continuation_pool) is not _ContinuationPool
+    ):
+        raise TypeError("_continuation_pool must be exactly _ContinuationPool")
     if type(postfilter) is not bool:
         raise TypeError("postfilter must be bool")
     if type(telemetry) is not bool:
@@ -785,7 +892,7 @@ def hmmsearch(
         )
     if not pairs:
         return iter(())
-    if worker_count == 1:
+    if worker_count == 1 and _continuation_pool is None:
         if telemetry_collector is None:
             return _serial_hmmsearch(candidates, options, telemetry)
         return _serial_hmmsearch(
@@ -797,7 +904,11 @@ def hmmsearch(
         )
     if telemetry_collector is None:
         return _threaded_hmmsearch(
-            candidates, worker_count, options, telemetry
+            candidates,
+            worker_count,
+            options,
+            telemetry,
+            continuation_pool=_continuation_pool,
         )
     return _threaded_hmmsearch(
         candidates,
@@ -806,6 +917,61 @@ def hmmsearch(
         telemetry,
         telemetry_collector,
         ordinal_values,
+        _continuation_pool,
+    )
+
+
+def hmmsearch(
+    profile_pairs: Iterable[PressedProfilePair],
+    batch: SequenceBatch | CandidateBatch,
+    *,
+    cpus: int = 1,
+    postfilter: bool = False,
+    telemetry: bool = False,
+    telemetry_collector: TelemetryCollector | None = None,
+    profile_ordinals: Iterable[int] | None = None,
+    profile_keys: Iterable[str | None] | None = None,
+    **pipeline_options: Any,
+) -> Iterator[Any]:
+    """Yield exact candidate-aware searches through the stable public bridge."""
+    return _hmmsearch_impl(
+        profile_pairs,
+        batch,
+        cpus=cpus,
+        postfilter=postfilter,
+        telemetry=telemetry,
+        telemetry_collector=telemetry_collector,
+        profile_ordinals=profile_ordinals,
+        profile_keys=profile_keys,
+        **pipeline_options,
+    )
+
+
+def _hmmsearch_with_continuation_pool(
+    profile_pairs: Iterable[PressedProfilePair],
+    batch: SequenceBatch | CandidateBatch,
+    *,
+    continuation_pool: _ContinuationPool,
+    cpus: int = 1,
+    postfilter: bool = False,
+    telemetry: bool = False,
+    telemetry_collector: TelemetryCollector | None = None,
+    profile_ordinals: Iterable[int] | None = None,
+    profile_keys: Iterable[str | None] | None = None,
+    **pipeline_options: Any,
+) -> Iterator[Any]:
+    """Private Astra entry retaining worker Pipelines across profile chunks."""
+    return _hmmsearch_impl(
+        profile_pairs,
+        batch,
+        cpus=cpus,
+        postfilter=postfilter,
+        telemetry=telemetry,
+        telemetry_collector=telemetry_collector,
+        profile_ordinals=profile_ordinals,
+        profile_keys=profile_keys,
+        _continuation_pool=continuation_pool,
+        **pipeline_options,
     )
 
 

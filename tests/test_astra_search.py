@@ -26,7 +26,11 @@ try:
         load_pressed_profiles,
     )
     import plan7_gpu.astra_search as astra_search_module
-    from plan7_gpu.astra_search import hmmsearch
+    from plan7_gpu.astra_search import (
+        _ContinuationPool,
+        _hmmsearch_with_continuation_pool,
+        hmmsearch,
+    )
 except ImportError:
     _native = None
     _pipeline = None
@@ -36,6 +40,8 @@ except ImportError:
     load_pressed_profiles = None
     astra_search_module = None
     hmmsearch = None
+    _ContinuationPool = None
+    _hmmsearch_with_continuation_pool = None
 
 
 HMM_GLOBINS = ROOT / "refs" / "src" / "hmmer-3.4" / "tutorial" / "globins4.hmm"
@@ -376,6 +382,49 @@ class AstraSearchTests(unittest.TestCase):
                     cpus=cpus,
                     **options,
                 )
+
+    def test_private_continuation_pool_reuses_worker_pipelines_across_calls(self):
+        pairs = self.pairs * 2
+        candidates = self.synthetic_batch.candidate_batch(pairs, F1=1.0)
+        expected = self.reference(pairs, self.synthetic_targets, cpus=2, F1=1.0)
+        pool = _ContinuationPool(2)
+        try:
+            first = list(
+                _hmmsearch_with_continuation_pool(
+                    pairs,
+                    candidates,
+                    cpus=2,
+                    F1=1.0,
+                    continuation_pool=pool,
+                )
+            )
+            first_statistics = pool.statistics
+            second = list(
+                _hmmsearch_with_continuation_pool(
+                    pairs,
+                    candidates,
+                    cpus=2,
+                    F1=1.0,
+                    continuation_pool=pool,
+                )
+            )
+            second_statistics = pool.statistics
+        finally:
+            pool.close()
+
+        self.assertEqual(first_statistics["call_count"], 1)
+        self.assertEqual(second_statistics["call_count"], 2)
+        self.assertGreater(first_statistics["pipeline_count"], 0)
+        self.assertLessEqual(first_statistics["pipeline_count"], 2)
+        self.assertEqual(
+            second_statistics["pipeline_count"],
+            first_statistics["pipeline_count"],
+        )
+        for observed in (first, second):
+            for expected_hits, actual_hits in zip(
+                expected, observed, strict=True
+            ):
+                self.assert_exact_hits(expected_hits, actual_hits)
 
     def test_threaded_order_and_worker_local_pipeline_reuse(self):
         # Forty rows select the maximum eight-row task size and leave one task
