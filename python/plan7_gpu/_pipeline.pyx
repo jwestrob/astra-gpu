@@ -9274,6 +9274,86 @@ def _sealed_postfilter_candidate_count_bound(sealed_object, Py_ssize_t row):
     return sealed._postfilter_offsets[row + 1] - sealed._postfilter_offsets[row]
 
 
+def _sealed_continuation_work_hints_bound(sealed_object):
+    """Return deterministic per-profile continuation work hints.
+
+    The hints use only immutable, authenticated sparse-v3 metadata.  They are
+    deliberately coarse: their purpose is to keep obviously heavy DP rows out
+    of the same continuation task, not to predict elapsed time.
+    """
+    cdef _SealedPostfilterBatch sealed
+    cdef const uint8_t *base
+    cdef const plan7_continuation_journal_v3_profile *profiles
+    cdef const plan7_continuation_journal_v3_exception *exceptions
+    cdef const plan7_continuation_journal_v3_profile *profile
+    cdef const plan7_continuation_journal_v3_exception *exception
+    cdef OptimizedProfile optimized_profile
+    cdef uint64_t maximum = <uint64_t> -1
+    cdef uint64_t cells
+    cdef uint64_t weighted
+    cdef uint64_t cost
+    cdef uint64_t weight
+    cdef uint64_t local_index
+    cdef size_t profile_index
+    cdef list hints
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    if sealed._journal_v3 == NULL:
+        raise TypeError("continuation work hints require sparse journal v3")
+
+    base = <const uint8_t *> sealed._journal_v3
+    profiles = <const plan7_continuation_journal_v3_profile *> (
+        base + sealed._journal_v3.profiles_offset
+    )
+    exceptions = <const plan7_continuation_journal_v3_exception *> (
+        base + sealed._journal_v3.exceptions_offset
+    )
+    hints = []
+    for profile_index in range(<size_t> sealed._journal_v3.profile_count):
+        profile = &profiles[profile_index]
+        optimized_profile = <OptimizedProfile> sealed._optimized_profiles[
+            profile_index
+        ]
+        # A nonzero base keeps cert-only profiles schedulable. Each exception
+        # also contributes one unit so zero-cell output/control work remains
+        # visible beside the DP-cell terms below.
+        cost = 1
+        for local_index in range(profile.exception_count):
+            exception = &exceptions[profile.exception_begin + local_index]
+            if cost != maximum and not plan7_continuation_journal_v3_checked_add(
+                cost, 1, &cost
+            ):
+                cost = maximum
+            weight = 0
+            if exception.route == PLAN7_CONTINUATION_V3_FULL_PIPELINE:
+                weight = 4
+            elif exception.route == PLAN7_CONTINUATION_V3_FILTER_SCORES:
+                weight = 3
+            elif (
+                exception.route == PLAN7_CONTINUATION_V3_FORWARD_SCORES
+                and exception.payload_flags & PLAN7_CONTINUATION_V3_HAS_DOMAIN
+            ):
+                weight = 2
+            if weight == 0 or cost == maximum:
+                continue
+            if not plan7_continuation_journal_v3_checked_multiply(
+                <uint64_t> optimized_profile._om.M,
+                exception.residue_delta,
+                &cells,
+            ) or not plan7_continuation_journal_v3_checked_multiply(
+                cells, weight, &weighted
+            ) or not plan7_continuation_journal_v3_checked_add(
+                cost, weighted, &cost
+            ):
+                cost = maximum
+        hints.append(cost)
+    return tuple(hints)
+
+
 def _sealed_sparse_journal_v3_enabled_bound(sealed_object):
     """Return whether one sealed batch opted into reusable sparse v3."""
     cdef _SealedPostfilterBatch sealed

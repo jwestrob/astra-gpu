@@ -1613,6 +1613,9 @@ print(json.dumps(after_repeat, sort_keys=True))
         self.assertTrue(
             _pipeline._sealed_sparse_journal_v3_enabled_bound(sparse)
         )
+        work_hints = _pipeline._sealed_continuation_work_hints_bound(sparse)
+        self.assertEqual(len(work_hints), 1)
+        self.assertGreater(work_hints[0], 0)
 
         expected = _pipeline._search_hmm_sealed_postfilter_bound(
             dense, 0, self.pipeline(**options)

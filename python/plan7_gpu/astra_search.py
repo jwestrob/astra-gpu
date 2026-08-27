@@ -45,15 +45,20 @@ _MAX_ROWS_PER_TASK = 8
 _TASKS_PER_WORKER_WINDOW = 2
 _COMPLETION_REORDER_WINDOWS = 1
 _CONTINUATION_SCHEDULER_ENV = "PLAN7_GPU_CONTINUATION_SCHEDULER"
+_CONTINUATION_TASK_POLICY_ENV = "PLAN7_GPU_CONTINUATION_TASK_POLICY"
 _CONTINUATION_PROFILE_ENV = "PLAN7_GPU_CONTINUATION_PROFILE"
 _SCHEDULER_OLDEST = "oldest"
 _SCHEDULER_COMPLETION = "completion"
+_TASK_POLICY_FIXED = "fixed"
+_TASK_POLICY_BALANCED = "balanced"
 _scheduler_statistics_lock = Lock()
 _scheduler_statistics: dict[str, Any] = {
     "schema_version": 1,
     "call_count": 0,
     "oldest_call_count": 0,
     "completion_call_count": 0,
+    "fixed_task_call_count": 0,
+    "balanced_task_call_count": 0,
     "task_count": 0,
     "task_wall_ns": 0,
     "scheduler_wait_ns": 0,
@@ -75,6 +80,71 @@ def _continuation_scheduler_mode() -> str:
     return mode
 
 
+def _continuation_task_policy() -> str:
+    policy = os.environ.get(
+        _CONTINUATION_TASK_POLICY_ENV, _TASK_POLICY_FIXED
+    )
+    if policy not in (_TASK_POLICY_FIXED, _TASK_POLICY_BALANCED):
+        raise ValueError(
+            f"{_CONTINUATION_TASK_POLICY_ENV} must be "
+            f"{_TASK_POLICY_FIXED!r} or {_TASK_POLICY_BALANCED!r}"
+        )
+    return policy
+
+
+def _balanced_task_bounds(
+    work_hints: tuple[int, ...], max_rows: int
+) -> tuple[tuple[int, int, int], ...]:
+    """Partition canonical rows by immutable work while preserving order."""
+    if not work_hints:
+        return ()
+    if max_rows <= 0:
+        raise ValueError("maximum task rows must be positive")
+    if any(type(value) is not int or value <= 0 for value in work_hints):
+        raise ValueError("continuation work hints must be positive integers")
+    fixed_task_count = (len(work_hints) + max_rows - 1) // max_rows
+    target = (sum(work_hints) + fixed_task_count - 1) // fixed_task_count
+    bounds: list[tuple[int, int, int]] = []
+    start = 0
+    accumulated = 0
+    for row, hint in enumerate(work_hints):
+        if row > start and (
+            row - start >= max_rows or accumulated + hint > target
+        ):
+            bounds.append((start, row, accumulated))
+            start = row
+            accumulated = 0
+        accumulated += hint
+    bounds.append((start, len(work_hints), accumulated))
+    return tuple(bounds)
+
+
+def _continuation_task_bounds(
+    candidates: CandidateBatch,
+    max_rows: int,
+    policy: str,
+) -> tuple[tuple[int, int, int], ...]:
+    if policy == _TASK_POLICY_BALANCED:
+        state = _candidate_state(candidates)
+        if state.sealed_postfilter is not None:
+            from . import _pipeline  # type: ignore[attr-defined]
+
+            helper = getattr(
+                _pipeline, "_sealed_continuation_work_hints_bound", None
+            )
+            if callable(helper):
+                hints = tuple(helper(state.sealed_postfilter))
+                if len(hints) != len(candidates):
+                    raise RuntimeError(
+                        "continuation work-hint profile count changed"
+                    )
+                return _balanced_task_bounds(hints, max_rows)
+    return tuple(
+        (start, min(start + max_rows, len(candidates)), 0)
+        for start in range(0, len(candidates), max_rows)
+    )
+
+
 def _continuation_profile_enabled() -> bool:
     value = os.environ.get(_CONTINUATION_PROFILE_ENV)
     return value is not None and value not in ("", "0", "false", "False")
@@ -87,6 +157,8 @@ def _reset_continuation_scheduler_statistics() -> None:
             call_count=0,
             oldest_call_count=0,
             completion_call_count=0,
+            fixed_task_call_count=0,
+            balanced_task_call_count=0,
             task_count=0,
             task_wall_ns=0,
             scheduler_wait_ns=0,
@@ -111,6 +183,7 @@ def _continuation_scheduler_statistics() -> dict[str, Any]:
 def _record_continuation_scheduler_call(
     *,
     mode: str,
+    task_policy: str,
     task_records: list[dict[str, int]],
     scheduler_wait_ns: int,
     oldest_pending_wait_ns: int,
@@ -121,6 +194,7 @@ def _record_continuation_scheduler_call(
     with _scheduler_statistics_lock:
         _scheduler_statistics["call_count"] += 1
         _scheduler_statistics[f"{mode}_call_count"] += 1
+        _scheduler_statistics[f"{task_policy}_task_call_count"] += 1
         _scheduler_statistics["task_count"] += len(task_records)
         _scheduler_statistics["task_wall_ns"] += sum(
             record["finished_ns"] - record["started_ns"]
@@ -351,6 +425,7 @@ def _threaded_hmmsearch(
     worker_count = min(cpus, len(candidates))
     worker_state = local()
     scheduler_mode = _continuation_scheduler_mode()
+    task_policy = _continuation_task_policy()
     collect_profile = _continuation_profile_enabled()
     active_lock = Lock()
     active_workers = 0
@@ -374,11 +449,15 @@ def _threaded_hmmsearch(
             // (_TASKS_PER_WORKER_WINDOW * worker_count),
         ),
     )
+    task_bounds = _continuation_task_bounds(
+        candidates, chunk_size, task_policy
+    )
 
     def search_chunk(
         task_ordinal: int,
         start: int,
         stop: int,
+        work_hint: int,
         submitted_ns: int,
     ) -> tuple[list[Any], BaseException | None, dict[str, int]]:
         nonlocal active_workers, maximum_active_workers
@@ -425,6 +504,7 @@ def _threaded_hmmsearch(
             "task_ordinal": task_ordinal,
             "row_begin": start,
             "row_end": stop,
+            "work_hint": work_hint,
             "submitted_ns": submitted_ns,
             "started_ns": started_ns,
             "finished_ns": finished_ns,
@@ -435,23 +515,28 @@ def _threaded_hmmsearch(
         thread_name_prefix="plan7-gpu-astra",
     )
 
-    def submit(task_ordinal: int, start: int) -> tuple[Future[Any], tuple[int, ...]]:
-        stop = min(start + chunk_size, len(candidates))
+    def submit(task_ordinal: int) -> tuple[Future[Any], tuple[int, ...]]:
+        start, stop, work_hint = task_bounds[task_ordinal]
         submitted_ns = time.perf_counter_ns() if collect_profile else 0
         try:
             future = executor.submit(
-                search_chunk, task_ordinal, start, stop, submitted_ns
+                search_chunk,
+                task_ordinal,
+                start,
+                stop,
+                work_hint,
+                submitted_ns,
             )
         except BaseException as error:
             failed: Future[Any] = Future()
             failed.set_exception(error)
             future = failed
-        return future, (task_ordinal, start, stop, submitted_ns)
+        return future, (task_ordinal, start, stop, work_hint, submitted_ns)
 
     def collect_future(
         future: Future[Any], metadata: tuple[int, ...]
     ) -> tuple[list[Any], BaseException | None, dict[str, int]]:
-        task_ordinal, start, stop, submitted_ns = metadata
+        task_ordinal, start, stop, work_hint, submitted_ns = metadata
         try:
             return future.result()
         except BaseException as error:
@@ -460,26 +545,24 @@ def _threaded_hmmsearch(
                 "task_ordinal": task_ordinal,
                 "row_begin": start,
                 "row_end": stop,
+                "work_hint": work_hint,
                 "submitted_ns": submitted_ns,
                 "started_ns": now_ns,
                 "finished_ns": now_ns,
             }
 
     active_task_limit = min(
-        (len(candidates) + chunk_size - 1) // chunk_size,
-        _TASKS_PER_WORKER_WINDOW * worker_count,
+        len(task_bounds), _TASKS_PER_WORKER_WINDOW * worker_count
     )
     try:
         if scheduler_mode == _SCHEDULER_OLDEST:
             pending_oldest: deque[
                 tuple[Future[Any], tuple[int, ...]]
             ] = deque()
-            next_row = 0
             next_task_ordinal = 0
             while len(pending_oldest) < active_task_limit:
-                pending_oldest.append(submit(next_task_ordinal, next_row))
+                pending_oldest.append(submit(next_task_ordinal))
                 next_task_ordinal += 1
-                next_row += chunk_size
             maximum_pending_tasks = len(pending_oldest)
 
             while pending_oldest:
@@ -498,12 +581,11 @@ def _threaded_hmmsearch(
                     task_records.append(record)
                 # Refill before yielding, preserving the retained scheduler's
                 # exact failure and buffering behavior.
-                if error is None and next_row < len(candidates):
+                if error is None and next_task_ordinal < len(task_bounds):
                     pending_oldest.append(
-                        submit(next_task_ordinal, next_row)
+                        submit(next_task_ordinal)
                     )
                     next_task_ordinal += 1
-                    next_row += chunk_size
                     maximum_pending_tasks = max(
                         maximum_pending_tasks, len(pending_oldest)
                     )
@@ -516,7 +598,6 @@ def _threaded_hmmsearch(
             completed: dict[
                 int, tuple[list[Any], BaseException | None, dict[str, int]]
             ] = {}
-            next_row = 0
             next_task_ordinal = 0
             next_yield_ordinal = 0
             known_failure_ordinal: int | None = None
@@ -525,18 +606,17 @@ def _threaded_hmmsearch(
             )
 
             def refill_completion() -> None:
-                nonlocal next_row, next_task_ordinal, maximum_pending_tasks
+                nonlocal next_task_ordinal, maximum_pending_tasks
                 while (
                     known_failure_ordinal is None
-                    and next_row < len(candidates)
+                    and next_task_ordinal < len(task_bounds)
                     and len(pending_completion) < active_task_limit
                     and len(pending_completion) + len(completed)
                         < total_task_limit
                 ):
-                    future, metadata = submit(next_task_ordinal, next_row)
+                    future, metadata = submit(next_task_ordinal)
                     pending_completion[future] = metadata
                     next_task_ordinal += 1
-                    next_row += chunk_size
                     maximum_pending_tasks = max(
                         maximum_pending_tasks, len(pending_completion)
                     )
@@ -601,6 +681,7 @@ def _threaded_hmmsearch(
         if collect_profile:
             _record_continuation_scheduler_call(
                 mode=scheduler_mode,
+                task_policy=task_policy,
                 task_records=task_records,
                 scheduler_wait_ns=scheduler_wait_ns,
                 oldest_pending_wait_ns=oldest_pending_wait_ns,
