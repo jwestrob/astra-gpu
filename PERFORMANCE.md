@@ -5,8 +5,9 @@ This file is the compact, source-controlled performance record for external revi
 ## Exact implementation under review
 
 - Native `plan7_gpu` retained source: commit
-  `348f2774f696f1a7697f93fa56e507f3ebed95fd`, tree
-  `1ee529ef6df3b3926f268ea9d0c00613d7993a24`. The original sealed
+  `f6e73e4` for the measured cost-balanced scheduler, promoted as the default
+  in `b8037df`. The prior resident compute line is commit
+  `348f2774f696f1a7697f93fa56e507f3ebed95fd`. The original sealed
   architectural baseline remains commit
   `614161a4d24c05564b863a0d1b67f0b2f26aeaf1`.
 - Astra companion used by the retained GA/full-workload path: commit
@@ -46,6 +47,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, Phase 9 certified GA pruning | 64 host workers | **449.104112 s** | 13,159,348 KiB | **exact; 1.5649x faster than Astra CPU64; new best** |
 | Astra GPU, H200, Phase 11 automatic policy | 64 host workers | 451.083043 s | 13,380,000 KiB | exact; 0.441% slower than Phase 9, with 22 MiB less sampled H200 memory |
 | Astra GPU, H200, resident F2→Forward handoff | 64 host workers | **448.140781 s** | 13,195,416 KiB | **exact; 0.2145% faster than Phase 9; new best** |
+| Astra GPU, H200, completion-driven cost-balanced continuation | 64 host workers | **403.057068 s** | 14,345,372 KiB | **exact; 10.060% faster than 448.141 s; new retained best** |
 | Rejected experiment: packed Viterbi | 64 host workers | 454.963381 s | 13,340,692 KiB | exact, but 0.211% slower and 94,836 KiB larger; excluded from `main` |
 | Rejected experiment: external multidomain continuation | 64 host workers | 480.258523 s | 13,080,804 KiB | exact, but 7.167% slower; implementation excluded from `main` |
 | Rejected experiment: bounded Backward waves | 64 host workers | 479.533852 s | 13,028,936 KiB | exact; removed all Backward work-cap fallbacks, but 7.005% slower |
@@ -61,6 +63,28 @@ Additional GPU timing layers:
 - The measured request was a cache hit in the same persistent GPU profile session: profile load and device build were both zero during the measured request. Target parsing and all per-request search/output work remained included.
 
 These are one-run, cross-node measurements. They establish the observed result but do not provide a sampling distribution or confidence interval.
+
+### Post-roadmap continuation scheduling result
+
+Full H200 job `1184487` replaced fixed, oldest-completion-driven continuation
+tasks with deterministic contiguous tasks balanced by authenticated sparse-v3
+DP-work metadata. It refilled on any completed task but buffered and yielded
+results in canonical order. The 27,481-profile by 300,186-target request took
+**403.057068 seconds**, with 335.398222 seconds of native generation,
+342.896046 seconds of continuation/output, 283.735825 seconds of measured
+overlap, and 394.679967 seconds of pipeline wall. Relative to job `1183504`,
+request wall fell 45.083713 seconds (10.060%) and continuation fell 57.187058
+seconds; generation rose 1.404617 seconds. Peak RSS increased 1,149,956 KiB
+(1.097 GiB, 8.715%) because the bounded completion reorder window retains more
+finished task results.
+
+The output remained exactly 39,010,327 bytes and 383,235 lines with SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`.
+The machine-readable summary is
+`build/post448-cost-balanced-h200/attempt-01/summary.json` (SHA-256
+`44bb49747b2bcf239c1c33ebf46e11f30a15eba21575dd0979b7ed5a69a7c984`).
+The measured policy is retained; `oldest` and `fixed` remain explicit audit and
+rollback controls.
 
 ### Current optimization-stage result
 

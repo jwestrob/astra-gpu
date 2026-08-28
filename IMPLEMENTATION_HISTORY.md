@@ -8,9 +8,10 @@ hashes live in `PERFORMANCE.md`.
 ## Canonical line
 
 - Review baseline: `5ffe5d43cf4177493b72f24b0fb96c00276c96ab`.
-- Current retained implementation: `348f277` (resident exact F2-to-Forward
-  handoff, on top of the deterministic Phase 11 policy and certified Phase 9
-  GA pruning).
+- Current retained implementation: the resident compute line through
+  `348f277`, followed by completion-driven scheduling (`6b4a83a`),
+  authenticated cost balancing (`f6e73e4`), and retained-default promotion
+  (`b8037df`).
 - Exact full-output oracle: SHA-256
   `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
   39,010,327 bytes, 383,235 lines.
@@ -32,6 +33,14 @@ hashes live in `PERFORMANCE.md`.
 | 9 | `50f762c` | Certified gathering-cutoff GA pruning retained; exact request 449.104 s, 1.08% faster than the prior best. |
 | 10 | `786d1a6` | Exact mandatory-seed evaluator retained as evidence; production index rejected after certifying only 0.494% of cells. |
 | 11 | `2fc2a92` | Deterministic request-scoped GPU execution policy retained; exact six-shape H200 matrix preserves the simple path and accelerates large-by-large generation. |
+
+## Post-roadmap performance program
+
+| Change | Source | Result |
+|---|---|---|
+| Completion-driven refill | `6b4a83a` | Preserves canonical output/failure order and bounded buffering; retained as the scheduler foundation. |
+| Authenticated cost-balanced tasks | `f6e73e4` | Full job `1184487` exact at **403.057068 s**, 10.060% below the 448.140781-second reference. |
+| Production default | `b8037df` | Completion+balanced retained by default; oldest+fixed remains forceable for audit/rollback. |
 
 ## Rejected or non-production experiments
 
@@ -65,10 +74,12 @@ hashes live in `PERFORMANCE.md`.
 ## Current status
 
 All numbered roadmap phases and the final continuation-tail experiments have
-an exact oracle result and an explicit retain/reject decision. Full H200 job
-`1183504` is the retained performance result: 448.140781 seconds with the
-exact 39,010,327-byte output. Generation was 333.993605 seconds, CPU
-continuation/output 400.083104 seconds, and overlap 293.693784 seconds.
+an exact oracle result and an explicit retain/reject decision. The subsequent
+post-roadmap scheduler program established a new retained result in full H200
+job `1184487`: **403.057068 seconds**, with the exact 39,010,327-byte output.
+Generation was 335.398222 seconds, CPU continuation/output 342.896046 seconds,
+and overlap 283.735825 seconds. Peak RSS was 14,345,372 KiB, 1.097 GiB above
+the 448-second reference in exchange for a 10.060% wall-time reduction.
 
 The remaining measured continuation causes were then exercised directly on
 the full workload. Multidomain rerouting, bounded Backward waves, bounded
@@ -76,12 +87,11 @@ rescore waves, and the zero-cost threshold upper bound all reduced their
 target route counts but made request wall 7.005% to 8.494% slower. Those
 implementations remain isolated and are not ancestors of `main`.
 
-This satisfies the bottleneck-focused stop condition. The evidence does not
-declare an absolute Plan7 hardware ceiling; it shows that the scoped cap,
-threshold, and multidomain changes cannot materially reduce the present exact
-CPU tail. A future performance program needs a fundamentally faster exact
-domain/rescore/multidomain algorithm, not another route transfer. The complete
-decision is in `CPU_CONTINUATION_TAIL_RESULTS.md`.
+The cap, threshold, and multidomain changes remain closed negative results.
+The scheduler win did not change their algorithms; it reduced head-of-line
+idle time and balanced the existing exact CPU tail using immutable work known
+before execution. Further compute work still requires a fundamentally faster
+exact tail algorithm rather than another route transfer.
 
 For the complete commit-by-commit history, run:
 

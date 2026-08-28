@@ -22,7 +22,7 @@ compaction, sparse ordered continuation, and resident interstage handoffs. The
 original query-major/audit paths remain available.
 
 The retained full H200 run searched 27,481 Pfam profiles against 300,186
-proteins (8.249 billion logical pairs) in **448.140781 seconds**, versus
+proteins (8.249 billion logical pairs) in **403.057068 seconds**, versus
 702.79 seconds for Astra CPU64. Its 39,010,327-byte output was byte-identical
 to the CPU oracle (SHA-256
 `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`).
@@ -30,8 +30,9 @@ to the CPU oracle (SHA-256
 Full exact experiments subsequently attacked every dominant measured CPU-tail
 reason. Multidomain rerouting, bounded Backward/rescore waves, and a zero-cost
 threshold upper bound all reduced their target fallback counts but regressed
-request wall by 7.005%--8.494%. They remain isolated experiments; the
-448.140781-second path is the retained production winner.
+request wall by 7.005%--8.494%. They remain isolated experiments. A subsequent
+completion-driven, cost-balanced continuation scheduler reduced the exact
+448.140781-second request by 10.060% and is now the retained production path.
 
 The durable engineering record is in:
 
