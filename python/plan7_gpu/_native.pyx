@@ -7748,6 +7748,11 @@ cdef class SequenceBatch:
         object ga_target_cutoffs,
     ):
         """Run selection-aware F2/F3 without reading a live optimized profile."""
+        # CPU-rescore ownership deliberately exposes the pre-compact tail to
+        # continuation.  Bind and seal that actual generation contract, not
+        # the compact-tail fingerprint requested by the ordinary GPU path.
+        if self._cpu_rescore_route:
+            generation_tail_fingerprint = 0
         cdef plan7_profile_selection_view view = selection._view()
         cdef vector[uint64_t] candidate_offsets
         cdef vector[uint32_t] candidate_indices
