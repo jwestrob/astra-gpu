@@ -21,6 +21,7 @@ try:
     from plan7_gpu import _native, _pipeline
     from plan7_gpu.adapter import (
         CandidateBatch,
+        ProfileSession,
         SequenceBatch,
         _candidate_state,
         load_pressed_profiles,
@@ -31,6 +32,7 @@ except ImportError:
     _native = None
     _pipeline = None
     CandidateBatch = None
+    ProfileSession = None
     SequenceBatch = None
     _candidate_state = None
     load_pressed_profiles = None
@@ -324,6 +326,91 @@ class AstraSearchTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 1)
         for expected_hits, actual_hits in zip(expected, actual, strict=True):
             self.assert_exact_hits(expected_hits, actual_hits)
+
+    def test_sharded_sparse_continuation_matches_unsharded(self):
+        if (
+            _pipeline is None
+            or not hasattr(
+                _pipeline,
+                "_search_hmm_sealed_sparse_journal_v3_shard_bound",
+            )
+        ):
+            self.skipTest("sparse continuation sharding is unavailable")
+        pairs = self.pairs
+        options = {
+            "F1": 0.5,
+            "F2": 1.0,
+            "F3": 1.0,
+            "E": 10.0,
+            "domE": 10.0,
+            "incE": 10.0,
+            "incdomE": 10.0,
+        }
+        with ProfileSession(pairs, pack_workers=1) as session:
+            with session.select(range(len(pairs))) as selection:
+                candidates = self.synthetic_batch._postfilter_forward_selection(
+                    selection,
+                    options["F1"],
+                    options["F2"],
+                    options["F3"],
+                    True,
+                    pipeline=pyhmmer.plan7.Pipeline(
+                        self.alphabet, **options
+                    ),
+                    sparse_journal_v3=True,
+                )
+
+        state = _candidate_state(candidates)
+        shard_hints = tuple(
+            _pipeline._sealed_continuation_shard_work_hints_bound(
+                state.sealed_postfilter
+            )
+        )
+        try:
+            heavy_row = next(
+                row for row, hints in enumerate(shard_hints) if len(hints) >= 2
+            )
+        except StopIteration:
+            self.skipTest("fixture produced no shardable sparse profile")
+        expected = [
+            candidates.search(
+                row,
+                pyhmmer.plan7.Pipeline(self.alphabet, **options),
+            )
+            for row in range(len(candidates))
+        ]
+
+        forced_profile_hints = [1] * len(candidates)
+        forced_profile_hints[heavy_row] = max(
+            1_000_000,
+            sum(shard_hints[heavy_row]),
+        )
+        astra_search_module._reset_continuation_scheduler_statistics()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLAN7_GPU_CONTINUATION_SCHEDULER": "completion",
+                    "PLAN7_GPU_CONTINUATION_TASK_POLICY": "sharded",
+                    "PLAN7_GPU_CONTINUATION_PROFILE": "1",
+                },
+            ),
+            mock.patch.object(
+                _pipeline,
+                "_sealed_continuation_work_hints_bound",
+                return_value=tuple(forced_profile_hints),
+            ),
+        ):
+            actual = list(
+                hmmsearch(pairs, candidates, cpus=4, **options)
+            )
+
+        self.assertEqual(len(actual), len(expected))
+        for expected_hits, actual_hits in zip(expected, actual, strict=True):
+            self.assert_exact_hits(expected_hits, actual_hits)
+        statistics = astra_search_module._continuation_scheduler_statistics()
+        self.assertEqual(statistics["sharded_task_call_count"], 1)
+        self.assertGreater(statistics["shard_task_count"], 1)
 
     def test_precomputed_none_sparse_and_all_rows_match_pyhmmer(self):
         cases = (
