@@ -51,6 +51,7 @@ _SCHEDULER_OLDEST = "oldest"
 _SCHEDULER_COMPLETION = "completion"
 _TASK_POLICY_FIXED = "fixed"
 _TASK_POLICY_BALANCED = "balanced"
+_TASK_POLICY_SHARDED = "sharded"
 _scheduler_statistics_lock = Lock()
 _scheduler_statistics: dict[str, Any] = {
     "schema_version": 1,
@@ -59,7 +60,9 @@ _scheduler_statistics: dict[str, Any] = {
     "completion_call_count": 0,
     "fixed_task_call_count": 0,
     "balanced_task_call_count": 0,
+    "sharded_task_call_count": 0,
     "task_count": 0,
+    "shard_task_count": 0,
     "task_wall_ns": 0,
     "scheduler_wait_ns": 0,
     "oldest_pending_wait_ns": 0,
@@ -84,10 +87,15 @@ def _continuation_task_policy() -> str:
     policy = os.environ.get(
         _CONTINUATION_TASK_POLICY_ENV, _TASK_POLICY_BALANCED
     )
-    if policy not in (_TASK_POLICY_FIXED, _TASK_POLICY_BALANCED):
+    if policy not in (
+        _TASK_POLICY_FIXED,
+        _TASK_POLICY_BALANCED,
+        _TASK_POLICY_SHARDED,
+    ):
         raise ValueError(
             f"{_CONTINUATION_TASK_POLICY_ENV} must be "
-            f"{_TASK_POLICY_FIXED!r} or {_TASK_POLICY_BALANCED!r}"
+            f"{_TASK_POLICY_FIXED!r}, {_TASK_POLICY_BALANCED!r}, or "
+            f"{_TASK_POLICY_SHARDED!r}"
         )
     return policy
 
@@ -119,12 +127,73 @@ def _balanced_task_bounds(
     return tuple(bounds)
 
 
+def _partition_exception_hints(
+    work_hints: tuple[int, ...], target: int
+) -> tuple[tuple[int, int, int], ...]:
+    """Partition one profile at exact exception boundaries."""
+    if not work_hints:
+        return ()
+    if target <= 0:
+        raise ValueError("continuation shard target must be positive")
+    if any(type(value) is not int or value <= 0 for value in work_hints):
+        raise ValueError("continuation shard hints must be positive integers")
+    bounds: list[tuple[int, int, int]] = []
+    start = 0
+    accumulated = 0
+    for index, hint in enumerate(work_hints):
+        if index > start and accumulated + hint > target:
+            bounds.append((start, index, accumulated))
+            start = index
+            accumulated = 0
+        accumulated += hint
+    bounds.append((start, len(work_hints), accumulated))
+    return tuple(bounds)
+
+
+def _sharded_task_bounds(
+    profile_hints: tuple[int, ...],
+    exception_hints: tuple[tuple[int, ...], ...],
+    max_rows: int,
+) -> tuple[tuple[int, int, int, int, int, int], ...]:
+    """Split only pathological single-profile tasks into exact shards."""
+    if len(profile_hints) != len(exception_hints):
+        raise ValueError("profile and exception work-hint counts differ")
+    base = _balanced_task_bounds(profile_hints, max_rows)
+    if not base:
+        return ()
+    fixed_task_count = (len(profile_hints) + max_rows - 1) // max_rows
+    target = (sum(profile_hints) + fixed_task_count - 1) // fixed_task_count
+    tasks: list[tuple[int, int, int, int, int, int]] = []
+    for start, stop, work_hint in base:
+        row_hints = exception_hints[start] if stop == start + 1 else ()
+        shards = (
+            _partition_exception_hints(row_hints, target)
+            if work_hint > 2 * target and len(row_hints) > 1
+            else ()
+        )
+        if len(shards) <= 1:
+            tasks.append((start, stop, work_hint, -1, -1, 1))
+            continue
+        for shard_index, (begin, end, shard_hint) in enumerate(shards):
+            tasks.append(
+                (
+                    start,
+                    stop,
+                    shard_hint,
+                    begin,
+                    end,
+                    int(shard_index + 1 == len(shards)),
+                )
+            )
+    return tuple(tasks)
+
+
 def _continuation_task_bounds(
     candidates: CandidateBatch,
     max_rows: int,
     policy: str,
-) -> tuple[tuple[int, int, int], ...]:
-    if policy == _TASK_POLICY_BALANCED:
+) -> tuple[tuple[int, int, int, int, int, int], ...]:
+    if policy in (_TASK_POLICY_BALANCED, _TASK_POLICY_SHARDED):
         state = _candidate_state(candidates)
         if state.sealed_postfilter is not None:
             from . import _pipeline  # type: ignore[attr-defined]
@@ -138,9 +207,26 @@ def _continuation_task_bounds(
                     raise RuntimeError(
                         "continuation work-hint profile count changed"
                     )
-                return _balanced_task_bounds(hints, max_rows)
+                if policy == _TASK_POLICY_SHARDED:
+                    shard_helper = getattr(
+                        _pipeline,
+                        "_sealed_continuation_shard_work_hints_bound",
+                        None,
+                    )
+                    if not callable(shard_helper):
+                        raise RuntimeError(
+                            "sharded continuation work hints are unavailable"
+                        )
+                    shard_hints = tuple(shard_helper(state.sealed_postfilter))
+                    return _sharded_task_bounds(hints, shard_hints, max_rows)
+                return tuple(
+                    (start, stop, work, -1, -1, 1)
+                    for start, stop, work in _balanced_task_bounds(
+                        hints, max_rows
+                    )
+                )
     return tuple(
-        (start, min(start + max_rows, len(candidates)), 0)
+        (start, min(start + max_rows, len(candidates)), 0, -1, -1, 1)
         for start in range(0, len(candidates), max_rows)
     )
 
@@ -159,7 +245,9 @@ def _reset_continuation_scheduler_statistics() -> None:
             completion_call_count=0,
             fixed_task_call_count=0,
             balanced_task_call_count=0,
+            sharded_task_call_count=0,
             task_count=0,
+            shard_task_count=0,
             task_wall_ns=0,
             scheduler_wait_ns=0,
             oldest_pending_wait_ns=0,
@@ -196,6 +284,10 @@ def _record_continuation_scheduler_call(
         _scheduler_statistics[f"{mode}_call_count"] += 1
         _scheduler_statistics[f"{task_policy}_task_call_count"] += 1
         _scheduler_statistics["task_count"] += len(task_records)
+        _scheduler_statistics["shard_task_count"] += sum(
+            record.get("exception_begin", -1) >= 0
+            for record in task_records
+        )
         _scheduler_statistics["task_wall_ns"] += sum(
             record["finished_ns"] - record["started_ns"]
             for record in task_records
@@ -517,6 +609,12 @@ def _threaded_hmmsearch(
         continuation_pool._acquire(cpus, pipeline_options)
     scheduler_mode = _continuation_scheduler_mode()
     task_policy = _continuation_task_policy()
+    if task_policy == _TASK_POLICY_SHARDED and (
+        telemetry or collector is not None
+    ):
+        raise ValueError(
+            "sharded continuation is an uninstrumented experimental path"
+        )
     collect_profile = _continuation_profile_enabled()
     active_lock = Lock()
     active_workers = 0
@@ -543,12 +641,22 @@ def _threaded_hmmsearch(
     task_bounds = _continuation_task_bounds(
         candidates, chunk_size, task_policy
     )
+    candidate_state = _candidate_state(candidates)
+    sealed_postfilter = candidate_state.sealed_postfilter
+    pending_shard_row: int | None = None
+    pending_shard_hits: list[Any] = []
+
+    if task_policy == _TASK_POLICY_SHARDED and sealed_postfilter is None:
+        raise RuntimeError("sharded continuation requires a sealed sparse batch")
 
     def search_chunk(
         task_ordinal: int,
         start: int,
         stop: int,
         work_hint: int,
+        exception_begin: int,
+        exception_end: int,
+        final_shard: int,
         submitted_ns: int,
     ) -> tuple[list[Any], BaseException | None, dict[str, int]]:
         nonlocal active_workers, maximum_active_workers
@@ -569,22 +677,45 @@ def _threaded_hmmsearch(
         hits = []
         error: BaseException | None = None
         try:
-            for row in range(start, stop):
-                if collector is None:
+            if exception_begin >= 0:
+                if stop != start + 1 or sealed_postfilter is None:
+                    raise RuntimeError("continuation shard task is malformed")
+                from . import _pipeline  # type: ignore[attr-defined]
+
+                try:
                     hits.append(
-                        _search_row(candidates, row, pipeline, telemetry)
-                    )
-                else:
-                    hits.append(
-                        _search_row(
-                            candidates,
-                            row,
+                        _pipeline._search_hmm_sealed_sparse_journal_v3_shard_bound(
+                            sealed_postfilter,
+                            start,
+                            exception_begin,
+                            exception_end,
                             pipeline,
-                            telemetry,
-                            collector,
-                            profile_ordinals[row],
                         )
                     )
+                    pipeline.clear()
+                except BaseException:
+                    try:
+                        pipeline.clear()
+                    except BaseException:
+                        pass
+                    raise
+            else:
+                for row in range(start, stop):
+                    if collector is None:
+                        hits.append(
+                            _search_row(candidates, row, pipeline, telemetry)
+                        )
+                    else:
+                        hits.append(
+                            _search_row(
+                                candidates,
+                                row,
+                                pipeline,
+                                telemetry,
+                                collector,
+                                profile_ordinals[row],
+                            )
+                        )
         except BaseException as caught:
             # A task preserves row-wise failure order: successful rows before
             # the failing row are yielded before this exact error.
@@ -599,6 +730,9 @@ def _threaded_hmmsearch(
             "row_begin": start,
             "row_end": stop,
             "work_hint": work_hint,
+            "exception_begin": exception_begin,
+            "exception_end": exception_end,
+            "final_shard": final_shard,
             "submitted_ns": submitted_ns,
             "started_ns": started_ns,
             "finished_ns": finished_ns,
@@ -614,7 +748,14 @@ def _threaded_hmmsearch(
     )
 
     def submit(task_ordinal: int) -> tuple[Future[Any], tuple[int, ...]]:
-        start, stop, work_hint = task_bounds[task_ordinal]
+        (
+            start,
+            stop,
+            work_hint,
+            exception_begin,
+            exception_end,
+            final_shard,
+        ) = task_bounds[task_ordinal]
         submitted_ns = time.perf_counter_ns() if collect_profile else 0
         try:
             future = executor.submit(
@@ -623,18 +764,39 @@ def _threaded_hmmsearch(
                 start,
                 stop,
                 work_hint,
+                exception_begin,
+                exception_end,
+                final_shard,
                 submitted_ns,
             )
         except BaseException as error:
             failed: Future[Any] = Future()
             failed.set_exception(error)
             future = failed
-        return future, (task_ordinal, start, stop, work_hint, submitted_ns)
+        return future, (
+            task_ordinal,
+            start,
+            stop,
+            work_hint,
+            exception_begin,
+            exception_end,
+            final_shard,
+            submitted_ns,
+        )
 
     def collect_future(
         future: Future[Any], metadata: tuple[int, ...]
     ) -> tuple[list[Any], BaseException | None, dict[str, int]]:
-        task_ordinal, start, stop, work_hint, submitted_ns = metadata
+        (
+            task_ordinal,
+            start,
+            stop,
+            work_hint,
+            exception_begin,
+            exception_end,
+            final_shard,
+            submitted_ns,
+        ) = metadata
         try:
             return future.result()
         except BaseException as error:
@@ -644,10 +806,44 @@ def _threaded_hmmsearch(
                 "row_begin": start,
                 "row_end": stop,
                 "work_hint": work_hint,
+                "exception_begin": exception_begin,
+                "exception_end": exception_end,
+                "final_shard": final_shard,
                 "submitted_ns": submitted_ns,
                 "started_ns": now_ns,
                 "finished_ns": now_ns,
             }
+
+    def canonical_chunk_hits(
+        chunk_hits: list[Any], metadata: tuple[int, ...]
+    ) -> tuple[Any, ...]:
+        """Merge completed shards only when their canonical row is complete."""
+        nonlocal pending_shard_row, pending_shard_hits
+        start = metadata[1]
+        exception_begin = metadata[4]
+        final_shard = metadata[6]
+        if exception_begin < 0:
+            if pending_shard_row is not None:
+                raise RuntimeError("continuation shard sequence is incomplete")
+            return tuple(chunk_hits)
+        if len(chunk_hits) != 1:
+            raise RuntimeError("continuation shard returned the wrong result count")
+        if pending_shard_row is None:
+            pending_shard_row = start
+        elif pending_shard_row != start:
+            raise RuntimeError("continuation shard profile order changed")
+        pending_shard_hits.append(chunk_hits[0])
+        if not final_shard:
+            return ()
+        base = pending_shard_hits[-1]
+        merged = (
+            base.merge(*pending_shard_hits[:-1])
+            if len(pending_shard_hits) > 1
+            else base
+        )
+        pending_shard_row = None
+        pending_shard_hits = []
+        return (merged,)
 
     active_task_limit = min(
         len(task_bounds), _TASKS_PER_WORKER_WINDOW * worker_count
@@ -687,7 +883,9 @@ def _threaded_hmmsearch(
                     maximum_pending_tasks = max(
                         maximum_pending_tasks, len(pending_oldest)
                     )
-                for hits in chunk_hits:
+                if error is not None and metadata[4] >= 0:
+                    raise error
+                for hits in canonical_chunk_hits(chunk_hits, metadata):
                     yield hits
                 if error is not None:
                     raise error
@@ -696,6 +894,7 @@ def _threaded_hmmsearch(
             completed: dict[
                 int, tuple[list[Any], BaseException | None, dict[str, int]]
             ] = {}
+            task_metadata: dict[int, tuple[int, ...]] = {}
             next_task_ordinal = 0
             next_yield_ordinal = 0
             known_failure_ordinal: int | None = None
@@ -724,9 +923,12 @@ def _threaded_hmmsearch(
                 ready = completed.pop(next_yield_ordinal, None)
                 if ready is not None:
                     chunk_hits, error, _record = ready
+                    metadata = task_metadata.pop(next_yield_ordinal)
                     next_yield_ordinal += 1
                     refill_completion()
-                    for hits in chunk_hits:
+                    if error is not None and metadata[4] >= 0:
+                        raise error
+                    for hits in canonical_chunk_hits(chunk_hits, metadata):
                         yield hits
                     if error is not None:
                         raise error
@@ -755,6 +957,7 @@ def _threaded_hmmsearch(
                     chunk_hits, error, record = collect_future(future, metadata)
                     task_ordinal = metadata[0]
                     completed[task_ordinal] = chunk_hits, error, record
+                    task_metadata[task_ordinal] = metadata
                     if collect_profile:
                         task_records.append(record)
                     if error is not None and (
@@ -766,6 +969,8 @@ def _threaded_hmmsearch(
                     maximum_completed_tasks, len(completed)
                 )
                 refill_completion()
+        if pending_shard_row is not None:
+            raise RuntimeError("continuation shard sequence is incomplete")
     finally:
         pending_to_cancel = (
             pending_oldest

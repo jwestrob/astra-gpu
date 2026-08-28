@@ -9354,6 +9354,82 @@ def _sealed_continuation_work_hints_bound(sealed_object):
     return tuple(hints)
 
 
+def _sealed_continuation_shard_work_hints_bound(sealed_object):
+    """Return deterministic work hints for each sparse-v3 exception.
+
+    The nested tuples preserve profile and exception order exactly.  They use
+    the same coarse route weights as the retained per-profile scheduler hint,
+    but expose exception boundaries so an internal scheduler can split a
+    pathological profile without splitting one HMMER target continuation.
+    """
+    cdef _SealedPostfilterBatch sealed
+    cdef const uint8_t *base
+    cdef const plan7_continuation_journal_v3_profile *profiles
+    cdef const plan7_continuation_journal_v3_exception *exceptions
+    cdef const plan7_continuation_journal_v3_profile *profile
+    cdef const plan7_continuation_journal_v3_exception *exception
+    cdef OptimizedProfile optimized_profile
+    cdef uint64_t maximum = <uint64_t> -1
+    cdef uint64_t cells
+    cdef uint64_t weighted
+    cdef uint64_t cost
+    cdef uint64_t weight
+    cdef uint64_t local_index
+    cdef size_t profile_index
+    cdef list profile_hints
+    cdef list exception_hints
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    if sealed._journal_v3 == NULL:
+        raise TypeError("continuation shard hints require sparse journal v3")
+
+    base = <const uint8_t *> sealed._journal_v3
+    profiles = <const plan7_continuation_journal_v3_profile *> (
+        base + sealed._journal_v3.profiles_offset
+    )
+    exceptions = <const plan7_continuation_journal_v3_exception *> (
+        base + sealed._journal_v3.exceptions_offset
+    )
+    profile_hints = []
+    for profile_index in range(<size_t> sealed._journal_v3.profile_count):
+        profile = &profiles[profile_index]
+        optimized_profile = <OptimizedProfile> sealed._optimized_profiles[
+            profile_index
+        ]
+        exception_hints = []
+        for local_index in range(profile.exception_count):
+            exception = &exceptions[profile.exception_begin + local_index]
+            cost = 1
+            weight = 0
+            if exception.route == PLAN7_CONTINUATION_V3_FULL_PIPELINE:
+                weight = 4
+            elif exception.route == PLAN7_CONTINUATION_V3_FILTER_SCORES:
+                weight = 3
+            elif (
+                exception.route == PLAN7_CONTINUATION_V3_FORWARD_SCORES
+                and exception.payload_flags & PLAN7_CONTINUATION_V3_HAS_DOMAIN
+            ):
+                weight = 2
+            if weight != 0:
+                if not plan7_continuation_journal_v3_checked_multiply(
+                    <uint64_t> optimized_profile._om.M,
+                    exception.residue_delta,
+                    &cells,
+                ) or not plan7_continuation_journal_v3_checked_multiply(
+                    cells, weight, &weighted
+                ) or not plan7_continuation_journal_v3_checked_add(
+                    cost, weighted, &cost
+                ):
+                    cost = maximum
+            exception_hints.append(cost)
+        profile_hints.append(tuple(exception_hints))
+    return tuple(profile_hints)
+
+
 def _sealed_sparse_journal_v3_enabled_bound(sealed_object):
     """Return whether one sealed batch opted into reusable sparse v3."""
     cdef _SealedPostfilterBatch sealed
@@ -12136,7 +12212,12 @@ def _search_hmm_sealed_sparse_journal_v3_shard_bound(
         sealed._journal_v3, sealed, pipeline, <size_t> row
     )
     query = (<HMM> sealed._queries[row]).copy()
-    optimized_profile = <OptimizedProfile> sealed._optimized_profiles[row]
+    # Shards of one profile may execute concurrently. Reconfiguration mutates
+    # an optimized profile's target-length transitions, so each shard must own
+    # an independent copy rather than racing on the seal's shared profile.
+    optimized_profile = (
+        <OptimizedProfile> sealed._optimized_profiles[row]
+    ).copy()
     hits = TopHits(query)
     for local_index in range(
         <uint64_t> exception_begin, <uint64_t> exception_end
