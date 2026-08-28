@@ -1698,6 +1698,51 @@ print(json.dumps(after_repeat, sort_keys=True))
             before,
         )
 
+    def test_sparse_v3_profile_shards_merge_exactly(self):
+        indexes = (1, 5, 6, len(self.sequences) - 2)
+        records = b"".join(
+            self.postfilter_record(
+                index, math.nan, 0, 173, 0, math.nan
+            )
+            for index in indexes
+        )
+        options = {"F1": 1.0, "F2": 1.0, "F3": 1.0}
+        sealed = self.seal_v2_terminal_fixture(
+            self.sequences,
+            records,
+            pipeline=self.pipeline(**options),
+            f1=1.0,
+            sparse_journal_v3=True,
+        )
+
+        expected = _pipeline._search_hmm_sealed_sparse_journal_v3_bound(
+            sealed, 0, self.pipeline(**options)
+        )
+        self.assertGreater(len(expected), 0)
+        first = _pipeline._search_hmm_sealed_sparse_journal_v3_shard_bound(
+            sealed, 0, 0, 2, self.pipeline(**options)
+        )
+        last = _pipeline._search_hmm_sealed_sparse_journal_v3_shard_bound(
+            sealed, 0, 2, 4, self.pipeline(**options)
+        )
+        actual = last.merge(first)
+
+        self.assert_exact_hits(expected, actual)
+        self.assertEqual(actual.searched_models, 1)
+        self.assertEqual(actual.searched_nodes, self.hmms[0].M)
+        self.assertEqual(actual.searched_sequences, len(self.sequences))
+        self.assertEqual(actual.searched_residues, self.sequences.total_length())
+        self.assertEqual(actual.Z, float(len(self.sequences)))
+
+        with self.assertRaisesRegex(ValueError, "deterministic reseeding"):
+            _pipeline._search_hmm_sealed_sparse_journal_v3_shard_bound(
+                sealed,
+                0,
+                0,
+                2,
+                self.pipeline(seed=0, **options),
+            )
+
     def test_journal_v3_postclaim_failure_stays_consumed(self):
         options = {
             "F1": 0.02,
