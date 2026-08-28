@@ -536,7 +536,7 @@ class CudaBiasTests(unittest.TestCase):
         ):
             with native_batch(sequences) as batch:
                 reconstructed = batch.bias_candidates_many_raw(
-                    *packed_ssv, m_mu, m_lambda, 1.0, packed_bias
+                    *packed_ssv, m_mu, m_lambda, 0.02, packed_bias
                 )
                 statistics = dict(batch.workspace_statistics)
         with mock.patch.dict(
@@ -544,7 +544,7 @@ class CudaBiasTests(unittest.TestCase):
         ):
             with native_batch(sequences) as batch:
                 replayed = batch.bias_candidates_many_raw(
-                    *packed_ssv, m_mu, m_lambda, 1.0, packed_bias
+                    *packed_ssv, m_mu, m_lambda, 0.02, packed_bias
                 )
         self.assertEqual(reconstructed, replayed)
         candidate_count = sum(map(len, reconstructed))
