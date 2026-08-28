@@ -2827,8 +2827,10 @@ int postfilter_candidates_device_with_workspace_impl(
   const char *vit_length_policy =
       std::getenv("PLAN7_GPU_VIT_LENGTH_CACHE");
   const bool vit_length_cache_requested =
-      vit_length_policy != nullptr &&
-      std::strcmp(vit_length_policy, "0") != 0;
+      vit_length_policy == nullptr
+          ? (execution_policy != PLAN7_GPU_EXECUTION_POLICY_SIMPLE &&
+             candidate_count >= 65536)
+          : std::strcmp(vit_length_policy, "0") != 0;
   const bool vit_length_cache_audit =
       vit_length_policy != nullptr &&
       std::strcmp(vit_length_policy, "audit") == 0;

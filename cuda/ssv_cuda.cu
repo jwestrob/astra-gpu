@@ -2996,8 +2996,16 @@ sequence_batch_f1_mask_many_impl(
     f1_profile->tjb_offset = tjb_offset;
   }
   const char *raw_xe_policy = getenv("PLAN7_GPU_F1_RAW_XE");
+  size_t raw_xe_logical_pair_count = 0;
+  const bool auto_raw_xe =
+    raw_xe_policy == nullptr &&
+    batch->execution_policy_mode != PLAN7_GPU_EXECUTION_POLICY_SIMPLE &&
+    checked_product(profile_count, batch->sequence_count,
+                    &raw_xe_logical_pair_count) &&
+    raw_xe_logical_pair_count >= 65536;
   raw_xe_reconstructable =
-    raw_xe_policy != nullptr && strcmp(raw_xe_policy, "1") == 0 &&
+    (auto_raw_xe ||
+     (raw_xe_policy != nullptr && strcmp(raw_xe_policy, "1") == 0)) &&
     float_environment_valid;
   if (raw_xe_reconstructable) {
     for (size_t profile = 0; profile < profile_count; ++profile) {
@@ -3017,7 +3025,7 @@ sequence_batch_f1_mask_many_impl(
   const char *identity_padding_policy =
     getenv("PLAN7_GPU_SSV_IDENTITY_PADDING");
   const bool use_identity_padding =
-    identity_padding_policy != nullptr &&
+    identity_padding_policy == nullptr ||
     strcmp(identity_padding_policy, "1") == 0;
   const size_t profile_packed_minimum =
     batch->execution_policy_mode == PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT

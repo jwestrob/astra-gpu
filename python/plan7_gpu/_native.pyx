@@ -5924,6 +5924,11 @@ cdef class SequenceBatch:
         )
         self._cpu_domain_route = (
             _os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP") == "cpu"
+            or (
+                "PLAN7_GPU_DOMAIN_OWNERSHIP" not in _os.environ
+                and _execution_policy != PLAN7_GPU_EXECUTION_POLICY_SIMPLE
+                and offsets.shape[0] > 65536
+            )
         )
         self._cpu_rescore_route = (
             _os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP") == "cpu_rescore"
