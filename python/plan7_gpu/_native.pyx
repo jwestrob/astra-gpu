@@ -417,6 +417,9 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t f1_profile_packed_profile_count
         uint64_t f1_profile_scalar_profile_count
         uint64_t f1_profile_packed_score_bytes
+        uint64_t f1_identity_padding_run_count
+        uint64_t f1_identity_padding_quartet_count
+        uint64_t f1_identity_padding_profile_count
         uint64_t f1_length_class_run_count
         uint64_t f1_length_class_value_count
         uint64_t f1_length_compact_h2d_bytes
@@ -6050,6 +6053,15 @@ cdef class SequenceBatch:
             ),
             "f1_profile_packed_score_bytes": (
                 statistics.f1_profile_packed_score_bytes
+            ),
+            "f1_identity_padding_run_count": (
+                statistics.f1_identity_padding_run_count
+            ),
+            "f1_identity_padding_quartet_count": (
+                statistics.f1_identity_padding_quartet_count
+            ),
+            "f1_identity_padding_profile_count": (
+                statistics.f1_identity_padding_profile_count
             ),
             "f1_length_class_run_count": statistics.f1_length_class_run_count,
             "f1_length_class_value_count": (

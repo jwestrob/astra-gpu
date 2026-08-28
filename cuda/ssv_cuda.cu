@@ -120,6 +120,9 @@ struct plan7_ssv_sequence_batch {
   uint64_t f1_profile_packed_profile_count;
   uint64_t f1_profile_scalar_profile_count;
   uint64_t f1_profile_packed_score_bytes;
+  uint64_t f1_identity_padding_run_count;
+  uint64_t f1_identity_padding_quartet_count;
+  uint64_t f1_identity_padding_profile_count;
   uint64_t f1_length_class_run_count;
   uint64_t f1_length_class_value_count;
   uint64_t f1_length_compact_h2d_bytes;
@@ -844,6 +847,7 @@ pack_profile_quartet_scores_kernel(
   const uint8_t *scalar_scores,
   const plan7_ssv_f1_profile *profiles,
   const ProfilePackedQuartet *quartets,
+  bool identity_padding,
   uint32_t *quartet_scores)
 {
   const size_t quartet_index = static_cast<size_t>(blockIdx.y);
@@ -861,7 +865,7 @@ pack_profile_quartet_scores_kernel(
     for (int lane = 0; lane < kProfilesPerPackedWord; ++lane) {
       const uint32_t profile_index = quartet.profile_indices[lane];
       const plan7_ssv_profile profile = profiles[profile_index].profile;
-      uint8_t cost = UINT8_C(0x80);
+      uint8_t cost = identity_padding ? UINT8_C(0) : UINT8_C(0x80);
       if (model_position < static_cast<size_t>(profile.model_length))
         cost = scalar_scores[
           profile.score_offset + model_position * profile.score_stride +
@@ -872,6 +876,7 @@ pack_profile_quartet_scores_kernel(
   }
 }
 
+template<bool IdentityPadding>
 __device__ __forceinline__ void
 ssv_profile_packed_filter_block(
   const uint32_t *scores,
@@ -911,15 +916,19 @@ ssv_profile_packed_filter_block(
       const unsigned residue = residues[start + static_cast<uint64_t>(i)];
       const uint32_t cost = scores[
         quartet.score_word_offset + static_cast<size_t>(k) * 29 + residue];
-      uint32_t active = 0;
-#pragma unroll
-      for (int lane = 0; lane < kProfilesPerPackedWord; ++lane) {
-        const uint32_t profile_index = quartet.profile_indices[lane];
-        if (k < profiles[profile_index].profile.model_length)
-          active |= UINT32_C(0xff) << (lane * 8);
-      }
       const uint32_t next = __vsubss4(value, cost);
-      value = (next & active) | (value & ~active);
+      if constexpr (IdentityPadding) {
+        value = next;
+      } else {
+        uint32_t active = 0;
+#pragma unroll
+        for (int lane = 0; lane < kProfilesPerPackedWord; ++lane) {
+          const uint32_t profile_index = quartet.profile_indices[lane];
+          if (k < profiles[profile_index].profile.model_length)
+            active |= UINT32_C(0xff) << (lane * 8);
+        }
+        value = (next & active) | (value & ~active);
+      }
       local_maximum = __vmaxu4(local_maximum, value);
       ++i;
       ++k;
@@ -962,6 +971,7 @@ ssv_profile_packed_filter_block(
   }
 }
 
+template<bool IdentityPadding>
 __global__ void
 ssv_f1_mask_profile_packed_kernel(
   const uint32_t *quartet_scores,
@@ -987,7 +997,7 @@ ssv_f1_mask_profile_packed_kernel(
   for (int iteration = 0; iteration < kSequencesPerBlock; ++iteration) {
     const size_t sequence = first_sequence + static_cast<size_t>(iteration);
     if (sequence >= sequence_count) break;
-    ssv_profile_packed_filter_block(
+    ssv_profile_packed_filter_block<IdentityPadding>(
       quartet_scores, quartet, profiles, residues, offsets, sequence, tjb,
       results, maxima);
     if (threadIdx.x == 0) {
@@ -2311,6 +2321,12 @@ plan7_ssv_sequence_batch_get_workspace_statistics(
     batch->f1_profile_scalar_profile_count;
   statistics->f1_profile_packed_score_bytes =
     batch->f1_profile_packed_score_bytes;
+  statistics->f1_identity_padding_run_count =
+    batch->f1_identity_padding_run_count;
+  statistics->f1_identity_padding_quartet_count =
+    batch->f1_identity_padding_quartet_count;
+  statistics->f1_identity_padding_profile_count =
+    batch->f1_identity_padding_profile_count;
   statistics->f1_length_class_run_count =
     batch->f1_length_class_run_count;
   statistics->f1_length_class_value_count =
@@ -2986,6 +3002,11 @@ sequence_batch_f1_mask_many_impl(
   const bool profile_packing_enabled =
     (profile_policy == nullptr || strcmp(profile_policy, "scalar") != 0) &&
     batch->execution_policy_mode != PLAN7_GPU_EXECUTION_POLICY_SIMPLE;
+  const char *identity_padding_policy =
+    getenv("PLAN7_GPU_SSV_IDENTITY_PADDING");
+  const bool use_identity_padding =
+    identity_padding_policy != nullptr &&
+    strcmp(identity_padding_policy, "1") == 0;
   const size_t profile_packed_minimum =
     batch->execution_policy_mode == PLAN7_GPU_EXECUTION_POLICY_THROUGHPUT
       ? kProfilesPerPackedWord : kProfilePackedMinimumProfiles;
@@ -3278,18 +3299,31 @@ sequence_batch_f1_mask_many_impl(
     pack_profile_quartet_scores_kernel<<<
       dim3(pack_blocks, static_cast<unsigned>(profile_quartets.size())),
       kThreads>>>(
-        batch->device_scores, batch->device_f1_profiles, device_quartets,
+      batch->device_scores, batch->device_f1_profiles, device_quartets,
+        use_identity_padding,
         batch->device_f1_profile_packed_scores);
     CUDA_TRY_FUSED(cudaGetLastError());
-    ssv_f1_mask_profile_packed_kernel<<<
-      dim3(sequence_blocks, static_cast<unsigned>(profile_quartets.size())),
-      kThreads>>>(
-        batch->device_f1_profile_packed_scores, device_quartets,
-        batch->device_f1_profiles, batch->sequence_count,
-        batch->device_residues, batch->device_offsets,
-        batch->device_null_scores, batch->device_tjb, words_per_profile,
-        batch->device_candidate_words,
-        raw_xe_reconstructable ? batch->device_f1_raw_xe : nullptr);
+    if (use_identity_padding) {
+      ssv_f1_mask_profile_packed_kernel<true><<<
+        dim3(sequence_blocks, static_cast<unsigned>(profile_quartets.size())),
+        kThreads>>>(
+          batch->device_f1_profile_packed_scores, device_quartets,
+          batch->device_f1_profiles, batch->sequence_count,
+          batch->device_residues, batch->device_offsets,
+          batch->device_null_scores, batch->device_tjb, words_per_profile,
+          batch->device_candidate_words,
+          raw_xe_reconstructable ? batch->device_f1_raw_xe : nullptr);
+    } else {
+      ssv_f1_mask_profile_packed_kernel<false><<<
+        dim3(sequence_blocks, static_cast<unsigned>(profile_quartets.size())),
+        kThreads>>>(
+          batch->device_f1_profile_packed_scores, device_quartets,
+          batch->device_f1_profiles, batch->sequence_count,
+          batch->device_residues, batch->device_offsets,
+          batch->device_null_scores, batch->device_tjb, words_per_profile,
+          batch->device_candidate_words,
+          raw_xe_reconstructable ? batch->device_f1_raw_xe : nullptr);
+    }
     CUDA_TRY_FUSED(cudaGetLastError());
     if (!scalar_profile_indices.empty()) {
       ssv_f1_mask_indexed_kernel<<<
@@ -3310,6 +3344,12 @@ sequence_batch_f1_mask_many_impl(
       profile_quartets.size() * kProfilesPerPackedWord;
     batch->f1_profile_scalar_profile_count += scalar_profile_indices.size();
     batch->f1_profile_packed_score_bytes += packed_score_bytes;
+    if (use_identity_padding) {
+      ++batch->f1_identity_padding_run_count;
+      batch->f1_identity_padding_quartet_count += profile_quartets.size();
+      batch->f1_identity_padding_profile_count +=
+        profile_quartets.size() * kProfilesPerPackedWord;
+    }
   }
   if (copy_candidate_words)
     CUDA_TRY_FUSED(cudaMemcpy(profile_major_candidate_words,

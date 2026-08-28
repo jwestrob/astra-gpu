@@ -97,6 +97,9 @@ typedef struct plan7_ssv_workspace_statistics {
   uint64_t f1_profile_packed_profile_count;
   uint64_t f1_profile_scalar_profile_count;
   uint64_t f1_profile_packed_score_bytes;
+  uint64_t f1_identity_padding_run_count;
+  uint64_t f1_identity_padding_quartet_count;
+  uint64_t f1_identity_padding_profile_count;
   uint64_t f1_length_class_run_count;
   uint64_t f1_length_class_value_count;
   uint64_t f1_length_compact_h2d_bytes;
