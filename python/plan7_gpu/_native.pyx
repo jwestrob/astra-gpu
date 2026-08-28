@@ -5880,6 +5880,7 @@ cdef class SequenceBatch:
     cdef bytes _content_fingerprint
     cdef bint _generation_ledger_enabled
     cdef bint _cpu_domain_route
+    cdef bint _cpu_rescore_route
     cdef uint64_t _ledger_fused_call_count
     cdef uint64_t _ledger_fused_total_ns
     cdef uint64_t _ledger_f1_native_ns
@@ -5914,6 +5915,9 @@ cdef class SequenceBatch:
         )
         self._cpu_domain_route = (
             _os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP") == "cpu"
+        )
+        self._cpu_rescore_route = (
+            _os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP") == "cpu_rescore"
         )
         self._ledger_fused_call_count = 0
         self._ledger_fused_total_ns = 0
@@ -6163,6 +6167,7 @@ cdef class SequenceBatch:
                 "rescore_native_ns": self._ledger_rescore_native_ns,
             },
             "cpu_domain_ownership": bool(self._cpu_domain_route),
+            "cpu_rescore_ownership": bool(self._cpu_rescore_route),
         }
 
     @property
@@ -8949,7 +8954,7 @@ cdef class SequenceBatch:
                 if (
                     rescore_simple_diagnostic
                     or generation_tail_fingerprint != 0
-                ):
+                ) and not self._cpu_rescore_route:
                     if rescore_test_fault != 0:
                         error[0] = 0
                         with nogil:

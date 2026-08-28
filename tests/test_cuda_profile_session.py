@@ -1205,6 +1205,52 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
         simple_region_seam_available(),
         "private simple-region seam is unavailable",
     )
+    def test_cpu_rescore_ownership_matches_exact_hmmer_continuation(self):
+        options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        previous = os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP")
+        os.environ["PLAN7_GPU_DOMAIN_OWNERSHIP"] = "cpu_rescore"
+        try:
+            with ProfileSession(self.pairs, pack_workers=1) as session:
+                with session.select([2, 0]) as selection:
+                    with SequenceBatch(self.targets) as batch:
+                        fused = batch._postfilter_forward_selection(
+                            selection,
+                            options["F1"],
+                            options["F2"],
+                            options["F3"],
+                            True,
+                            pipeline=self.pipeline(**options),
+                            sparse_journal_v3=True,
+                        )
+                        workspace = (
+                            _sequence_state(batch).native.workspace_statistics
+                        )
+                        self.assertTrue(workspace["cpu_rescore_ownership"])
+                        self.assertFalse(workspace["cpu_domain_ownership"])
+                        for row, pair in enumerate((self.pairs[2], self.pairs[0])):
+                            actual_pipeline = self.pipeline(**options)
+                            expected_pipeline = self.pipeline(**options)
+                            actual = fused.search(row, actual_pipeline)
+                            expected = expected_pipeline.search_hmm(
+                                pair.hmm, self.targets
+                            )
+                            self.assertEqual(
+                                self.hits_bytes(actual), self.hits_bytes(expected)
+                            )
+                            self.assertEqual(
+                                self.semantic_pipeline_state(actual),
+                                self.semantic_pipeline_state(expected),
+                            )
+        finally:
+            if previous is None:
+                os.environ.pop("PLAN7_GPU_DOMAIN_OWNERSHIP", None)
+            else:
+                os.environ["PLAN7_GPU_DOMAIN_OWNERSHIP"] = previous
+
+    @unittest.skipUnless(
+        simple_region_seam_available(),
+        "private simple-region seam is unavailable",
+    )
     def test_fused_domain_selection_rejects_pair_and_mode_drift(self):
         options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
         with ProfileSession(self.pairs, pack_workers=0) as session:
