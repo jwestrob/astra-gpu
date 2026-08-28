@@ -529,7 +529,7 @@ class CudaBiasTests(unittest.TestCase):
         )
         packed_ssv = _pack_profiles(profiles)
         packed_bias, m_mu, m_lambda = pack_bias_profiles(
-            background, profiles, 1.0
+            background, profiles, 0.02
         )
         with mock.patch.dict(
             "os.environ", {"PLAN7_GPU_F1_RAW_XE": "1"}, clear=False
