@@ -27,5 +27,17 @@ sharded median was 0.161588 s, a 7.567x speedup. Target and domain table hashes
 were respectively `921ca92e709c2121366943d96533050f121dac52cf6582aa6fff3cc46267a3c3`
 and `19624d6e7bef09a5a1c7b2fb3b272e23793867bab6dc16fafd1d5c2eefd087e0`.
 
-Full H200 Pfam x PLM evaluation is queued as Slurm job `1185224`. Retain or
-reject only after exact full-output and end-to-end timing evidence.
+Full H200 Pfam x PLM evaluation, Slurm job `1185304`, passed the complete
+oracle: SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
+39,010,327 bytes, and 383,235 lines. Request wall was 343.280213 s,
+generation 333.695317 s, continuation/output 77.913357 s, measured overlap
+76.569992 s, and pipeline wall 335.099062 s. This is 59.776855 s (14.83%)
+faster than the retained 403.057068 s line. All 83 chunks used sharding,
+creating 6,454 actual shard tasks. Peak RSS was 17,643,588 KiB, higher than the
+retained line; combine with request-scoped worker reuse before choosing the
+final memory policy.
+
+Decision: retain the exact sharding implementation. The isolated `sharded`
+policy remains explicit until its worker-pool combination and small-workload
+matrix pass; do not silently replace the retained default before those gates.
