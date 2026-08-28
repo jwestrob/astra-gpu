@@ -14,4 +14,15 @@ Local exact first-1000 A/B, one warm profile session, 63 continuation workers:
 - change: request -2.02%; continuation -7.32%
 - pooled calls: 14; Pipelines constructed: 63 total
 
-Decision: retain as an isolated opt-in pending the paired full H200 oracle.
+Full H200 job `1185208` reproduced the exact retained output (SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
+39,010,327 bytes, 383,235 lines). Request wall was 400.888634 s,
+generation 335.637724 s, continuation/output 337.703163 s, measured overlap
+280.580475 s, and pipeline wall 392.908699 s. This was 2.168434 s (0.54%)
+faster than the retained 403.057068 s run, below the threshold for a runtime
+claim without repeats. Peak RSS fell from 14,345,372 KiB to 6,865,076 KiB, a
+52.14% reduction, while constructing exactly 63 Pipelines for all 83 chunks.
+
+Decision: retain the request-scoped pool as an exact opt-in for its large
+memory-efficiency gain. Paired runtime repeats remain required before making
+it the automatic default.
