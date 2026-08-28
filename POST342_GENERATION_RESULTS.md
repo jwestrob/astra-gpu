@@ -39,7 +39,7 @@ and generation fell 54.838847 seconds (17.8%). Against the former retained
 was 7,396,012 KiB, 59,392 KiB below job `1185334`; this run did not collect an
 independent peak-HBM sample.
 
-## Pending: cached Viterbi length transitions
+## Retained: cached Viterbi length transitions
 
 The exact cache replaces per-candidate transcendental transition planning with
 profile-by-observed-length-class lookup when the table is smaller than the
@@ -47,6 +47,30 @@ candidate stream. A 333-profile by full-target H200 oracle (`1185360`) was
 exact and reduced measured candidate planning from 88.053 to 45.862 ms
 (-47.9%). Full job `1185378` was exact at 315.392470 seconds request and
 306.528780 seconds generation, improvements of 0.44% and 0.47% relative to
-job `1185334`. Because the end-to-end difference is below 1%, this path is not
-promoted without matched repeats. Tiny workloads retain direct planning when
-the cache table would exceed the candidate count.
+job `1185334`. Tiny workloads retain direct planning when the cache table would
+exceed the candidate count.
+
+The combined identity-padding and length-cache run, full H200 job `1185455`,
+was again exact and completed in **258.817809 seconds**: 249.859082 seconds
+generation, 81.052199 seconds continuation/output, 79.923879 seconds overlap,
+and 251.045017 seconds pipeline wall. This improved the exact G8-only run by
+3.058394 seconds (1.17%) and generation by 3.292753 seconds (1.30%). All 83
+full-workload chunks used identity padding and the Viterbi cache. The cache
+served all 203,671,109 candidates from 40,259,665 compiled entries, taking
+0.527898 seconds to build its per-chunk tables and 2.300863 seconds for the
+remaining candidate planning. Peak RSS was 7,356,372 KiB, 39,640 KiB below
+the G8-only run. The first-1,000 prerequisite deliberately retained direct
+planning because its cache table would have exceeded its 879,857 candidates.
+
+Automatic promotion retains explicit `0`/reference controls. Identity padding
+is selected whenever packed SSV is selected. Raw-xE is selected for supported
+non-simple workloads with at least 65,536 logical pairs. Cached Viterbi
+planning is considered only for non-simple streams with at least 65,536
+candidates and is used only when its table is smaller than that stream. CPU
+domain ownership is selected automatically at 65,536 or more targets; simple
+policy and smaller target batches retain the prior GPU-domain route.
+
+Focused H200 policy job `1185459` passed exact record, offset, and HMM-output
+oracles for 1x1, 1x4,096, 10x4,096, 100x512, 512x16, and 512x4,096 workloads.
+It also verified that the 65,536-target automatic CPU-domain boundary remains
+disabled under the explicit simple policy.

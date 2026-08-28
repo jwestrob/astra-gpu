@@ -52,6 +52,7 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, exact profile-sharded continuation | 64 host workers | **343.280213 s** | 17,643,588 KiB | **exact; 14.83% faster than 403.057 s** |
 | Astra GPU, H200, profile sharding + request-scoped worker pool | 64 host workers | **342.819173 s** | 7,420,788 KiB | **exact; new retained best; 57.94% less RSS than sharding alone** |
 | Astra GPU, H200, CPU-domain + raw-xE + packed-SSV identity padding | 64 host workers | **261.876203 s** | 7,396,012 KiB | **exact; 2.6836x faster than CPU64; 23.61% faster than 342.819 s** |
+| Astra GPU, H200, post-342 retained generation engine | 64 host workers | **258.817809 s** | 7,356,372 KiB | **exact; 2.7154x faster than CPU64; 24.50% faster than 342.819 s** |
 | Rejected experiment: packed Viterbi | 64 host workers | 454.963381 s | 13,340,692 KiB | exact, but 0.211% slower and 94,836 KiB larger; excluded from `main` |
 | Rejected experiment: external multidomain continuation | 64 host workers | 480.258523 s | 13,080,804 KiB | exact, but 7.167% slower; implementation excluded from `main` |
 | Rejected experiment: bounded Backward waves | 64 host workers | 479.533852 s | 13,028,936 KiB | exact; removed all Backward work-cap fallbacks, but 7.005% slower |
