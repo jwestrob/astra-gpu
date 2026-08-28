@@ -19,6 +19,7 @@ from libeasel cimport eslCONST_LOG2
 from pyhmmer.plan7 cimport OptimizedProfile
 
 import array as _array
+import os as _os
 import pyhmmer as _pyhmmer
 import time as _time
 
@@ -5862,6 +5863,20 @@ cdef class SequenceBatch:
     cdef size_t _sequence_count
     cdef int _alphabet_size
     cdef bytes _content_fingerprint
+    cdef bint _generation_ledger_enabled
+    cdef uint64_t _ledger_fused_call_count
+    cdef uint64_t _ledger_fused_total_ns
+    cdef uint64_t _ledger_f1_native_ns
+    cdef uint64_t _ledger_f1_candidate_mirror_ns
+    cdef uint64_t _ledger_postfilter_host_prepare_ns
+    cdef uint64_t _ledger_viterbi_stage_ns
+    cdef uint64_t _ledger_postfilter_native_ns
+    cdef uint64_t _ledger_postfilter_materialize_ns
+    cdef uint64_t _ledger_f2_control_ns
+    cdef uint64_t _ledger_forward_stage_ns
+    cdef uint64_t _ledger_forward_native_ns
+    cdef uint64_t _ledger_backward_native_ns
+    cdef uint64_t _ledger_rescore_native_ns
 
     def __cinit__(
         self,
@@ -5878,6 +5893,22 @@ cdef class SequenceBatch:
         self._sequence_count = 0
         self._alphabet_size = alphabet_size
         self._content_fingerprint = b""
+        self._generation_ledger_enabled = (
+            _os.environ.get("PLAN7_GPU_GENERATION_LEDGER") == "1"
+        )
+        self._ledger_fused_call_count = 0
+        self._ledger_fused_total_ns = 0
+        self._ledger_f1_native_ns = 0
+        self._ledger_f1_candidate_mirror_ns = 0
+        self._ledger_postfilter_host_prepare_ns = 0
+        self._ledger_viterbi_stage_ns = 0
+        self._ledger_postfilter_native_ns = 0
+        self._ledger_postfilter_materialize_ns = 0
+        self._ledger_f2_control_ns = 0
+        self._ledger_forward_stage_ns = 0
+        self._ledger_forward_native_ns = 0
+        self._ledger_backward_native_ns = 0
+        self._ledger_rescore_native_ns = 0
         if offsets.shape[0] == 0:
             raise ValueError("offsets must contain an initial zero")
         if alphabet_size < 1:
@@ -6088,6 +6119,30 @@ cdef class SequenceBatch:
             "execution_policy_forward_candidates_per_warp": (
                 policy_statistics.forward_candidates_per_warp
             ),
+            "generation_ledger": {
+                "schema_version": 1,
+                "enabled": bool(self._generation_ledger_enabled),
+                "units": "nanoseconds",
+                "fused_call_count": self._ledger_fused_call_count,
+                "fused_total_ns": self._ledger_fused_total_ns,
+                "f1_native_ns": self._ledger_f1_native_ns,
+                "f1_candidate_mirror_ns": (
+                    self._ledger_f1_candidate_mirror_ns
+                ),
+                "postfilter_host_prepare_ns": (
+                    self._ledger_postfilter_host_prepare_ns
+                ),
+                "viterbi_stage_ns": self._ledger_viterbi_stage_ns,
+                "postfilter_native_ns": self._ledger_postfilter_native_ns,
+                "postfilter_materialize_ns": (
+                    self._ledger_postfilter_materialize_ns
+                ),
+                "f2_control_ns": self._ledger_f2_control_ns,
+                "forward_stage_ns": self._ledger_forward_stage_ns,
+                "forward_native_ns": self._ledger_forward_native_ns,
+                "backward_native_ns": self._ledger_backward_native_ns,
+                "rescore_native_ns": self._ledger_rescore_native_ns,
+            },
         }
 
     @property
@@ -6396,6 +6451,7 @@ cdef class SequenceBatch:
         cdef char error[512]
         cdef plan7_ssv_f1_candidate_view compact_view
         cdef plan7_bias_candidate mapping
+        cdef uint64_t ledger_start_ns = 0
 
         profile_count = <size_t> score_offsets.shape[0]
         if (
@@ -6421,6 +6477,8 @@ cdef class SequenceBatch:
         if not host_candidate_expansion and candidate_word_count <= INT_MAX:
             self._candidate_words.clear()
             error[0] = 0
+            if self._generation_ledger_enabled:
+                ledger_start_ns = _time.perf_counter_ns()
             with nogil:
                 status = plan7_ssv_sequence_batch_f1_compact_many(
                     self._batch,
@@ -6436,6 +6494,11 @@ cdef class SequenceBatch:
                 )
             if status != 0:
                 raise RuntimeError(error.decode("utf-8", "replace"))
+            if self._generation_ledger_enabled:
+                self._ledger_f1_native_ns += (
+                    _time.perf_counter_ns() - ledger_start_ns
+                )
+                ledger_start_ns = _time.perf_counter_ns()
             error[0] = 0
             status = plan7_ssv_sequence_batch_get_f1_candidate_view(
                 self._batch, &compact_view, error, sizeof(error)
@@ -6478,10 +6541,16 @@ cdef class SequenceBatch:
                 and compact_view.candidate_offsets[profile_count] != candidate_count
             ):
                 raise RuntimeError("device candidate count changed")
+            if self._generation_ledger_enabled:
+                self._ledger_f1_candidate_mirror_ns += (
+                    _time.perf_counter_ns() - ledger_start_ns
+                )
             return profile_count
 
         self._candidate_words.resize(candidate_word_count)
         error[0] = 0
+        if self._generation_ledger_enabled:
+            ledger_start_ns = _time.perf_counter_ns()
         with nogil:
             status = plan7_ssv_sequence_batch_f1_mask_many(
                 self._batch,
@@ -6499,6 +6568,11 @@ cdef class SequenceBatch:
             )
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
+        if self._generation_ledger_enabled:
+            self._ledger_f1_native_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
+            )
+            ledger_start_ns = _time.perf_counter_ns()
 
         self._candidate_offsets.resize(profile_count)
         for profile_index in range(profile_count):
@@ -6534,6 +6608,10 @@ cdef class SequenceBatch:
                 + self._candidate_counts[profile_index]
             ):
                 raise RuntimeError("candidate mask count changed")
+        if self._generation_ledger_enabled:
+            self._ledger_f1_candidate_mirror_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
+            )
         return profile_count
 
     def cpu_candidates_many_raw(
@@ -7797,6 +7875,7 @@ cdef class SequenceBatch:
         cdef bint ga_pruning = ga_target_cutoffs is not None
         cdef double_bits threshold_bits
         cdef float_bits threshold_float_bits
+        cdef uint64_t ledger_start_ns = 0
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
@@ -7956,6 +8035,8 @@ cdef class SequenceBatch:
                     <uint64_t> view.profiles[profile_index].model_length
                 )
 
+        if self._generation_ledger_enabled:
+            ledger_start_ns = _time.perf_counter_ns()
         host_attested = plan7_bias_host_environment_attested() == 1
         if sealed_domain_journal:
             error[0] = 0
@@ -8270,10 +8351,19 @@ cdef class SequenceBatch:
         expected_indices = clone(_UINT32_ARRAY_TEMPLATE, candidate_count, False)
         for cursor in range(candidate_count):
             expected_indices.data.as_uints[cursor] = candidate_indices[cursor]
+        if self._generation_ledger_enabled:
+            self._ledger_f2_control_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
+            )
+            ledger_start_ns = _time.perf_counter_ns()
         error[0] = 0
         with nogil:
             status = plan7_profile_selection_stage_forward(
                 selection._selection, &database, error, sizeof(error)
+            )
+        if self._generation_ledger_enabled:
+            self._ledger_forward_stage_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
             )
         if status == 0 and collect_generation_telemetry:
             for profile_index in range(profile_count):
@@ -8288,6 +8378,8 @@ cdef class SequenceBatch:
                     )
                 if status != 0:
                     break
+        if self._generation_ledger_enabled:
+            ledger_start_ns = _time.perf_counter_ns()
         if status == 0 and use_resident_f2:
             with nogil:
                 status = plan7_forward_run_batch_workspace_postfilter_resident(
@@ -8385,6 +8477,10 @@ cdef class SequenceBatch:
             if output != NULL:
                 plan7_forward_output_destroy(&output, NULL, 0)
             raise RuntimeError(error.decode("utf-8", "replace"))
+        if self._generation_ledger_enabled:
+            self._ledger_forward_native_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
+            )
 
         if sealed_domain_journal:
             try:
@@ -8581,6 +8677,8 @@ cdef class SequenceBatch:
                 if resident_status < 0:
                     raise RuntimeError(error.decode("utf-8", "replace"))
                 error[0] = 0
+                if self._generation_ledger_enabled:
+                    ledger_start_ns = _time.perf_counter_ns()
                 if collect_generation_telemetry and resident_status == 1:
                     with nogil:
                         status = (
@@ -8665,6 +8763,10 @@ cdef class SequenceBatch:
                         )
                 if status != 0:
                     raise RuntimeError(error.decode("utf-8", "replace"))
+                if self._generation_ledger_enabled:
+                    self._ledger_backward_native_ns += (
+                        _time.perf_counter_ns() - ledger_start_ns
+                    )
                 if collect_generation_telemetry:
                     reason_count = (
                         plan7_backward_domain_output_reason_count(
@@ -8822,6 +8924,8 @@ cdef class SequenceBatch:
                                 error.decode("utf-8", "replace")
                             )
                     error[0] = 0
+                    if self._generation_ledger_enabled:
+                        ledger_start_ns = _time.perf_counter_ns()
                     if ga_pruning and collect_generation_telemetry:
                         with nogil:
                             status = (
@@ -8904,6 +9008,10 @@ cdef class SequenceBatch:
                             )
                     if status != 0:
                         raise RuntimeError(error.decode("utf-8", "replace"))
+                    if self._generation_ledger_enabled:
+                        self._ledger_rescore_native_ns += (
+                            _time.perf_counter_ns() - ledger_start_ns
+                        )
                     if collect_generation_telemetry:
                         reason_count = (
                             plan7_domain_rescore_output_reason_count(
@@ -9989,6 +10097,10 @@ cdef class SequenceBatch:
         cdef object postfilter_reason_statistics = None
         cdef carray residue_offsets
         cdef size_t index
+        cdef uint64_t ledger_start_ns = 0
+
+        if self._generation_ledger_enabled:
+            ledger_start_ns = _time.perf_counter_ns()
 
         if rescore_simple_diagnostic and (
             _return_stage_timings or _return_generation_statistics
@@ -10062,6 +10174,11 @@ cdef class SequenceBatch:
             _direct_sparse_v3,
             _ga_target_cutoffs,
         )
+        if self._generation_ledger_enabled:
+            self._ledger_fused_call_count += 1
+            self._ledger_fused_total_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
+            )
         if (
             rescore_simple_diagnostic
             or _return_stage_timings
@@ -10115,6 +10232,8 @@ cdef class SequenceBatch:
         if not host_candidate_expansion and candidate_word_count <= INT_MAX:
             self._candidate_words.clear()
             error[0] = 0
+            if self._generation_ledger_enabled:
+                ledger_start_ns = _time.perf_counter_ns()
             with nogil:
                 status = plan7_ssv_sequence_batch_f1_compact_many(
                     self._batch,
@@ -10130,6 +10249,11 @@ cdef class SequenceBatch:
                 )
             if status != 0:
                 raise RuntimeError(error.decode("utf-8", "replace"))
+            if self._generation_ledger_enabled:
+                self._ledger_f1_native_ns += (
+                    _time.perf_counter_ns() - ledger_start_ns
+                )
+                ledger_start_ns = _time.perf_counter_ns()
             error[0] = 0
             status = plan7_ssv_sequence_batch_get_f1_candidate_view(
                 self._batch, &compact_view, error, sizeof(error)
@@ -10172,10 +10296,16 @@ cdef class SequenceBatch:
                 and compact_view.candidate_offsets[profile_count] != candidate_count
             ):
                 raise RuntimeError("device candidate count changed")
+            if self._generation_ledger_enabled:
+                self._ledger_f1_candidate_mirror_ns += (
+                    _time.perf_counter_ns() - ledger_start_ns
+                )
             return profile_count
 
         self._candidate_words.resize(candidate_word_count)
         error[0] = 0
+        if self._generation_ledger_enabled:
+            ledger_start_ns = _time.perf_counter_ns()
         with nogil:
             status = plan7_ssv_sequence_batch_f1_mask_many(
                 self._batch,
@@ -10193,6 +10323,11 @@ cdef class SequenceBatch:
             )
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
+        if self._generation_ledger_enabled:
+            self._ledger_f1_native_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
+            )
+            ledger_start_ns = _time.perf_counter_ns()
 
         self._candidate_offsets.resize(profile_count)
         for profile_index in range(profile_count):
@@ -10230,6 +10365,10 @@ cdef class SequenceBatch:
                 + self._candidate_counts[profile_index]
             ):
                 raise RuntimeError("candidate mask count changed")
+        if self._generation_ledger_enabled:
+            self._ledger_f1_candidate_mirror_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
+            )
         return profile_count
 
     def postfilter_profile_selection_csr_raw(
@@ -10259,6 +10398,7 @@ cdef class SequenceBatch:
         cdef vector[uint16_t] reason_facts
         cdef plan7_postfilter_reason_statistics reason_statistics
         cdef bytes reason_storage
+        cdef uint64_t ledger_start_ns = 0
 
         if _UINT64_ARRAY_TEMPLATE.itemsize != sizeof(uint64_t):
             raise RuntimeError("array('Q') is not native uint64")
@@ -10267,6 +10407,8 @@ cdef class SequenceBatch:
         profile_count = self._run_profile_selection_candidates(
             &view, f1, _host_candidate_expansion
         )
+        if self._generation_ledger_enabled:
+            ledger_start_ns = _time.perf_counter_ns()
         self._bias_profiles.resize(profile_count)
         self._bias_candidate_offsets.resize(profile_count + 1)
         if profile_count:
@@ -10301,12 +10443,23 @@ cdef class SequenceBatch:
             reason_statistics.work_cells = 0
 
         if candidate_count:
+            if self._generation_ledger_enabled:
+                self._ledger_postfilter_host_prepare_ns += (
+                    _time.perf_counter_ns() - ledger_start_ns
+                )
+                ledger_start_ns = _time.perf_counter_ns()
             error[0] = 0
             with nogil:
                 status = plan7_profile_selection_stage_viterbi(
                     selection._selection, &database, error, sizeof(error)
                 )
+            if self._generation_ledger_enabled:
+                self._ledger_viterbi_stage_ns += (
+                    _time.perf_counter_ns() - ledger_start_ns
+                )
             if status == 0:
+                if self._generation_ledger_enabled:
+                    ledger_start_ns = _time.perf_counter_ns()
                 if _return_reason_facts:
                     with nogil:
                         status = (
@@ -10344,6 +10497,10 @@ cdef class SequenceBatch:
                             error,
                             sizeof(error),
                         )
+                if self._generation_ledger_enabled:
+                    self._ledger_postfilter_native_ns += (
+                        _time.perf_counter_ns() - ledger_start_ns
+                    )
                 destroy_error[0] = 0
                 with nogil:
                     destroy_status = plan7_viterbi_database_destroy(
@@ -10353,7 +10510,13 @@ cdef class SequenceBatch:
                 raise RuntimeError(error.decode("utf-8", "replace"))
             if destroy_status != 0:
                 raise RuntimeError(destroy_error.decode("utf-8", "replace"))
+        elif self._generation_ledger_enabled:
+            self._ledger_postfilter_host_prepare_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
+            )
 
+        if self._generation_ledger_enabled:
+            ledger_start_ns = _time.perf_counter_ns()
         if candidate_count > (<size_t> -1) // sizeof(plan7_postfilter_result):
             raise OverflowError("post-filter result size overflows size_t")
         result_bytes = candidate_count * sizeof(plan7_postfilter_result)
@@ -10389,6 +10552,10 @@ cdef class SequenceBatch:
                     reason_facts.data(),
                     candidate_count * sizeof(uint16_t),
                 )
+            if self._generation_ledger_enabled:
+                self._ledger_postfilter_materialize_ns += (
+                    _time.perf_counter_ns() - ledger_start_ns
+                )
             return records, offsets, reason_storage, (
                 reason_statistics.candidate_count,
                 reason_statistics.full_msv_execution_count,
@@ -10396,6 +10563,10 @@ cdef class SequenceBatch:
                 reason_statistics.full_msv_work_cells,
                 reason_statistics.viterbi_work_cells,
                 reason_statistics.work_cells,
+            )
+        if self._generation_ledger_enabled:
+            self._ledger_postfilter_materialize_ns += (
+                _time.perf_counter_ns() - ledger_start_ns
             )
         return records, offsets
 

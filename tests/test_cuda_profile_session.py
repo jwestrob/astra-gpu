@@ -1095,6 +1095,64 @@ class CudaProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
         simple_region_seam_available(),
         "private simple-region seam is unavailable",
     )
+    def test_generation_ledger_is_opt_in_and_covers_fused_boundaries(self):
+        options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        previous = os.environ.get("PLAN7_GPU_GENERATION_LEDGER")
+        os.environ["PLAN7_GPU_GENERATION_LEDGER"] = "1"
+        try:
+            with ProfileSession(self.pairs, pack_workers=1) as session:
+                with session.select([2, 0]) as selection:
+                    with SequenceBatch(self.targets) as batch:
+                        candidates = batch._postfilter_forward_selection(
+                            selection,
+                            options["F1"],
+                            options["F2"],
+                            options["F3"],
+                            True,
+                            pipeline=self.pipeline(**options),
+                        )
+                        ledger = _sequence_state(
+                            batch
+                        ).native.workspace_statistics["generation_ledger"]
+                        self.assertEqual(ledger["schema_version"], 1)
+                        self.assertTrue(ledger["enabled"])
+                        self.assertEqual(ledger["fused_call_count"], 1)
+                        for name in (
+                            "fused_total_ns",
+                            "f1_native_ns",
+                            "f1_candidate_mirror_ns",
+                            "postfilter_host_prepare_ns",
+                            "viterbi_stage_ns",
+                            "postfilter_native_ns",
+                            "postfilter_materialize_ns",
+                            "f2_control_ns",
+                            "forward_stage_ns",
+                            "forward_native_ns",
+                            "backward_native_ns",
+                        ):
+                            self.assertGreater(ledger[name], 0, name)
+                        self.assertGreaterEqual(
+                            ledger["fused_total_ns"],
+                            sum(
+                                value
+                                for name, value in ledger.items()
+                                if name.endswith("_ns")
+                                and name != "fused_total_ns"
+                            ),
+                        )
+                        self.assertIsNotNone(
+                            _candidate_state(candidates).sealed_postfilter
+                        )
+        finally:
+            if previous is None:
+                os.environ.pop("PLAN7_GPU_GENERATION_LEDGER", None)
+            else:
+                os.environ["PLAN7_GPU_GENERATION_LEDGER"] = previous
+
+    @unittest.skipUnless(
+        simple_region_seam_available(),
+        "private simple-region seam is unavailable",
+    )
     def test_fused_domain_selection_rejects_pair_and_mode_drift(self):
         options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
         with ProfileSession(self.pairs, pack_workers=0) as session:
