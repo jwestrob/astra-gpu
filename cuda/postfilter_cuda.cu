@@ -2832,6 +2832,9 @@ int postfilter_candidates_device_with_workspace_impl(
   const bool vit_length_cache_audit =
       vit_length_policy != nullptr &&
       std::strcmp(vit_length_policy, "audit") == 0;
+  const bool vit_length_cache_reference =
+      vit_length_policy != nullptr &&
+      std::strcmp(vit_length_policy, "reference") == 0;
   const bool vit_length_cache_force =
       vit_length_cache_audit ||
       (vit_length_policy != nullptr &&
@@ -2853,8 +2856,9 @@ int postfilter_candidates_device_with_workspace_impl(
     }
     vit_length_table_entries = profiles.size() *
         workspace->host_msv_class_lengths.size();
-    use_vit_length_cache = vit_length_cache_force ||
-        vit_length_table_entries < candidate_count;
+    use_vit_length_cache = !vit_length_cache_reference &&
+        (vit_length_cache_force ||
+         vit_length_table_entries < candidate_count);
   }
   if (use_vit_length_cache) {
     const auto cache_started = std::chrono::steady_clock::now();
