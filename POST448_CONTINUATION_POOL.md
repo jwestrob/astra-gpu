@@ -23,6 +23,18 @@ faster than the retained 403.057068 s run, below the threshold for a runtime
 claim without repeats. Peak RSS fell from 14,345,372 KiB to 6,865,076 KiB, a
 52.14% reduction, while constructing exactly 63 Pipelines for all 83 chunks.
 
-Decision: retain the request-scoped pool as an exact opt-in for its large
-memory-efficiency gain. Paired runtime repeats remain required before making
-it the automatic default.
+The same-allocation paired full repeats were also exact. The unpooled arms
+took 399.239473 s and 397.853595 s; pooled arms took 397.331963 s and
+398.103527 s. Their means were 398.546534 s and 397.717745 s respectively, a
+0.208% pooled reduction that is below the runtime noise threshold. Mean peak
+RSS, however, fell from 14,576,952 KiB to 6,864,202 KiB, a reproducible 52.91%
+reduction.
+
+The decisive combination gate was full H200 job `1185307`, which paired the
+pool with exact profile sharding. It reproduced the full output oracle in
+342.819173 s with 7,420,788 KiB peak RSS. Relative to sharding alone, wall was
+effectively flat (-0.134%) while peak RSS fell 57.94%.
+
+Decision: retain the request-scoped pool. It is a measured memory-efficiency
+win, not a standalone runtime claim, and is the retained companion to profile
+sharding.

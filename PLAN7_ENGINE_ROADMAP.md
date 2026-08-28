@@ -385,14 +385,19 @@ retained production line implements the resident computational handoffs and
 keeps only strategies that survived their end-to-end gates. Rejected
 strategies remain audit-only or isolated.
 
-The accepted full-workload result is 448.140781 seconds with byte-identical
-HMMER/Astra output. Multidomain rerouting, bounded Backward waves, bounded
-rescore waves, and the zero-cost threshold upper bound all reduced their target
-route counts but regressed request wall by 7.005% to 8.494%. The measured stop
-condition is therefore met: the remaining exact tail is not materially
-reducible by the scoped architecture changes. Future work should resume only
-with a genuinely faster exact domain/rescore/multidomain algorithm, not another
-cap increase or route transfer.
+The post-roadmap scheduler program subsequently reduced the exact full request
+to 403.057068 seconds with completion-driven cost balancing, then to
+343.280213 seconds by splitting pathological sparse-v3 profile rows at exact
+exception boundaries. Combining those shards with request-scoped continuation
+workers produced the retained job `1185307`: **342.819173 seconds**, exact
+byte-identical output, and 7,420,788 KiB peak RSS. The pool was runtime-flat
+against sharding alone but reduced RSS by 57.94%.
+
+This changes the active bottleneck. Continuation/output is now 76.702733
+seconds and overlaps 75.605812 seconds with 333.307039 seconds of native GPU
+generation. Further material improvement should target generation kernels and
+dataflow; the closed cap, threshold, and multidomain rerouting experiments
+remain closed.
 
 Every retained full-workload result will continue to report exact output
 identity, request/generation/continuation/overlap timing, peak H200 memory,

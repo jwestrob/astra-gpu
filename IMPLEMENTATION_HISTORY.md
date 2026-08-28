@@ -11,7 +11,8 @@ hashes live in `PERFORMANCE.md`.
 - Current retained implementation: the resident compute line through
   `348f277`, followed by completion-driven scheduling (`6b4a83a`),
   authenticated cost balancing (`f6e73e4`), and retained-default promotion
-  (`b8037df`).
+  (`b8037df`), request-scoped worker reuse (`b486714`), and exact sparse
+  profile sharding (through `1199864`).
 - Exact full-output oracle: SHA-256
   `3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`,
   39,010,327 bytes, 383,235 lines.
@@ -41,6 +42,9 @@ hashes live in `PERFORMANCE.md`.
 | Completion-driven refill | `6b4a83a` | Preserves canonical output/failure order and bounded buffering; retained as the scheduler foundation. |
 | Authenticated cost-balanced tasks | `f6e73e4` | Full job `1184487` exact at **403.057068 s**, 10.060% below the 448.140781-second reference. |
 | Production default | `b8037df` | Completion+balanced retained by default; oldest+fixed remains forceable for audit/rollback. |
+| Request-scoped continuation pool | `b486714` | Paired runtime was flat, while mean peak RSS fell 52.91%. |
+| Exact profile sharding | through `1199864` | Full job `1185304` exact at **343.280213 s**, 14.83% below the 403.057068-second line. |
+| Sharding + worker pool | measured tree `48e504d` | Full job `1185307` exact at **342.819173 s** and 7,420,788 KiB RSS; new retained reference. |
 
 ## Rejected or non-production experiments
 
@@ -75,11 +79,13 @@ hashes live in `PERFORMANCE.md`.
 
 All numbered roadmap phases and the final continuation-tail experiments have
 an exact oracle result and an explicit retain/reject decision. The subsequent
-post-roadmap scheduler program established a new retained result in full H200
-job `1184487`: **403.057068 seconds**, with the exact 39,010,327-byte output.
-Generation was 335.398222 seconds, CPU continuation/output 342.896046 seconds,
-and overlap 283.735825 seconds. Peak RSS was 14,345,372 KiB, 1.097 GiB above
-the 448-second reference in exchange for a 10.060% wall-time reduction.
+post-roadmap scheduler program first reached 403.057068 seconds, then removed
+the pathological single-profile stragglers with exact sparse-v3 sharding.
+Full H200 job `1185307` is the retained reference: **342.819173 seconds**, with
+the exact 39,010,327-byte output. Generation was 333.307039 seconds, CPU
+continuation/output 76.702733 seconds, overlap 75.605812 seconds, and peak RSS
+7,420,788 KiB. This is 14.945% below the prior 403.057068-second line and
+23.502% below the 448.140781-second post-roadmap starting point.
 
 The remaining measured continuation causes were then exercised directly on
 the full workload. Multidomain rerouting, bounded Backward waves, bounded
@@ -88,10 +94,10 @@ target route counts but made request wall 7.005% to 8.494% slower. Those
 implementations remain isolated and are not ancestors of `main`.
 
 The cap, threshold, and multidomain changes remain closed negative results.
-The scheduler win did not change their algorithms; it reduced head-of-line
-idle time and balanced the existing exact CPU tail using immutable work known
-before execution. Further compute work still requires a fundamentally faster
-exact tail algorithm rather than another route transfer.
+Sharding changed the live bottleneck: continuation now fits almost entirely
+under the roughly 333-second GPU generation path. Further material gains must
+therefore reduce native generation rather than reroute more rows through the
+unchanged GPU domain algorithms.
 
 For the complete commit-by-commit history, run:
 

@@ -4,9 +4,10 @@ This file is the compact, source-controlled performance record for external revi
 
 ## Exact implementation under review
 
-- Native `plan7_gpu` retained source: commit
-  `f6e73e4` for the measured cost-balanced scheduler, promoted as the default
-  in `b8037df`. The prior resident compute line is commit
+- Native `plan7_gpu` retained source: the completion-balanced line through
+  `b8037df`, request-scoped continuation pool through `b486714`, and exact
+  profile sharding through `1199864`. The measured combined H200 tree is
+  `48e504d`. The prior resident compute line is commit
   `348f2774f696f1a7697f93fa56e507f3ebed95fd`. The original sealed
   architectural baseline remains commit
   `614161a4d24c05564b863a0d1b67f0b2f26aeaf1`.
@@ -48,6 +49,8 @@ All figures below are measured wall time from the sealed runs, not projections.
 | Astra GPU, H200, Phase 11 automatic policy | 64 host workers | 451.083043 s | 13,380,000 KiB | exact; 0.441% slower than Phase 9, with 22 MiB less sampled H200 memory |
 | Astra GPU, H200, resident F2→Forward handoff | 64 host workers | **448.140781 s** | 13,195,416 KiB | **exact; 0.2145% faster than Phase 9; new best** |
 | Astra GPU, H200, completion-driven cost-balanced continuation | 64 host workers | **403.057068 s** | 14,345,372 KiB | **exact; 10.060% faster than 448.141 s; new retained best** |
+| Astra GPU, H200, exact profile-sharded continuation | 64 host workers | **343.280213 s** | 17,643,588 KiB | **exact; 14.83% faster than 403.057 s** |
+| Astra GPU, H200, profile sharding + request-scoped worker pool | 64 host workers | **342.819173 s** | 7,420,788 KiB | **exact; new retained best; 57.94% less RSS than sharding alone** |
 | Rejected experiment: packed Viterbi | 64 host workers | 454.963381 s | 13,340,692 KiB | exact, but 0.211% slower and 94,836 KiB larger; excluded from `main` |
 | Rejected experiment: external multidomain continuation | 64 host workers | 480.258523 s | 13,080,804 KiB | exact, but 7.167% slower; implementation excluded from `main` |
 | Rejected experiment: bounded Backward waves | 64 host workers | 479.533852 s | 13,028,936 KiB | exact; removed all Backward work-cap fallbacks, but 7.005% slower |
@@ -85,6 +88,26 @@ The machine-readable summary is
 `44bb49747b2bcf239c1c33ebf46e11f30a15eba21575dd0979b7ed5a69a7c984`).
 The measured policy is retained; `oldest` and `fixed` remain explicit audit and
 rollback controls.
+
+### Exact profile-sharded continuation result
+
+Full H200 job `1185304` split only pathological sparse-v3 profile rows at
+authenticated exception boundaries and merged their `TopHits` in canonical
+profile order. It reproduced the exact full output in **343.280213 seconds**:
+333.695317 seconds of generation, 77.913357 seconds of continuation/output,
+76.569992 seconds of overlap, and 335.099062 seconds of pipeline wall. This
+was 59.776855 seconds (14.83%) faster than the 403.057068-second scheduler
+line. Peak RSS rose to 17,643,588 KiB.
+
+Full H200 job `1185307` combined those exact shards with one request-scoped
+continuation pool. It again reproduced the exact SHA-256, 39,010,327 bytes,
+and 383,235 lines. Request wall was **342.819173 seconds**, generation
+333.307039 seconds, continuation/output 76.702733 seconds, measured overlap
+75.605812 seconds, and pipeline wall 334.455286 seconds. Runtime was flat
+relative to sharding alone (-0.134%), but peak RSS fell to 7,420,788 KiB, a
+57.94% reduction. This combined line is the retained full-workload reference:
+2.0500x faster than Astra CPU64 and 23.502% faster than the 448.140781-second
+post-roadmap starting point.
 
 ### Current optimization-stage result
 

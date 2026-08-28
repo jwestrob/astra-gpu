@@ -38,6 +38,13 @@ creating 6,454 actual shard tasks. Peak RSS was 17,643,588 KiB, higher than the
 retained line; combine with request-scoped worker reuse before choosing the
 final memory policy.
 
-Decision: retain the exact sharding implementation. The isolated `sharded`
-policy remains explicit until its worker-pool combination and small-workload
-matrix pass; do not silently replace the retained default before those gates.
+The worker-pool combination gate, full H200 job `1185307`, also passed the
+complete oracle. Request wall was 342.819173 s, generation 333.307039 s,
+continuation/output 76.702733 s, measured overlap 75.605812 s, and pipeline
+wall 334.455286 s. Peak RSS was 7,420,788 KiB. Relative to sharding alone,
+runtime was flat (-0.461039 s, -0.134%) while RSS fell by 10,222,800 KiB
+(57.94%). All 83 chunks used sharding and the request-scoped pool.
+
+Decision: retain exact sharding and its request-scoped pool companion. The
+combined result is the new full-workload reference: 342.819173 s with exact
+output and roughly 7.08 GiB peak RSS.
