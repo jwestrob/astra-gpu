@@ -8,6 +8,8 @@ for any PyHMMER version change; the runtime guard below prevents accidentally
 loading it against an unsupported private ABI.
 """
 
+import os as _os
+
 from libc.stddef cimport size_t
 from libc.math cimport isfinite, isnan, log
 from libc.stdint cimport (
@@ -7901,6 +7903,8 @@ def _seal_profile_selection_continuation_bound(
             expected_tail_fingerprint = compact_tail_fingerprint(
                 pipeline._pli
             )
+    if _os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP") == "cpu_rescore":
+        expected_tail_fingerprint = 0
     frequency_bytes = <size_t> pipeline.background._bg.abc.K * sizeof(float)
     if (
         background_view.shape[0] != frequency_bytes + sizeof(float)
