@@ -463,8 +463,10 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
         tjb[profile_descriptor.tjb_offset + sequence]) +
       static_cast<unsigned>(profile_descriptor.profile.tbm) +
       static_cast<unsigned>(profile_descriptor.profile.tec);
-    if (static_cast<unsigned>(profile_descriptor.profile.base) <
-        transition_total) {
+    const bool force_retain =
+      static_cast<unsigned>(profile_descriptor.profile.base) <
+      transition_total;
+    if (force_retain && raw_xe == nullptr) {
       if (threadIdx.x == 0) {
         const size_t word = profile * words_per_profile + sequence / 32;
         atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
@@ -490,7 +492,8 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
     if (threadIdx.x == 0) {
       if (raw_xe != nullptr)
         raw_xe[profile * sequence_count + sequence] = result.xE;
-      if (f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
+      if (force_retain ||
+          f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
         const size_t word = profile * words_per_profile + sequence / 32;
         atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
       }
@@ -2830,7 +2833,6 @@ sequence_batch_f1_mask_many_impl(
   size_t maximum_quartet_score_words = 0;
   std::vector<ProfilePackedQuartet> profile_quartets;
   std::vector<uint32_t> scalar_profile_indices;
-  std::vector<uint8_t> maximum_tjb_by_row;
   int current_device;
   int maximum_grid_x;
   int maximum_grid_y;
@@ -3089,15 +3091,6 @@ sequence_batch_f1_mask_many_impl(
       batch->length_class_count <= batch->sequence_count / 2)) &&
     batch->execution_policy_mode != PLAN7_GPU_EXECUTION_POLICY_SIMPLE;
   host_tjb_count = use_length_classes ? compact_tjb_count : tjb_count;
-  if (raw_xe_reconstructable) {
-    try {
-      maximum_tjb_by_row.assign(unique_tjb_rows, 0);
-    } catch (...) {
-      set_error(error, error_size,
-                "F1 transition maximum allocation failed");
-      return -1;
-    }
-  }
   if (host_tjb_count > batch->host_tjb_capacity) {
     void *replacement = realloc(batch->host_tjb, host_tjb_count);
     if (replacement == nullptr) {
@@ -3129,34 +3122,12 @@ sequence_batch_f1_mask_many_impl(
           profiles[profile].scale,
           batch->host_length_class_log_terms[length_class]);
         batch->host_tjb[compact_row + length_class] = value;
-        if (raw_xe_reconstructable)
-          maximum_tjb_by_row[row_offset / batch->sequence_count] = std::max(
-            maximum_tjb_by_row[row_offset / batch->sequence_count], value);
       }
     } else {
       for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence) {
         const uint8_t value = compute_tjb_from_log_term(
           profiles[profile].scale, batch->host_tjb_log_terms[sequence]);
         batch->host_tjb[row_offset + sequence] = value;
-        if (raw_xe_reconstructable)
-          maximum_tjb_by_row[row_offset / batch->sequence_count] = std::max(
-            maximum_tjb_by_row[row_offset / batch->sequence_count], value);
-      }
-    }
-  }
-  if (raw_xe_reconstructable) {
-    for (size_t profile = 0; profile < profile_count; ++profile) {
-      const plan7_ssv_f1_profile &f1_profile =
-        batch->host_f1_profiles[profile];
-      const size_t row = static_cast<size_t>(f1_profile.tjb_offset) /
-                         batch->sequence_count;
-      const unsigned transition_total =
-        static_cast<unsigned>(maximum_tjb_by_row[row]) +
-        static_cast<unsigned>(f1_profile.profile.tbm) +
-        static_cast<unsigned>(f1_profile.profile.tec);
-      if (static_cast<unsigned>(f1_profile.profile.base) < transition_total) {
-        raw_xe_reconstructable = false;
-        break;
       }
     }
   }
