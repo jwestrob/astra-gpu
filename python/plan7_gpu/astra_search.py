@@ -11,10 +11,10 @@ wants this function to build the candidate rows.  Passing a precomputed
 :class:`~plan7_gpu.adapter.CandidateBatch` avoids filtering twice; its bound
 profile identities and F1 threshold are checked before any CPU search starts.
 Parallel searches use small contiguous row chunks and one exclusively owned,
-exact-base PyHMMER ``Pipeline`` per worker thread. The retained scheduler has a
-strict two-chunks-per-worker window. An experimental completion-driven mode
-adds one equally bounded reorder window, refills on any completed task, and
-still yields or raises strictly in canonical task order.
+exact-base PyHMMER ``Pipeline`` per worker thread. The retained scheduler
+refills on any completed cost-balanced task through one bounded reorder window,
+while still yielding or raising strictly in canonical task order. The prior
+oldest-completion/fixed-row policy remains forceable for audit and rollback.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ _scheduler_statistics: dict[str, Any] = {
 
 
 def _continuation_scheduler_mode() -> str:
-    mode = os.environ.get(_CONTINUATION_SCHEDULER_ENV, _SCHEDULER_OLDEST)
+    mode = os.environ.get(_CONTINUATION_SCHEDULER_ENV, _SCHEDULER_COMPLETION)
     if mode not in (_SCHEDULER_OLDEST, _SCHEDULER_COMPLETION):
         raise ValueError(
             f"{_CONTINUATION_SCHEDULER_ENV} must be "
@@ -82,7 +82,7 @@ def _continuation_scheduler_mode() -> str:
 
 def _continuation_task_policy() -> str:
     policy = os.environ.get(
-        _CONTINUATION_TASK_POLICY_ENV, _TASK_POLICY_FIXED
+        _CONTINUATION_TASK_POLICY_ENV, _TASK_POLICY_BALANCED
     )
     if policy not in (_TASK_POLICY_FIXED, _TASK_POLICY_BALANCED):
         raise ValueError(

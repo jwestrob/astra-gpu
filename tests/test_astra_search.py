@@ -465,6 +465,13 @@ class AstraSearchTests(unittest.TestCase):
                 "plan7_gpu.astra_search.ThreadPoolExecutor",
                 new=ObservedExecutor,
             ),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLAN7_GPU_CONTINUATION_SCHEDULER": "oldest",
+                    "PLAN7_GPU_CONTINUATION_TASK_POLICY": "fixed",
+                },
+            ),
             mock.patch.object(CandidateBatch, "search", new=observed_search),
         ):
             consumer = threading.Thread(target=consume, name="astra-test-consumer")
@@ -512,6 +519,17 @@ class AstraSearchTests(unittest.TestCase):
         self.assertTrue(any(count > 1 for count in pipeline_calls.values()))
         for expected_hits, actual_hits in zip(expected, actual, strict=True):
             self.assert_exact_hits(expected_hits, actual_hits)
+
+    def test_retained_scheduler_defaults_to_completion_and_balanced(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                astra_search_module._continuation_scheduler_mode(),
+                "completion",
+            )
+            self.assertEqual(
+                astra_search_module._continuation_task_policy(),
+                "balanced",
+            )
 
     def test_completion_scheduler_refills_behind_blocked_oldest_task(self):
         pairs = self.pairs * 5
@@ -640,14 +658,14 @@ class AstraSearchTests(unittest.TestCase):
         searched_rows = []
         lock = threading.Lock()
 
-        def observed_search(candidate_batch, row, pipeline):
+        def observed_search(candidate_batch, row, pipeline, **kwargs):
             with lock:
                 searched_rows.append(row)
             if row in blocked_rows_started:
                 blocked_rows_started[row].set()
                 if not release_workers.wait(10):
                     raise RuntimeError("test did not release worker")
-            return original_search(candidate_batch, row, pipeline)
+            return original_search(candidate_batch, row, pipeline, **kwargs)
 
         with mock.patch.object(CandidateBatch, "search", new=observed_search):
             iterator = hmmsearch(pairs, candidates, cpus=2)
