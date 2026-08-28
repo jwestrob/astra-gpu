@@ -19,5 +19,15 @@ records and CSR offsets were byte-identical.  Warm medians were approximately
 to 14.88 ms (3.01x).  The path loses for one/few very sparse profiles, so any
 future policy must retain the existing candidate-major fallback.
 
-Retain/reject decision: keep isolated pending a representative H200 exact and
-stage-timing gate.  Do not enable production dispatch from this evidence alone.
+The focused H200 oracle reproduced every output byte. At the realistic
+384-profile/1,000-target density (14.985 candidates per target), the retained
+kernel took 0.617520 ms and sequence-major execution including grouping took
+0.602896 ms: only 1.024x faster. A forced all-pass 384x1,000 case improved
+2.311696 -> 1.643552 ms (1.407x), while the dense 384x16 small case regressed
+0.411520 -> 0.837120 ms (0.492x). One-, 16-, and 64-profile realistic cases
+were effectively flat.
+
+Retain/reject decision: reject production integration. The exact experiment
+remains isolated, but realistic H200 density does not clear the 5% stage gate
+and the small dense case regresses substantially. Revisit only with a new
+mapping that removes that measured loss.
