@@ -196,6 +196,12 @@ typedef struct plan7_postfilter_workspace_statistics {
   uint64_t full_msv_packed_group_count;
   uint64_t full_msv_packed_candidate_count;
   uint64_t full_msv_scalar_candidate_count;
+  uint64_t vit_length_cache_run_count;
+  uint64_t vit_length_cache_entry_count;
+  uint64_t vit_length_cache_candidate_count;
+  uint64_t vit_length_direct_candidate_count;
+  uint64_t vit_length_cache_build_ns;
+  uint64_t vit_length_candidate_plan_ns;
   uint64_t capacity_bytes[PLAN7_POSTFILTER_CAPACITY_COUNT];
 } plan7_postfilter_workspace_statistics;
 

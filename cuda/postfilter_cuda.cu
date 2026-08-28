@@ -1607,6 +1607,7 @@ struct plan7_postfilter_workspace {
   std::vector<uint32_t> host_msv_candidate_indices;
   std::vector<uint32_t> host_msv_execution_indices;
   std::vector<uint32_t> host_msv_length_to_class;
+  std::vector<uint32_t> host_msv_class_lengths;
   std::vector<std::vector<uint32_t>> host_msv_length_buckets;
   std::vector<uint32_t> host_msv_touched_length_classes;
   const uint64_t *host_msv_length_source;
@@ -1647,6 +1648,13 @@ struct plan7_postfilter_workspace {
   uint64_t full_msv_packed_group_count;
   uint64_t full_msv_packed_candidate_count;
   uint64_t full_msv_scalar_candidate_count;
+  uint64_t vit_length_cache_run_count;
+  uint64_t vit_length_cache_entry_count;
+  uint64_t vit_length_cache_candidate_count;
+  uint64_t vit_length_direct_candidate_count;
+  uint64_t vit_length_cache_build_ns;
+  uint64_t vit_length_candidate_plan_ns;
+  std::vector<VitLengthTransitions> host_length_transition_table;
   const plan7_bias_candidate *resident_device_candidates;
   const plan7_bias_candidate *resident_host_candidates;
   const plan7_postfilter_result *resident_host_results;
@@ -1670,6 +1678,52 @@ const std::vector<VitProfile> &database_host_profiles(
   return database->sealed_pack != nullptr
       ? database->sealed_pack->vit_profiles
       : database->host_profiles;
+}
+
+bool prepare_target_length_classes(plan7_postfilter_workspace *workspace,
+                                   const uint64_t *lengths,
+                                   size_t sequence_count,
+                                   char *error, size_t error_size) {
+  if (workspace->host_msv_length_source == lengths &&
+      workspace->host_msv_length_source_count == sequence_count &&
+      (sequence_count == 0 ||
+       !workspace->host_msv_class_lengths.empty()))
+    return true;
+  try {
+    workspace->host_msv_length_to_class.assign(
+        kMaximumTargetLength + 1, UINT32_MAX);
+    workspace->host_msv_class_lengths.clear();
+    workspace->host_msv_length_buckets.clear();
+    for (size_t sequence = 0; sequence < sequence_count; ++sequence) {
+      const uint64_t length = lengths[sequence];
+      if (length > kMaximumTargetLength) {
+        set_error(error, error_size,
+                  "post-filter target length is invalid");
+        return false;
+      }
+      uint32_t &length_class =
+          workspace->host_msv_length_to_class[length];
+      if (length_class == UINT32_MAX) {
+        if (workspace->host_msv_class_lengths.size() >= UINT32_MAX) {
+          set_error(error, error_size,
+                    "post-filter length-class count overflow");
+          return false;
+        }
+        length_class = static_cast<uint32_t>(
+            workspace->host_msv_class_lengths.size());
+        workspace->host_msv_class_lengths.push_back(
+            static_cast<uint32_t>(length));
+        workspace->host_msv_length_buckets.emplace_back();
+      }
+    }
+    workspace->host_msv_length_source = lengths;
+    workspace->host_msv_length_source_count = sequence_count;
+  } catch (...) {
+    set_error(error, error_size,
+              "post-filter length-class allocation failed");
+    return false;
+  }
+  return true;
 }
 
 const std::vector<uint8_t> &database_host_ssv_scores(
@@ -2578,6 +2632,18 @@ extern "C" int plan7_postfilter_workspace_get_statistics(
       workspace->full_msv_packed_candidate_count;
   statistics->full_msv_scalar_candidate_count =
       workspace->full_msv_scalar_candidate_count;
+  statistics->vit_length_cache_run_count =
+      workspace->vit_length_cache_run_count;
+  statistics->vit_length_cache_entry_count =
+      workspace->vit_length_cache_entry_count;
+  statistics->vit_length_cache_candidate_count =
+      workspace->vit_length_cache_candidate_count;
+  statistics->vit_length_direct_candidate_count =
+      workspace->vit_length_direct_candidate_count;
+  statistics->vit_length_cache_build_ns =
+      workspace->vit_length_cache_build_ns;
+  statistics->vit_length_candidate_plan_ns =
+      workspace->vit_length_candidate_plan_ns;
   const size_t capacities[PLAN7_POSTFILTER_CAPACITY_COUNT] = {
       workspace->states_capacity,
       workspace->bias_inputs_capacity,
@@ -2757,9 +2823,82 @@ int postfilter_candidates_device_with_workspace_impl(
   std::vector<VitLengthTransitions> &host_moves = workspace->host_moves;
   std::vector<size_t> &msv_tiles = workspace->msv_tiles;
   std::vector<size_t> &vit_tiles = workspace->vit_tiles;
+  const auto &profiles = database_host_profiles(database);
+  const char *vit_length_policy =
+      std::getenv("PLAN7_GPU_VIT_LENGTH_CACHE");
+  const bool vit_length_cache_requested =
+      vit_length_policy != nullptr &&
+      std::strcmp(vit_length_policy, "0") != 0;
+  const bool vit_length_cache_audit =
+      vit_length_policy != nullptr &&
+      std::strcmp(vit_length_policy, "audit") == 0;
+  const bool vit_length_cache_force =
+      vit_length_cache_audit ||
+      (vit_length_policy != nullptr &&
+       std::strcmp(vit_length_policy, "force") == 0);
+  size_t vit_length_table_entries = 0;
+  bool use_vit_length_cache = false;
+  if (vit_length_cache_requested) {
+    if (!prepare_target_length_classes(
+            workspace, host_sequence_lengths, sequence_count,
+            error, error_size))
+      return -1;
+    const size_t length_class_count =
+        workspace->host_msv_class_lengths.size();
+    if (profiles.size() != 0 &&
+        length_class_count > SIZE_MAX / profiles.size()) {
+      set_error(error, error_size,
+                "Viterbi length-transition table size overflow");
+      return -1;
+    }
+    vit_length_table_entries = profiles.size() *
+        workspace->host_msv_class_lengths.size();
+    use_vit_length_cache = vit_length_cache_force ||
+        vit_length_table_entries < candidate_count;
+  }
+  if (use_vit_length_cache) {
+    const auto cache_started = std::chrono::steady_clock::now();
+    try {
+      workspace->host_length_transition_table.resize(
+          vit_length_table_entries);
+      const size_t length_class_count =
+          workspace->host_msv_class_lengths.size();
+      for (size_t profile_index = 0; profile_index < profiles.size();
+           ++profile_index) {
+        for (size_t length_class = 0;
+             length_class < length_class_count; ++length_class) {
+          workspace->host_length_transition_table[
+              profile_index * length_class_count + length_class] =
+              length_transitions_for(
+                  profiles[profile_index],
+                  static_cast<int>(
+                      workspace->host_msv_class_lengths[length_class]));
+        }
+      }
+    } catch (...) {
+      set_error(error, error_size,
+                "Viterbi length-transition cache allocation failed");
+      return -1;
+    }
+    const auto cache_elapsed = std::chrono::duration_cast<
+        std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - cache_started).count();
+    ++workspace->vit_length_cache_run_count;
+    saturating_counter_add(vit_length_table_entries,
+                           &workspace->vit_length_cache_entry_count);
+    saturating_counter_add(candidate_count,
+                           &workspace->vit_length_cache_candidate_count);
+    saturating_counter_add(
+        cache_elapsed < 0 ? 0 : static_cast<uint64_t>(cache_elapsed),
+        &workspace->vit_length_cache_build_ns);
+  } else if (vit_length_cache_requested) {
+    saturating_counter_add(candidate_count,
+                           &workspace->vit_length_direct_candidate_count);
+  }
   uint64_t maximum_msv_bytes = 0;
   uint64_t maximum_vit_cells = 0;
   constexpr uint64_t kVitCellLimit = kDpByteLimit / sizeof(int16_t);
+  const auto candidate_plan_started = std::chrono::steady_clock::now();
   try {
     if (compact_full_msv) {
       host_msv_offsets.clear();
@@ -2776,7 +2915,6 @@ int postfilter_candidates_device_with_workspace_impl(
     vit_tiles.push_back(0);
     for (size_t c = 0; c < candidate_count; ++c) {
       const plan7_bias_candidate mapping = host_candidates[c];
-      const auto &profiles = database_host_profiles(database);
       if (mapping.profile_index >= profiles.size() ||
           mapping.sequence_index >= sequence_count ||
           host_sequence_lengths[mapping.sequence_index] > 100000) {
@@ -2786,7 +2924,34 @@ int postfilter_candidates_device_with_workspace_impl(
       const VitProfile &profile = profiles[mapping.profile_index];
       const int length = static_cast<int>(
           host_sequence_lengths[mapping.sequence_index]);
-      host_moves[c] = length_transitions_for(profile, length);
+      if (use_vit_length_cache) {
+        const uint32_t length_class =
+            workspace->host_msv_length_to_class[
+                static_cast<size_t>(length)];
+        const size_t length_class_count =
+            workspace->host_msv_class_lengths.size();
+        if (length_class >= length_class_count) {
+          set_error(error, error_size,
+                    "Viterbi length-transition class is invalid");
+          return -1;
+        }
+        host_moves[c] = workspace->host_length_transition_table[
+            static_cast<size_t>(mapping.profile_index) *
+                length_class_count + length_class];
+        if (vit_length_cache_audit) {
+          const VitLengthTransitions reference =
+              length_transitions_for(profile, length);
+          if (reference.n_move != host_moves[c].n_move ||
+              reference.j_move != host_moves[c].j_move ||
+              reference.c_move != host_moves[c].c_move) {
+            set_error(error, error_size,
+                      "Viterbi length-transition cache mismatch");
+            return -1;
+          }
+        }
+      } else {
+        host_moves[c] = length_transitions_for(profile, length);
+      }
       const uint64_t msv_cells =
           static_cast<uint64_t>(profile.q) * kWarpSize;
       const uint64_t vit_cells = msv_cells * 3;
@@ -2828,6 +2993,14 @@ int postfilter_candidates_device_with_workspace_impl(
   } catch (...) {
     set_error(error, error_size, "post-filter host workspace allocation failed");
     return -1;
+  }
+  if (vit_length_cache_requested) {
+    const auto plan_elapsed = std::chrono::duration_cast<
+        std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - candidate_plan_started).count();
+    saturating_counter_add(
+        plan_elapsed < 0 ? 0 : static_cast<uint64_t>(plan_elapsed),
+        &workspace->vit_length_candidate_plan_ns);
   }
   const uint64_t maximum_vit_bytes = maximum_vit_cells * sizeof(int16_t);
   if (maximum_msv_bytes > kDpByteLimit ||
@@ -2969,40 +3142,10 @@ int postfilter_candidates_device_with_workspace_impl(
     saturating_counter_add(candidate_count,
                            &workspace->full_msv_compaction_source_count);
     if (allow_packed_full_msv &&
-        (workspace->host_msv_length_source != host_sequence_lengths ||
-         workspace->host_msv_length_source_count != sequence_count)) {
-      try {
-        workspace->host_msv_length_to_class.assign(
-            kMaximumTargetLength + 1, UINT32_MAX);
-        workspace->host_msv_length_buckets.clear();
-        for (size_t sequence = 0; sequence < sequence_count; ++sequence) {
-          const uint64_t length = host_sequence_lengths[sequence];
-          if (length > kMaximumTargetLength) {
-            set_error(error, error_size,
-                      "packed full-MSV target length is invalid");
-            return -1;
-          }
-          uint32_t &length_class =
-              workspace->host_msv_length_to_class[length];
-          if (length_class == UINT32_MAX) {
-            if (workspace->host_msv_length_buckets.size() >= UINT32_MAX) {
-              set_error(error, error_size,
-                        "packed full-MSV length-class count overflow");
-              return -1;
-            }
-            length_class = static_cast<uint32_t>(
-                workspace->host_msv_length_buckets.size());
-            workspace->host_msv_length_buckets.emplace_back();
-          }
-        }
-        workspace->host_msv_length_source = host_sequence_lengths;
-        workspace->host_msv_length_source_count = sequence_count;
-      } catch (...) {
-        set_error(error, error_size,
-                  "packed full-MSV length-class allocation failed");
-        return -1;
-      }
-    }
+        !prepare_target_length_classes(
+            workspace, host_sequence_lengths, sequence_count,
+            error, error_size))
+      return -1;
     for (size_t source_begin = 0; source_begin < candidate_count;) {
       const size_t source_count = std::min(
           kFullMsvCompactSourceChunk, candidate_count - source_begin);

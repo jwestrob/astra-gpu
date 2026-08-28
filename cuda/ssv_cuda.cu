@@ -2384,6 +2384,18 @@ plan7_ssv_sequence_batch_get_workspace_statistics(
       postfilter.full_msv_packed_candidate_count;
     statistics->full_msv_scalar_candidate_count =
       postfilter.full_msv_scalar_candidate_count;
+    statistics->vit_length_cache_run_count =
+      postfilter.vit_length_cache_run_count;
+    statistics->vit_length_cache_entry_count =
+      postfilter.vit_length_cache_entry_count;
+    statistics->vit_length_cache_candidate_count =
+      postfilter.vit_length_cache_candidate_count;
+    statistics->vit_length_direct_candidate_count =
+      postfilter.vit_length_direct_candidate_count;
+    statistics->vit_length_cache_build_ns =
+      postfilter.vit_length_cache_build_ns;
+    statistics->vit_length_candidate_plan_ns =
+      postfilter.vit_length_candidate_plan_ns;
   }
   if (batch->forward_workspace != nullptr) {
     plan7_forward_workspace_statistics forward{};
