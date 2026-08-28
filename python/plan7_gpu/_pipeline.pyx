@@ -11079,8 +11079,11 @@ cdef int _search_loop_continuation_journal_v3(
     _pipeline_from_filter_forward_compact_domains_f compact_domains_seam,
     uint64_t *compact_rebased_offsets,
     _compact_consumption_statistics *statistics,
+    uint64_t local_begin,
+    uint64_t local_stop,
+    bint apply_terminal_certificate,
 ) except 1 nogil:
-    """Consume one validated v3 profile partition without dense-row replay."""
+    """Consume one validated v3 profile exception range without dense replay."""
     cdef const uint8_t *base = <const uint8_t *> journal
     cdef const plan7_continuation_journal_v3_certificate *certificates = (
         <const plan7_continuation_journal_v3_certificate *> (
@@ -11136,6 +11139,9 @@ cdef int _search_loop_continuation_journal_v3(
     cdef bint used_simple_regions_seam
     cdef bint used_compact_domains_seam
 
+    if local_begin > local_stop or local_stop > profile_record.exception_count:
+        raise IndexError("journal v3 exception range is invalid")
+
     if statistics != NULL:
         statistics.target_count = n_targets
         statistics.postfilter_record_count = (
@@ -11151,7 +11157,7 @@ cdef int _search_loop_continuation_journal_v3(
     elif status != eslOK:
         raise UnexpectedError(status, "p7_pli_NewModel")
 
-    for local_index in range(profile_record.exception_count):
+    for local_index in range(local_begin, local_stop):
         certificate = &certificates[
             profile_record.certificate_begin + local_index
         ]
@@ -11163,7 +11169,7 @@ cdef int _search_loop_continuation_journal_v3(
 
         # The dense loop reuses once for an omitted prefix before its first
         # retained row. Later gaps follow a reuse of the preceding exception.
-        if local_index == 0 and certificate.target_delta != 0:
+        if local_index == local_begin and certificate.target_delta != 0:
             p7_pipeline_Reuse(pli)
 
         exception = &exceptions[
@@ -11405,30 +11411,31 @@ cdef int _search_loop_continuation_journal_v3(
             raise UnexpectedError(status, "p7_Pipeline")
         p7_pipeline_Reuse(pli)
 
-    certificate = &certificates[
-        profile_record.certificate_begin + profile_record.exception_count
-    ]
-    _v3_apply_certificate_accounting(pli, certificate)
-    if statistics != NULL:
-        statistics.definite_reject_count += certificate.raw_f1_reject_count
+    if apply_terminal_certificate:
+        certificate = &certificates[
+            profile_record.certificate_begin + profile_record.exception_count
+        ]
+        _v3_apply_certificate_accounting(pli, certificate)
+        if statistics != NULL:
+            statistics.definite_reject_count += certificate.raw_f1_reject_count
 
-    if (
-        n_targets != 0
-        and (
-            profile_record.exception_count == 0
-            or exceptions[
-                profile_record.exception_begin
-                + profile_record.exception_count - 1
-            ].sequence_index != n_targets - 1
-        )
-    ):
-        status = p7_bg_SetLength(bg, sq[n_targets - 1].n)
-        if status != eslOK:
-            raise UnexpectedError(status, "p7_bg_SetLength")
-        status = p7_oprofile_ReconfigLength(om, sq[n_targets - 1].n)
-        if status != eslOK:
-            raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
-        p7_pipeline_Reuse(pli)
+        if (
+            n_targets != 0
+            and (
+                profile_record.exception_count == 0
+                or exceptions[
+                    profile_record.exception_begin
+                    + profile_record.exception_count - 1
+                ].sequence_index != n_targets - 1
+            )
+        ):
+            status = p7_bg_SetLength(bg, sq[n_targets - 1].n)
+            if status != eslOK:
+                raise UnexpectedError(status, "p7_bg_SetLength")
+            status = p7_oprofile_ReconfigLength(om, sq[n_targets - 1].n)
+            if status != eslOK:
+                raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
+            p7_pipeline_Reuse(pli)
     return 0
 
 
@@ -11712,10 +11719,13 @@ cdef void _v3_preflight_live_pipeline_row(
     )
 
 
-cdef TopHits _v3_sparse_profile_preallocated(
+cdef TopHits _v3_sparse_profile_range_preallocated(
     const plan7_continuation_journal_v3 *journal,
     _SealedPostfilterBatch sealed,
     size_t profile_index,
+    uint64_t local_begin,
+    uint64_t local_stop,
+    bint apply_terminal_certificate,
     Pipeline pipeline,
     HMM query,
     OptimizedProfile optimized_profile,
@@ -11747,12 +11757,48 @@ cdef TopHits _v3_sparse_profile_preallocated(
             sealed._compact_domains_seam,
             compact_rebased_offsets,
             statistics,
+            local_begin,
+            local_stop,
+            apply_terminal_certificate,
         )
         hits._sort_by_key()
         hits._threshold(pipeline)
     hits._query = query
     hits._empty = False
     return hits
+
+
+cdef TopHits _v3_sparse_profile_preallocated(
+    const plan7_continuation_journal_v3 *journal,
+    _SealedPostfilterBatch sealed,
+    size_t profile_index,
+    Pipeline pipeline,
+    HMM query,
+    OptimizedProfile optimized_profile,
+    TopHits hits,
+    uint64_t *compact_rebased_offsets,
+    _compact_consumption_statistics *statistics,
+):
+    cdef const uint8_t *base = <const uint8_t *> journal
+    cdef const plan7_continuation_journal_v3_profile *profiles = (
+        <const plan7_continuation_journal_v3_profile *> (
+            base + journal.profiles_offset
+        )
+    )
+    return _v3_sparse_profile_range_preallocated(
+        journal,
+        sealed,
+        profile_index,
+        0,
+        profiles[profile_index].exception_count,
+        True,
+        pipeline,
+        query,
+        optimized_profile,
+        hits,
+        compact_rebased_offsets,
+        statistics,
+    )
 
 
 cdef void _v3_complete_row_route_statistics(
@@ -12013,6 +12059,117 @@ def _search_hmm_sealed_sparse_journal_v3_bound(
             sealed._telemetry_session_id,
             sealed._telemetry_selection_id,
             sealed._telemetry_batch_generation,
+        )
+    finally:
+        free(compact_rebased_offsets)
+
+
+def _search_hmm_sealed_sparse_journal_v3_shard_bound(
+    sealed_object,
+    Py_ssize_t row,
+    Py_ssize_t exception_begin,
+    Py_ssize_t exception_end,
+    Pipeline pipeline,
+):
+    """Search one exception-boundary shard for private parallel merging.
+
+    Each shard owns complete certificate/exception units.  The final shard
+    additionally owns the terminal certificate and final target-length state.
+    This is deliberately restricted to a fresh, deterministically reseeded
+    pipeline so HMMER's stochastic domain traces remain target-independent.
+    """
+    cdef _SealedPostfilterBatch sealed
+    cdef const uint8_t *base
+    cdef const plan7_continuation_journal_v3_profile *profiles
+    cdef const plan7_continuation_journal_v3_exception *exceptions
+    cdef const plan7_continuation_journal_v3_profile *profile
+    cdef const plan7_continuation_journal_v3_exception *exception
+    cdef HMM query
+    cdef OptimizedProfile optimized_profile
+    cdef TopHits hits
+    cdef uint64_t *compact_rebased_offsets = NULL
+    cdef uint64_t scratch_count = 1
+    cdef uint64_t local_index
+    cdef bint apply_terminal_certificate
+
+    if type(sealed_object) is not _SealedPostfilterBatch:
+        raise TypeError("sealed batch has the wrong extension type")
+    sealed = <_SealedPostfilterBatch> sealed_object
+    if not sealed._ready:
+        raise TypeError("sealed batch was not created by the provenance adapter")
+    if sealed._journal_v3 == NULL:
+        raise TypeError("sealed batch has no sparse journal v3")
+    if row < 0 or row >= len(sealed._queries):
+        raise IndexError("sealed post-filter row out of range")
+    if type(pipeline) is not _pyhmmer.plan7.Pipeline:
+        raise TypeError("pipeline must be exactly pyhmmer.plan7.Pipeline")
+    if not pipeline._pli.do_reseeding:
+        raise ValueError("journal v3 sharding requires deterministic reseeding")
+    if (
+        pipeline._pli.nmodels != 0
+        or pipeline._pli.nseqs != 0
+        or pipeline._pli.nres != 0
+        or pipeline._pli.nnodes != 0
+        or pipeline._pli.n_past_msv != 0
+        or pipeline._pli.n_past_bias != 0
+        or pipeline._pli.n_past_vit != 0
+        or pipeline._pli.n_past_fwd != 0
+    ):
+        raise ValueError("journal v3 sharding requires a fresh pipeline")
+
+    base = <const uint8_t *> sealed._journal_v3
+    profiles = <const plan7_continuation_journal_v3_profile *> (
+        base + sealed._journal_v3.profiles_offset
+    )
+    exceptions = <const plan7_continuation_journal_v3_exception *> (
+        base + sealed._journal_v3.exceptions_offset
+    )
+    profile = &profiles[row]
+    if (
+        exception_begin < 0
+        or exception_end <= exception_begin
+        or <uint64_t> exception_end > profile.exception_count
+    ):
+        raise IndexError("journal v3 shard exception range is invalid")
+
+    _v3_preflight_live_pipeline_row(
+        sealed._journal_v3, sealed, pipeline, <size_t> row
+    )
+    query = (<HMM> sealed._queries[row]).copy()
+    optimized_profile = <OptimizedProfile> sealed._optimized_profiles[row]
+    hits = TopHits(query)
+    for local_index in range(
+        <uint64_t> exception_begin, <uint64_t> exception_end
+    ):
+        exception = &exceptions[profile.exception_begin + local_index]
+        if exception.compact_result_count >= scratch_count:
+            if exception.compact_result_count == <uint64_t> (<size_t> -1):
+                raise OverflowError("journal v3 compact scratch size overflows")
+            scratch_count = exception.compact_result_count + 1
+    if scratch_count > <uint64_t> ((<size_t> -1) // sizeof(uint64_t)):
+        raise OverflowError("journal v3 compact scratch size overflows")
+    compact_rebased_offsets = <uint64_t *> malloc(
+        <size_t> scratch_count * sizeof(uint64_t)
+    )
+    if compact_rebased_offsets == NULL:
+        raise MemoryError("journal v3 compact scratch allocation failed")
+    apply_terminal_certificate = (
+        <uint64_t> exception_end == profile.exception_count
+    )
+    try:
+        return _v3_sparse_profile_range_preallocated(
+            sealed._journal_v3,
+            sealed,
+            <size_t> row,
+            <uint64_t> exception_begin,
+            <uint64_t> exception_end,
+            apply_terminal_certificate,
+            pipeline,
+            query,
+            optimized_profile,
+            hits,
+            compact_rebased_offsets,
+            NULL,
         )
     finally:
         free(compact_rebased_offsets)
