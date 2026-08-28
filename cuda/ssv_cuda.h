@@ -125,6 +125,13 @@ typedef struct plan7_ssv_workspace_statistics {
   uint64_t forward_growth_count;
   uint64_t forward_event_create_count;
   uint64_t forward_run_count;
+  uint64_t f1_raw_xe_run_count;
+  uint64_t f1_raw_xe_logical_pair_count;
+  uint64_t f1_raw_xe_sidecar_bytes_written;
+  uint64_t f1_raw_xe_candidate_gather_count;
+  uint64_t f1_candidate_ssv_replay_count;
+  uint64_t f1_candidate_ssv_replay_avoided_count;
+  uint64_t f1_raw_xe_fallback_run_count;
 } plan7_ssv_workspace_statistics;
 
 /* Requested device bytes for amino-profile packers. The Viterbi exact-RBV
@@ -198,7 +205,8 @@ enum plan7_ssv_device_capacity {
   PLAN7_SSV_CAPACITY_F1_SCALAR_PROFILE_INDICES = 43,
   PLAN7_SSV_CAPACITY_LENGTH_CLASS_INDICES = 44,
   PLAN7_SSV_CAPACITY_F1_COMPACT_TJB = 45,
-  PLAN7_SSV_DEVICE_CAPACITY_COUNT = 46
+  PLAN7_SSV_CAPACITY_F1_RAW_XE = 46,
+  PLAN7_SSV_DEVICE_CAPACITY_COUNT = 47
 };
 
 typedef struct plan7_ssv_memory_snapshot {

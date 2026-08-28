@@ -6,6 +6,7 @@ import sys
 import unittest
 from array import array
 from pathlib import Path
+from unittest import mock
 
 import pyhmmer
 
@@ -519,6 +520,47 @@ class CudaBiasTests(unittest.TestCase):
                 filtersc_bits,
                 _pipeline._bias_filter_score_bits(pipeline, profile, sequence),
             )
+
+    def test_raw_xe_compaction_reconstructs_exact_ssv_and_skips_replay(self):
+        background, profiles = load_optimized(HMM_GLOBINS)
+        sequences = digitize(
+            profiles[0].alphabet,
+            ["", "A", "ACDEFGHIKLMNPQRSTVWY", "BJZOUX", "G" * 127],
+        )
+        packed_ssv = _pack_profiles(profiles)
+        packed_bias, m_mu, m_lambda = pack_bias_profiles(
+            background, profiles, 1.0
+        )
+        with mock.patch.dict(
+            "os.environ", {"PLAN7_GPU_F1_RAW_XE": "1"}, clear=False
+        ):
+            with native_batch(sequences) as batch:
+                reconstructed = batch.bias_candidates_many_raw(
+                    *packed_ssv, m_mu, m_lambda, 1.0, packed_bias
+                )
+                statistics = dict(batch.workspace_statistics)
+        with mock.patch.dict(
+            "os.environ", {"PLAN7_GPU_F1_RAW_XE": "0"}, clear=False
+        ):
+            with native_batch(sequences) as batch:
+                replayed = batch.bias_candidates_many_raw(
+                    *packed_ssv, m_mu, m_lambda, 1.0, packed_bias
+                )
+        self.assertEqual(reconstructed, replayed)
+        candidate_count = sum(map(len, reconstructed))
+        self.assertEqual(statistics["f1_raw_xe_run_count"], 1)
+        self.assertEqual(
+            statistics["f1_raw_xe_logical_pair_count"],
+            len(profiles) * len(sequences),
+        )
+        self.assertEqual(
+            statistics["f1_raw_xe_candidate_gather_count"], candidate_count
+        )
+        self.assertEqual(statistics["f1_candidate_ssv_replay_count"], 0)
+        self.assertEqual(
+            statistics["f1_candidate_ssv_replay_avoided_count"],
+            candidate_count,
+        )
 
     def test_real_f1_rows_are_exact_and_keep_all_actions(self):
         background, profiles = load_optimized(HMM_STRIPES)

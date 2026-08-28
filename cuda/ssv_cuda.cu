@@ -62,6 +62,8 @@ struct plan7_ssv_sequence_batch {
   size_t device_length_class_index_capacity;
   uint8_t *device_f1_compact_tjb;
   size_t device_f1_compact_tjb_capacity;
+  uint8_t *device_f1_raw_xe;
+  size_t device_f1_raw_xe_capacity;
   uint8_t *device_tjb;
   size_t device_tjb_capacity;
   plan7_ssv_result *device_results;
@@ -102,6 +104,8 @@ struct plan7_ssv_sequence_batch {
   size_t cached_f1_candidate_count;
   int f1_cache_valid;
   int f1_device_candidates_valid;
+  int f1_raw_xe_valid;
+  int f1_compact_ssv_inputs_valid;
   int bias_length_terms_device_valid;
   int host_float_environment_valid;
   uint64_t input_device_bytes;
@@ -122,6 +126,13 @@ struct plan7_ssv_sequence_batch {
   uint64_t f1_length_dense_h2d_bytes_avoided;
   uint64_t f1_length_dense_materialized_bytes;
   uint64_t execution_policy_f1_run_count;
+  uint64_t f1_raw_xe_run_count;
+  uint64_t f1_raw_xe_logical_pair_count;
+  uint64_t f1_raw_xe_sidecar_bytes_written;
+  uint64_t f1_raw_xe_candidate_gather_count;
+  uint64_t f1_candidate_ssv_replay_count;
+  uint64_t f1_candidate_ssv_replay_avoided_count;
+  uint64_t f1_raw_xe_fallback_run_count;
 };
 
 namespace {
@@ -206,6 +217,48 @@ saturating_signed_subtract(int left, int right)
   return value > INT8_MAX ? INT8_MAX : (value < INT8_MIN ? INT8_MIN : value);
 }
 
+__device__ __forceinline__ plan7_ssv_result
+ssv_result_from_raw_xe(unsigned raw_xE,
+                       uint8_t length_tjb,
+                       uint8_t tbm,
+                       uint8_t tec,
+                       uint8_t base,
+                       uint8_t bias,
+                       bool empty)
+{
+  plan7_ssv_result result = {
+    static_cast<uint8_t>(raw_xE),
+    static_cast<uint8_t>(empty ? PLAN7_SSV_EMPTY : PLAN7_SSV_OK),
+    length_tjb, 0, 0
+  };
+  if (empty) return result;
+  if (static_cast<unsigned>(length_tjb) + tbm + tec + bias >= 127U) {
+    result.status = PLAN7_SSV_ENORESULT;
+  } else if (raw_xE >= 255U - bias) {
+    result.status =
+      static_cast<int>(base) - static_cast<int>(length_tjb) -
+          static_cast<int>(tbm) < 128
+        ? PLAN7_SSV_ENORESULT
+        : PLAN7_SSV_ERANGE;
+  } else {
+    unsigned adjusted = raw_xE + base - length_tjb - tbm;
+    adjusted -= 128U;
+    if (adjusted >= 255U - bias) {
+      result.status = PLAN7_SSV_ERANGE;
+    } else {
+      const unsigned xJ = adjusted - tec;
+      if (xJ > base) {
+        result.status = PLAN7_SSV_ENORESULT;
+      } else {
+        result.numerator = static_cast<int16_t>(
+          static_cast<int>(xJ) - static_cast<int>(length_tjb) -
+          static_cast<int>(base));
+      }
+    }
+  }
+  return result;
+}
+
 template<bool CompactScores>
 __device__ __forceinline__ void
 ssv_filter_block(const uint8_t *scores,
@@ -282,36 +335,8 @@ ssv_filter_block(const uint8_t *scores,
 
   if (threadIdx.x == 0) {
     const unsigned raw_xE = maxima[0];
-    plan7_ssv_result result = {
-      static_cast<uint8_t>(raw_xE), PLAN7_SSV_OK,
-      static_cast<uint8_t>(length_tjb), 0, 0
-    };
-
-    if (length_tjb + tbm + tec + bias >= 127) {
-      result.status = PLAN7_SSV_ENORESULT;
-    } else if (raw_xE >= 255U - bias) {
-      result.status =
-        static_cast<int>(base) - static_cast<int>(length_tjb) -
-            static_cast<int>(tbm) < 128
-          ? PLAN7_SSV_ENORESULT
-          : PLAN7_SSV_ERANGE;
-    } else {
-      unsigned adjusted = raw_xE + base - length_tjb - tbm;
-      adjusted -= 128;
-      if (adjusted >= 255U - bias) {
-        result.status = PLAN7_SSV_ERANGE;
-      } else {
-        const unsigned xJ = adjusted - tec;
-        if (xJ > base) {
-          result.status = PLAN7_SSV_ENORESULT;
-        } else {
-          result.numerator = static_cast<int16_t>(
-            static_cast<int>(xJ) - static_cast<int>(length_tjb) -
-            static_cast<int>(base));
-        }
-      }
-    }
-    *result_out = result;
+    *result_out = ssv_result_from_raw_xe(
+      raw_xE, length_tjb, tbm, tec, base, bias, false);
   }
 }
 
@@ -405,7 +430,8 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
                         const float *null_scores,
                         const uint8_t *tjb,
                         size_t words_per_profile,
-                        uint32_t *candidate_words)
+                        uint32_t *candidate_words,
+                        uint8_t *raw_xe)
 {
   __shared__ unsigned maxima[kThreads];
   __shared__ plan7_ssv_f1_profile profile_descriptor;
@@ -461,10 +487,13 @@ ssv_f1_mask_many_kernel(const uint8_t *packed_scores,
       profile_descriptor.profile.bias,
       &result,
       maxima);
-    if (threadIdx.x == 0 &&
-        f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
-      const size_t word = profile * words_per_profile + sequence / 32;
-      atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+    if (threadIdx.x == 0) {
+      if (raw_xe != nullptr)
+        raw_xe[profile * sequence_count + sequence] = result.xE;
+      if (f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
+        const size_t word = profile * words_per_profile + sequence / 32;
+        atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+      }
     }
     __syncthreads();
   }
@@ -639,33 +668,9 @@ ssv_result_for_local_gain(unsigned gain,
                           const plan7_ssv_profile profile)
 {
   const unsigned raw_xE = 128U + gain;
-  plan7_ssv_result result = {
-    static_cast<uint8_t>(raw_xE), PLAN7_SSV_OK, length_tjb, 0, 0};
-  if (static_cast<unsigned>(length_tjb) + profile.tbm + profile.tec +
-        profile.bias >= 127U) {
-    result.status = PLAN7_SSV_ENORESULT;
-  } else if (raw_xE >= 255U - profile.bias) {
-    result.status =
-      static_cast<int>(profile.base) - static_cast<int>(length_tjb) -
-          static_cast<int>(profile.tbm) < 128
-        ? PLAN7_SSV_ENORESULT : PLAN7_SSV_ERANGE;
-  } else {
-    unsigned adjusted = raw_xE + profile.base - length_tjb - profile.tbm;
-    adjusted -= 128U;
-    if (adjusted >= 255U - profile.bias) {
-      result.status = PLAN7_SSV_ERANGE;
-    } else {
-      const unsigned xJ = adjusted - profile.tec;
-      if (xJ > profile.base) {
-        result.status = PLAN7_SSV_ENORESULT;
-      } else {
-        result.numerator = static_cast<int16_t>(
-          static_cast<int>(xJ) - static_cast<int>(length_tjb) -
-          static_cast<int>(profile.base));
-      }
-    }
-  }
-  return result;
+  return ssv_result_from_raw_xe(
+    raw_xE, length_tjb, profile.tbm, profile.tec, profile.base,
+    profile.bias, false);
 }
 
 /* Return the first pre-wrap integer gain that the exact F1 decision cannot
@@ -947,33 +952,9 @@ ssv_profile_packed_filter_block(
         profiles[profile_index].tjb_offset + sequence];
       const unsigned raw_xE =
         (maxima[0] >> (packed_lane * 8)) & UINT32_C(0xff);
-      plan7_ssv_result result = {
-        static_cast<uint8_t>(raw_xE), PLAN7_SSV_OK, length_tjb, 0, 0};
-      if (static_cast<unsigned>(length_tjb) + profile.tbm + profile.tec +
-            profile.bias >= 127U) {
-        result.status = PLAN7_SSV_ENORESULT;
-      } else if (raw_xE >= 255U - profile.bias) {
-        result.status =
-          static_cast<int>(profile.base) - static_cast<int>(length_tjb) -
-                static_cast<int>(profile.tbm) < 128
-            ? PLAN7_SSV_ENORESULT : PLAN7_SSV_ERANGE;
-      } else {
-        unsigned adjusted = raw_xE + profile.base - length_tjb - profile.tbm;
-        adjusted -= 128;
-        if (adjusted >= 255U - profile.bias) {
-          result.status = PLAN7_SSV_ERANGE;
-        } else {
-          const unsigned xJ = adjusted - profile.tec;
-          if (xJ > profile.base) {
-            result.status = PLAN7_SSV_ENORESULT;
-          } else {
-            result.numerator = static_cast<int16_t>(
-              static_cast<int>(xJ) - static_cast<int>(length_tjb) -
-              static_cast<int>(profile.base));
-          }
-        }
-      }
-      results[packed_lane] = result;
+      results[packed_lane] = ssv_result_from_raw_xe(
+        raw_xE, length_tjb, profile.tbm, profile.tec, profile.base,
+        profile.bias, false);
     }
   }
 }
@@ -989,7 +970,8 @@ ssv_f1_mask_profile_packed_kernel(
   const float *null_scores,
   const uint8_t *tjb,
   size_t words_per_profile,
-  uint32_t *candidate_words)
+  uint32_t *candidate_words,
+  uint8_t *raw_xe)
 {
   __shared__ unsigned maxima[kThreads];
   __shared__ ProfilePackedQuartet quartet;
@@ -1009,6 +991,9 @@ ssv_f1_mask_profile_packed_kernel(
 #pragma unroll
       for (int lane = 0; lane < kProfilesPerPackedWord; ++lane) {
         const uint32_t profile_index = quartet.profile_indices[lane];
+        if (raw_xe != nullptr)
+          raw_xe[static_cast<size_t>(profile_index) * sequence_count +
+                 sequence] = results[lane].xE;
         if (f1_requires_cpu(results[lane], null_scores[sequence],
                             profiles[profile_index])) {
           const size_t word =
@@ -1033,7 +1018,8 @@ ssv_f1_mask_indexed_kernel(const uint8_t *packed_scores,
                            const float *null_scores,
                            const uint8_t *tjb,
                            size_t words_per_profile,
-                           uint32_t *candidate_words)
+                           uint32_t *candidate_words,
+                           uint8_t *raw_xe)
 {
   __shared__ unsigned maxima[kThreads];
   __shared__ plan7_ssv_f1_profile profile_descriptor;
@@ -1069,11 +1055,15 @@ ssv_f1_mask_indexed_kernel(const uint8_t *packed_scores,
       profile_descriptor.profile.tbm, profile_descriptor.profile.tec,
       profile_descriptor.profile.base, profile_descriptor.profile.bias,
       &result, maxima);
-    if (threadIdx.x == 0 &&
-        f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
-      const size_t word =
-        static_cast<size_t>(profile_index) * words_per_profile + sequence / 32;
-      atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+    if (threadIdx.x == 0) {
+      if (raw_xe != nullptr)
+        raw_xe[static_cast<size_t>(profile_index) * sequence_count +
+               sequence] = result.xE;
+      if (f1_requires_cpu(result, null_scores[sequence], profile_descriptor)) {
+        const size_t word = static_cast<size_t>(profile_index) *
+                            words_per_profile + sequence / 32;
+        atomicOr(&candidate_words[word], UINT32_C(1) << (sequence % 32));
+      }
     }
     __syncthreads();
   }
@@ -1132,7 +1122,13 @@ candidate_scatter_kernel(const uint32_t *candidate_words,
                          const uint64_t *word_offsets,
                          size_t word_count,
                          size_t words_per_profile,
-                         plan7_bias_candidate *candidates)
+                         size_t sequence_count,
+                         const uint8_t *raw_xe,
+                         const plan7_ssv_f1_profile *profiles,
+                         const uint8_t *tjb,
+                         const uint64_t *sequence_offsets,
+                         plan7_bias_candidate *candidates,
+                         plan7_bias_ssv_input *ssv_inputs)
 {
   const size_t word_index = static_cast<size_t>(blockIdx.x) * blockDim.x +
                             threadIdx.x;
@@ -1146,7 +1142,21 @@ candidate_scatter_kernel(const uint32_t *candidate_words,
     (word_index % words_per_profile) * 32);
   while (word != 0) {
     const unsigned bit = static_cast<unsigned>(__ffs(word) - 1);
-    candidates[output++] = {profile, sequence_base + bit};
+    const uint32_t sequence = sequence_base + bit;
+    candidates[output] = {profile, sequence};
+    if (ssv_inputs != nullptr) {
+      const plan7_ssv_f1_profile descriptor = profiles[profile];
+      const uint8_t length_tjb =
+        tjb[descriptor.tjb_offset + sequence];
+      const bool empty = sequence_offsets[sequence] ==
+                         sequence_offsets[sequence + 1];
+      const plan7_ssv_result result = ssv_result_from_raw_xe(
+        raw_xe[static_cast<size_t>(profile) * sequence_count + sequence],
+        length_tjb, descriptor.profile.tbm, descriptor.profile.tec,
+        descriptor.profile.base, descriptor.profile.bias, empty);
+      ssv_inputs[output] = {result.numerator, result.status, 0};
+    }
+    ++output;
     word &= word - 1;
   }
 }
@@ -1504,6 +1514,7 @@ void
 invalidate_f1_device_candidates(plan7_ssv_sequence_batch *batch)
 {
   batch->f1_device_candidates_valid = 0;
+  batch->f1_compact_ssv_inputs_valid = 0;
   batch->cached_f1_candidate_count = 0;
 }
 
@@ -1511,6 +1522,7 @@ void
 invalidate_f1_cache(plan7_ssv_sequence_batch *batch)
 {
   batch->f1_cache_valid = 0;
+  batch->f1_raw_xe_valid = 0;
   invalidate_f1_device_candidates(batch);
 }
 
@@ -1641,6 +1653,7 @@ destroy_sequence_batch(plan7_ssv_sequence_batch *batch,
   CUDA_FREE(batch->device_f1_profile_packed_scores);
   CUDA_FREE(batch->device_f1_profile_packed_quartets);
   CUDA_FREE(batch->device_f1_scalar_profile_indices);
+  CUDA_FREE(batch->device_f1_raw_xe);
   CUDA_FREE(batch->device_candidate_words);
   CUDA_FREE(batch->device_candidate_word_counts);
   CUDA_FREE(batch->device_candidate_word_offsets);
@@ -2305,6 +2318,19 @@ plan7_ssv_sequence_batch_get_workspace_statistics(
     batch->f1_length_dense_h2d_bytes_avoided;
   statistics->f1_length_dense_materialized_bytes =
     batch->f1_length_dense_materialized_bytes;
+  statistics->f1_raw_xe_run_count = batch->f1_raw_xe_run_count;
+  statistics->f1_raw_xe_logical_pair_count =
+    batch->f1_raw_xe_logical_pair_count;
+  statistics->f1_raw_xe_sidecar_bytes_written =
+    batch->f1_raw_xe_sidecar_bytes_written;
+  statistics->f1_raw_xe_candidate_gather_count =
+    batch->f1_raw_xe_candidate_gather_count;
+  statistics->f1_candidate_ssv_replay_count =
+    batch->f1_candidate_ssv_replay_count;
+  statistics->f1_candidate_ssv_replay_avoided_count =
+    batch->f1_candidate_ssv_replay_avoided_count;
+  statistics->f1_raw_xe_fallback_run_count =
+    batch->f1_raw_xe_fallback_run_count;
   if (batch->postfilter_workspace != nullptr) {
     plan7_postfilter_workspace_statistics postfilter{};
     if (plan7_postfilter_workspace_get_statistics(
@@ -2428,6 +2454,8 @@ plan7_ssv_sequence_batch_get_memory_snapshot(
       static_cast<uint64_t>(batch->device_length_class_index_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_F1_COMPACT_TJB] =
       static_cast<uint64_t>(batch->device_f1_compact_tjb_capacity);
+  snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_F1_RAW_XE] =
+      static_cast<uint64_t>(batch->device_f1_raw_xe_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_PROFILES] =
       static_cast<uint64_t>(batch->device_bias_profile_capacity);
   snapshot->device_capacity_bytes[PLAN7_SSV_CAPACITY_BIAS_CANDIDATES] =
@@ -2793,6 +2821,8 @@ sequence_batch_f1_mask_many_impl(
   size_t compact_tjb_count = 0;
   size_t host_tjb_count;
   bool use_length_classes = false;
+  bool raw_xe_reconstructable = false;
+  size_t raw_xe_count = 0;
   size_t packed_score_word_count = 0;
   size_t packed_score_bytes = 0;
   size_t packed_quartet_bytes = 0;
@@ -2800,6 +2830,7 @@ sequence_batch_f1_mask_many_impl(
   size_t maximum_quartet_score_words = 0;
   std::vector<ProfilePackedQuartet> profile_quartets;
   std::vector<uint32_t> scalar_profile_indices;
+  std::vector<uint8_t> maximum_tjb_by_row;
   int current_device;
   int maximum_grid_x;
   int maximum_grid_y;
@@ -2934,6 +2965,20 @@ sequence_batch_f1_mask_many_impl(
     }
     f1_profile->tjb_offset = tjb_offset;
   }
+  const char *raw_xe_policy = getenv("PLAN7_GPU_F1_RAW_XE");
+  raw_xe_reconstructable =
+    raw_xe_policy != nullptr && strcmp(raw_xe_policy, "1") == 0 &&
+    float_environment_valid;
+  if (raw_xe_reconstructable) {
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      const int mode = batch->host_f1_profiles[profile].cutoff_mode;
+      if (mode != PLAN7_F1_CUTOFF_SCORE &&
+          mode != PLAN7_F1_CUTOFF_ALWAYS_REJECT) {
+        raw_xe_reconstructable = false;
+        break;
+      }
+    }
+  }
 
   const char *profile_policy = getenv("PLAN7_GPU_SSV_PROFILE_POLICY");
   const bool profile_packing_enabled =
@@ -3044,6 +3089,15 @@ sequence_batch_f1_mask_many_impl(
       batch->length_class_count <= batch->sequence_count / 2)) &&
     batch->execution_policy_mode != PLAN7_GPU_EXECUTION_POLICY_SIMPLE;
   host_tjb_count = use_length_classes ? compact_tjb_count : tjb_count;
+  if (raw_xe_reconstructable) {
+    try {
+      maximum_tjb_by_row.assign(unique_tjb_rows, 0);
+    } catch (...) {
+      set_error(error, error_size,
+                "F1 transition maximum allocation failed");
+      return -1;
+    }
+  }
   if (host_tjb_count > batch->host_tjb_capacity) {
     void *replacement = realloc(batch->host_tjb, host_tjb_count);
     if (replacement == nullptr) {
@@ -3070,17 +3124,46 @@ sequence_batch_f1_mask_many_impl(
       const size_t compact_row =
         (row_offset / batch->sequence_count) * batch->length_class_count;
       for (size_t length_class = 0;
-           length_class < batch->length_class_count; ++length_class)
-        batch->host_tjb[compact_row + length_class] =
-          compute_tjb_from_log_term(
-            profiles[profile].scale,
-            batch->host_length_class_log_terms[length_class]);
+           length_class < batch->length_class_count; ++length_class) {
+        const uint8_t value = compute_tjb_from_log_term(
+          profiles[profile].scale,
+          batch->host_length_class_log_terms[length_class]);
+        batch->host_tjb[compact_row + length_class] = value;
+        if (raw_xe_reconstructable)
+          maximum_tjb_by_row[row_offset / batch->sequence_count] = std::max(
+            maximum_tjb_by_row[row_offset / batch->sequence_count], value);
+      }
     } else {
-      for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence)
-        batch->host_tjb[row_offset + sequence] =
-          compute_tjb_from_log_term(profiles[profile].scale,
-                                    batch->host_tjb_log_terms[sequence]);
+      for (size_t sequence = 0; sequence < batch->sequence_count; ++sequence) {
+        const uint8_t value = compute_tjb_from_log_term(
+          profiles[profile].scale, batch->host_tjb_log_terms[sequence]);
+        batch->host_tjb[row_offset + sequence] = value;
+        if (raw_xe_reconstructable)
+          maximum_tjb_by_row[row_offset / batch->sequence_count] = std::max(
+            maximum_tjb_by_row[row_offset / batch->sequence_count], value);
+      }
     }
+  }
+  if (raw_xe_reconstructable) {
+    for (size_t profile = 0; profile < profile_count; ++profile) {
+      const plan7_ssv_f1_profile &f1_profile =
+        batch->host_f1_profiles[profile];
+      const size_t row = static_cast<size_t>(f1_profile.tjb_offset) /
+                         batch->sequence_count;
+      const unsigned transition_total =
+        static_cast<unsigned>(maximum_tjb_by_row[row]) +
+        static_cast<unsigned>(f1_profile.profile.tbm) +
+        static_cast<unsigned>(f1_profile.profile.tec);
+      if (static_cast<unsigned>(f1_profile.profile.base) < transition_total) {
+        raw_xe_reconstructable = false;
+        break;
+      }
+    }
+  }
+  if (raw_xe_reconstructable &&
+      !checked_product(profile_count, batch->sequence_count, &raw_xe_count)) {
+    set_error(error, error_size, "F1 raw-xE sidecar size overflow");
+    return -1;
   }
   batch->tjb_cache_valid = 0;
 
@@ -3140,7 +3223,15 @@ sequence_batch_f1_mask_many_impl(
                          "cudaMalloc(fused F1 mask)",
                          "cudaFree(fused F1 mask)",
                          error,
-                         error_size) != 0)
+                         error_size) != 0 ||
+      (raw_xe_reconstructable &&
+       grow_device_buffer(&batch->device_f1_raw_xe,
+                          &batch->device_f1_raw_xe_capacity,
+                          raw_xe_count,
+                          "cudaMalloc(F1 raw-xE sidecar)",
+                          "cudaFree(F1 raw-xE sidecar)",
+                          error,
+                          error_size) != 0))
     return -1;
 
 #define CUDA_TRY_FUSED(call)                                                  \
@@ -3202,7 +3293,8 @@ sequence_batch_f1_mask_many_impl(
       batch->device_scores, batch->device_f1_profiles,
       batch->sequence_count, batch->device_residues, batch->device_offsets,
       batch->device_null_scores, batch->device_tjb, words_per_profile,
-      batch->device_candidate_words);
+      batch->device_candidate_words,
+      raw_xe_reconstructable ? batch->device_f1_raw_xe : nullptr);
     CUDA_TRY_FUSED(cudaGetLastError());
   } else {
     const size_t requested_pack_blocks =
@@ -3225,7 +3317,8 @@ sequence_batch_f1_mask_many_impl(
         batch->device_f1_profiles, batch->sequence_count,
         batch->device_residues, batch->device_offsets,
         batch->device_null_scores, batch->device_tjb, words_per_profile,
-        batch->device_candidate_words);
+        batch->device_candidate_words,
+        raw_xe_reconstructable ? batch->device_f1_raw_xe : nullptr);
     CUDA_TRY_FUSED(cudaGetLastError());
     if (!scalar_profile_indices.empty()) {
       ssv_f1_mask_indexed_kernel<<<
@@ -3236,7 +3329,8 @@ sequence_batch_f1_mask_many_impl(
           batch->device_f1_scalar_profile_indices, batch->sequence_count,
           batch->device_residues, batch->device_offsets,
           batch->device_null_scores, batch->device_tjb, words_per_profile,
-          batch->device_candidate_words);
+          batch->device_candidate_words,
+          raw_xe_reconstructable ? batch->device_f1_raw_xe : nullptr);
       CUDA_TRY_FUSED(cudaGetLastError());
     }
     ++batch->f1_profile_packed_run_count;
@@ -3253,6 +3347,14 @@ sequence_batch_f1_mask_many_impl(
                               cudaMemcpyDeviceToHost));
   batch->cached_f1_profile_count = profile_count;
   batch->f1_cache_valid = 1;
+  batch->f1_raw_xe_valid = raw_xe_reconstructable ? 1 : 0;
+  if (raw_xe_reconstructable) {
+    ++batch->f1_raw_xe_run_count;
+    batch->f1_raw_xe_logical_pair_count += raw_xe_count;
+    batch->f1_raw_xe_sidecar_bytes_written += raw_xe_count;
+  } else {
+    ++batch->f1_raw_xe_fallback_run_count;
+  }
   if (use_length_classes) {
     ++batch->f1_length_class_run_count;
     batch->f1_length_class_value_count += batch->length_class_count;
@@ -3306,6 +3408,7 @@ plan7_ssv_sequence_batch_f1_compact_many(
   size_t word_bytes;
   size_t profile_offset_bytes;
   size_t candidate_bytes;
+  size_t ssv_input_bytes;
   size_t scan_workspace_bytes = 0;
   cudaError_t status;
 
@@ -3358,6 +3461,7 @@ plan7_ssv_sequence_batch_f1_compact_many(
     batch->cached_f1_candidate_count = 0;
     batch->f1_cache_valid = 1;
     batch->f1_device_candidates_valid = 1;
+    batch->f1_compact_ssv_inputs_valid = batch->f1_raw_xe_valid;
     ++batch->f1_device_compaction_run_count;
     return 0;
   }
@@ -3436,7 +3540,9 @@ plan7_ssv_sequence_batch_f1_compact_many(
 
   const size_t candidate_count = batch->host_candidate_offsets[profile_count];
   if (!checked_product(candidate_count, sizeof(plan7_bias_candidate),
-                       &candidate_bytes)) {
+                       &candidate_bytes) ||
+      !checked_product(candidate_count, sizeof(plan7_bias_ssv_input),
+                       &ssv_input_bytes)) {
     set_error(error, error_size, "F1 candidate mapping size overflow");
     return -1;
   }
@@ -3455,7 +3561,14 @@ plan7_ssv_sequence_batch_f1_compact_many(
                          candidate_bytes,
                          "cudaMalloc(compact F1 candidates)",
                          "cudaFree(compact F1 candidates)",
-                         error, error_size) != 0)
+                         error, error_size) != 0 ||
+      (batch->f1_raw_xe_valid &&
+       grow_device_buffer(&batch->device_bias_ssv_inputs,
+                          &batch->device_bias_ssv_input_capacity,
+                          ssv_input_bytes,
+                          "cudaMalloc(compact F1 SSV inputs)",
+                          "cudaFree(compact F1 SSV inputs)",
+                          error, error_size) != 0))
     return -1;
 
   if (candidate_count != 0) {
@@ -3464,7 +3577,13 @@ plan7_ssv_sequence_batch_f1_compact_many(
       batch->device_candidate_word_offsets,
       word_count,
       words_per_profile,
-      batch->device_bias_candidates);
+      batch->sequence_count,
+      batch->f1_raw_xe_valid ? batch->device_f1_raw_xe : nullptr,
+      batch->device_f1_profiles,
+      batch->device_tjb,
+      batch->device_offsets,
+      batch->device_bias_candidates,
+      batch->f1_raw_xe_valid ? batch->device_bias_ssv_inputs : nullptr);
     CUDA_TRY_COMPACT(cudaGetLastError());
     CUDA_TRY_COMPACT(cudaMemcpy(batch->host_bias_candidates,
                                 batch->device_bias_candidates,
@@ -3475,6 +3594,9 @@ plan7_ssv_sequence_batch_f1_compact_many(
   batch->cached_f1_profile_count = profile_count;
   batch->cached_f1_candidate_count = candidate_count;
   batch->f1_device_candidates_valid = 1;
+  batch->f1_compact_ssv_inputs_valid = batch->f1_raw_xe_valid;
+  if (batch->f1_raw_xe_valid)
+    batch->f1_raw_xe_candidate_gather_count += candidate_count;
   ++batch->f1_device_compaction_run_count;
 #undef CUDA_TRY_COMPACT
   return 0;
@@ -4322,17 +4444,23 @@ plan7_ssv_sequence_batch_bias_candidates_many(
     batch->bias_length_terms_device_valid = 1;
   }
 
-  ssv_bias_candidates_kernel<<<static_cast<unsigned>(candidate_count),
-                               kThreads>>>(
-    batch->device_scores,
-    batch->device_f1_profiles,
-    batch->sequence_count,
-    batch->device_residues,
-    batch->device_offsets,
-    batch->device_tjb,
-    batch->device_bias_candidates,
-    batch->device_bias_ssv_inputs);
-  CUDA_TRY_BIAS(cudaGetLastError());
+  if (use_cached_device_candidates &&
+      batch->f1_compact_ssv_inputs_valid) {
+    batch->f1_candidate_ssv_replay_avoided_count += candidate_count;
+  } else {
+    ssv_bias_candidates_kernel<<<static_cast<unsigned>(candidate_count),
+                                 kThreads>>>(
+      batch->device_scores,
+      batch->device_f1_profiles,
+      batch->sequence_count,
+      batch->device_residues,
+      batch->device_offsets,
+      batch->device_tjb,
+      batch->device_bias_candidates,
+      batch->device_bias_ssv_inputs);
+    CUDA_TRY_BIAS(cudaGetLastError());
+    batch->f1_candidate_ssv_replay_count += candidate_count;
+  }
   if (plan7_bias_filter_candidates_device(
         batch->device_residues,
         batch->device_offsets,
@@ -4612,17 +4740,23 @@ sequence_batch_postfilter_candidates_many_impl(
                                    cudaMemcpyHostToDevice));
     batch->bias_length_terms_device_valid = 1;
   }
-  ssv_bias_candidates_kernel<<<static_cast<unsigned>(candidate_count),
-                               kThreads>>>(
-    batch->device_scores,
-    batch->device_f1_profiles,
-    batch->sequence_count,
-    batch->device_residues,
-    batch->device_offsets,
-    batch->device_tjb,
-    batch->device_bias_candidates,
-    batch->device_bias_ssv_inputs);
-  CUDA_TRY_POSTFILTER(cudaGetLastError());
+  if (use_cached_device_candidates &&
+      batch->f1_compact_ssv_inputs_valid) {
+    batch->f1_candidate_ssv_replay_avoided_count += candidate_count;
+  } else {
+    ssv_bias_candidates_kernel<<<static_cast<unsigned>(candidate_count),
+                                 kThreads>>>(
+      batch->device_scores,
+      batch->device_f1_profiles,
+      batch->sequence_count,
+      batch->device_residues,
+      batch->device_offsets,
+      batch->device_tjb,
+      batch->device_bias_candidates,
+      batch->device_bias_ssv_inputs);
+    CUDA_TRY_POSTFILTER(cudaGetLastError());
+    batch->f1_candidate_ssv_replay_count += candidate_count;
+  }
   if (batch->postfilter_workspace == nullptr &&
       plan7_postfilter_workspace_create(
         &batch->postfilter_workspace, error, error_size) != 0)

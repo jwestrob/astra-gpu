@@ -191,6 +191,7 @@ _DEVICE_CAPACITY_NAMES = (
     "f1_scalar_profile_indices",
     "length_class_indices",
     "f1_compact_tjb",
+    "f1_raw_xe",
 )
 
 
@@ -443,6 +444,13 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t forward_growth_count
         uint64_t forward_event_create_count
         uint64_t forward_run_count
+        uint64_t f1_raw_xe_run_count
+        uint64_t f1_raw_xe_logical_pair_count
+        uint64_t f1_raw_xe_sidecar_bytes_written
+        uint64_t f1_raw_xe_candidate_gather_count
+        uint64_t f1_candidate_ssv_replay_count
+        uint64_t f1_candidate_ssv_replay_avoided_count
+        uint64_t f1_raw_xe_fallback_run_count
 
     ctypedef struct plan7_gpu_execution_policy_statistics:
         uint32_t version
@@ -480,7 +488,7 @@ cdef extern from "ssv_cuda.h" nogil:
         uint64_t cuda_free_bytes
         uint64_t cuda_total_bytes
         uint64_t persistent_device_bytes
-        uint64_t device_capacity_bytes[46]
+        uint64_t device_capacity_bytes[47]
 
     ctypedef struct plan7_ssv_f1_candidate_view:
         size_t profile_count
@@ -6001,6 +6009,25 @@ cdef class SequenceBatch:
             ),
             "f1_length_dense_materialized_bytes": (
                 statistics.f1_length_dense_materialized_bytes
+            ),
+            "f1_raw_xe_run_count": statistics.f1_raw_xe_run_count,
+            "f1_raw_xe_logical_pair_count": (
+                statistics.f1_raw_xe_logical_pair_count
+            ),
+            "f1_raw_xe_sidecar_bytes_written": (
+                statistics.f1_raw_xe_sidecar_bytes_written
+            ),
+            "f1_raw_xe_candidate_gather_count": (
+                statistics.f1_raw_xe_candidate_gather_count
+            ),
+            "f1_candidate_ssv_replay_count": (
+                statistics.f1_candidate_ssv_replay_count
+            ),
+            "f1_candidate_ssv_replay_avoided_count": (
+                statistics.f1_candidate_ssv_replay_avoided_count
+            ),
+            "f1_raw_xe_fallback_run_count": (
+                statistics.f1_raw_xe_fallback_run_count
             ),
             "postfilter_device_bytes": statistics.postfilter_device_bytes,
             "postfilter_dp_capacity_bytes": (
