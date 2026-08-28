@@ -261,6 +261,24 @@ int plan7_backward_domain_run_from_forward_output_with_reason_facts(
   char *error,
   size_t error_size);
 
+/* Experimental reverse-ownership seam.  It authenticates the sealed Forward
+ * generation and emits an ordered CPU_REQUIRED domain shell without scanning
+ * or executing Backward trajectories.  The ordinary GPU route remains the
+ * default and this seam is selected only by the private performance policy. */
+int plan7_backward_domain_route_all_cpu_from_forward_output(
+  const plan7_backward_domain_candidate *candidates,
+  size_t candidate_count,
+  const uint64_t *forward_offsets,
+  const plan7_forward_output *forward_output,
+  float rt1,
+  float rt2,
+  float rt3,
+  float guard_band,
+  int collect_reason_facts,
+  plan7_backward_domain_output **output,
+  char *error,
+  size_t error_size);
+
 /* Test-only recurrence seam for synthetic Forward scale fixtures. It never
  * validates provenance or seals output and forces every returned route to
  * CPU_REQUIRED, so its journal cannot be consumed by production code. */

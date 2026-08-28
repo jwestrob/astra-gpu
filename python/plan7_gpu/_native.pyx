@@ -1755,6 +1755,21 @@ cdef extern from "backward_domain_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_backward_domain_route_all_cpu_from_forward_output(
+        const plan7_backward_domain_candidate *candidates,
+        size_t candidate_count,
+        const uint64_t *forward_offsets,
+        const plan7_forward_output *forward_output,
+        float rt1,
+        float rt2,
+        float rt3,
+        float guard_band,
+        int collect_reason_facts,
+        plan7_backward_domain_output **output,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_backward_domain_unsealed_test_run(
         const plan7_forward_database *database,
         const plan7_ssv_sequence_batch *batch,
@@ -5864,6 +5879,7 @@ cdef class SequenceBatch:
     cdef int _alphabet_size
     cdef bytes _content_fingerprint
     cdef bint _generation_ledger_enabled
+    cdef bint _cpu_domain_route
     cdef uint64_t _ledger_fused_call_count
     cdef uint64_t _ledger_fused_total_ns
     cdef uint64_t _ledger_f1_native_ns
@@ -5895,6 +5911,9 @@ cdef class SequenceBatch:
         self._content_fingerprint = b""
         self._generation_ledger_enabled = (
             _os.environ.get("PLAN7_GPU_GENERATION_LEDGER") == "1"
+        )
+        self._cpu_domain_route = (
+            _os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP") == "cpu"
         )
         self._ledger_fused_call_count = 0
         self._ledger_fused_total_ns = 0
@@ -6143,6 +6162,7 @@ cdef class SequenceBatch:
                 "backward_native_ns": self._ledger_backward_native_ns,
                 "rescore_native_ns": self._ledger_rescore_native_ns,
             },
+            "cpu_domain_ownership": bool(self._cpu_domain_route),
         }
 
     @property
@@ -8679,7 +8699,29 @@ cdef class SequenceBatch:
                 error[0] = 0
                 if self._generation_ledger_enabled:
                     ledger_start_ns = _time.perf_counter_ns()
-                if collect_generation_telemetry and resident_status == 1:
+                if self._cpu_domain_route:
+                    with nogil:
+                        status = (
+                            plan7_backward_domain_route_all_cpu_from_forward_output(
+                                (
+                                    domain_candidates.data()
+                                    if pass_count
+                                    else NULL
+                                ),
+                                pass_count,
+                                pass_special_offsets.data(),
+                                output,
+                                rt1,
+                                rt2,
+                                rt3,
+                                guard_band,
+                                1 if collect_generation_telemetry else 0,
+                                &domain_output,
+                                error,
+                                sizeof(error),
+                            )
+                        )
+                elif collect_generation_telemetry and resident_status == 1:
                     with nogil:
                         status = (
                             plan7_backward_domain_run_from_forward_output_with_reason_facts(

@@ -1799,6 +1799,110 @@ plan7_backward_domain_run_from_forward_output_with_reason_facts(
   }
 }
 
+extern "C" int plan7_backward_domain_route_all_cpu_from_forward_output(
+    const plan7_backward_domain_candidate *candidates,
+    size_t candidate_count, const uint64_t *forward_offsets,
+    const plan7_forward_output *forward_output,
+    float rt1, float rt2, float rt3, float guard_band,
+    int collect_reason_facts,
+    plan7_backward_domain_output **output,
+    char *error, size_t error_size) {
+  const auto total_begin = std::chrono::steady_clock::now();
+  try {
+    if (output == nullptr || *output != nullptr || forward_output == nullptr ||
+        forward_offsets == nullptr ||
+        (candidate_count != 0 && candidates == nullptr) ||
+        !valid_thresholds(rt1, rt2, rt3, guard_band) ||
+        collect_reason_facts < 0 || collect_reason_facts > 1) {
+      set_error(error, error_size,
+                "invalid CPU-domain ownership arguments");
+      return -1;
+    }
+    const plan7_forward_provenance *provenance =
+        plan7_forward_output_provenance(forward_output);
+    const size_t special_count =
+        plan7_forward_output_special_count(forward_output);
+    if (provenance == nullptr || provenance->pass_count != candidate_count ||
+        provenance->special_count != special_count ||
+        forward_offsets[0] != 0 ||
+        forward_offsets[candidate_count] != special_count) {
+      set_error(error, error_size,
+                "CPU-domain ownership Forward provenance differs");
+      return -1;
+    }
+
+    std::unique_ptr<plan7_backward_domain_output> created(
+        new (std::nothrow) plan7_backward_domain_output{});
+    if (!created) {
+      set_error(error, error_size,
+                "CPU-domain ownership output allocation failed");
+      return -1;
+    }
+    created->rt1 = rt1;
+    created->rt2 = rt2;
+    created->rt3 = rt3;
+    created->guard_band = guard_band;
+    created->results.resize(candidate_count);
+    created->posterior_offsets.assign(candidate_count + 1, 0);
+    created->region_offsets.assign(candidate_count + 1, 0);
+    if (collect_reason_facts)
+      created->reason_facts.assign(
+          candidate_count,
+          PLAN7_BACKWARD_DOMAIN_REASON_OTHER_CPU_REQUIRED |
+              PLAN7_BACKWARD_DOMAIN_REASON_FINAL_CPU_REQUIRED);
+
+    uint32_t previous_profile = 0;
+    uint32_t previous_sequence = 0;
+    bool have_previous = false;
+    for (size_t candidate = 0; candidate < candidate_count; ++candidate) {
+      const auto row = candidates[candidate];
+      if (forward_offsets[candidate] > forward_offsets[candidate + 1] ||
+          (have_previous &&
+           (row.profile_index < previous_profile ||
+            (row.profile_index == previous_profile &&
+             row.sequence_index <= previous_sequence)))) {
+        set_error(error, error_size,
+                  "CPU-domain ownership rows are not canonical");
+        return -1;
+      }
+      have_previous = true;
+      previous_profile = row.profile_index;
+      previous_sequence = row.sequence_index;
+      auto &result = created->results[candidate];
+      result = {};
+      result.profile_index = row.profile_index;
+      result.sequence_index = row.sequence_index;
+      result.backward_score = NAN;
+      result.nexpected = NAN;
+      result.status = PLAN7_BACKWARD_DOMAIN_OK;
+      result.route = PLAN7_BACKWARD_DOMAIN_CPU_REQUIRED;
+    }
+    created->statistics.candidate_count = candidate_count;
+    created->statistics.cpu_required_count = candidate_count;
+    created->statistics.output_byte_limit = 0;
+    created->statistics.total_milliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - total_begin).count();
+    if (!seal_backward_domain_provenance(
+            created.get(), *provenance, rt1, rt2, rt3, guard_band)) {
+      set_error(error, error_size,
+                "CPU-domain ownership provenance sealing failed");
+      return -1;
+    }
+    created->sealed = true;
+    *output = created.release();
+    return 0;
+  } catch (const std::bad_alloc &) {
+    set_error(error, error_size,
+              "CPU-domain ownership output allocation failed");
+    return -1;
+  } catch (...) {
+    set_error(error, error_size,
+              "CPU-domain ownership unexpected native failure");
+    return -1;
+  }
+}
+
 extern "C" int plan7_backward_domain_unsealed_test_run(
     const plan7_forward_database *database,
     const plan7_ssv_sequence_batch *batch,
