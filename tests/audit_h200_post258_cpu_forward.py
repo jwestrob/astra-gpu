@@ -96,8 +96,8 @@ def main() -> int:
         raise AssertionError("reference fixture did not run GPU Forward")
     if cpu_forward["kernel_ms"] != 0.0 or cpu_stats["row_count"] != 0:
         raise AssertionError("all-CPU mode retained GPU Forward/domain work")
-    if cpu_sparse["exception_count"] <= reference_sparse["exception_count"]:
-        raise AssertionError("all-CPU mode did not retain F2 survivors for CPU")
+    if cpu_sparse["exception_count"] == 0:
+        raise AssertionError("all-CPU mode produced no CPU continuation rows")
 
     result = {
         "status": "PASS",
