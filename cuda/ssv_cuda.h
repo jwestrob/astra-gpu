@@ -589,6 +589,27 @@ int plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
   char *error,
   size_t error_size);
 
+/* Private sealed fixed-options path.  A non-null reason sidecar selects the
+ * same diagnostic census as the ordinary entry point.  Bias-rejected rows
+ * are terminal under the authenticated request and need no reusable Viterbi
+ * score. */
+int plan7_ssv_sequence_batch_postfilter_candidates_many_fixed_bias(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  const uintptr_t *source_profile_pointers,
+  const struct plan7_viterbi_database *viterbi_database,
+  struct plan7_postfilter_result *results,
+  size_t result_count,
+  uint16_t *reason_facts,
+  size_t reason_count,
+  struct plan7_postfilter_reason_statistics *reason_statistics,
+  char *error,
+  size_t error_size);
+
 /* Compile exact F2 boundaries and stably compact the just-produced resident
  * postfilter rows.  The view remains valid only until the next serialized
  * operation on batch.  Unsupported profile parameters return a valid view

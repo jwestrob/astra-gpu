@@ -4528,6 +4528,7 @@ sequence_batch_postfilter_candidates_many_impl(
   uint16_t *reason_facts,
   size_t reason_count,
   plan7_postfilter_reason_statistics *reason_statistics,
+  bool fixed_bias_filter,
   char *error,
   size_t error_size)
 {
@@ -4793,7 +4794,8 @@ sequence_batch_postfilter_candidates_many_impl(
         &batch->postfilter_workspace, error, error_size) != 0)
     return -1;
   const int postfilter_status = reason_facts == nullptr
-      ? plan7_postfilter_candidates_device_with_workspace_policy(
+      ? (fixed_bias_filter
+        ? plan7_postfilter_candidates_device_with_workspace_fixed_bias_policy(
           batch->postfilter_workspace, viterbi_database,
           batch->device_residues, batch->device_offsets, batch->host_lengths,
           batch->sequence_count, batch->device_null_scores,
@@ -4803,7 +4805,18 @@ sequence_batch_postfilter_candidates_many_impl(
           batch->host_bias_candidates, batch->device_bias_ssv_inputs,
           candidate_count, results, batch->execution_policy_mode,
           error, error_size)
-      : plan7_postfilter_candidates_device_with_workspace_reason_facts_policy(
+        : plan7_postfilter_candidates_device_with_workspace_policy(
+          batch->postfilter_workspace, viterbi_database,
+          batch->device_residues, batch->device_offsets, batch->host_lengths,
+          batch->sequence_count, batch->device_null_scores,
+          batch->device_scores, batch->device_f1_profiles, batch->device_tjb,
+          batch->device_bias_logp, batch->device_bias_log1mp,
+          batch->device_bias_profiles, batch->device_bias_candidates,
+          batch->host_bias_candidates, batch->device_bias_ssv_inputs,
+          candidate_count, results, batch->execution_policy_mode,
+          error, error_size))
+      : (fixed_bias_filter
+        ? plan7_postfilter_candidates_device_with_workspace_fixed_bias_reason_facts_policy(
           batch->postfilter_workspace, viterbi_database,
           batch->device_residues, batch->device_offsets, batch->host_lengths,
           batch->sequence_count, batch->device_null_scores,
@@ -4812,7 +4825,17 @@ sequence_batch_postfilter_candidates_many_impl(
           batch->device_bias_profiles, batch->device_bias_candidates,
           batch->host_bias_candidates, batch->device_bias_ssv_inputs,
           candidate_count, results, reason_facts, reason_statistics,
-          batch->execution_policy_mode, error, error_size);
+          batch->execution_policy_mode, error, error_size)
+        : plan7_postfilter_candidates_device_with_workspace_reason_facts_policy(
+          batch->postfilter_workspace, viterbi_database,
+          batch->device_residues, batch->device_offsets, batch->host_lengths,
+          batch->sequence_count, batch->device_null_scores,
+          batch->device_scores, batch->device_f1_profiles, batch->device_tjb,
+          batch->device_bias_logp, batch->device_bias_log1mp,
+          batch->device_bias_profiles, batch->device_bias_candidates,
+          batch->host_bias_candidates, batch->device_bias_ssv_inputs,
+          candidate_count, results, reason_facts, reason_statistics,
+          batch->execution_policy_mode, error, error_size));
   if (postfilter_status != 0)
     return -1;
 #undef CUDA_TRY_POSTFILTER
@@ -4838,7 +4861,7 @@ plan7_ssv_sequence_batch_postfilter_candidates_many(
       batch, bias_profiles, profile_count, candidate_offsets,
       candidate_indices, candidate_count, source_profile_pointers,
       viterbi_database, results, result_count, nullptr, 0, nullptr,
-      error, error_size);
+      false, error, error_size);
 }
 
 extern "C" int
@@ -4869,8 +4892,38 @@ plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
       batch, bias_profiles, profile_count, candidate_offsets,
       candidate_indices, candidate_count, source_profile_pointers,
       viterbi_database, results, result_count, reason_facts, reason_count,
-      reason_statistics,
+      reason_statistics, false,
       error, error_size);
+}
+
+extern "C" int
+plan7_ssv_sequence_batch_postfilter_candidates_many_fixed_bias(
+  plan7_ssv_sequence_batch *batch,
+  const plan7_bias_profile *bias_profiles,
+  size_t profile_count,
+  const size_t *candidate_offsets,
+  const uint32_t *candidate_indices,
+  size_t candidate_count,
+  const uintptr_t *source_profile_pointers,
+  const plan7_viterbi_database *viterbi_database,
+  plan7_postfilter_result *results,
+  size_t result_count,
+  uint16_t *reason_facts,
+  size_t reason_count,
+  plan7_postfilter_reason_statistics *reason_statistics,
+  char *error,
+  size_t error_size)
+{
+  if ((reason_facts == nullptr) != (reason_statistics == nullptr) ||
+      (reason_facts != nullptr && reason_count < candidate_count)) {
+    set_error(error, error_size, "fixed-bias reason output is invalid");
+    return -1;
+  }
+  return sequence_batch_postfilter_candidates_many_impl(
+      batch, bias_profiles, profile_count, candidate_offsets,
+      candidate_indices, candidate_count, source_profile_pointers,
+      viterbi_database, results, result_count, reason_facts, reason_count,
+      reason_statistics, true, error, error_size);
 }
 
 extern "C" int plan7_ssv_sequence_batch_compact_postfilter_f2(

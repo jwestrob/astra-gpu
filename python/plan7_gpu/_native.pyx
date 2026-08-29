@@ -1052,6 +1052,24 @@ cdef extern from "postfilter_cuda.h" nogil:
         size_t error_size,
     )
 
+    int plan7_ssv_sequence_batch_postfilter_candidates_many_fixed_bias(
+        plan7_ssv_sequence_batch *batch,
+        const plan7_bias_profile *bias_profiles,
+        size_t profile_count,
+        const size_t *candidate_offsets,
+        const uint32_t *candidate_indices,
+        size_t candidate_count,
+        const uintptr_t *source_profile_pointers,
+        const plan7_viterbi_database *viterbi_database,
+        plan7_postfilter_result *results,
+        size_t result_count,
+        uint16_t *reason_facts,
+        size_t reason_count,
+        plan7_postfilter_reason_statistics *reason_statistics,
+        char *error,
+        size_t error_size,
+    )
+
     int plan7_ssv_sequence_batch_compact_postfilter_f2(
         plan7_ssv_sequence_batch *batch,
         const plan7_ssv_profile *profiles,
@@ -10187,6 +10205,12 @@ cdef class SequenceBatch:
         cdef carray residue_offsets
         cdef size_t index
         cdef uint64_t ledger_start_ns = 0
+        cdef bint sealed_bias_viterbi_skip = (
+            _direct_sparse_v3
+            and _os.environ.get(
+                "PLAN7_GPU_SEALED_BIAS_VITERBI_SKIP"
+            ) == "1"
+        )
 
         if self._generation_ledger_enabled:
             ledger_start_ns = _time.perf_counter_ns()
@@ -10209,6 +10233,7 @@ cdef class SequenceBatch:
                 f1,
                 _return_reason_facts=True,
                 _immutable_records=_direct_sparse_v3,
+                _sealed_bias_viterbi_skip=sealed_bias_viterbi_skip,
             )
             generation_telemetry_seed = (
                 GENERATION_TELEMETRY_SCHEMA_VERSION,
@@ -10221,6 +10246,7 @@ cdef class SequenceBatch:
                     selection,
                     f1,
                     _immutable_records=_direct_sparse_v3,
+                    _sealed_bias_viterbi_skip=sealed_bias_viterbi_skip,
                 )
             )
         residue_offsets = clone(
@@ -10467,6 +10493,7 @@ cdef class SequenceBatch:
         bint _return_reason_facts=False,
         bint _immutable_records=False,
         bint _host_candidate_expansion=False,
+        bint _sealed_bias_viterbi_skip=False,
     ):
         """Run a sealed selection without reading any live optimized profile."""
         cdef plan7_profile_selection_view view = selection._view()
@@ -10486,6 +10513,9 @@ cdef class SequenceBatch:
         cdef carray offsets
         cdef vector[uint16_t] reason_facts
         cdef plan7_postfilter_reason_statistics reason_statistics
+        cdef uint16_t *reason_facts_ptr = NULL
+        cdef plan7_postfilter_reason_statistics *reason_statistics_ptr = NULL
+        cdef size_t reason_count = 0
         cdef bytes reason_storage
         cdef uint64_t ledger_start_ns = 0
 
@@ -10524,6 +10554,9 @@ cdef class SequenceBatch:
         self._postfilter_results.resize(candidate_count)
         if _return_reason_facts:
             reason_facts.resize(candidate_count)
+            reason_facts_ptr = reason_facts.data()
+            reason_statistics_ptr = &reason_statistics
+            reason_count = candidate_count
             reason_statistics.candidate_count = 0
             reason_statistics.full_msv_execution_count = 0
             reason_statistics.viterbi_execution_count = 0
@@ -10549,7 +10582,28 @@ cdef class SequenceBatch:
             if status == 0:
                 if self._generation_ledger_enabled:
                     ledger_start_ns = _time.perf_counter_ns()
-                if _return_reason_facts:
+                if _sealed_bias_viterbi_skip:
+                    with nogil:
+                        status = (
+                            plan7_ssv_sequence_batch_postfilter_candidates_many_fixed_bias(
+                                self._batch,
+                                self._bias_profiles.data(),
+                                profile_count,
+                                self._bias_candidate_offsets.data(),
+                                self._candidate_indices.data(),
+                                candidate_count,
+                                view.identity_tokens,
+                                database,
+                                self._postfilter_results.data(),
+                                candidate_count,
+                                reason_facts_ptr,
+                                reason_count,
+                                reason_statistics_ptr,
+                                error,
+                                sizeof(error),
+                            )
+                        )
+                elif _return_reason_facts:
                     with nogil:
                         status = (
                             plan7_ssv_sequence_batch_postfilter_candidates_many_reason_facts(
