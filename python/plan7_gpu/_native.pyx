@@ -5910,7 +5910,12 @@ cdef class SequenceBatch:
     cdef bint _cpu_rescore_route
     cdef int _cpu_forward_route_mode
     cdef uint64_t _cpu_forward_min_cells
+    cdef uint64_t _cpu_forward_max_cells
     cdef uint64_t _cpu_forward_min_length
+    cdef uint64_t _cpu_forward_selected_count
+    cdef uint64_t _cpu_forward_selected_cells
+    cdef uint64_t _gpu_forward_selected_count
+    cdef uint64_t _gpu_forward_selected_cells
     cdef uint64_t _ledger_fused_call_count
     cdef uint64_t _ledger_fused_total_ns
     cdef uint64_t _ledger_f1_native_ns
@@ -5958,7 +5963,12 @@ cdef class SequenceBatch:
         )
         self._cpu_forward_route_mode = 0
         self._cpu_forward_min_cells = 0
+        self._cpu_forward_max_cells = 0
         self._cpu_forward_min_length = 0
+        self._cpu_forward_selected_count = 0
+        self._cpu_forward_selected_cells = 0
+        self._gpu_forward_selected_count = 0
+        self._gpu_forward_selected_cells = 0
         forward_ownership = _os.environ.get(
             "PLAN7_GPU_FORWARD_OWNERSHIP", "gpu"
         )
@@ -5977,6 +5987,19 @@ cdef class SequenceBatch:
             if self._cpu_forward_min_cells == 0:
                 raise ValueError("Forward CPU cell threshold must be positive")
             self._cpu_forward_route_mode = 2
+        elif forward_ownership == "hybrid_cells_below":
+            forward_threshold = _os.environ.get(
+                "PLAN7_GPU_FORWARD_CPU_MAX_CELLS"
+            )
+            if forward_threshold is None:
+                raise ValueError(
+                    "hybrid_cells_below Forward ownership requires "
+                    "PLAN7_GPU_FORWARD_CPU_MAX_CELLS"
+                )
+            self._cpu_forward_max_cells = int(forward_threshold)
+            if self._cpu_forward_max_cells == 0:
+                raise ValueError("Forward CPU cell threshold must be positive")
+            self._cpu_forward_route_mode = 4
         elif forward_ownership == "hybrid_length":
             forward_threshold = _os.environ.get(
                 "PLAN7_GPU_FORWARD_CPU_MIN_LENGTH"
@@ -6264,6 +6287,14 @@ cdef class SequenceBatch:
             },
             "cpu_domain_ownership": bool(self._cpu_domain_route),
             "cpu_rescore_ownership": bool(self._cpu_rescore_route),
+            "cpu_forward_ownership_mode": self._cpu_forward_route_mode,
+            "cpu_forward_min_cells": self._cpu_forward_min_cells,
+            "cpu_forward_max_cells": self._cpu_forward_max_cells,
+            "cpu_forward_min_length": self._cpu_forward_min_length,
+            "cpu_forward_selected_count": self._cpu_forward_selected_count,
+            "cpu_forward_selected_cells": self._cpu_forward_selected_cells,
+            "gpu_forward_selected_count": self._gpu_forward_selected_count,
+            "gpu_forward_selected_cells": self._gpu_forward_selected_cells,
         }
 
     @property
@@ -8469,8 +8500,9 @@ cdef class SequenceBatch:
                     generation_metrics[
                         reason_base + GENERATION_F2_PASS_COUNT
                     ] += 1
-                cpu_forward_selected = self._cpu_forward_route_mode == 1
-                if self._cpu_forward_route_mode == 2:
+                cpu_forward_selected = False
+                forward_work_cells = 0
+                if self._cpu_forward_route_mode != 0:
                     if (
                         view.profiles[profile_index].model_length > 0
                         and sequence_length > (<uint64_t> -1) // (
@@ -8481,13 +8513,35 @@ cdef class SequenceBatch:
                     forward_work_cells = sequence_length * (
                         <uint64_t> view.profiles[profile_index].model_length
                     )
+                if self._cpu_forward_route_mode == 1:
+                    cpu_forward_selected = True
+                elif self._cpu_forward_route_mode in (2, 4):
                     cpu_forward_selected = (
                         forward_work_cells >= self._cpu_forward_min_cells
+                        if self._cpu_forward_route_mode == 2
+                        else forward_work_cells <= self._cpu_forward_max_cells
                     )
                 elif self._cpu_forward_route_mode == 3:
                     cpu_forward_selected = (
                         sequence_length >= self._cpu_forward_min_length
                     )
+                if self._cpu_forward_route_mode != 0:
+                    if cpu_forward_selected:
+                        if (
+                            self._cpu_forward_selected_cells
+                            > (<uint64_t> -1) - forward_work_cells
+                        ):
+                            raise OverflowError("CPU Forward cell census overflow")
+                        self._cpu_forward_selected_count += 1
+                        self._cpu_forward_selected_cells += forward_work_cells
+                    else:
+                        if (
+                            self._gpu_forward_selected_cells
+                            > (<uint64_t> -1) - forward_work_cells
+                        ):
+                            raise OverflowError("GPU Forward cell census overflow")
+                        self._gpu_forward_selected_count += 1
+                        self._gpu_forward_selected_cells += forward_work_cells
                 if cpu_forward_selected:
                     continue
                 candidate_indices.push_back(record.sequence_index)
