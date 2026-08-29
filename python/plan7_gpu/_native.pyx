@@ -10205,11 +10205,18 @@ cdef class SequenceBatch:
         cdef carray residue_offsets
         cdef size_t index
         cdef uint64_t ledger_start_ns = 0
+        cdef object sealed_bias_viterbi_policy = _os.environ.get(
+            "PLAN7_GPU_SEALED_BIAS_VITERBI_SKIP"
+        )
         cdef bint sealed_bias_viterbi_skip = (
             _direct_sparse_v3
-            and _os.environ.get(
-                "PLAN7_GPU_SEALED_BIAS_VITERBI_SKIP"
-            ) == "1"
+            and (
+                sealed_bias_viterbi_policy == "1"
+                or (
+                    sealed_bias_viterbi_policy is None
+                    and self._sequence_count > 65536
+                )
+            )
         )
 
         if self._generation_ledger_enabled:
