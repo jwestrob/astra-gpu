@@ -5908,6 +5908,9 @@ cdef class SequenceBatch:
     cdef bint _generation_ledger_enabled
     cdef bint _cpu_domain_route
     cdef bint _cpu_rescore_route
+    cdef int _cpu_forward_route_mode
+    cdef uint64_t _cpu_forward_min_cells
+    cdef uint64_t _cpu_forward_min_length
     cdef uint64_t _ledger_fused_call_count
     cdef uint64_t _ledger_fused_total_ns
     cdef uint64_t _ledger_f1_native_ns
@@ -5932,6 +5935,8 @@ cdef class SequenceBatch:
         cdef char error[512]
         cdef int status
         cdef size_t i
+        cdef object forward_ownership
+        cdef object forward_threshold
 
         self._batch = NULL
         self._sequence_count = 0
@@ -5951,6 +5956,42 @@ cdef class SequenceBatch:
         self._cpu_rescore_route = (
             _os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP") == "cpu_rescore"
         )
+        self._cpu_forward_route_mode = 0
+        self._cpu_forward_min_cells = 0
+        self._cpu_forward_min_length = 0
+        forward_ownership = _os.environ.get(
+            "PLAN7_GPU_FORWARD_OWNERSHIP", "gpu"
+        )
+        if forward_ownership == "cpu":
+            self._cpu_forward_route_mode = 1
+        elif forward_ownership == "hybrid_cells":
+            forward_threshold = _os.environ.get(
+                "PLAN7_GPU_FORWARD_CPU_MIN_CELLS"
+            )
+            if forward_threshold is None:
+                raise ValueError(
+                    "hybrid_cells Forward ownership requires "
+                    "PLAN7_GPU_FORWARD_CPU_MIN_CELLS"
+                )
+            self._cpu_forward_min_cells = int(forward_threshold)
+            if self._cpu_forward_min_cells == 0:
+                raise ValueError("Forward CPU cell threshold must be positive")
+            self._cpu_forward_route_mode = 2
+        elif forward_ownership == "hybrid_length":
+            forward_threshold = _os.environ.get(
+                "PLAN7_GPU_FORWARD_CPU_MIN_LENGTH"
+            )
+            if forward_threshold is None:
+                raise ValueError(
+                    "hybrid_length Forward ownership requires "
+                    "PLAN7_GPU_FORWARD_CPU_MIN_LENGTH"
+                )
+            self._cpu_forward_min_length = int(forward_threshold)
+            if self._cpu_forward_min_length == 0:
+                raise ValueError("Forward CPU length threshold must be positive")
+            self._cpu_forward_route_mode = 3
+        elif forward_ownership != "gpu":
+            raise ValueError("invalid PLAN7_GPU_FORWARD_OWNERSHIP")
         self._ledger_fused_call_count = 0
         self._ledger_fused_total_ns = 0
         self._ledger_f1_native_ns = 0
@@ -7914,6 +7955,8 @@ cdef class SequenceBatch:
         cdef bint direct_domain_safe
         cdef bint direct_no_region
         cdef bint direct_ga_reject
+        cdef bint cpu_forward_selected
+        cdef uint64_t forward_work_cells
         cdef size_t direct_postfilter_source
         cdef size_t direct_region_begin
         cdef size_t direct_region_end
@@ -7964,6 +8007,19 @@ cdef class SequenceBatch:
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
+        if self._cpu_forward_route_mode != 0:
+            if not sealed_domain_journal or not direct_sparse_v3:
+                raise ValueError(
+                    "CPU Forward ownership requires direct sparse sealed generation"
+                )
+            if not self._cpu_domain_route:
+                raise ValueError(
+                    "CPU Forward ownership requires CPU domain ownership"
+                )
+            if collect_generation_telemetry:
+                raise ValueError(
+                    "CPU Forward ownership reason telemetry is not implemented"
+                )
         memset(&f2_resident_view, 0, sizeof(f2_resident_view))
         if ga_pruning:
             if not sealed_domain_journal or not direct_sparse_v3:
@@ -8395,11 +8451,6 @@ cdef class SequenceBatch:
                 )
                 if sequence_length > 100000:
                     raise ValueError("Forward target exceeds HMMER's protein limit")
-                candidate_indices.push_back(record.sequence_index)
-                filter_scores.push_back(record.filtersc)
-                uncorrected_scores.push_back(usc)
-                candidate_records.push_back(record)
-                candidate_profiles.push_back(<uint32_t> profile_index)
                 if direct_sparse_v3:
                     _direct_v3_plan_initial(
                         direct_decisions,
@@ -8411,7 +8462,6 @@ cdef class SequenceBatch:
                         &direct_decision_terms,
                         &direct_exception_count,
                     )
-                    candidate_postfilter_sources.push_back(cursor)
                 if collect_generation_telemetry:
                     f2_reason_counts[
                         profile_index * GENERATION_F2_REASON_COUNT + 4
@@ -8419,6 +8469,34 @@ cdef class SequenceBatch:
                     generation_metrics[
                         reason_base + GENERATION_F2_PASS_COUNT
                     ] += 1
+                cpu_forward_selected = self._cpu_forward_route_mode == 1
+                if self._cpu_forward_route_mode == 2:
+                    if (
+                        view.profiles[profile_index].model_length > 0
+                        and sequence_length > (<uint64_t> -1) // (
+                            <uint64_t> view.profiles[profile_index].model_length
+                        )
+                    ):
+                        raise OverflowError("Forward work cells overflow uint64")
+                    forward_work_cells = sequence_length * (
+                        <uint64_t> view.profiles[profile_index].model_length
+                    )
+                    cpu_forward_selected = (
+                        forward_work_cells >= self._cpu_forward_min_cells
+                    )
+                elif self._cpu_forward_route_mode == 3:
+                    cpu_forward_selected = (
+                        sequence_length >= self._cpu_forward_min_length
+                    )
+                if cpu_forward_selected:
+                    continue
+                candidate_indices.push_back(record.sequence_index)
+                filter_scores.push_back(record.filtersc)
+                uncorrected_scores.push_back(usc)
+                candidate_records.push_back(record)
+                candidate_profiles.push_back(<uint32_t> profile_index)
+                if direct_sparse_v3:
+                    candidate_postfilter_sources.push_back(cursor)
             candidate_offsets.push_back(candidate_indices.size())
 
         if (
