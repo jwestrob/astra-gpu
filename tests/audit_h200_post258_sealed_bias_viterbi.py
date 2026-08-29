@@ -66,10 +66,16 @@ def fixture(profile_count: int, target_count: int, maximum_length: int):
     sequences = []
     for index in range(target_count):
         length = 32 + (index * 131) % (maximum_length - 31)
-        text = "".join(
-            amino[(index * 11 + position * 7) % len(amino)]
-            for position in range(length)
-        )
+        if index % 4 == 0:
+            # The production census is roughly 27.5% finite bias rejects.
+            # Include a comparable low-complexity fraction so the timing gate
+            # actually exercises the work being removed.
+            text = amino[(index // 4) % len(amino)] * length
+        else:
+            text = "".join(
+                amino[(index * 11 + position * 7) % len(amino)]
+                for position in range(length)
+            )
         sequences.append(
             pyhmmer.easel.TextSequence(
                 name=f"post258-p7-target-{index:05d}".encode(), sequence=text
