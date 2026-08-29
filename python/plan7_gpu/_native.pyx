@@ -8504,6 +8504,12 @@ cdef class SequenceBatch:
             and resident_f2_cursor != f2_resident_view.selected_count
         ):
             raise RuntimeError("resident F2 sources do not span the selection")
+        # The resident F2 view authenticates the complete F2 survivor list.
+        # Experimental CPU ownership deliberately removes a subset before
+        # Forward, so the remaining GPU rows use the existing explicit,
+        # authenticated candidate input instead of misrepresenting that view.
+        if self._cpu_forward_route_mode != 0:
+            use_resident_f2 = False
 
         candidate_count = candidate_indices.size()
         row_offsets = clone(_UINT64_ARRAY_TEMPLATE, profile_count + 1, False)
