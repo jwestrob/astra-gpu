@@ -90,12 +90,14 @@ def main() -> int:
 
     reference_sparse = reference_stats["sparse_journal_v3"]
     cpu_sparse = cpu_stats["sparse_journal_v3"]
-    if reference_sparse["dense_forward_count"] == 0:
+    reference_forward = reference_stats["native_stage_timings"]["forward"]
+    cpu_forward = cpu_stats["native_stage_timings"]["forward"]
+    if reference_forward["kernel_ms"] <= 0.0:
         raise AssertionError("reference fixture did not run GPU Forward")
-    if cpu_sparse["dense_forward_count"] != 0:
-        raise AssertionError("all-CPU mode retained GPU Forward rows")
-    if cpu_sparse["exception_routes"]["filter_scores"] == 0:
-        raise AssertionError("all-CPU mode produced no filter-score routes")
+    if cpu_forward["kernel_ms"] != 0.0 or cpu_stats["row_count"] != 0:
+        raise AssertionError("all-CPU mode retained GPU Forward/domain work")
+    if cpu_sparse["exception_count"] <= reference_sparse["exception_count"]:
+        raise AssertionError("all-CPU mode did not retain F2 survivors for CPU")
 
     result = {
         "status": "PASS",
@@ -105,6 +107,8 @@ def main() -> int:
         "cpu_generation_ns": cpu_ns,
         "reference_sparse": reference_sparse,
         "cpu_sparse": cpu_sparse,
+        "reference_forward": reference_forward,
+        "cpu_forward": cpu_forward,
         "reference_workspace": reference_workspace,
         "cpu_workspace": cpu_workspace,
         "tophits_sha256": rows,
