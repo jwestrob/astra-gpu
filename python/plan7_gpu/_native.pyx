@@ -5909,6 +5909,7 @@ cdef class SequenceBatch:
     cdef bint _cpu_domain_route
     cdef bint _cpu_rescore_route
     cdef int _cpu_forward_route_mode
+    cdef bint _cpu_forward_route_auto
     cdef uint64_t _cpu_forward_min_cells
     cdef uint64_t _cpu_forward_max_cells
     cdef uint64_t _cpu_forward_min_length
@@ -5962,6 +5963,7 @@ cdef class SequenceBatch:
             _os.environ.get("PLAN7_GPU_DOMAIN_OWNERSHIP") == "cpu_rescore"
         )
         self._cpu_forward_route_mode = 0
+        self._cpu_forward_route_auto = False
         self._cpu_forward_min_cells = 0
         self._cpu_forward_max_cells = 0
         self._cpu_forward_min_length = 0
@@ -5969,10 +5971,23 @@ cdef class SequenceBatch:
         self._cpu_forward_selected_cells = 0
         self._gpu_forward_selected_count = 0
         self._gpu_forward_selected_cells = 0
-        forward_ownership = _os.environ.get(
-            "PLAN7_GPU_FORWARD_OWNERSHIP", "gpu"
-        )
-        if forward_ownership == "cpu":
+        forward_ownership = _os.environ.get("PLAN7_GPU_FORWARD_OWNERSHIP")
+        if (
+            forward_ownership is None
+            and _os.environ.get("ASTRA_GPU_CONTINUATION_POOL") == "1"
+            and _execution_policy != PLAN7_GPU_EXECUTION_POLICY_SIMPLE
+            and offsets.shape[0] > 65536
+            and self._cpu_domain_route
+        ):
+            self._cpu_forward_route_mode = 4
+            self._cpu_forward_route_auto = True
+            self._cpu_forward_max_cells = 200000
+            forward_ownership = "hybrid_cells_below"
+        elif forward_ownership is None:
+            forward_ownership = "gpu"
+        if self._cpu_forward_route_auto:
+            pass
+        elif forward_ownership == "cpu":
             self._cpu_forward_route_mode = 1
         elif forward_ownership == "hybrid_cells":
             forward_threshold = _os.environ.get(
@@ -6288,6 +6303,7 @@ cdef class SequenceBatch:
             "cpu_domain_ownership": bool(self._cpu_domain_route),
             "cpu_rescore_ownership": bool(self._cpu_rescore_route),
             "cpu_forward_ownership_mode": self._cpu_forward_route_mode,
+            "cpu_forward_ownership_auto": bool(self._cpu_forward_route_auto),
             "cpu_forward_min_cells": self._cpu_forward_min_cells,
             "cpu_forward_max_cells": self._cpu_forward_max_cells,
             "cpu_forward_min_length": self._cpu_forward_min_length,
@@ -7987,6 +8003,7 @@ cdef class SequenceBatch:
         cdef bint direct_no_region
         cdef bint direct_ga_reject
         cdef bint cpu_forward_selected
+        cdef int cpu_forward_route_mode = self._cpu_forward_route_mode
         cdef uint64_t forward_work_cells
         cdef size_t direct_postfilter_source
         cdef size_t direct_region_begin
@@ -8038,7 +8055,15 @@ cdef class SequenceBatch:
 
         if self._batch == NULL:
             raise RuntimeError("sequence batch is closed")
-        if self._cpu_forward_route_mode != 0:
+        if self._cpu_forward_route_auto and (
+            profile_count < 64
+            or not sealed_domain_journal
+            or not direct_sparse_v3
+            or not self._cpu_domain_route
+            or collect_generation_telemetry
+        ):
+            cpu_forward_route_mode = 0
+        if cpu_forward_route_mode != 0:
             if not sealed_domain_journal or not direct_sparse_v3:
                 raise ValueError(
                     "CPU Forward ownership requires direct sparse sealed generation"
@@ -8502,7 +8527,7 @@ cdef class SequenceBatch:
                     ] += 1
                 cpu_forward_selected = False
                 forward_work_cells = 0
-                if self._cpu_forward_route_mode != 0:
+                if cpu_forward_route_mode != 0:
                     if (
                         view.profiles[profile_index].model_length > 0
                         and sequence_length > (<uint64_t> -1) // (
@@ -8513,19 +8538,19 @@ cdef class SequenceBatch:
                     forward_work_cells = sequence_length * (
                         <uint64_t> view.profiles[profile_index].model_length
                     )
-                if self._cpu_forward_route_mode == 1:
+                if cpu_forward_route_mode == 1:
                     cpu_forward_selected = True
-                elif self._cpu_forward_route_mode in (2, 4):
+                elif cpu_forward_route_mode in (2, 4):
                     cpu_forward_selected = (
                         forward_work_cells >= self._cpu_forward_min_cells
-                        if self._cpu_forward_route_mode == 2
+                        if cpu_forward_route_mode == 2
                         else forward_work_cells <= self._cpu_forward_max_cells
                     )
-                elif self._cpu_forward_route_mode == 3:
+                elif cpu_forward_route_mode == 3:
                     cpu_forward_selected = (
                         sequence_length >= self._cpu_forward_min_length
                     )
-                if self._cpu_forward_route_mode != 0:
+                if cpu_forward_route_mode != 0:
                     if cpu_forward_selected:
                         if (
                             self._cpu_forward_selected_cells
@@ -8562,7 +8587,7 @@ cdef class SequenceBatch:
         # Experimental CPU ownership deliberately removes a subset before
         # Forward, so the remaining GPU rows use the existing explicit,
         # authenticated candidate input instead of misrepresenting that view.
-        if self._cpu_forward_route_mode != 0:
+        if cpu_forward_route_mode != 0:
             use_resident_f2 = False
 
         candidate_count = candidate_indices.size()
