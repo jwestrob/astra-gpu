@@ -28,7 +28,10 @@ try:
     )
     import plan7_gpu.astra_search as astra_search_module
     from plan7_gpu.astra_search import (
+        _AstraTSVRows,
         _ContinuationPool,
+        _hmmsearch_astra_tsv,
+        _hmmsearch_astra_tsv_with_continuation_pool,
         _hmmsearch_with_continuation_pool,
         hmmsearch,
     )
@@ -43,6 +46,9 @@ except ImportError:
     astra_search_module = None
     hmmsearch = None
     _ContinuationPool = None
+    _AstraTSVRows = None
+    _hmmsearch_astra_tsv = None
+    _hmmsearch_astra_tsv_with_continuation_pool = None
     _hmmsearch_with_continuation_pool = None
 
 
@@ -469,6 +475,80 @@ class AstraSearchTests(unittest.TestCase):
                     cpus=cpus,
                     **options,
                 )
+
+    def test_private_worker_tsv_sink_is_exact_and_ordered(self):
+        pairs = self.pairs[:2]
+        options = {"E": 10.0, "domE": 10.0, "incE": 10.0, "incdomE": 10.0}
+        expected = list(hmmsearch(pairs, self.real_batch, cpus=2, **options))
+        for cpus in (1, 2):
+            with self.subTest(cpus=cpus):
+                actual = list(
+                    _hmmsearch_astra_tsv(
+                        pairs, self.real_batch, cpus=cpus, **options
+                    )
+                )
+                self.assertTrue(
+                    all(type(item) is _AstraTSVRows for item in actual)
+                )
+                self.assertEqual(
+                    [item.rows for item in actual],
+                    [
+                        _pipeline._astra_tsv_rows_bound(hits)
+                        for hits in expected
+                    ],
+                )
+                self.assertEqual(
+                    [item.row_count for item in actual],
+                    [item.rows.count("\n") for item in actual],
+                )
+                self.assertEqual(
+                    [item.byte_count for item in actual],
+                    [len(item.rows.encode("utf-8")) for item in actual],
+                )
+
+        pool = _ContinuationPool(2)
+        try:
+            pooled = list(
+                _hmmsearch_astra_tsv_with_continuation_pool(
+                    pairs,
+                    self.real_batch,
+                    cpus=2,
+                    continuation_pool=pool,
+                    **options,
+                )
+            )
+        finally:
+            pool.close()
+        self.assertEqual(
+            [item.rows for item in pooled],
+            [_pipeline._astra_tsv_rows_bound(hits) for hits in expected],
+        )
+
+    def test_private_worker_tsv_sink_preserves_canonical_failure_order(self):
+        pairs = self.pairs[:3]
+        options = {"E": 10.0, "domE": 10.0, "incE": 10.0, "incdomE": 10.0}
+
+        class RenderFailure(RuntimeError):
+            pass
+
+        def renderer(hits):
+            if hits.query.name == pairs[1].hmm.name:
+                raise RenderFailure("row-one-render-failure")
+            return hits.query.name
+
+        iterator = astra_search_module._hmmsearch_impl(
+            pairs,
+            self.real_batch,
+            cpus=2,
+            _result_renderer=renderer,
+            **options,
+        )
+        first = next(iterator)
+        self.assertIs(type(first), _AstraTSVRows)
+        self.assertEqual(first.rows, pairs[0].hmm.name)
+        with self.assertRaisesRegex(RenderFailure, "row-one-render-failure"):
+            next(iterator)
+        iterator.close()
 
     def test_private_continuation_pool_reuses_worker_pipelines_across_calls(self):
         pairs = self.pairs * 2

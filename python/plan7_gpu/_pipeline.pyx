@@ -11,7 +11,7 @@ loading it against an unsupported private ABI.
 import os as _os
 
 from libc.stddef cimport size_t
-from libc.math cimport isfinite, isnan, log
+from libc.math cimport exp, isfinite, isnan, log
 from libc.stdint cimport (
     int16_t,
     int32_t,
@@ -41,6 +41,7 @@ from cpython.pycapsule cimport (
     PyCapsule_SetPointer,
 )
 from cpython.pyport cimport PY_SSIZE_T_MAX
+from cpython.unicode cimport PyUnicode_FromString
 
 from libeasel cimport (
     eslCONST_LOG2,
@@ -84,7 +85,7 @@ from libhmmer.p7_bg cimport (
 from libhmmer.p7_alidisplay cimport P7_ALIDISPLAY
 from libhmmer.p7_domain cimport P7_DOMAIN
 from libhmmer.p7_domaindef cimport P7_DOMAINDEF
-from libhmmer.p7_hit cimport P7_HIT
+from libhmmer.p7_hit cimport P7_HIT, p7_IS_INCLUDED
 from libhmmer.p7_pipeline cimport (
     P7_PIPELINE,
     p7_SEARCH_SEQS,
@@ -9627,6 +9628,71 @@ def _sealed_continuation_statistics_bound(sealed_object):
             ),
         },
     }
+
+
+def _astra_tsv_rows_bound(TopHits hits):
+    """Render Astra's bulk TSV rows without constructing hit/domain wrappers.
+
+    This is a private output seam for Astra's already-thresholded ``TopHits``
+    objects.  It deliberately mirrors ``astra.search.process_hits_to_file``
+    byte for byte while walking the native HMMER result structures directly.
+    The ordinary PyHMMER and plan7_gpu result APIs remain unchanged.
+    """
+    cdef P7_HIT *hit
+    cdef P7_DOMAIN *domain
+    cdef P7_ALIDISPLAY *alignment
+    cdef uint64_t hit_index
+    cdef int domain_index
+    cdef double full_evalue
+    cdef double conditional_evalue
+    cdef double independent_evalue
+    cdef object cog
+    cdef object hit_name
+    cdef list rows = []
+
+    if type(hits) is not _pyhmmer.plan7.TopHits:
+        raise TypeError("hits must be exactly pyhmmer.plan7.TopHits")
+    if hits._th == NULL:
+        raise ValueError("TopHits state is unavailable")
+    if hits._query is None:
+        raise ValueError("TopHits query is unavailable")
+    cog = hits._query.name
+
+    for hit_index in range(hits._th.N):
+        hit = hits._th.hit[hit_index]
+        if hit == NULL:
+            raise ValueError("TopHits order contains a null hit")
+        if not (hit.flags & p7_IS_INCLUDED):
+            continue
+        if hit.name == NULL:
+            raise ValueError("included TopHits row has no target name")
+        if hit.ndom < 0 or (hit.ndom != 0 and hit.dcl == NULL):
+            raise ValueError("included TopHits row has invalid domains")
+        hit_name = PyUnicode_FromString(hit.name)
+        full_evalue = exp(hit.lnP) * hits._pli.Z
+        for domain_index in range(hit.ndom):
+            domain = &hit.dcl[domain_index]
+            if not domain.is_reported:
+                continue
+            conditional_evalue = exp(domain.lnP) * hits._pli.domZ
+            independent_evalue = exp(domain.lnP) * hits._pli.Z
+            alignment = domain.ad
+            if alignment == NULL:
+                rows.append(
+                    f"{hit_name}\t{cog}\t{hit.score:.2f}\t{full_evalue:.2e}\t"
+                    f"{conditional_evalue:.2e}\t{independent_evalue:.2e}\t"
+                    f"{domain.ienv}\t{domain.jenv}\t{domain.bitscore:.2f}\t"
+                    f"{domain.ienv}\t{domain.jenv}\t\t\n"
+                )
+            else:
+                rows.append(
+                    f"{hit_name}\t{cog}\t{hit.score:.2f}\t{full_evalue:.2e}\t"
+                    f"{conditional_evalue:.2e}\t{independent_evalue:.2e}\t"
+                    f"{domain.ienv}\t{domain.jenv}\t{domain.bitscore:.2f}\t"
+                    f"{alignment.sqfrom}\t{alignment.sqto}\t"
+                    f"{alignment.hmmfrom}\t{alignment.hmmto}\n"
+                )
+    return "".join(rows)
 
 
 def _sealed_generation_statistics_bound(sealed_object):

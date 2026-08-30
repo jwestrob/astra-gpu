@@ -440,6 +440,29 @@ class MaskedPipelineTests(unittest.TestCase):
             self.table_bytes(expected, "domains"),
         )
 
+    @staticmethod
+    def astra_tsv_rows_reference(hits):
+        rows = []
+        cog = hits.query.name
+        for hit in hits:
+            if not hit.included:
+                continue
+            for domain in hit.domains.reported:
+                alignment = domain.alignment
+                ali_from = (
+                    alignment.target_from if alignment else domain.env_from
+                )
+                ali_to = alignment.target_to if alignment else domain.env_to
+                hmm_from = alignment.hmm_from if alignment else ""
+                hmm_to = alignment.hmm_to if alignment else ""
+                rows.append(
+                    f"{hit.name}\t{cog}\t{hit.score:.2f}\t{hit.evalue:.2e}\t"
+                    f"{domain.c_evalue:.2e}\t{domain.i_evalue:.2e}\t"
+                    f"{domain.env_from}\t{domain.env_to}\t{domain.score:.2f}\t"
+                    f"{ali_from}\t{ali_to}\t{hmm_from}\t{hmm_to}\n"
+                )
+        return "".join(rows)
+
     def test_pressed_hmm_and_optimized_profiles_are_lockstep(self):
         self.assertEqual(len(self.hmms), len(self.optimized_profiles))
         self.assertGreater(len(self.hmms), 1)
@@ -463,6 +486,15 @@ class MaskedPipelineTests(unittest.TestCase):
 
         self.assertIs(actual.query, hmm)
         self.assert_exact_hits(expected, actual)
+
+    def test_private_astra_tsv_renderer_is_byte_exact(self):
+        hits = self.pipeline().search_hmm(self.hmms[0], self.sequences)
+        expected = self.astra_tsv_rows_reference(hits)
+        self.assertTrue(expected)
+        self.assertEqual(_pipeline._astra_tsv_rows_bound(hits), expected)
+
+        empty = pyhmmer.plan7.TopHits(self.hmms[0])
+        self.assertEqual(_pipeline._astra_tsv_rows_bound(empty), "")
 
     def test_all_rejects_keep_database_accounting_and_automatic_z(self):
         hmm = self.hmms[0]

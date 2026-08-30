@@ -73,6 +73,32 @@ _scheduler_statistics: dict[str, Any] = {
 }
 
 
+class _AstraTSVRows:
+    """Private marker for exact rows rendered before scheduler buffering."""
+
+    __slots__ = ("rows", "row_count", "byte_count")
+
+    def __init__(self, rows: str) -> None:
+        if type(rows) is not str:
+            raise TypeError("Astra TSV renderer must return exactly str")
+        self.rows = rows
+        self.row_count = rows.count("\n")
+        self.byte_count = len(rows.encode("utf-8"))
+
+
+def _render_search_result(
+    result: Any, renderer: Any, telemetry: bool
+) -> Any:
+    if renderer is None:
+        return result
+    if telemetry:
+        if type(result) is not tuple or len(result) != 2:
+            raise RuntimeError("instrumented search result shape changed")
+        hits, evidence = result
+        return _AstraTSVRows(renderer(hits)), evidence
+    return _AstraTSVRows(renderer(result))
+
+
 def _continuation_scheduler_mode() -> str:
     mode = os.environ.get(_CONTINUATION_SCHEDULER_ENV, _SCHEDULER_COMPLETION)
     if mode not in (_SCHEDULER_OLDEST, _SCHEDULER_COMPLETION):
@@ -573,15 +599,16 @@ def _serial_hmmsearch(
     telemetry: bool,
     collector: TelemetryCollector | None = None,
     profile_ordinals: tuple[int, ...] | None = None,
+    result_renderer: Any = None,
 ) -> Iterator[Any]:
     if collector is not None and profile_ordinals is None:
         raise RuntimeError("collector search lacks profile ordinals")
     pipeline = pyhmmer.plan7.Pipeline(**pipeline_options)
     for row in range(len(candidates)):
         if collector is None:
-            yield _search_row(candidates, row, pipeline, telemetry)
+            result = _search_row(candidates, row, pipeline, telemetry)
         else:
-            yield _search_row(
+            result = _search_row(
                 candidates,
                 row,
                 pipeline,
@@ -589,6 +616,7 @@ def _serial_hmmsearch(
                 collector,
                 profile_ordinals[row],
             )
+        yield _render_search_result(result, result_renderer, telemetry)
 
 
 def _threaded_hmmsearch(
@@ -599,6 +627,7 @@ def _threaded_hmmsearch(
     collector: TelemetryCollector | None = None,
     profile_ordinals: tuple[int, ...] | None = None,
     continuation_pool: _ContinuationPool | None = None,
+    result_renderer: Any = None,
 ) -> Iterator[Any]:
     if collector is not None and profile_ordinals is None:
         raise RuntimeError("collector search lacks profile ordinals")
@@ -702,20 +731,23 @@ def _threaded_hmmsearch(
             else:
                 for row in range(start, stop):
                     if collector is None:
-                        hits.append(
-                            _search_row(candidates, row, pipeline, telemetry)
+                        result = _search_row(
+                            candidates, row, pipeline, telemetry
                         )
                     else:
-                        hits.append(
-                            _search_row(
-                                candidates,
-                                row,
-                                pipeline,
-                                telemetry,
-                                collector,
-                                profile_ordinals[row],
-                            )
+                        result = _search_row(
+                            candidates,
+                            row,
+                            pipeline,
+                            telemetry,
+                            collector,
+                            profile_ordinals[row],
                         )
+                    hits.append(
+                        _render_search_result(
+                            result, result_renderer, telemetry
+                        )
+                    )
         except BaseException as caught:
             # A task preserves row-wise failure order: successful rows before
             # the failing row are yielded before this exact error.
@@ -843,7 +875,9 @@ def _threaded_hmmsearch(
         )
         pending_shard_row = None
         pending_shard_hits = []
-        return (merged,)
+        return (
+            _render_search_result(merged, result_renderer, telemetry),
+        )
 
     active_task_limit = min(
         len(task_bounds), _TASKS_PER_WORKER_WINDOW * worker_count
@@ -1008,6 +1042,7 @@ def _hmmsearch_impl(
     profile_ordinals: Iterable[int] | None = None,
     profile_keys: Iterable[str | None] | None = None,
     _continuation_pool: _ContinuationPool | None = None,
+    _result_renderer: Any = None,
     **pipeline_options: Any,
 ) -> Iterator[Any]:
     """Yield candidate-aware HMM searches in supplied query order.
@@ -1046,6 +1081,8 @@ def _hmmsearch_impl(
         raise TypeError("postfilter must be bool")
     if type(telemetry) is not bool:
         raise TypeError("telemetry must be bool")
+    if _result_renderer is not None and not callable(_result_renderer):
+        raise TypeError("_result_renderer must be callable or None")
     if telemetry_collector is not None:
         from .telemetry_report import TelemetryCollector
 
@@ -1099,13 +1136,19 @@ def _hmmsearch_impl(
         return iter(())
     if worker_count == 1 and _continuation_pool is None:
         if telemetry_collector is None:
-            return _serial_hmmsearch(candidates, options, telemetry)
+            return _serial_hmmsearch(
+                candidates,
+                options,
+                telemetry,
+                result_renderer=_result_renderer,
+            )
         return _serial_hmmsearch(
             candidates,
             options,
             telemetry,
             telemetry_collector,
             ordinal_values,
+            _result_renderer,
         )
     if telemetry_collector is None:
         return _threaded_hmmsearch(
@@ -1114,6 +1157,7 @@ def _hmmsearch_impl(
             options,
             telemetry,
             continuation_pool=_continuation_pool,
+            result_renderer=_result_renderer,
         )
     return _threaded_hmmsearch(
         candidates,
@@ -1123,6 +1167,7 @@ def _hmmsearch_impl(
         telemetry_collector,
         ordinal_values,
         _continuation_pool,
+        _result_renderer,
     )
 
 
@@ -1176,6 +1221,71 @@ def _hmmsearch_with_continuation_pool(
         profile_ordinals=profile_ordinals,
         profile_keys=profile_keys,
         _continuation_pool=continuation_pool,
+        **pipeline_options,
+    )
+
+
+def _astra_tsv_renderer() -> Any:
+    from . import _pipeline  # type: ignore[attr-defined]
+
+    renderer = getattr(_pipeline, "_astra_tsv_rows_bound", None)
+    if not callable(renderer):
+        raise RuntimeError("native Astra TSV renderer is unavailable")
+    return renderer
+
+
+def _hmmsearch_astra_tsv(
+    profile_pairs: Iterable[PressedProfilePair],
+    batch: SequenceBatch | CandidateBatch,
+    *,
+    cpus: int = 1,
+    postfilter: bool = False,
+    telemetry: bool = False,
+    telemetry_collector: TelemetryCollector | None = None,
+    profile_ordinals: Iterable[int] | None = None,
+    profile_keys: Iterable[str | None] | None = None,
+    **pipeline_options: Any,
+) -> Iterator[Any]:
+    """Private Astra path rendering exact rows inside continuation workers."""
+    return _hmmsearch_impl(
+        profile_pairs,
+        batch,
+        cpus=cpus,
+        postfilter=postfilter,
+        telemetry=telemetry,
+        telemetry_collector=telemetry_collector,
+        profile_ordinals=profile_ordinals,
+        profile_keys=profile_keys,
+        _result_renderer=_astra_tsv_renderer(),
+        **pipeline_options,
+    )
+
+
+def _hmmsearch_astra_tsv_with_continuation_pool(
+    profile_pairs: Iterable[PressedProfilePair],
+    batch: SequenceBatch | CandidateBatch,
+    *,
+    continuation_pool: _ContinuationPool,
+    cpus: int = 1,
+    postfilter: bool = False,
+    telemetry: bool = False,
+    telemetry_collector: TelemetryCollector | None = None,
+    profile_ordinals: Iterable[int] | None = None,
+    profile_keys: Iterable[str | None] | None = None,
+    **pipeline_options: Any,
+) -> Iterator[Any]:
+    """Worker-rendering Astra path retaining request-scoped Pipelines."""
+    return _hmmsearch_impl(
+        profile_pairs,
+        batch,
+        cpus=cpus,
+        postfilter=postfilter,
+        telemetry=telemetry,
+        telemetry_collector=telemetry_collector,
+        profile_ordinals=profile_ordinals,
+        profile_keys=profile_keys,
+        _continuation_pool=continuation_pool,
+        _result_renderer=_astra_tsv_renderer(),
         **pipeline_options,
     )
 
