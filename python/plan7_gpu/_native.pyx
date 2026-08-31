@@ -29,6 +29,9 @@ from ._fingerprint import (
     optimized_profile_fingerprint as _profile_fingerprint,
     sequence_content_fingerprint as _sequence_content_fingerprint,
 )
+from ._private_tuning import (
+    auto_forward_cpu_max_cells as _auto_forward_cpu_max_cells,
+)
 
 
 PYHMMER_PRIVATE_ABI = "0.12.0"
@@ -5981,7 +5984,7 @@ cdef class SequenceBatch:
         ):
             self._cpu_forward_route_mode = 4
             self._cpu_forward_route_auto = True
-            self._cpu_forward_max_cells = 200000
+            self._cpu_forward_max_cells = _auto_forward_cpu_max_cells()
             forward_ownership = "hybrid_cells_below"
         elif forward_ownership is None:
             forward_ownership = "gpu"

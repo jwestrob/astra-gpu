@@ -36,6 +36,7 @@ from .adapter import (
     SequenceBatch,
     _candidate_state,
 )
+from ._private_tuning import continuation_shard_trigger, exceeds_ratio
 
 if TYPE_CHECKING:
     from .telemetry_report import TelemetryCollector
@@ -186,6 +187,7 @@ def _sharded_task_bounds(
     profile_hints: tuple[int, ...],
     exception_hints: tuple[tuple[int, ...], ...],
     max_rows: int,
+    shard_trigger: tuple[int, int] = (2, 1),
 ) -> tuple[tuple[int, int, int, int, int, int], ...]:
     """Split only pathological single-profile tasks into exact shards."""
     if len(profile_hints) != len(exception_hints):
@@ -200,7 +202,8 @@ def _sharded_task_bounds(
         row_hints = exception_hints[start] if stop == start + 1 else ()
         shards = (
             _partition_exception_hints(row_hints, target)
-            if work_hint > 2 * target and len(row_hints) > 1
+            if exceeds_ratio(work_hint, target, shard_trigger)
+            and len(row_hints) > 1
             else ()
         )
         if len(shards) <= 1:
@@ -250,7 +253,12 @@ def _continuation_task_bounds(
                             "sharded continuation work hints are unavailable"
                         )
                     shard_hints = tuple(shard_helper(state.sealed_postfilter))
-                    return _sharded_task_bounds(hints, shard_hints, max_rows)
+                    return _sharded_task_bounds(
+                        hints,
+                        shard_hints,
+                        max_rows,
+                        continuation_shard_trigger(),
+                    )
                 return tuple(
                     (start, stop, work, -1, -1, 1)
                     for start, stop, work in _balanced_task_bounds(
