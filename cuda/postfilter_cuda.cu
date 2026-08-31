@@ -1608,7 +1608,12 @@ struct plan7_profile_session {
   uint64_t build_worker_count;
   uint64_t build_parallel_run_count;
   uint64_t selection_count;
+  size_t profile_count;
+  bool chunk_local_pack;
   std::shared_ptr<const HostProfilePack> pack;
+  std::vector<uintptr_t> source_profile_pointers;
+  std::vector<float> background;
+  std::vector<uintptr_t> identity_tokens;
   std::unique_ptr<PackWorkerPool> selection_workers;
   std::mutex operation_mutex;
 };
@@ -2184,11 +2189,13 @@ extern "C" int plan7_profile_session_create(
     const uintptr_t *profile_pointers, size_t profile_count,
     const float *background, size_t background_count,
     size_t build_worker_count, size_t selection_worker_count,
+    int chunk_local_pack,
     plan7_profile_session **session, char *error, size_t error_size) {
   if (session == nullptr || *session != nullptr || background == nullptr ||
       background_count != 20 ||
       build_worker_count > profile_count ||
       selection_worker_count > profile_count ||
+      (chunk_local_pack != 0 && chunk_local_pack != 1) ||
       (profile_count != 0 && profile_pointers == nullptr)) {
     set_error(error, error_size, "invalid profile session arguments");
     return -1;
@@ -2205,20 +2212,23 @@ extern "C" int plan7_profile_session_create(
     }
   }
 
-  std::unique_ptr<PackWorkerPool> build_workers;
-  try {
-    build_workers = std::make_unique<PackWorkerPool>(build_worker_count);
-  } catch (...) {
-    set_error(error, error_size, "profile session build worker launch failed");
-    return -1;
-  }
   HostProfilePack pack;
-  if (snapshot_profiles(profile_pointers, profile_count, background,
-                        build_workers.get(), &pack, error, error_size) != 0)
-    return -1;
-  const uint64_t build_parallel_run_count =
-      build_workers->parallel_run_count();
-  build_workers.reset();
+  uint64_t build_parallel_run_count = 0;
+  if (chunk_local_pack == 0) {
+    std::unique_ptr<PackWorkerPool> build_workers;
+    try {
+      build_workers = std::make_unique<PackWorkerPool>(build_worker_count);
+    } catch (...) {
+      set_error(error, error_size,
+                "profile session build worker launch failed");
+      return -1;
+    }
+    if (snapshot_profiles(profile_pointers, profile_count, background,
+                          build_workers.get(), &pack,
+                          error, error_size) != 0)
+      return -1;
+    build_parallel_run_count = build_workers->parallel_run_count();
+  }
 
   uint64_t session_id;
   if (!claim_profile_session_id(&session_id)) {
@@ -2230,12 +2240,15 @@ extern "C" int plan7_profile_session_create(
     set_error(error, error_size, "profile identity token space exhausted");
     return -1;
   }
+  std::vector<uintptr_t> identity_tokens;
   try {
-    pack.identity_tokens.resize(profile_count);
+    identity_tokens.resize(profile_count);
     for (size_t profile_index = 0; profile_index < profile_count;
          ++profile_index)
-      pack.identity_tokens[profile_index] =
+      identity_tokens[profile_index] =
           static_cast<uintptr_t>(first_identity_token + profile_index);
+    if (chunk_local_pack == 0)
+      pack.identity_tokens = std::move(identity_tokens);
   } catch (...) {
     set_error(error, error_size, "profile session identity allocation failed");
     return -1;
@@ -2258,10 +2271,22 @@ extern "C" int plan7_profile_session_create(
   }
   try {
     created->session_id = session_id;
-    created->build_worker_count = build_worker_count;
+    created->build_worker_count =
+        chunk_local_pack == 0 ? build_worker_count : 0;
     created->build_parallel_run_count = build_parallel_run_count;
     created->selection_count = 0;
-    created->pack = std::make_shared<const HostProfilePack>(std::move(pack));
+    created->profile_count = profile_count;
+    created->chunk_local_pack = chunk_local_pack != 0;
+    if (created->chunk_local_pack) {
+      if (profile_count != 0)
+        created->source_profile_pointers.assign(
+            profile_pointers, profile_pointers + profile_count);
+      created->background.assign(background, background + background_count);
+      created->identity_tokens = std::move(identity_tokens);
+    } else {
+      created->pack =
+          std::make_shared<const HostProfilePack>(std::move(pack));
+    }
     created->selection_workers = std::move(selection_workers);
   } catch (...) {
     delete created;
@@ -2288,15 +2313,19 @@ extern "C" int plan7_profile_session_get_statistics(
     const plan7_profile_session *session,
     plan7_profile_session_statistics *statistics,
     char *error, size_t error_size) {
-  if (session == nullptr || statistics == nullptr || session->pack == nullptr ||
-      session->selection_workers == nullptr) {
+  if (session == nullptr || statistics == nullptr ||
+      session->selection_workers == nullptr ||
+      (!session->chunk_local_pack && session->pack == nullptr) ||
+      (session->chunk_local_pack &&
+       (session->source_profile_pointers.size() != session->profile_count ||
+        session->background.size() != 20 ||
+        session->identity_tokens.size() != session->profile_count))) {
     set_error(error, error_size, "invalid profile session statistics");
     return -1;
   }
-  const HostProfilePack &pack = *session->pack;
   *statistics = {};
   statistics->session_id = session->session_id;
-  statistics->profile_count = pack.vit_profiles.size();
+  statistics->profile_count = session->profile_count;
   statistics->worker_count = session->selection_workers->worker_count();
   statistics->build_worker_count = session->build_worker_count;
   statistics->selection_worker_count =
@@ -2312,25 +2341,46 @@ extern "C" int plan7_profile_session_get_statistics(
           ? UINT64_MAX
           : statistics->build_parallel_run_count +
                 statistics->selection_parallel_run_count;
-  statistics->host_bytes = host_pack_bytes(pack);
-  statistics->ssv_score_bytes = pack.ssv_scores.size();
-  statistics->bias_profile_bytes =
-      static_cast<uint64_t>(pack.bias_templates.size()) *
-      sizeof(plan7_bias_profile);
-  statistics->viterbi_descriptor_bytes =
-      static_cast<uint64_t>(pack.vit_profiles.size()) * sizeof(VitProfile);
-  statistics->viterbi_emission_bytes =
-      static_cast<uint64_t>(pack.emissions.size()) * sizeof(int16_t);
-  statistics->viterbi_transition_bytes =
-      static_cast<uint64_t>(pack.transitions.size()) * sizeof(int16_t);
-  statistics->viterbi_exact_rbv_bytes = pack.exact_rbv.size();
-  statistics->forward_descriptor_bytes =
-      static_cast<uint64_t>(pack.forward_profiles.size()) *
-      sizeof(plan7_forward_snapshot_profile);
-  statistics->forward_emission_bytes =
-      static_cast<uint64_t>(pack.forward_emissions.size()) * sizeof(float);
-  statistics->forward_transition_bytes =
-      static_cast<uint64_t>(pack.forward_transitions.size()) * sizeof(float);
+  statistics->chunk_local_pack = session->chunk_local_pack ? 1 : 0;
+  if (session->chunk_local_pack) {
+    statistics->profile_pointer_bytes =
+        static_cast<uint64_t>(session->source_profile_pointers.size()) *
+        sizeof(uintptr_t);
+    statistics->identity_token_bytes =
+        static_cast<uint64_t>(session->identity_tokens.size()) *
+        sizeof(uintptr_t);
+    statistics->background_bytes =
+        static_cast<uint64_t>(session->background.size()) * sizeof(float);
+    const uint64_t first = statistics->profile_pointer_bytes >
+            UINT64_MAX - statistics->identity_token_bytes
+        ? UINT64_MAX
+        : statistics->profile_pointer_bytes +
+              statistics->identity_token_bytes;
+    statistics->host_bytes = first > UINT64_MAX - statistics->background_bytes
+        ? UINT64_MAX
+        : first + statistics->background_bytes;
+  } else {
+    const HostProfilePack &pack = *session->pack;
+    statistics->host_bytes = host_pack_bytes(pack);
+    statistics->ssv_score_bytes = pack.ssv_scores.size();
+    statistics->bias_profile_bytes =
+        static_cast<uint64_t>(pack.bias_templates.size()) *
+        sizeof(plan7_bias_profile);
+    statistics->viterbi_descriptor_bytes =
+        static_cast<uint64_t>(pack.vit_profiles.size()) * sizeof(VitProfile);
+    statistics->viterbi_emission_bytes =
+        static_cast<uint64_t>(pack.emissions.size()) * sizeof(int16_t);
+    statistics->viterbi_transition_bytes =
+        static_cast<uint64_t>(pack.transitions.size()) * sizeof(int16_t);
+    statistics->viterbi_exact_rbv_bytes = pack.exact_rbv.size();
+    statistics->forward_descriptor_bytes =
+        static_cast<uint64_t>(pack.forward_profiles.size()) *
+        sizeof(plan7_forward_snapshot_profile);
+    statistics->forward_emission_bytes =
+        static_cast<uint64_t>(pack.forward_emissions.size()) * sizeof(float);
+    statistics->forward_transition_bytes =
+        static_cast<uint64_t>(pack.forward_transitions.size()) * sizeof(float);
+  }
   return 0;
 }
 
@@ -2338,14 +2388,87 @@ extern "C" int plan7_profile_session_select(
     plan7_profile_session *session, const size_t *profile_indices,
     size_t profile_count, plan7_profile_selection **selection,
     char *error, size_t error_size) {
-  if (session == nullptr || session->pack == nullptr ||
-      session->selection_workers == nullptr || selection == nullptr ||
+  if (session == nullptr || session->selection_workers == nullptr ||
+      (!session->chunk_local_pack && session->pack == nullptr) ||
+      (session->chunk_local_pack &&
+       (session->source_profile_pointers.size() != session->profile_count ||
+        session->background.size() != 20 ||
+        session->identity_tokens.size() != session->profile_count)) ||
+      selection == nullptr ||
       *selection != nullptr ||
       (profile_count != 0 && profile_indices == nullptr)) {
     set_error(error, error_size, "invalid profile selection arguments");
     return -1;
   }
   std::lock_guard<std::mutex> operation(session->operation_mutex);
+  if (session->chunk_local_pack) {
+    std::vector<uint8_t> seen;
+    std::vector<uintptr_t> selected_pointers;
+    try {
+      seen.assign(session->profile_count, 0);
+      selected_pointers.reserve(profile_count);
+      for (size_t output_index = 0; output_index < profile_count;
+           ++output_index) {
+        const size_t source_index = profile_indices[output_index];
+        if (source_index >= session->profile_count) {
+          set_error(error, error_size,
+                    "profile selection index is out of range");
+          return -1;
+        }
+        if (seen[source_index] != 0) {
+          set_error(error, error_size,
+                    "profile selection indexes must be unique");
+          return -1;
+        }
+        seen[source_index] = 1;
+        selected_pointers.push_back(
+            session->source_profile_pointers[source_index]);
+      }
+    } catch (...) {
+      set_error(error, error_size, "profile selection allocation failed");
+      return -1;
+    }
+
+    HostProfilePack selected;
+    if (snapshot_profiles(
+            selected_pointers.empty() ? nullptr : selected_pointers.data(),
+            selected_pointers.size(), session->background.data(),
+            session->selection_workers.get(), &selected,
+            error, error_size) != 0)
+      return -1;
+    try {
+      selected.identity_tokens.resize(profile_count);
+      for (size_t output_index = 0; output_index < profile_count;
+           ++output_index)
+        selected.identity_tokens[output_index] =
+            session->identity_tokens[profile_indices[output_index]];
+    } catch (...) {
+      set_error(error, error_size, "profile selection allocation failed");
+      return -1;
+    }
+    if (session->selection_count == UINT64_MAX) {
+      set_error(error, error_size, "profile selection identity exhausted");
+      return -1;
+    }
+    auto *created = new (std::nothrow) plan7_profile_selection{};
+    if (created == nullptr) {
+      set_error(error, error_size, "profile selection allocation failed");
+      return -1;
+    }
+    try {
+      created->session_id = session->session_id;
+      created->selection_id = session->selection_count + 1;
+      created->pack =
+          std::make_shared<const HostProfilePack>(std::move(selected));
+    } catch (...) {
+      delete created;
+      set_error(error, error_size, "profile selection allocation failed");
+      return -1;
+    }
+    ++session->selection_count;
+    *selection = created;
+    return 0;
+  }
   const HostProfilePack &source = *session->pack;
   HostProfilePack selected;
   selected.alphabet_size = source.alphabet_size;
@@ -2518,6 +2641,41 @@ extern "C" int plan7_profile_selection_get_view(
       ? nullptr : pack.identity_tokens.data();
   view->host_bytes = host_pack_bytes(pack);
   return 0;
+}
+
+extern "C" int plan7_profile_selection_snapshot_equal_for_test(
+    const plan7_profile_selection *left,
+    const plan7_profile_selection *right,
+    char *error, size_t error_size) {
+  if (left == nullptr || left->pack == nullptr ||
+      right == nullptr || right->pack == nullptr) {
+    set_error(error, error_size,
+              "invalid profile selection snapshot comparison");
+    return -1;
+  }
+  const HostProfilePack &a = *left->pack;
+  const HostProfilePack &b = *right->pack;
+  const auto equal_bytes = [](const auto &x, const auto &y) {
+    if (x.size() != y.size()) return false;
+    return x.empty() ||
+        std::memcmp(x.data(), y.data(), x.size() * sizeof(x[0])) == 0;
+  };
+  return a.alphabet_size == b.alphabet_size &&
+      equal_bytes(a.vit_profiles, b.vit_profiles) &&
+      equal_bytes(a.ssv_scores, b.ssv_scores) &&
+      equal_bytes(a.exact_rbv, b.exact_rbv) &&
+      equal_bytes(a.emissions, b.emissions) &&
+      equal_bytes(a.transitions, b.transitions) &&
+      equal_bytes(a.ssv_profiles, b.ssv_profiles) &&
+      equal_bytes(a.m_mu, b.m_mu) &&
+      equal_bytes(a.m_lambda, b.m_lambda) &&
+      equal_bytes(a.v_mu, b.v_mu) &&
+      equal_bytes(a.v_lambda, b.v_lambda) &&
+      equal_bytes(a.bias_templates, b.bias_templates) &&
+      equal_bytes(a.forward_profiles, b.forward_profiles) &&
+      equal_bytes(a.forward_emissions, b.forward_emissions) &&
+      equal_bytes(a.forward_transitions, b.forward_transitions)
+      ? 1 : 0;
 }
 
 extern "C" int plan7_profile_selection_stage_viterbi(

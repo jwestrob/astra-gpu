@@ -164,6 +164,12 @@ typedef struct plan7_profile_session_statistics {
   uint64_t forward_descriptor_bytes;
   uint64_t forward_emission_bytes;
   uint64_t forward_transition_bytes;
+  /* A chunk-local session retains only live profile pointers, identity
+   * tokens, and its copied background until a selection is requested. */
+  uint64_t chunk_local_pack;
+  uint64_t profile_pointer_bytes;
+  uint64_t identity_token_bytes;
+  uint64_t background_bytes;
 } plan7_profile_session_statistics;
 
 enum plan7_postfilter_workspace_capacity {
@@ -220,14 +226,17 @@ size_t plan7_viterbi_database_profile_count(
   const plan7_viterbi_database *database);
 
 /* Snapshot private optimized-profile arrays into immutable host storage.
- * The caller must prevent every source profile from being mutated until this
- * function returns.  No CUDA context or device allocation is used here. */
+ * With chunk_local_pack=1, retain only the supplied pointers and copy each
+ * ordered selection directly into its own immutable host pack. The caller
+ * must keep those source profiles alive and immutable until the session is
+ * destroyed. No CUDA context or device allocation is used here. */
 int plan7_profile_session_create(const uintptr_t *profile_pointers,
                                  size_t profile_count,
                                  const float *background,
                                  size_t background_count,
                                  size_t build_worker_count,
                                  size_t selection_worker_count,
+                                 int chunk_local_pack,
                                  plan7_profile_session **session,
                                  char *error,
                                  size_t error_size);
@@ -260,6 +269,15 @@ int plan7_profile_selection_destroy(plan7_profile_selection **selection,
 int plan7_profile_selection_get_view(
   const plan7_profile_selection *selection,
   plan7_profile_selection_view *view,
+  char *error,
+  size_t error_size);
+
+/* Test-only exact comparison of immutable snapshot payloads. Identity tokens
+ * are deliberately excluded because they identify a session, not profile
+ * arithmetic. Returns 1 for equal, 0 for different, and -1 on invalid input. */
+int plan7_profile_selection_snapshot_equal_for_test(
+  const plan7_profile_selection *left,
+  const plan7_profile_selection *right,
   char *error,
   size_t error_size);
 

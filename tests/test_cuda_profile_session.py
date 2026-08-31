@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import hashlib
 import io
 import math
@@ -382,6 +383,145 @@ class HostProfileSessionTests(ProfileSessionFixture, unittest.TestCase):
                 first.close()
         finally:
             session.close()
+
+    def test_chunk_local_pack_matches_eager_snapshot_and_accounts_lifetime(self):
+        eager = ProfileSession(self.pairs, pack_workers=0)
+        lazy = ProfileSession(
+            self.pairs,
+            build_workers=3,
+            selection_workers=0,
+            _chunk_local_pack=True,
+        )
+        eager_selection = None
+        lazy_selection = None
+        eager_empty = None
+        lazy_empty = None
+        try:
+            eager_statistics = eager.statistics
+            lazy_statistics = lazy.statistics
+            self.assertFalse(eager_statistics["chunk_local_pack"])
+            self.assertEqual(eager_statistics["profile_pointer_bytes"], 0)
+            self.assertEqual(eager_statistics["identity_token_bytes"], 0)
+            self.assertEqual(eager_statistics["background_bytes"], 0)
+            self.assertTrue(lazy_statistics["chunk_local_pack"])
+            self.assertEqual(lazy_statistics["profile_count"], len(self.pairs))
+            self.assertEqual(lazy_statistics["build_worker_count"], 0)
+            self.assertEqual(lazy_statistics["build_parallel_run_count"], 0)
+            self.assertEqual(
+                lazy_statistics["profile_pointer_bytes"],
+                len(self.pairs) * struct.calcsize("P"),
+            )
+            self.assertEqual(
+                lazy_statistics["identity_token_bytes"],
+                len(self.pairs) * struct.calcsize("P"),
+            )
+            self.assertEqual(lazy_statistics["background_bytes"], 20 * 4)
+            self.assertEqual(
+                lazy_statistics["host_bytes"],
+                lazy_statistics["profile_pointer_bytes"]
+                + lazy_statistics["identity_token_bytes"]
+                + lazy_statistics["background_bytes"],
+            )
+            self.assertLess(
+                lazy_statistics["host_bytes"], eager_statistics["host_bytes"]
+            )
+            for field in (
+                "ssv_score_bytes",
+                "bias_profile_bytes",
+                "viterbi_descriptor_bytes",
+                "viterbi_emission_bytes",
+                "viterbi_transition_bytes",
+                "viterbi_exact_rbv_bytes",
+                "forward_descriptor_bytes",
+                "forward_emission_bytes",
+                "forward_transition_bytes",
+            ):
+                self.assertEqual(lazy_statistics[field], 0, field)
+
+            eager_selection = eager.select([2, 0])
+            lazy_selection = lazy.select([2, 0])
+            eager_empty = eager.select([])
+            lazy_empty = lazy.select([])
+            eager_native = _profile_selection_state(eager_selection).native
+            lazy_native = _profile_selection_state(lazy_selection).native
+            self.assertTrue(
+                eager_native._snapshot_equal_for_test(lazy_native)
+            )
+            self.assertEqual(
+                eager_selection.host_bytes, lazy_selection.host_bytes
+            )
+            self.assertTrue(
+                _profile_selection_state(eager_empty).native
+                ._snapshot_equal_for_test(
+                    _profile_selection_state(lazy_empty).native
+                )
+            )
+            self.assertEqual(lazy.statistics["selection_count"], 2)
+            self.assertEqual(
+                lazy.statistics["selection_parallel_run_count"], 1
+            )
+
+            # Every selection is pointer-free and remains valid after the
+            # native session source-pointer table is released.
+            lazy.close()
+            self.assertTrue(lazy.closed)
+            self.assertTrue(
+                eager_native._snapshot_equal_for_test(lazy_native)
+            )
+        finally:
+            for selection in (
+                lazy_empty,
+                eager_empty,
+                lazy_selection,
+                eager_selection,
+            ):
+                if selection is not None:
+                    selection.close()
+            lazy.close()
+            eager.close()
+
+    def test_chunk_local_pack_opt_in_is_exact_bool(self):
+        for value in (0, 1, None, "yes"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, "_chunk_local_pack"):
+                    ProfileSession(self.pairs, _chunk_local_pack=value)
+
+    def test_native_chunk_local_session_owns_sources_until_close(self):
+        background = pyhmmer.plan7.Background(self.alphabet)
+        sources = [
+            _pair_state(pair).optimized_profile.copy() for pair in self.pairs
+        ]
+        native = _native.ProfileSession(
+            sources,
+            memoryview(background.residue_frequencies),
+            0,
+            0,
+            None,
+            True,
+        )
+        eager = ProfileSession(self.pairs, pack_workers=0)
+        native_selection = None
+        eager_selection = None
+        try:
+            del sources
+            gc.collect()
+            native_selection = native.select([2, 0])
+            eager_selection = eager.select([2, 0])
+            eager_native = _profile_selection_state(eager_selection).native
+            self.assertTrue(
+                eager_native._snapshot_equal_for_test(native_selection)
+            )
+            native.close()
+            self.assertTrue(
+                eager_native._snapshot_equal_for_test(native_selection)
+            )
+        finally:
+            if native_selection is not None:
+                native_selection.close()
+            if eager_selection is not None:
+                eager_selection.close()
+            native.close()
+            eager.close()
 
     def test_pack_worker_budget_is_explicit_and_bounded(self):
         for requested, expected in (

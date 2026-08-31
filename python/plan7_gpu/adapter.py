@@ -228,6 +228,7 @@ class _ProfileSessionState:
         "profiles",
         "profile_fingerprints",
         "background_fingerprint",
+        "chunk_local_pack",
     )
 
     def __init__(
@@ -239,6 +240,7 @@ class _ProfileSessionState:
         profiles: tuple[Any, ...],
         profile_fingerprints: tuple[bytes, ...],
         background_fingerprint: bytes,
+        chunk_local_pack: bool,
     ) -> None:
         self.pairs = pairs
         self.alphabet = alphabet
@@ -248,6 +250,7 @@ class _ProfileSessionState:
         self.profiles = profiles
         self.profile_fingerprints = profile_fingerprints
         self.background_fingerprint = background_fingerprint
+        self.chunk_local_pack = chunk_local_pack
 
 
 class _ProfileSelectionState:
@@ -335,6 +338,10 @@ class ProfileSession:
     ``pack_workers`` remains the shared default for construction and selection.
     Either phase may be overridden independently; construction workers are
     retired before this constructor returns.
+
+    ``_chunk_local_pack`` is a private large-database experiment. It keeps the
+    already-owned optimized profiles alive and creates only immutable selected
+    packs, leaving normal and small-workload behavior unchanged.
     """
 
     __slots__ = ("__weakref__",)
@@ -346,10 +353,13 @@ class ProfileSession:
         pack_workers: int | None = None,
         build_workers: int | None = None,
         selection_workers: int | None = None,
+        _chunk_local_pack: bool = False,
     ):
         pairs = tuple(profile_pairs)
         if not pairs:
             raise ValueError("a profile session requires at least one profile")
+        if type(_chunk_local_pack) is not bool:
+            raise TypeError("_chunk_local_pack must be bool")
         default_workers = min(16, len(pairs))
         shared_workers = _profile_worker_budget(
             pack_workers, default_workers, len(pairs), "pack_workers"
@@ -423,6 +433,7 @@ class ProfileSession:
                 build_worker_count,
                 selection_worker_count,
                 profile_fingerprints,
+                _chunk_local_pack,
             )
             if (
                 native._fingerprints_for_seal()
@@ -440,6 +451,7 @@ class ProfileSession:
             profiles,
             profile_fingerprints,
             background_fingerprint,
+            _chunk_local_pack,
         )
 
     def __len__(self) -> int:
@@ -478,7 +490,19 @@ class ProfileSession:
             seen.add(index)
             normalized.append(index)
         normalized_indices = tuple(normalized)
-        with state.lock:
+        with ExitStack() as locks:
+            if state.chunk_local_pack:
+                pair_states = tuple(
+                    _pair_state(state.pairs[index])
+                    for index in normalized_indices
+                )
+                unique_locks = {
+                    id(pair_state.lock): pair_state.lock
+                    for pair_state in pair_states
+                }
+                for lock_id in sorted(unique_locks):
+                    locks.enter_context(unique_locks[lock_id])
+            locks.enter_context(state.lock)
             if state.native.closed:
                 raise RuntimeError("profile session is closed")
             native = state.native.select(normalized_indices)

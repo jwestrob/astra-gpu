@@ -942,6 +942,10 @@ cdef extern from "postfilter_cuda.h" nogil:
         uint64_t forward_descriptor_bytes
         uint64_t forward_emission_bytes
         uint64_t forward_transition_bytes
+        uint64_t chunk_local_pack
+        uint64_t profile_pointer_bytes
+        uint64_t identity_token_bytes
+        uint64_t background_bytes
 
     int plan7_viterbi_database_create(
         const uintptr_t *profile_pointers,
@@ -968,6 +972,7 @@ cdef extern from "postfilter_cuda.h" nogil:
         size_t background_count,
         size_t build_worker_count,
         size_t selection_worker_count,
+        int chunk_local_pack,
         plan7_profile_session **session,
         char *error,
         size_t error_size,
@@ -1004,6 +1009,13 @@ cdef extern from "postfilter_cuda.h" nogil:
     int plan7_profile_selection_get_view(
         const plan7_profile_selection *selection,
         plan7_profile_selection_view *view,
+        char *error,
+        size_t error_size,
+    )
+
+    int plan7_profile_selection_snapshot_equal_for_test(
+        const plan7_profile_selection *left,
+        const plan7_profile_selection *right,
         char *error,
         size_t error_size,
     )
@@ -5479,6 +5491,30 @@ cdef class ProfileSelection:
         cdef plan7_profile_selection_view view = self._view()
         return view.host_bytes
 
+    def _snapshot_equal_for_test(self, other):
+        """Compare every arithmetic snapshot byte except identity tokens."""
+        cdef ProfileSelection right
+        cdef char error[512]
+        cdef int status
+        if self._selection == NULL:
+            raise RuntimeError("profile selection is closed")
+        if not isinstance(other, ProfileSelection):
+            raise TypeError("snapshot comparison requires ProfileSelection")
+        right = other
+        if right._selection == NULL:
+            raise RuntimeError("profile selection is closed")
+        error[0] = 0
+        with nogil:
+            status = plan7_profile_selection_snapshot_equal_for_test(
+                self._selection,
+                right._selection,
+                error,
+                sizeof(error),
+            )
+        if status < 0:
+            raise RuntimeError(error.decode("utf-8", "replace"))
+        return bool(status)
+
     def close(self):
         cdef plan7_profile_selection *selection = NULL
         cdef char error[512]
@@ -5497,18 +5533,22 @@ cdef class ProfileSelection:
 
 
 cdef class ProfileSession:
-    """Host-owned immutable SSV, bias, Viterbi, and Forward snapshots.
+    """Host-owned exact SSV, bias, Viterbi, and Forward snapshots.
 
     Session operations and ``close`` must be serialized by the public adapter.
     Construction does not create a CUDA context or allocate device memory.
+    The private chunk-local mode keeps source owners alive and snapshots only
+    the profiles in each ordered selection.
     """
 
     cdef plan7_profile_session *_session
     cdef tuple _fingerprints
+    cdef tuple _owners
 
     def __cinit__(self):
         self._session = NULL
         self._fingerprints = ()
+        self._owners = ()
 
     def __init__(
         self,
@@ -5517,6 +5557,7 @@ cdef class ProfileSession:
         size_t build_worker_count,
         size_t selection_worker_count,
         profile_fingerprints=None,
+        bint chunk_local_pack=False,
     ):
         cdef tuple owners = tuple(profiles)
         cdef tuple fingerprints
@@ -5550,6 +5591,7 @@ cdef class ProfileSession:
                 <size_t> background.shape[0],
                 build_worker_count,
                 selection_worker_count,
+                1 if chunk_local_pack else 0,
                 &self._session,
                 error,
                 sizeof(error),
@@ -5557,6 +5599,8 @@ cdef class ProfileSession:
         if status != 0:
             raise ValueError(error.decode("utf-8", "replace"))
         try:
+            if chunk_local_pack:
+                self._owners = owners
             if profile_fingerprints is None:
                 fingerprints = tuple(
                     _profile_fingerprint(value) for value in owners
@@ -5629,6 +5673,10 @@ cdef class ProfileSession:
             "forward_descriptor_bytes": statistics.forward_descriptor_bytes,
             "forward_emission_bytes": statistics.forward_emission_bytes,
             "forward_transition_bytes": statistics.forward_transition_bytes,
+            "chunk_local_pack": bool(statistics.chunk_local_pack),
+            "profile_pointer_bytes": statistics.profile_pointer_bytes,
+            "identity_token_bytes": statistics.identity_token_bytes,
+            "background_bytes": statistics.background_bytes,
         }
 
     def _fingerprints_for_seal(self):
@@ -5692,6 +5740,7 @@ cdef class ProfileSession:
                 status = plan7_profile_session_destroy(
                     &session, error, sizeof(error)
                 )
+            self._owners = ()
         if status != 0:
             raise RuntimeError(error.decode("utf-8", "replace"))
 
