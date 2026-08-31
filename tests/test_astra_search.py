@@ -66,6 +66,37 @@ def bridge_available():
         return False
 
 
+@unittest.skipUnless(
+    _ContinuationPool is not None,
+    "Astra continuation bridge unavailable",
+)
+class ContinuationPoolLifecycleTests(unittest.TestCase):
+    def test_concurrency_is_explicit_and_bounded(self):
+        default_pool = _ContinuationPool(2)
+        try:
+            default_pool._acquire(2, {"F1": 1.0})
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                default_pool._acquire(2, {"F1": 1.0})
+            default_pool._release()
+        finally:
+            default_pool.close()
+
+        pool = _ContinuationPool(2, allow_concurrent_calls=True)
+        try:
+            pool._acquire(2, {"F1": 1.0})
+            pool._acquire(2, {"F1": 1.0})
+            statistics = pool.statistics
+            self.assertTrue(statistics["active"])
+            self.assertEqual(statistics["active_call_count"], 2)
+            self.assertEqual(statistics["maximum_active_call_count"], 2)
+            self.assertTrue(statistics["allow_concurrent_calls"])
+            pool._release()
+            pool._release()
+            self.assertFalse(pool.statistics["active"])
+        finally:
+            pool.close()
+
+
 @unittest.skipUnless(bridge_available(), "Astra bridge CUDA backend unavailable")
 class AstraSearchTests(unittest.TestCase):
     @classmethod
