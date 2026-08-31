@@ -22,8 +22,8 @@ from libc.stdint cimport (
     uint64_t,
     uintptr_t,
 )
-from libc.stdlib cimport calloc, free, malloc
-from libc.string cimport memcmp, memcpy, memset, strlen
+from libc.stdlib cimport calloc, free, getenv, malloc
+from libc.string cimport memcmp, memcpy, memset, strcmp, strlen
 from cpython.bytes cimport (
     PyBytes_AS_STRING,
     PyBytes_FromStringAndSize,
@@ -159,6 +159,35 @@ cdef extern from "dlfcn.h" nogil:
     int dlclose(void* handle)
     void* dlopen(const char* filename, int flags)
     void* dlsym(void* handle, const char* symbol)
+
+
+cdef extern from "avx512_tail.h" nogil:
+    int PLAN7_AVX512_TAIL_LANES
+    int plan7_avx512_tail_available() noexcept
+    int plan7_avx512_forward4_varlen(
+        const unsigned char *const sequences[4],
+        const int lengths[4],
+        const P7_OPROFILE *profile,
+        const float *forward_xmx[4],
+        uint64_t forward_xmx_counts[4],
+        float forward_scores[4],
+        float forward_totscales[4],
+        int forward_statuses[4],
+        uint64_t *elapsed_ns,
+    ) noexcept
+    int plan7_avx512_backward4_varlen(
+        const unsigned char *const sequences[4],
+        const int lengths[4],
+        const P7_OPROFILE *profile,
+        const float *const forward_xmx[4],
+        const uint64_t forward_xmx_counts[4],
+        const float *backward_xmx[4],
+        uint64_t backward_xmx_counts[4],
+        float backward_scores[4],
+        float backward_totscales[4],
+        int backward_has_own_scales[4],
+        uint64_t *elapsed_ns,
+    ) noexcept
 
 
 cdef extern from * nogil:
@@ -801,6 +830,22 @@ cdef struct _compact_consumption_statistics:
     uint64_t decision_compact_empty
     uint64_t decision_compact_tail_changed
     uint64_t decision_compact_rebase_unavailable
+    uint64_t cpu_tail_simd_eligible_rows
+    uint64_t cpu_tail_simd_groups
+    uint64_t cpu_tail_simd_rows
+    uint64_t cpu_tail_simd_scalar_tail_rows
+    uint64_t cpu_tail_simd_fallback_groups
+    uint64_t cpu_tail_simd_kernel_ns
+    uint64_t cpu_tail_filter_simd_eligible_rows
+    uint64_t cpu_tail_filter_simd_groups
+    uint64_t cpu_tail_filter_simd_rows
+    uint64_t cpu_tail_filter_simd_scalar_tail_rows
+    uint64_t cpu_tail_filter_simd_fallback_groups
+    uint64_t cpu_tail_filter_simd_fallback_rows
+    uint64_t cpu_tail_filter_simd_f3_survivor_rows
+    uint64_t cpu_tail_filter_simd_backward_groups
+    uint64_t cpu_tail_filter_simd_forward_kernel_ns
+    uint64_t cpu_tail_filter_simd_backward_kernel_ns
 
 
 ctypedef int (*_pipeline_from_filter_scores_f)(
@@ -829,6 +874,26 @@ ctypedef int (*_pipeline_from_filter_and_forward_scores_f)(
     float,
     const float*,
     uint64_t,
+) noexcept nogil
+
+ctypedef int (*_pipeline_from_filter_forward_backward_scores_f)(
+    P7_PIPELINE*,
+    P7_OPROFILE*,
+    P7_BG*,
+    const ESL_SQ*,
+    const ESL_SQ*,
+    P7_TOPHITS*,
+    float,
+    float,
+    float,
+    float,
+    const float*,
+    uint64_t,
+    float,
+    const float*,
+    uint64_t,
+    float,
+    int,
 ) noexcept nogil
 
 ctypedef int (*_pipeline_from_filter_and_forward_simple_regions_f)(
@@ -1002,6 +1067,7 @@ cdef class _SealedPostfilterBatch:
     cdef _pipeline_tail_snapshot _pipeline_options
     cdef _pipeline_from_filter_scores_f _filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam
+    cdef _pipeline_from_filter_forward_backward_scores_f _forward_backward_scores_seam
     cdef _pipeline_from_filter_and_forward_simple_regions_f _simple_regions_seam
     cdef _pipeline_compact_tail_fingerprint_f _compact_tail_fingerprint
     cdef _pipeline_from_filter_forward_compact_domains_f _compact_domains_seam
@@ -1078,23 +1144,29 @@ cdef class _ContinuationJournalStorage:
 
 cdef _pipeline_from_filter_scores_f _filter_scores_seam_cache = NULL
 cdef _pipeline_from_filter_and_forward_scores_f _forward_scores_seam_cache = NULL
+cdef _pipeline_from_filter_forward_backward_scores_f _forward_backward_scores_seam_cache = NULL
 cdef _pipeline_from_filter_and_forward_simple_regions_f _simple_regions_seam_cache = NULL
 cdef _pipeline_compact_tail_fingerprint_f _compact_tail_fingerprint_cache = NULL
 cdef _pipeline_from_filter_forward_compact_domains_f _compact_domains_seam_cache = NULL
 cdef bint _filter_scores_seam_resolved = False
 cdef bint _forward_scores_seam_resolved = False
+cdef bint _forward_backward_scores_seam_resolved = False
 cdef bint _simple_regions_seam_resolved = False
 cdef bint _compact_domains_seam_resolved = False
 cdef bint _filter_scores_same_dso = False
 cdef bint _forward_scores_same_dso = False
+cdef bint _forward_backward_scores_same_dso = False
 cdef bint _simple_regions_same_dso = False
 cdef bint _compact_domains_same_dso = False
 cdef uint64_t _filter_scores_resolutions = 0
 cdef uint64_t _forward_scores_resolutions = 0
+cdef uint64_t _forward_backward_scores_resolutions = 0
 cdef uint64_t _filter_scores_dlopen_calls = 0
 cdef uint64_t _forward_scores_dlopen_calls = 0
+cdef uint64_t _forward_backward_scores_dlopen_calls = 0
 cdef uint64_t _filter_scores_dlclose_calls = 0
 cdef uint64_t _forward_scores_dlclose_calls = 0
+cdef uint64_t _forward_backward_scores_dlclose_calls = 0
 cdef uint64_t _simple_regions_resolutions = 0
 cdef uint64_t _simple_regions_dlopen_calls = 0
 cdef uint64_t _simple_regions_dlclose_calls = 0
@@ -1107,6 +1179,26 @@ cdef uint64_t _v3_consumer_core_ns = 0
 cdef uint64_t _v3_consumer_statistics_ns = 0
 cdef uint64_t _v3_consumer_certificate_visits = 0
 cdef uint64_t _v3_consumer_exception_visits = 0
+cdef uint64_t _filter_tail_audit_eligible_rows = 0
+cdef uint64_t _filter_tail_audit_groups = 0
+cdef uint64_t _filter_tail_audit_rows = 0
+cdef uint64_t _filter_tail_audit_scalar_tail_rows = 0
+cdef uint64_t _filter_tail_audit_fallback_groups = 0
+cdef uint64_t _filter_tail_audit_fallback_rows = 0
+cdef uint64_t _filter_tail_audit_f3_survivor_rows = 0
+cdef uint64_t _filter_tail_audit_backward_groups = 0
+cdef uint64_t _filter_tail_audit_forward_kernel_ns = 0
+cdef uint64_t _filter_tail_audit_backward_kernel_ns = 0
+cdef uint64_t _shard_z_audit_call_count = 0
+cdef uint64_t _shard_z_audit_first_shard_count = 0
+cdef uint64_t _shard_z_audit_terminal_shard_count = 0
+cdef uint64_t _shard_z_audit_exception_count = 0
+cdef uint64_t _shard_z_audit_local_target_visits = 0
+cdef uint64_t _shard_z_audit_dynamic_applicable_count = 0
+cdef uint64_t _shard_z_audit_nonzero_offset_count = 0
+cdef uint64_t _shard_z_audit_restored_count = 0
+cdef uint64_t _shard_z_audit_offset_sum = 0
+cdef uint64_t _shard_z_audit_offset_max = 0
 
 _continuation_seam_resolve_lock = _Lock()
 cdef uint8_t _consumed_journal_sentinel = 0
@@ -1260,6 +1352,59 @@ cdef _pipeline_from_filter_and_forward_scores_f _cached_filter_and_forward_score
 def _filter_and_forward_scores_seam_available():
     """Return whether the exact external-Forward seam is loaded."""
     return _cached_filter_and_forward_scores_seam() != NULL
+
+
+cdef _pipeline_from_filter_forward_backward_scores_f _resolve_filter_forward_backward_scores_seam() noexcept nogil:
+    global _forward_backward_scores_dlopen_calls
+    global _forward_backward_scores_dlclose_calls
+    global _forward_backward_scores_same_dso
+    cdef Dl_info info
+    cdef Dl_info symbol_info
+    cdef void* handle
+    cdef void* symbol
+
+    if dladdr(<const void*> p7_Pipeline, &info) == 0 or info.dli_fname == NULL:
+        return NULL
+    _forward_backward_scores_dlopen_calls += 1
+    handle = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_NOW)
+    if handle == NULL:
+        return NULL
+    symbol = dlsym(
+        handle, "p7_PipelineFromFilterForwardAndBackwardScores"
+    )
+    if (
+        symbol == NULL
+        or dladdr(symbol, &symbol_info) == 0
+        or symbol_info.dli_fbase != info.dli_fbase
+    ):
+        _forward_backward_scores_dlclose_calls += 1
+        dlclose(handle)
+        return NULL
+    _forward_backward_scores_same_dso = True
+    _forward_backward_scores_dlclose_calls += 1
+    dlclose(handle)
+    return <_pipeline_from_filter_forward_backward_scores_f> symbol
+
+
+cdef _pipeline_from_filter_forward_backward_scores_f _cached_filter_forward_backward_scores_seam():
+    global _forward_backward_scores_resolutions
+    global _forward_backward_scores_seam_cache
+    global _forward_backward_scores_seam_resolved
+
+    if not _forward_backward_scores_seam_resolved:
+        with _continuation_seam_resolve_lock:
+            if not _forward_backward_scores_seam_resolved:
+                _forward_backward_scores_resolutions += 1
+                _forward_backward_scores_seam_cache = (
+                    _resolve_filter_forward_backward_scores_seam()
+                )
+                _forward_backward_scores_seam_resolved = True
+    return _forward_backward_scores_seam_cache
+
+
+def _filter_forward_backward_scores_seam_available():
+    """Return whether the exact external-Backward seam is loaded."""
+    return _cached_filter_forward_backward_scores_seam() != NULL
 
 
 cdef _pipeline_from_filter_and_forward_simple_regions_f _resolve_simple_regions_seam() noexcept nogil:
@@ -7473,6 +7618,7 @@ def _seal_postfilter_batch_bound(
     cdef _SealedPostfilterBatch sealed
     cdef _pipeline_from_filter_scores_f filter_scores_seam = NULL
     cdef _pipeline_from_filter_and_forward_scores_f forward_scores_seam = NULL
+    cdef _pipeline_from_filter_forward_backward_scores_f forward_backward_scores_seam = NULL
     cdef _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam = NULL
     cdef _pipeline_tail_snapshot pipeline_options
     cdef object journal_values = None
@@ -7674,6 +7820,9 @@ def _seal_postfilter_batch_bound(
             )
     if has_forward_storage:
         forward_scores_seam = _cached_filter_and_forward_scores_seam()
+        forward_backward_scores_seam = (
+            _cached_filter_forward_backward_scores_seam()
+        )
 
     if (
         continuation_journal is not None
@@ -7741,6 +7890,7 @@ def _seal_postfilter_batch_bound(
         sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
     sealed._forward_scores_seam = forward_scores_seam
+    sealed._forward_backward_scores_seam = forward_backward_scores_seam
     sealed._simple_regions_seam = simple_regions_seam
     sealed._compact_tail_fingerprint = NULL
     sealed._compact_domains_seam = NULL
@@ -7827,6 +7977,7 @@ def _seal_profile_selection_continuation_bound(
     cdef _SealedPostfilterBatch sealed
     cdef _pipeline_from_filter_scores_f filter_scores_seam
     cdef _pipeline_from_filter_and_forward_scores_f forward_scores_seam
+    cdef _pipeline_from_filter_forward_backward_scores_f forward_backward_scores_seam
     cdef _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam
     cdef _pipeline_from_filter_forward_compact_domains_f compact_domains_seam
     cdef _pipeline_compact_tail_fingerprint_f compact_tail_fingerprint
@@ -8143,6 +8294,9 @@ def _seal_profile_selection_continuation_bound(
 
     filter_scores_seam = _cached_filter_scores_seam()
     forward_scores_seam = _cached_filter_and_forward_scores_seam()
+    forward_backward_scores_seam = (
+        _cached_filter_forward_backward_scores_seam()
+    )
     simple_regions_seam = _cached_simple_regions_seam()
     if has_direct and filter_scores_seam == NULL:
         raise RuntimeError(
@@ -8266,6 +8420,7 @@ def _seal_profile_selection_continuation_bound(
     sealed._pipeline_options = pipeline_options
     sealed._filter_scores_seam = filter_scores_seam
     sealed._forward_scores_seam = forward_scores_seam
+    sealed._forward_backward_scores_seam = forward_backward_scores_seam
     sealed._simple_regions_seam = simple_regions_seam
     sealed._compact_tail_fingerprint = (
         compact_tail_fingerprint if generation_compact_domains else NULL
@@ -8871,11 +9026,12 @@ cdef object _sealed_search_result(
     uint64_t telemetry_batch_generation,
 ):
     cdef object elapsed_ns
+    cdef object route_statistics
     if not return_compact_statistics and not return_route_statistics:
         return hits
     if return_route_statistics:
         elapsed_ns = _time.perf_counter_ns() - start_ns
-        return hits, _telemetry_module.build_continuation_statistics(
+        route_statistics = _telemetry_module.build_continuation_statistics(
             _telemetry_module.GENERATION_TELEMETRY_SCHEMA_VERSION,
             route_path,
             elapsed_ns,
@@ -8943,6 +9099,33 @@ cdef object _sealed_search_result(
                 )
             ),
         )
+        route_statistics["cpu_tail_filter_simd"] = {
+            "eligible_rows": statistics.cpu_tail_filter_simd_eligible_rows,
+            "groups": statistics.cpu_tail_filter_simd_groups,
+            "rows": statistics.cpu_tail_filter_simd_rows,
+            "scalar_tail_rows": (
+                statistics.cpu_tail_filter_simd_scalar_tail_rows
+            ),
+            "fallback_groups": (
+                statistics.cpu_tail_filter_simd_fallback_groups
+            ),
+            "fallback_rows": (
+                statistics.cpu_tail_filter_simd_fallback_rows
+            ),
+            "f3_survivor_rows": (
+                statistics.cpu_tail_filter_simd_f3_survivor_rows
+            ),
+            "backward_groups": (
+                statistics.cpu_tail_filter_simd_backward_groups
+            ),
+            "forward_kernel_ns": (
+                statistics.cpu_tail_filter_simd_forward_kernel_ns
+            ),
+            "backward_kernel_ns": (
+                statistics.cpu_tail_filter_simd_backward_kernel_ns
+            ),
+        }
+        return hits, route_statistics
     return hits, {
         "attempt_count": statistics.attempt_count,
         "accepted_count": statistics.accepted_count,
@@ -8958,6 +9141,40 @@ cdef object _sealed_search_result(
                 statistics.first_domain_count,
             )
         ),
+        "cpu_tail_simd": {
+            "eligible_rows": statistics.cpu_tail_simd_eligible_rows,
+            "groups": statistics.cpu_tail_simd_groups,
+            "rows": statistics.cpu_tail_simd_rows,
+            "scalar_tail_rows": statistics.cpu_tail_simd_scalar_tail_rows,
+            "fallback_groups": statistics.cpu_tail_simd_fallback_groups,
+            "kernel_ns": statistics.cpu_tail_simd_kernel_ns,
+        },
+        "cpu_tail_filter_simd": {
+            "eligible_rows": statistics.cpu_tail_filter_simd_eligible_rows,
+            "groups": statistics.cpu_tail_filter_simd_groups,
+            "rows": statistics.cpu_tail_filter_simd_rows,
+            "scalar_tail_rows": (
+                statistics.cpu_tail_filter_simd_scalar_tail_rows
+            ),
+            "fallback_groups": (
+                statistics.cpu_tail_filter_simd_fallback_groups
+            ),
+            "fallback_rows": (
+                statistics.cpu_tail_filter_simd_fallback_rows
+            ),
+            "f3_survivor_rows": (
+                statistics.cpu_tail_filter_simd_f3_survivor_rows
+            ),
+            "backward_groups": (
+                statistics.cpu_tail_filter_simd_backward_groups
+            ),
+            "forward_kernel_ns": (
+                statistics.cpu_tail_filter_simd_forward_kernel_ns
+            ),
+            "backward_kernel_ns": (
+                statistics.cpu_tail_filter_simd_backward_kernel_ns
+            ),
+        },
     }
 
 
@@ -9465,6 +9682,158 @@ def _sparse_journal_v3_consumer_statistics_bound():
         "statistics_ns": _v3_consumer_statistics_ns,
         "certificate_visits": _v3_consumer_certificate_visits,
         "exception_visits": _v3_consumer_exception_visits,
+    }
+
+
+cdef void _record_filter_tail_audit(
+    const _compact_consumption_statistics *statistics,
+) noexcept:
+    """Accumulate successful filter-tail work while the calling thread has GIL."""
+    global _filter_tail_audit_eligible_rows
+    global _filter_tail_audit_groups
+    global _filter_tail_audit_rows
+    global _filter_tail_audit_scalar_tail_rows
+    global _filter_tail_audit_fallback_groups
+    global _filter_tail_audit_fallback_rows
+    global _filter_tail_audit_f3_survivor_rows
+    global _filter_tail_audit_backward_groups
+    global _filter_tail_audit_forward_kernel_ns
+    global _filter_tail_audit_backward_kernel_ns
+    _filter_tail_audit_eligible_rows += (
+        statistics.cpu_tail_filter_simd_eligible_rows
+    )
+    _filter_tail_audit_groups += statistics.cpu_tail_filter_simd_groups
+    _filter_tail_audit_rows += statistics.cpu_tail_filter_simd_rows
+    _filter_tail_audit_scalar_tail_rows += (
+        statistics.cpu_tail_filter_simd_scalar_tail_rows
+    )
+    _filter_tail_audit_fallback_groups += (
+        statistics.cpu_tail_filter_simd_fallback_groups
+    )
+    _filter_tail_audit_fallback_rows += (
+        statistics.cpu_tail_filter_simd_fallback_rows
+    )
+    _filter_tail_audit_f3_survivor_rows += (
+        statistics.cpu_tail_filter_simd_f3_survivor_rows
+    )
+    _filter_tail_audit_backward_groups += (
+        statistics.cpu_tail_filter_simd_backward_groups
+    )
+    _filter_tail_audit_forward_kernel_ns += (
+        statistics.cpu_tail_filter_simd_forward_kernel_ns
+    )
+    _filter_tail_audit_backward_kernel_ns += (
+        statistics.cpu_tail_filter_simd_backward_kernel_ns
+    )
+
+
+cdef void _record_shard_z_audit(
+    uint64_t exception_begin,
+    uint64_t exception_end,
+    bint terminal,
+    uint64_t local_target_visits,
+    bint dynamic_applicable,
+    uint64_t dynamic_z_offset,
+    bint dynamic_z_restored,
+) noexcept:
+    """Record exact shard/Z accounting after a successful shard returns."""
+    global _shard_z_audit_call_count
+    global _shard_z_audit_first_shard_count
+    global _shard_z_audit_terminal_shard_count
+    global _shard_z_audit_exception_count
+    global _shard_z_audit_local_target_visits
+    global _shard_z_audit_dynamic_applicable_count
+    global _shard_z_audit_nonzero_offset_count
+    global _shard_z_audit_restored_count
+    global _shard_z_audit_offset_sum
+    global _shard_z_audit_offset_max
+    _shard_z_audit_call_count += 1
+    _shard_z_audit_first_shard_count += exception_begin == 0
+    _shard_z_audit_terminal_shard_count += terminal
+    _shard_z_audit_exception_count += exception_end - exception_begin
+    _shard_z_audit_local_target_visits += local_target_visits
+    _shard_z_audit_dynamic_applicable_count += dynamic_applicable
+    if dynamic_z_offset != 0:
+        _shard_z_audit_nonzero_offset_count += 1
+        _shard_z_audit_offset_sum += dynamic_z_offset
+        if dynamic_z_offset > _shard_z_audit_offset_max:
+            _shard_z_audit_offset_max = dynamic_z_offset
+    _shard_z_audit_restored_count += dynamic_z_restored
+
+
+def _reset_filter_tail_audit_statistics_bound():
+    """Reset opt-in full-gate filter SIMD and exact shard/Z accounting."""
+    global _filter_tail_audit_eligible_rows
+    global _filter_tail_audit_groups
+    global _filter_tail_audit_rows
+    global _filter_tail_audit_scalar_tail_rows
+    global _filter_tail_audit_fallback_groups
+    global _filter_tail_audit_fallback_rows
+    global _filter_tail_audit_f3_survivor_rows
+    global _filter_tail_audit_backward_groups
+    global _filter_tail_audit_forward_kernel_ns
+    global _filter_tail_audit_backward_kernel_ns
+    global _shard_z_audit_call_count
+    global _shard_z_audit_first_shard_count
+    global _shard_z_audit_terminal_shard_count
+    global _shard_z_audit_exception_count
+    global _shard_z_audit_local_target_visits
+    global _shard_z_audit_dynamic_applicable_count
+    global _shard_z_audit_nonzero_offset_count
+    global _shard_z_audit_restored_count
+    global _shard_z_audit_offset_sum
+    global _shard_z_audit_offset_max
+    _filter_tail_audit_eligible_rows = 0
+    _filter_tail_audit_groups = 0
+    _filter_tail_audit_rows = 0
+    _filter_tail_audit_scalar_tail_rows = 0
+    _filter_tail_audit_fallback_groups = 0
+    _filter_tail_audit_fallback_rows = 0
+    _filter_tail_audit_f3_survivor_rows = 0
+    _filter_tail_audit_backward_groups = 0
+    _filter_tail_audit_forward_kernel_ns = 0
+    _filter_tail_audit_backward_kernel_ns = 0
+    _shard_z_audit_call_count = 0
+    _shard_z_audit_first_shard_count = 0
+    _shard_z_audit_terminal_shard_count = 0
+    _shard_z_audit_exception_count = 0
+    _shard_z_audit_local_target_visits = 0
+    _shard_z_audit_dynamic_applicable_count = 0
+    _shard_z_audit_nonzero_offset_count = 0
+    _shard_z_audit_restored_count = 0
+    _shard_z_audit_offset_sum = 0
+    _shard_z_audit_offset_max = 0
+
+
+def _filter_tail_audit_statistics_bound():
+    """Snapshot opt-in full-gate SIMD and exact shard/Z accounting."""
+    return {
+        "cpu_tail_filter_simd": {
+            "eligible_rows": _filter_tail_audit_eligible_rows,
+            "groups": _filter_tail_audit_groups,
+            "rows": _filter_tail_audit_rows,
+            "scalar_tail_rows": _filter_tail_audit_scalar_tail_rows,
+            "fallback_groups": _filter_tail_audit_fallback_groups,
+            "fallback_rows": _filter_tail_audit_fallback_rows,
+            "f3_survivor_rows": _filter_tail_audit_f3_survivor_rows,
+            "backward_groups": _filter_tail_audit_backward_groups,
+            "forward_kernel_ns": _filter_tail_audit_forward_kernel_ns,
+            "backward_kernel_ns": _filter_tail_audit_backward_kernel_ns,
+        },
+        "sharded_z": {
+            "call_count": _shard_z_audit_call_count,
+            "first_shard_count": _shard_z_audit_first_shard_count,
+            "terminal_shard_count": _shard_z_audit_terminal_shard_count,
+            "exception_count": _shard_z_audit_exception_count,
+            "local_target_visits": _shard_z_audit_local_target_visits,
+            "dynamic_applicable_count": (
+                _shard_z_audit_dynamic_applicable_count
+            ),
+            "nonzero_offset_count": _shard_z_audit_nonzero_offset_count,
+            "restored_count": _shard_z_audit_restored_count,
+            "offset_sum": _shard_z_audit_offset_sum,
+            "offset_max": _shard_z_audit_offset_max,
+        },
     }
 
 
@@ -11261,6 +11630,7 @@ cdef int _search_loop_continuation_journal_v3(
     P7_TOPHITS *th,
     _pipeline_from_filter_scores_f filter_scores_seam,
     _pipeline_from_filter_and_forward_scores_f forward_scores_seam,
+    _pipeline_from_filter_forward_backward_scores_f forward_backward_scores_seam,
     _pipeline_from_filter_and_forward_simple_regions_f simple_regions_seam,
     _pipeline_from_filter_forward_compact_domains_f compact_domains_seam,
     uint64_t *compact_rebased_offsets,
@@ -11322,11 +11692,101 @@ cdef int _search_loop_continuation_journal_v3(
     cdef float usc
     cdef int status
     cdef bint used_forward_seam
+    cdef bint used_forward_backward_seam
     cdef bint used_simple_regions_seam
     cdef bint used_compact_domains_seam
+    cdef const unsigned char *simd_sequences[4]
+    cdef int simd_lengths[4]
+    cdef const float *simd_forward_xmx[4]
+    cdef uint64_t simd_forward_xmx_counts[4]
+    cdef const float *simd_backward_xmx[4]
+    cdef uint64_t simd_backward_xmx_counts[4]
+    cdef float simd_backward_scores[4]
+    cdef float simd_backward_totscales[4]
+    cdef int simd_backward_has_own_scales[4]
+    cdef uint64_t simd_exception_indices[4]
+    cdef uint64_t simd_kernel_ns = 0
+    cdef const unsigned char *filter_simd_sequences[4]
+    cdef int filter_simd_lengths[4]
+    cdef const float *filter_simd_forward_xmx[4]
+    cdef uint64_t filter_simd_forward_xmx_counts[4]
+    cdef float filter_simd_forward_scores[4]
+    cdef float filter_simd_forward_totscales[4]
+    cdef int filter_simd_forward_statuses[4]
+    cdef const float *filter_simd_backward_xmx[4]
+    cdef uint64_t filter_simd_backward_xmx_counts[4]
+    cdef float filter_simd_backward_scores[4]
+    cdef float filter_simd_backward_totscales[4]
+    cdef int filter_simd_backward_has_own_scales[4]
+    cdef float filter_simd_filtersc[4]
+    cdef bint filter_simd_f3_pass[4]
+    cdef uint64_t filter_simd_exception_indices[4]
+    cdef uint64_t filter_simd_forward_kernel_ns = 0
+    cdef uint64_t filter_simd_backward_kernel_ns = 0
+    cdef uint64_t scan_index
+    cdef uint64_t scan_sequence_index
+    cdef uint64_t dynamic_z_offset = 0
+    cdef const plan7_continuation_journal_v3_exception *scan_exception
+    cdef _postfilter_result scan_postfilter
+    cdef int simd_count
+    cdef int simd_lane = -1
+    cdef int simd_status
+    cdef int filter_simd_count
+    cdef int filter_simd_lane = -1
+    cdef int filter_simd_consumed_lane = -1
+    cdef int filter_simd_index
+    cdef int filter_simd_status
+    cdef int filter_simd_f3_decision
+    cdef int filter_simd_survivor_count
+    cdef bint filter_simd_backward_ready = False
+    cdef bint filter_simd_group_has_fallback = False
+    cdef bint filter_simd_prevalidation_unchanged
+    cdef uint64_t filter_simd_hits_before
+    cdef uint64_t filter_simd_n_past_msv_before
+    cdef uint64_t filter_simd_n_past_bias_before
+    cdef uint64_t filter_simd_n_past_vit_before
+    cdef uint64_t filter_simd_n_past_fwd_before
+    cdef uint64_t filter_simd_pos_past_msv_before
+    cdef uint64_t filter_simd_pos_past_bias_before
+    cdef uint64_t filter_simd_pos_past_vit_before
+    cdef uint64_t filter_simd_pos_past_fwd_before
+    cdef const char *filter_simd_env = getenv(
+        b"PLAN7_GPU_FILTER_TAIL_SIMD"
+    )
+    cdef const char *filter_simd_test_fallback_env = getenv(
+        b"PLAN7_GPU_FILTER_TAIL_SIMD_TEST_FALLBACK"
+    )
+    cdef bint filter_simd_test_fallback = (
+        filter_simd_test_fallback_env != NULL
+        and strcmp(filter_simd_test_fallback_env, b"1") == 0
+    )
+    cdef bint simd_available = (
+        forward_backward_scores_seam != NULL
+        and plan7_avx512_tail_available() != 0
+    )
+    cdef bint filter_simd_available = (
+        filter_simd_env != NULL
+        and strcmp(filter_simd_env, b"1") == 0
+        and forward_scores_seam != NULL
+        and forward_backward_scores_seam != NULL
+        and plan7_avx512_tail_available() != 0
+    )
 
     if local_begin > local_stop or local_stop > profile_record.exception_count:
         raise IndexError("journal v3 exception range is invalid")
+
+    # A shard owns local accounting so that TopHits.merge() can add each
+    # counter exactly once.  HMMER's online target-reportability decision,
+    # however, depends on the absolute number of targets seen so far when Z
+    # is dynamic.  Recover that absolute prefix from the preceding exception;
+    # restore local Z before returning so pipeline merging remains exact.
+    if local_begin != 0:
+        dynamic_z_offset = (
+            exceptions[
+                profile_record.exception_begin + local_begin - 1
+            ].sequence_index
+            + 1
+        )
 
     if statistics != NULL:
         statistics.target_count = n_targets
@@ -11348,6 +11808,12 @@ cdef int _search_loop_continuation_journal_v3(
             profile_record.certificate_begin + local_index
         ]
         _v3_apply_certificate_accounting(pli, certificate)
+        if (
+            dynamic_z_offset != 0
+            and pli.Z_setby == p7_ZSETBY_NTARGETS
+            and pli.mode == p7_SEARCH_SEQS
+        ):
+            pli.Z = pli.nseqs + dynamic_z_offset
         if statistics != NULL:
             statistics.definite_reject_count += (
                 certificate.raw_f1_reject_count
@@ -11367,7 +11833,7 @@ cdef int _search_loop_continuation_journal_v3(
         # applied here; none of its promotion counters are pre-accounted.
         pli.nseqs += 1
         if pli.Z_setby == p7_ZSETBY_NTARGETS and pli.mode == p7_SEARCH_SEQS:
-            pli.Z = pli.nseqs
+            pli.Z = pli.nseqs + dynamic_z_offset
         pli.nres += exception.residue_delta
 
         status = p7_bg_SetLength(bg, sq[t].n)
@@ -11383,6 +11849,7 @@ cdef int _search_loop_continuation_journal_v3(
             sizeof(_postfilter_result),
         )
         used_forward_seam = False
+        used_forward_backward_seam = False
         used_simple_regions_seam = False
         used_compact_domains_seam = False
 
@@ -11397,21 +11864,280 @@ cdef int _search_loop_continuation_journal_v3(
             if exception.route == PLAN7_CONTINUATION_V3_FILTER_SCORES:
                 if statistics != NULL:
                     statistics.filter_continuation_count += 1
-                status = filter_scores_seam(
-                    pli,
-                    om,
-                    bg,
-                    sq[t],
-                    NULL,
-                    th,
-                    usc,
-                    postfilter.filtersc,
-                    P7_VIT_EXTERNAL,
-                    postfilter.vfsc,
-                )
+                    statistics.cpu_tail_filter_simd_eligible_rows += 1
+                if (
+                    filter_simd_lane < 0
+                    and simd_lane < 0
+                    and filter_simd_available
+                ):
+                    filter_simd_count = 0
+                    for scan_index in range(local_index, local_stop):
+                        scan_exception = &exceptions[
+                            profile_record.exception_begin + scan_index
+                        ]
+                        if (
+                            scan_exception.route
+                            != PLAN7_CONTINUATION_V3_FILTER_SCORES
+                        ):
+                            continue
+                        scan_sequence_index = scan_exception.sequence_index
+                        if (
+                            sq[scan_sequence_index].n <= 0
+                            or sq[scan_sequence_index].n > 100000
+                        ):
+                            continue
+                        memcpy(
+                            &scan_postfilter,
+                            scan_exception.postfilter_record,
+                            sizeof(_postfilter_result),
+                        )
+                        filter_simd_exception_indices[
+                            filter_simd_count
+                        ] = scan_index
+                        filter_simd_sequences[filter_simd_count] = (
+                            <const unsigned char *>
+                            sq[scan_sequence_index].dsq
+                        )
+                        filter_simd_lengths[filter_simd_count] = (
+                            sq[scan_sequence_index].n
+                        )
+                        filter_simd_filtersc[filter_simd_count] = (
+                            scan_postfilter.filtersc
+                        )
+                        filter_simd_count += 1
+                        if (
+                            filter_simd_count
+                            == PLAN7_AVX512_TAIL_LANES
+                        ):
+                            break
+                    if (
+                        filter_simd_count
+                        == PLAN7_AVX512_TAIL_LANES
+                    ):
+                        filter_simd_group_has_fallback = False
+                        filter_simd_status = plan7_avx512_forward4_varlen(
+                            filter_simd_sequences,
+                            filter_simd_lengths,
+                            om,
+                            filter_simd_forward_xmx,
+                            filter_simd_forward_xmx_counts,
+                            filter_simd_forward_scores,
+                            filter_simd_forward_totscales,
+                            filter_simd_forward_statuses,
+                            &filter_simd_forward_kernel_ns,
+                        )
+                        filter_simd_survivor_count = 0
+                        if filter_simd_status == eslOK:
+                            for filter_simd_index in range(
+                                PLAN7_AVX512_TAIL_LANES
+                            ):
+                                if (
+                                    filter_simd_forward_statuses[
+                                        filter_simd_index
+                                    ] != eslOK
+                                    or not isfinite(
+                                        filter_simd_forward_scores[
+                                            filter_simd_index
+                                        ]
+                                    )
+                                ):
+                                    filter_simd_status = eslERANGE
+                                    break
+                                filter_simd_f3_decision = (
+                                    _hmmer_f3_decision(
+                                        om,
+                                        filter_simd_filtersc[
+                                            filter_simd_index
+                                        ],
+                                        filter_simd_forward_scores[
+                                            filter_simd_index
+                                        ],
+                                        pli.F3,
+                                    )
+                                )
+                                if filter_simd_f3_decision < 0:
+                                    filter_simd_status = eslEINVAL
+                                    break
+                                filter_simd_f3_pass[
+                                    filter_simd_index
+                                ] = filter_simd_f3_decision != 0
+                                if filter_simd_f3_pass[
+                                    filter_simd_index
+                                ]:
+                                    filter_simd_survivor_count += 1
+
+                        filter_simd_backward_ready = False
+                        if (
+                            filter_simd_status == eslOK
+                            and filter_simd_survivor_count != 0
+                        ):
+                            simd_status = plan7_avx512_backward4_varlen(
+                                filter_simd_sequences,
+                                filter_simd_lengths,
+                                om,
+                                filter_simd_forward_xmx,
+                                filter_simd_forward_xmx_counts,
+                                filter_simd_backward_xmx,
+                                filter_simd_backward_xmx_counts,
+                                filter_simd_backward_scores,
+                                filter_simd_backward_totscales,
+                                filter_simd_backward_has_own_scales,
+                                &filter_simd_backward_kernel_ns,
+                            )
+                            if simd_status == eslOK:
+                                filter_simd_backward_ready = True
+                                if statistics != NULL:
+                                    statistics.cpu_tail_filter_simd_backward_groups += 1
+                                    statistics.cpu_tail_filter_simd_backward_kernel_ns += (
+                                        filter_simd_backward_kernel_ns
+                                    )
+                            elif statistics != NULL:
+                                statistics.cpu_tail_filter_simd_fallback_groups += 1
+
+                        if filter_simd_status == eslOK:
+                            filter_simd_lane = 0
+                            if statistics != NULL:
+                                statistics.cpu_tail_filter_simd_groups += 1
+                                statistics.cpu_tail_filter_simd_rows += 4
+                                statistics.cpu_tail_filter_simd_f3_survivor_rows += (
+                                    filter_simd_survivor_count
+                                )
+                                statistics.cpu_tail_filter_simd_forward_kernel_ns += (
+                                    filter_simd_forward_kernel_ns
+                                )
+                        else:
+                            filter_simd_available = False
+                            if statistics != NULL:
+                                statistics.cpu_tail_filter_simd_fallback_groups += 1
+
+                if (
+                    filter_simd_lane >= 0
+                    and filter_simd_lane < PLAN7_AVX512_TAIL_LANES
+                    and filter_simd_exception_indices[
+                        filter_simd_lane
+                    ] == local_index
+                ):
+                    if (
+                        filter_simd_backward_ready
+                        and filter_simd_f3_pass[filter_simd_lane]
+                    ):
+                        filter_simd_consumed_lane = filter_simd_lane
+                        filter_simd_hits_before = th.N
+                        filter_simd_n_past_msv_before = pli.n_past_msv
+                        filter_simd_n_past_bias_before = pli.n_past_bias
+                        filter_simd_n_past_vit_before = pli.n_past_vit
+                        filter_simd_n_past_fwd_before = pli.n_past_fwd
+                        filter_simd_pos_past_msv_before = pli.pos_past_msv
+                        filter_simd_pos_past_bias_before = pli.pos_past_bias
+                        filter_simd_pos_past_vit_before = pli.pos_past_vit
+                        filter_simd_pos_past_fwd_before = pli.pos_past_fwd
+                        if filter_simd_test_fallback:
+                            status = eslEINVAL
+                        else:
+                            status = forward_backward_scores_seam(
+                                pli,
+                                om,
+                                bg,
+                                sq[t],
+                                NULL,
+                                th,
+                                usc,
+                                postfilter.filtersc,
+                                postfilter.vfsc,
+                                filter_simd_forward_scores[filter_simd_lane],
+                                filter_simd_forward_xmx[filter_simd_lane],
+                                filter_simd_forward_xmx_counts[filter_simd_lane],
+                                filter_simd_backward_scores[filter_simd_lane],
+                                filter_simd_backward_xmx[filter_simd_lane],
+                                filter_simd_backward_xmx_counts[filter_simd_lane],
+                                filter_simd_backward_totscales[
+                                    filter_simd_lane
+                                ],
+                                filter_simd_backward_has_own_scales[
+                                    filter_simd_lane
+                                ],
+                            )
+                        filter_simd_prevalidation_unchanged = (
+                            th.N == filter_simd_hits_before
+                            and pli.n_past_msv == filter_simd_n_past_msv_before
+                            and pli.n_past_bias == filter_simd_n_past_bias_before
+                            and pli.n_past_vit == filter_simd_n_past_vit_before
+                            and pli.n_past_fwd == filter_simd_n_past_fwd_before
+                            and pli.pos_past_msv == filter_simd_pos_past_msv_before
+                            and pli.pos_past_bias == filter_simd_pos_past_bias_before
+                            and pli.pos_past_vit == filter_simd_pos_past_vit_before
+                            and pli.pos_past_fwd == filter_simd_pos_past_fwd_before
+                        )
+                        if status == eslEINVAL and filter_simd_prevalidation_unchanged:
+                            # The private seam validates every external score
+                            # and special before changing any of these counters.
+                            # Replay only that proven pre-mutation rejection;
+                            # any later domain-workflow EINVAL remains fatal.
+                            p7_pipeline_Reuse(pli)
+                            pli.errbuf[0] = 0
+                            status = p7_bg_SetLength(bg, sq[t].n)
+                            if status == eslOK:
+                                status = p7_oprofile_ReconfigLength(
+                                    om, sq[t].n
+                                )
+                            if status == eslOK:
+                                status = filter_scores_seam(
+                                    pli,
+                                    om,
+                                    bg,
+                                    sq[t],
+                                    NULL,
+                                    th,
+                                    usc,
+                                    postfilter.filtersc,
+                                    P7_VIT_EXTERNAL,
+                                    postfilter.vfsc,
+                                )
+                            used_forward_seam = True
+                            if status == eslOK and statistics != NULL:
+                                statistics.cpu_tail_filter_simd_fallback_rows += 1
+                                if not filter_simd_group_has_fallback:
+                                    statistics.cpu_tail_filter_simd_fallback_groups += 1
+                                    filter_simd_group_has_fallback = True
+                        else:
+                            used_forward_backward_seam = True
+                    else:
+                        status = forward_scores_seam(
+                            pli,
+                            om,
+                            bg,
+                            sq[t],
+                            NULL,
+                            th,
+                            usc,
+                            postfilter.filtersc,
+                            postfilter.vfsc,
+                            filter_simd_forward_scores[filter_simd_lane],
+                            filter_simd_forward_xmx[filter_simd_lane],
+                            filter_simd_forward_xmx_counts[filter_simd_lane],
+                        )
+                        used_forward_seam = True
+                    filter_simd_lane += 1
+                    if filter_simd_lane == PLAN7_AVX512_TAIL_LANES:
+                        filter_simd_lane = -1
+                        filter_simd_backward_ready = False
+                else:
+                    status = filter_scores_seam(
+                        pli,
+                        om,
+                        bg,
+                        sq[t],
+                        NULL,
+                        th,
+                        usc,
+                        postfilter.filtersc,
+                        P7_VIT_EXTERNAL,
+                        postfilter.vfsc,
+                    )
             elif exception.route == PLAN7_CONTINUATION_V3_FORWARD_SCORES:
                 if statistics != NULL:
                     statistics.forward_continuation_count += 1
+                    statistics.cpu_tail_simd_eligible_rows += 1
                 memcpy(
                     &forward,
                     exception.forward_record,
@@ -11423,21 +12149,113 @@ cdef int _search_loop_continuation_journal_v3(
                     if xmx_count != 0
                     else NULL
                 )
-                status = forward_scores_seam(
-                    pli,
-                    om,
-                    bg,
-                    sq[t],
-                    NULL,
-                    th,
-                    usc,
-                    postfilter.filtersc,
-                    postfilter.vfsc,
-                    forward.fwdsc,
-                    xmx,
-                    xmx_count,
-                )
-                used_forward_seam = True
+                if (
+                    simd_lane < 0
+                    and filter_simd_lane < 0
+                    and simd_available
+                ):
+                    simd_count = 0
+                    for scan_index in range(local_index, local_stop):
+                        scan_exception = &exceptions[
+                            profile_record.exception_begin + scan_index
+                        ]
+                        if (
+                            scan_exception.route
+                            != PLAN7_CONTINUATION_V3_FORWARD_SCORES
+                        ):
+                            continue
+                        scan_sequence_index = scan_exception.sequence_index
+                        if (
+                            scan_exception.special_count == 0
+                            or sq[scan_sequence_index].n <= 0
+                            or sq[scan_sequence_index].n > 100000
+                        ):
+                            continue
+                        simd_exception_indices[simd_count] = scan_index
+                        simd_sequences[simd_count] = (
+                            <const unsigned char *>
+                            sq[scan_sequence_index].dsq
+                        )
+                        simd_lengths[simd_count] = sq[scan_sequence_index].n
+                        simd_forward_xmx[simd_count] = (
+                            specials + scan_exception.special_begin
+                        )
+                        simd_forward_xmx_counts[simd_count] = (
+                            scan_exception.special_count
+                        )
+                        simd_count += 1
+                        if simd_count == PLAN7_AVX512_TAIL_LANES:
+                            break
+                    if simd_count == PLAN7_AVX512_TAIL_LANES:
+                        simd_status = plan7_avx512_backward4_varlen(
+                            simd_sequences,
+                            simd_lengths,
+                            om,
+                            simd_forward_xmx,
+                            simd_forward_xmx_counts,
+                            simd_backward_xmx,
+                            simd_backward_xmx_counts,
+                            simd_backward_scores,
+                            simd_backward_totscales,
+                            simd_backward_has_own_scales,
+                            &simd_kernel_ns,
+                        )
+                        if simd_status == eslOK:
+                            simd_lane = 0
+                            if statistics != NULL:
+                                statistics.cpu_tail_simd_groups += 1
+                                statistics.cpu_tail_simd_rows += 4
+                                statistics.cpu_tail_simd_kernel_ns += (
+                                    simd_kernel_ns
+                                )
+                        else:
+                            simd_available = False
+                            if statistics != NULL:
+                                statistics.cpu_tail_simd_fallback_groups += 1
+                if (
+                    simd_lane >= 0
+                    and simd_lane < PLAN7_AVX512_TAIL_LANES
+                    and simd_exception_indices[simd_lane] == local_index
+                ):
+                    status = forward_backward_scores_seam(
+                        pli,
+                        om,
+                        bg,
+                        sq[t],
+                        NULL,
+                        th,
+                        usc,
+                        postfilter.filtersc,
+                        postfilter.vfsc,
+                        forward.fwdsc,
+                        xmx,
+                        xmx_count,
+                        simd_backward_scores[simd_lane],
+                        simd_backward_xmx[simd_lane],
+                        simd_backward_xmx_counts[simd_lane],
+                        simd_backward_totscales[simd_lane],
+                        simd_backward_has_own_scales[simd_lane],
+                    )
+                    simd_lane += 1
+                    if simd_lane == PLAN7_AVX512_TAIL_LANES:
+                        simd_lane = -1
+                    used_forward_backward_seam = True
+                else:
+                    status = forward_scores_seam(
+                        pli,
+                        om,
+                        bg,
+                        sq[t],
+                        NULL,
+                        th,
+                        usc,
+                        postfilter.filtersc,
+                        postfilter.vfsc,
+                        forward.fwdsc,
+                        xmx,
+                        xmx_count,
+                    )
+                    used_forward_seam = True
             elif exception.route == PLAN7_CONTINUATION_V3_SIMPLE_REGIONS:
                 if statistics != NULL:
                     statistics.simple_continuation_count += 1
@@ -11588,6 +12406,27 @@ cdef int _search_loop_continuation_journal_v3(
                     status,
                     "p7_PipelineFromFilterAndForwardScores",
                 )
+            elif used_forward_backward_seam:
+                raise UnexpectedError(
+                    status,
+                    (
+                        "p7_PipelineFromFilterForwardAndBackwardScores"
+                        f"[profile={profile_record.profile_index},"
+                        f"sequence={t},length={sq[t].n},"
+                        f"local_exception={local_index},"
+                        f"lane={filter_simd_consumed_lane},"
+                        f"group_exceptions={filter_simd_exception_indices[0]}/"
+                        f"{filter_simd_exception_indices[1]}/"
+                        f"{filter_simd_exception_indices[2]}/"
+                        f"{filter_simd_exception_indices[3]},"
+                        f"fwd={filter_simd_forward_scores[filter_simd_consumed_lane]},"
+                        f"bck={filter_simd_backward_scores[filter_simd_consumed_lane]},"
+                        f"fwd_xmx={filter_simd_forward_xmx_counts[filter_simd_consumed_lane]},"
+                        f"bck_xmx={filter_simd_backward_xmx_counts[filter_simd_consumed_lane]},"
+                        f"bck_scale={filter_simd_backward_totscales[filter_simd_consumed_lane]},"
+                        f"bck_own={filter_simd_backward_has_own_scales[filter_simd_consumed_lane]}]"
+                    ),
+                )
             Pipeline._missing_cutoffs(pli, om)
         elif status == eslERANGE:
             raise OverflowError(
@@ -11597,11 +12436,27 @@ cdef int _search_loop_continuation_journal_v3(
             raise UnexpectedError(status, "p7_Pipeline")
         p7_pipeline_Reuse(pli)
 
+    if statistics != NULL:
+        statistics.cpu_tail_simd_scalar_tail_rows = (
+            statistics.cpu_tail_simd_eligible_rows
+            - statistics.cpu_tail_simd_rows
+        )
+        statistics.cpu_tail_filter_simd_scalar_tail_rows = (
+            statistics.cpu_tail_filter_simd_eligible_rows
+            - statistics.cpu_tail_filter_simd_rows
+        )
+
     if apply_terminal_certificate:
         certificate = &certificates[
             profile_record.certificate_begin + profile_record.exception_count
         ]
         _v3_apply_certificate_accounting(pli, certificate)
+        if (
+            dynamic_z_offset != 0
+            and pli.Z_setby == p7_ZSETBY_NTARGETS
+            and pli.mode == p7_SEARCH_SEQS
+        ):
+            pli.Z = pli.nseqs + dynamic_z_offset
         if statistics != NULL:
             statistics.definite_reject_count += certificate.raw_f1_reject_count
 
@@ -11622,6 +12477,12 @@ cdef int _search_loop_continuation_journal_v3(
             if status != eslOK:
                 raise UnexpectedError(status, "p7_oprofile_ReconfigLength")
             p7_pipeline_Reuse(pli)
+    if (
+        dynamic_z_offset != 0
+        and pli.Z_setby == p7_ZSETBY_NTARGETS
+        and pli.mode == p7_SEARCH_SEQS
+    ):
+        pli.Z = pli.nseqs
     return 0
 
 
@@ -11939,6 +12800,7 @@ cdef TopHits _v3_sparse_profile_range_preallocated(
             hits._th,
             sealed._filter_scores_seam,
             sealed._forward_scores_seam,
+            sealed._forward_backward_scores_seam,
             sealed._simple_regions_seam,
             sealed._compact_domains_seam,
             compact_rebased_offsets,
@@ -12235,6 +13097,7 @@ def _search_hmm_sealed_sparse_journal_v3_bound(
         _v3_consumer_statistics_ns += <uint64_t> statistics_elapsed_ns
         _v3_consumer_certificate_visits += profile.certificate_count
         _v3_consumer_exception_visits += profile.exception_count
+        _record_filter_tail_audit(&statistics)
         return _sealed_search_result(
             hits,
             &statistics,
@@ -12276,7 +13139,11 @@ def _search_hmm_sealed_sparse_journal_v3_shard_bound(
     cdef uint64_t *compact_rebased_offsets = NULL
     cdef uint64_t scratch_count = 1
     cdef uint64_t local_index
+    cdef uint64_t dynamic_z_offset = 0
     cdef bint apply_terminal_certificate
+    cdef bint dynamic_z_applicable
+    cdef bint dynamic_z_restored
+    cdef _compact_consumption_statistics statistics
 
     if type(sealed_object) is not _SealedPostfilterBatch:
         raise TypeError("sealed batch has the wrong extension type")
@@ -12347,8 +13214,13 @@ def _search_hmm_sealed_sparse_journal_v3_shard_bound(
     apply_terminal_certificate = (
         <uint64_t> exception_end == profile.exception_count
     )
+    if exception_begin != 0:
+        dynamic_z_offset = exceptions[
+            profile.exception_begin + <uint64_t> exception_begin - 1
+        ].sequence_index + 1
+    _v3_zero_statistics(&statistics)
     try:
-        return _v3_sparse_profile_range_preallocated(
+        hits = _v3_sparse_profile_range_preallocated(
             sealed._journal_v3,
             sealed,
             <size_t> row,
@@ -12360,8 +13232,27 @@ def _search_hmm_sealed_sparse_journal_v3_shard_bound(
             optimized_profile,
             hits,
             compact_rebased_offsets,
-            NULL,
+            &statistics,
         )
+        dynamic_z_applicable = (
+            pipeline._pli.Z_setby == p7_ZSETBY_NTARGETS
+            and pipeline._pli.mode == p7_SEARCH_SEQS
+        )
+        dynamic_z_restored = (
+            dynamic_z_applicable
+            and pipeline._pli.Z == <double> pipeline._pli.nseqs
+        )
+        _record_filter_tail_audit(&statistics)
+        _record_shard_z_audit(
+            <uint64_t> exception_begin,
+            <uint64_t> exception_end,
+            apply_terminal_certificate,
+            pipeline._pli.nseqs,
+            dynamic_z_applicable,
+            dynamic_z_offset,
+            dynamic_z_restored,
+        )
+        return hits
     finally:
         free(compact_rebased_offsets)
 
@@ -13171,6 +14062,26 @@ def _audit_continuation_journal_v3_bound(
                 "sparse": sparse_stats,
                 "certificate": certificate,
                 "route_reconciliation": route_reconciliation,
+                "cpu_tail_simd": {
+                    "eligible_rows": sparse_statistics.cpu_tail_simd_eligible_rows,
+                    "groups": sparse_statistics.cpu_tail_simd_groups,
+                    "rows": sparse_statistics.cpu_tail_simd_rows,
+                    "scalar_tail_rows": sparse_statistics.cpu_tail_simd_scalar_tail_rows,
+                    "fallback_groups": sparse_statistics.cpu_tail_simd_fallback_groups,
+                    "kernel_ns": sparse_statistics.cpu_tail_simd_kernel_ns,
+                },
+                "cpu_tail_filter_simd": {
+                    "eligible_rows": sparse_statistics.cpu_tail_filter_simd_eligible_rows,
+                    "groups": sparse_statistics.cpu_tail_filter_simd_groups,
+                    "rows": sparse_statistics.cpu_tail_filter_simd_rows,
+                    "scalar_tail_rows": sparse_statistics.cpu_tail_filter_simd_scalar_tail_rows,
+                    "fallback_groups": sparse_statistics.cpu_tail_filter_simd_fallback_groups,
+                    "fallback_rows": sparse_statistics.cpu_tail_filter_simd_fallback_rows,
+                    "f3_survivor_rows": sparse_statistics.cpu_tail_filter_simd_f3_survivor_rows,
+                    "backward_groups": sparse_statistics.cpu_tail_filter_simd_backward_groups,
+                    "forward_kernel_ns": sparse_statistics.cpu_tail_filter_simd_forward_kernel_ns,
+                    "backward_kernel_ns": sparse_statistics.cpu_tail_filter_simd_backward_kernel_ns,
+                },
             })
         elapsed_ns = _time.perf_counter_ns() - start_ns
         return {

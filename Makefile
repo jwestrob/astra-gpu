@@ -44,6 +44,7 @@ DOMAIN_RESCORE_CUDA_OBJ := $(BUILD_DIR)/cuda/domain_rescore_cuda.o
 CUDA_MODULE := python/plan7_gpu/_native$(PYTHON_EXT_SUFFIX)
 PIPELINE_C := $(BUILD_DIR)/pipeline/_pipeline.c
 PIPELINE_OBJ := $(BUILD_DIR)/pipeline/_pipeline.o
+AVX512_TAIL_OBJ := $(BUILD_DIR)/pipeline/avx512_tail.o
 PIPELINE_MODULE := python/plan7_gpu/_pipeline$(PYTHON_EXT_SUFFIX)
 CUDA_ARCH_FLAGS := \
 	--generate-code=arch=compute_75,code=sm_75 \
@@ -56,7 +57,7 @@ HMMER_HEADERS := $(HMMER_ROOT)/src/hmmer.h \
 	$(HMMER_ROOT)/src/p7_config.h \
 	$(HMMER_ROOT)/src/impl_sse/impl_sse.h
 
-.PHONY: all oracle bias-attestation phase5-profile-packed-ssv \
+.PHONY: all oracle bias-attestation post448-forward4-avx512 phase5-profile-packed-ssv \
 	phase7-packed-integer cuda cuda-test \
 	h200-first1000-audit pipeline pipeline-test test clean
 
@@ -66,6 +67,15 @@ oracle: $(ORACLE_BIN)
 
 bias-attestation: $(BIAS_ATTEST_BIN)
 	$(BIAS_ATTEST_BIN) 0x1000000 64
+
+post448-forward4-avx512: $(BUILD_DIR)/experiments/post448-forward4-avx512
+
+$(BUILD_DIR)/experiments/post448-forward4-avx512: \
+		experiments/post448_forward4_avx512.cpp cpu/avx512_tail.h $(HMMER_HEADERS)
+	mkdir -p $(@D)
+	$(CXX) -O3 -g -std=c++17 -Wall -Wextra -Wshadow \
+		-mavx512f -mavx512dq -mavx512bw -mavx512vl \
+		-ffp-contract=off -Icpu $(CPPFLAGS) -o $@ $< $(LDLIBS)
 
 phase5-profile-packed-ssv: $(BUILD_DIR)/experiments/phase5-profile-packed-ssv
 
@@ -253,15 +263,27 @@ $(PIPELINE_C): python/plan7_gpu/_pipeline.pyx python/plan7_gpu/_abi.py \
 		-E TARGET_SYSTEM=$(PYHMMER_TARGET_SYSTEM) \
 		-E PYHMMER_ABI_SHA256=$(PYHMMER_ABI_SHA256) -o $@ $<
 
-$(PIPELINE_OBJ): $(PIPELINE_C)
+$(PIPELINE_OBJ): $(PIPELINE_C) cpu/avx512_tail.h
 	$(CC) -O3 -g -std=c11 -fPIC $(PYHMMER_SIMD_CFLAGS) \
 		$$($(PYTHON)-config --includes) \
 		-Icuda \
-		-I$(PYHMMER_INCLUDE) -I$(PYHMMER_EASEL_INCLUDE) \
+		-Icpu -I$(PYHMMER_INCLUDE) -I$(PYHMMER_EASEL_INCLUDE) \
 		-I$(PYHMMER_INCLUDE)/libhmmer -c -o $@ $<
 
-$(PIPELINE_MODULE): $(PIPELINE_OBJ) $(PYHMMER_HMMER_LIB) $(PYHMMER_EASEL_LIB)
-	$(CC) -shared -o $@ $(PIPELINE_OBJ) -L$(PYHMMER_LIB_DIR) \
+$(AVX512_TAIL_OBJ): experiments/post448_forward4_avx512.cpp \
+		cpu/avx512_tail.h $(PYHMMER_INCLUDE)/libhmmer/hmmer.h \
+		$(PYHMMER_INCLUDE)/libhmmer/impl_sse/impl_sse.h
+	mkdir -p $(@D)
+	$(CXX) -O3 -g -std=c++17 -fPIC -Wall -Wextra -Wshadow \
+		-mavx512f -mavx512dq -mavx512bw -mavx512vl \
+		-ffp-contract=off -DPLAN7_AVX512_TAIL_LIBRARY \
+		-Icpu -I$(PYHMMER_INCLUDE) -I$(PYHMMER_EASEL_INCLUDE) \
+		-I$(PYHMMER_INCLUDE)/libhmmer -c -o $@ $<
+
+$(PIPELINE_MODULE): $(PIPELINE_OBJ) $(AVX512_TAIL_OBJ) \
+		$(PYHMMER_HMMER_LIB) $(PYHMMER_EASEL_LIB)
+	$(CXX) -shared -o $@ $(PIPELINE_OBJ) $(AVX512_TAIL_OBJ) \
+		-L$(PYHMMER_LIB_DIR) \
 		-Wl,--no-as-needed -llibhmmer -llibeasel \
 		-Wl,-rpath,$(PYHMMER_LIB_DIR)
 
