@@ -73,6 +73,12 @@ _scheduler_statistics: dict[str, Any] = {
 }
 
 
+# Private cross-package contract consumed by Astra.  Keep this synchronized
+# with ``_pipeline._ASTRA_TSV_RENDERER_ABI``; Astra deliberately falls back to
+# public TopHits iteration for every other version.
+_ASTRA_TSV_RENDERER_ABI = 2
+
+
 class _AstraTSVRows:
     """Private marker for exact rows rendered before scheduler buffering."""
 
@@ -1228,6 +1234,10 @@ def _hmmsearch_with_continuation_pool(
 def _astra_tsv_renderer() -> Any:
     from . import _pipeline  # type: ignore[attr-defined]
 
+    if getattr(_pipeline, "_ASTRA_TSV_RENDERER_ABI", None) != (
+        _ASTRA_TSV_RENDERER_ABI
+    ):
+        raise RuntimeError("native Astra TSV renderer ABI is unavailable")
     renderer = getattr(_pipeline, "_astra_tsv_rows_bound", None)
     if not callable(renderer):
         raise RuntimeError("native Astra TSV renderer is unavailable")

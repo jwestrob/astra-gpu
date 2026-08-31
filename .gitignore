@@ -1,5 +1,6 @@
 # Local dependency sources, builds, and installations
 /refs/downloads/
+/refs/src
 /refs/src/
 /refs/build/
 /refs/install/

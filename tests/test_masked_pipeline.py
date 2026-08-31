@@ -79,6 +79,15 @@ class MaskedPipelineTests(unittest.TestCase):
     def candidates(*indexes):
         return array("I", indexes)
 
+    def require_filter_score_seam(self):
+        if not _pipeline._filter_scores_seam_available():
+            self.skipTest("private filter-score seam is unavailable")
+
+    def require_filter_forward_seams(self):
+        self.require_filter_score_seam()
+        if not _pipeline._filter_and_forward_scores_seam_available():
+            self.skipTest("private Forward-score seam is unavailable")
+
     @staticmethod
     def residue_offsets(sequences):
         offsets = array("Q", [0])
@@ -488,6 +497,10 @@ class MaskedPipelineTests(unittest.TestCase):
         self.assert_exact_hits(expected, actual)
 
     def test_private_astra_tsv_renderer_is_byte_exact(self):
+        self.assertEqual(_pipeline._ASTRA_TSV_RENDERER_ABI, 2)
+        self.assertTrue(
+            issubclass(_pipeline._AstraTSVRendererUnsupported, ValueError)
+        )
         hits = self.pipeline().search_hmm(self.hmms[0], self.sequences)
         expected = self.astra_tsv_rows_reference(hits)
         self.assertTrue(expected)
@@ -960,6 +973,7 @@ print(json.dumps(after_repeat, sort_keys=True))
         self.assertEqual([item["special_count"] for item in exceptions], [0, 0, matrix_count])
 
     def test_journal_v3_rejects_forward_rows_that_fail_exact_f2(self):
+        self.require_filter_forward_seams()
         target = 2
         records = self.postfilter_record(
             target, 0.0, 0, 0, 2, -1.0e30
@@ -1477,6 +1491,7 @@ print(json.dumps(after_repeat, sort_keys=True))
             _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
 
     def test_journal_v3_sparse_dual_matches_dense_gap_and_tail_accounting(self):
+        self.require_filter_score_seam()
         terminal = b"".join(
             (
                 self.postfilter_record(1, math.nan, -12, 0, 1, math.nan),
@@ -1832,6 +1847,7 @@ print(json.dumps(after_repeat, sort_keys=True))
             _pipeline._validate_continuation_journal_v3_bound(capsule, sealed)
 
     def test_journal_v3_sparse_dual_certifies_exact_f3_reject(self):
+        self.require_filter_forward_seams()
         generation = self.pipeline(F1=1.0, F2=1.0, F3=0.0)
         sealed = self.seal_v2_f3_reject_fixture(
             self.sequences, 3, pipeline=generation
@@ -1850,6 +1866,7 @@ print(json.dumps(after_repeat, sort_keys=True))
         self.assertTrue(row["route_reconciliation"]["equal"])
 
     def test_journal_v3_sparse_dual_certifies_domain_no_region(self):
+        self.require_filter_forward_seams()
         target = 3
         row_offsets = array("Q", [0, 1])
         special_count = 6 * (len(self.sequences[target]) + 1)

@@ -348,6 +348,12 @@ class AstraSearchTests(unittest.TestCase):
             )
         ):
             self.skipTest("sparse continuation sharding is unavailable")
+        if (
+            not _pipeline._filter_scores_seam_available()
+            or not _pipeline._filter_and_forward_scores_seam_available()
+            or not _pipeline._simple_regions_seam_available()
+        ):
+            self.skipTest("private fused continuation seams are unavailable")
         pairs = self.pairs
         options = {
             "F1": 0.5,
@@ -477,6 +483,11 @@ class AstraSearchTests(unittest.TestCase):
                 )
 
     def test_private_worker_tsv_sink_is_exact_and_ordered(self):
+        self.assertEqual(astra_search_module._ASTRA_TSV_RENDERER_ABI, 2)
+        self.assertEqual(
+            astra_search_module._ASTRA_TSV_RENDERER_ABI,
+            _pipeline._ASTRA_TSV_RENDERER_ABI,
+        )
         pairs = self.pairs[:2]
         options = {"E": 10.0, "domE": 10.0, "incE": 10.0, "incdomE": 10.0}
         expected = list(hmmsearch(pairs, self.real_batch, cpus=2, **options))

@@ -123,6 +123,16 @@ from plan7_gpu import _telemetry as _telemetry_module
 
 DIRECT_V3_STAGING_SCHEMA_VERSION = 3
 
+# Astra consumes this private renderer only when this exact contract is
+# present.  Version 2 is the first contract that includes the one-position
+# alignment fix and rejects TopHits shapes outside the ordinary sorted protein
+# search path before touching their private HMMER representation.
+_ASTRA_TSV_RENDERER_ABI = 2
+
+
+class _AstraTSVRendererUnsupported(ValueError):
+    """The private renderer cannot prove compatibility with this TopHits."""
+
 # These are the exact interval constants used by the patched HMMER compact
 # continuation seam.  The Phase 9 evaluator applies the same input and final
 # rounding allowance before it certifies any GA rejection.
@@ -9656,27 +9666,52 @@ def _astra_tsv_rows_bound(TopHits hits):
         raise ValueError("TopHits state is unavailable")
     if hits._query is None:
         raise ValueError("TopHits query is unavailable")
+    if hits._pli.long_targets:
+        raise _AstraTSVRendererUnsupported(
+            "native Astra TSV rendering is limited to ordinary searches"
+        )
+    if hits._th.N != 0 and not hits._th.is_sorted_by_sortkey:
+        raise _AstraTSVRendererUnsupported(
+            "native Astra TSV rendering requires sort-key ordered TopHits"
+        )
     cog = hits._query.name
 
     for hit_index in range(hits._th.N):
         hit = hits._th.hit[hit_index]
         if hit == NULL:
-            raise ValueError("TopHits order contains a null hit")
+            raise _AstraTSVRendererUnsupported(
+                "TopHits order contains a null hit"
+            )
         if not (hit.flags & p7_IS_INCLUDED):
             continue
         if hit.name == NULL:
-            raise ValueError("included TopHits row has no target name")
+            raise _AstraTSVRendererUnsupported(
+                "included TopHits row has no target name"
+            )
         if hit.ndom < 0 or (hit.ndom != 0 and hit.dcl == NULL):
-            raise ValueError("included TopHits row has invalid domains")
+            raise _AstraTSVRendererUnsupported(
+                "included TopHits row has invalid domains"
+            )
         hit_name = PyUnicode_FromString(hit.name)
         full_evalue = exp(hit.lnP) * hits._pli.Z
         for domain_index in range(hit.ndom):
             domain = &hit.dcl[domain_index]
             if not domain.is_reported:
                 continue
+            if domain.jenv < domain.ienv:
+                raise _AstraTSVRendererUnsupported(
+                    "reported domain has reversed envelope coordinates"
+                )
             conditional_evalue = exp(domain.lnP) * hits._pli.domZ
             independent_evalue = exp(domain.lnP) * hits._pli.Z
             alignment = domain.ad
+            if alignment != NULL and (
+                alignment.hmmto < alignment.hmmfrom
+                or alignment.sqto < alignment.sqfrom
+            ):
+                raise _AstraTSVRendererUnsupported(
+                    "reported domain has reversed alignment coordinates"
+                )
             # ``Alignment.__len__`` is ``hmm_to - hmm_from`` in PyHMMER,
             # so a one-position alignment is false-valued even though its
             # P7_ALIDISPLAY pointer is present.  Mirror Astra's public
