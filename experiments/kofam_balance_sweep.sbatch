@@ -23,7 +23,7 @@ PYTHON=$RUNTIME/bin/python
 INPUT=/groups/banfield/projects/environmental/EastRiver/hillslope/assembly.d/PLM_jun2017/PLM2_5_b1/PLM2_5_b1_jun17_idba_ud/PLM2_5_b1_jun17_scaffold_min1000.fa.genes.faa
 DB=/groups/banfield/users/jwestrob/.config/Astra/KOFAM/KOFAM
 REFERENCE=/groups/banfield/projects/environmental/sr/srvp2020/Jacob/metacerberus_benchmark_20260830/astra-gpu-kofam/runs/matrix-1186921/outputs/cpu48/output/KOFAM_hits_df.tsv
-MANIFEST=$SUPPORT/inputs/KOFAM.manifest.json
+MANIFEST=${KOFAM_SWEEP_MANIFEST:-$SUPPORT/inputs/KOFAM.manifest.json}
 ARMS=(control shard15 forward150 forward100 workers48 workers32)
 
 configure_arm() {
@@ -129,14 +129,18 @@ test -n "${CUDA_VISIBLE_DEVICES-}"
 : "${KOFAM_SWEEP_ASTRA:?set to the clean Astra balance worktree}"
 : "${KOFAM_SWEEP_CORE_COMMIT:?set to the exact expected core commit}"
 : "${KOFAM_SWEEP_ASTRA_COMMIT:?set to the exact expected Astra commit}"
+: "${KOFAM_SWEEP_PYHMMER_SITE:?set to the patched PyHMMER site-packages}"
 CORE=$(readlink -f "$KOFAM_SWEEP_CORE")
 ASTRA=$(readlink -f "$KOFAM_SWEEP_ASTRA")
+PYHMMER_SITE=$(readlink -f "$KOFAM_SWEEP_PYHMMER_SITE")
 test "$(git -C "$CORE" rev-parse HEAD)" = "$KOFAM_SWEEP_CORE_COMMIT"
 test "$(git -C "$ASTRA" rev-parse HEAD)" = "$KOFAM_SWEEP_ASTRA_COMMIT"
 test -z "$(git -C "$CORE" status --porcelain=v1 --untracked-files=no)"
 test -z "$(git -C "$ASTRA" status --porcelain=v1 --untracked-files=no)"
 test -f "$CORE/python/plan7_gpu/_native.cpython-312-x86_64-linux-gnu.so"
 test -f "$CORE/python/plan7_gpu/_pipeline.cpython-312-x86_64-linux-gnu.so"
+test -f "$PYHMMER_SITE/pyhmmer.libs/liblibhmmer.so"
+test -f "$PYHMMER_SITE/pyhmmer.libs/liblibeasel.so"
 
 RUN_ROOT=${KOFAM_SWEEP_OUTPUT_ROOT:-$ROOT/build/kofam-balance-sweep/runs/job-$SLURM_JOB_ID}
 test ! -e "$RUN_ROOT"
@@ -145,8 +149,8 @@ export LC_ALL=C
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
 export LD_PRELOAD=/home/jwestrob/dns_shim.so
-export LD_LIBRARY_PATH=$RUNTIME/python-base/lib:$RUNTIME/lib/python3.12/site-packages/pyhmmer.libs
-export PYTHONPATH=$CORE/python:$ASTRA
+export LD_LIBRARY_PATH=$RUNTIME/python-base/lib:$PYHMMER_SITE/pyhmmer.libs
+export PYTHONPATH=$CORE/python:$ASTRA:$PYHMMER_SITE
 unset MALLOC_ARENA_MAX ASTRA_CPU_MALLOC_ARENA_MAX \
   ASTRA_GPU_PROFILE_SERIAL ASTRA_GPU_PROFILE_LEGACY_OVERLAP \
   ASTRA_GPU_READY_QUEUE_DEPTH ASTRA_GPU_READY_QUEUE_BYTES \
@@ -168,6 +172,13 @@ git -C "$CORE" show --no-patch --format='%H %T %P %s' \
   >"$RUN_ROOT/provenance/core-commit.txt"
 git -C "$ASTRA" show --no-patch --format='%H %T %P %s' \
   >"$RUN_ROOT/provenance/astra-commit.txt"
+# The SIMD seam changes the private PyHMMER ABI. Create its required one-time
+# KOFAM onboarding manifest once, outside every measured search arm.
+export KOFAM_SWEEP_MANIFEST=$RUN_ROOT/provenance/KOFAM.abi62c.manifest.json
+/usr/bin/time --verbose --output="$RUN_ROOT/provenance/manifest-time.txt" \
+  "$PYTHON" -B "$CORE/scripts/verify_pressed_profiles.py" create \
+    "$DB" "$KOFAM_SWEEP_MANIFEST"
+MANIFEST=$KOFAM_SWEEP_MANIFEST
 # Verify and warm every immutable full-search input once; no prime, smoke, or
 # reduced request runs before the measured arms.
 sha256sum "$DB.h3m" "$DB.h3i" "$DB.h3f" "$DB.h3p" \
@@ -177,6 +188,8 @@ sha256sum "$CORE/python/plan7_gpu/_native.cpython-312-x86_64-linux-gnu.so" \
   "$CORE/python/plan7_gpu/_pipeline.cpython-312-x86_64-linux-gnu.so" \
   "$CORE/python/plan7_gpu/astra_search.py" \
   "$CORE/python/plan7_gpu/_private_tuning.py" "$ASTRA/astra/search.py" \
+  "$PYHMMER_SITE/pyhmmer.libs/liblibhmmer.so" \
+  "$PYHMMER_SITE/pyhmmer.libs/liblibeasel.so" \
   "$SUPPORT/benchmark.py" "${BASH_SOURCE[0]}" \
   >"$RUN_ROOT/provenance/executed-artifact-sha256.txt"
 
