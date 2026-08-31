@@ -663,8 +663,6 @@ def _threaded_hmmsearch(
     worker_count = min(cpus, len(candidates))
     worker_state = local() if continuation_pool is None else None
     owns_executor = continuation_pool is None
-    if continuation_pool is not None:
-        continuation_pool._acquire(cpus, pipeline_options)
     scheduler_mode = _continuation_scheduler_mode()
     task_policy = _continuation_task_policy()
     if task_policy == _TASK_POLICY_SHARDED and (
@@ -911,11 +909,14 @@ def _threaded_hmmsearch(
     active_task_limit = min(
         len(task_bounds), _TASKS_PER_WORKER_WINDOW * worker_count
     )
+    pool_acquired = False
+    pending_oldest: deque[tuple[Future[Any], tuple[int, ...]]] = deque()
+    pending_completion: dict[Future[Any], tuple[int, ...]] = {}
     try:
+        if continuation_pool is not None:
+            continuation_pool._acquire(cpus, pipeline_options)
+            pool_acquired = True
         if scheduler_mode == _SCHEDULER_OLDEST:
-            pending_oldest: deque[
-                tuple[Future[Any], tuple[int, ...]]
-            ] = deque()
             next_task_ordinal = 0
             while len(pending_oldest) < active_task_limit:
                 pending_oldest.append(submit(next_task_ordinal))
@@ -953,7 +954,6 @@ def _threaded_hmmsearch(
                 if error is not None:
                     raise error
         else:
-            pending_completion: dict[Future[Any], tuple[int, ...]] = {}
             completed: dict[
                 int, tuple[list[Any], BaseException | None, dict[str, int]]
             ] = {}
@@ -1045,7 +1045,7 @@ def _threaded_hmmsearch(
             future.cancel()
         if owns_executor:
             executor.shutdown(wait=True, cancel_futures=True)
-        else:
+        elif pool_acquired:
             continuation_pool._release()
         if collect_profile:
             _record_continuation_scheduler_call(

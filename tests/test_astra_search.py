@@ -96,6 +96,32 @@ class ContinuationPoolLifecycleTests(unittest.TestCase):
         finally:
             pool.close()
 
+    def test_preflight_failure_does_not_acquire_pool(self):
+        class Candidates:
+            def __len__(self):
+                return 1
+
+        pool = _ContinuationPool(2, allow_concurrent_calls=True)
+        try:
+            with mock.patch.object(
+                astra_search_module,
+                "_continuation_task_bounds",
+                side_effect=RuntimeError("preflight-failure"),
+            ):
+                iterator = astra_search_module._threaded_hmmsearch(
+                    Candidates(),
+                    2,
+                    {},
+                    False,
+                    continuation_pool=pool,
+                )
+                with self.assertRaisesRegex(RuntimeError, "preflight-failure"):
+                    next(iterator)
+            self.assertFalse(pool.statistics["active"])
+            self.assertEqual(pool.statistics["active_call_count"], 0)
+        finally:
+            pool.close()
+
 
 @unittest.skipUnless(bridge_available(), "Astra bridge CUDA backend unavailable")
 class AstraSearchTests(unittest.TestCase):
