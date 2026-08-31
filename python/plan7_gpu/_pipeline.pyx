@@ -9677,7 +9677,12 @@ def _astra_tsv_rows_bound(TopHits hits):
             conditional_evalue = exp(domain.lnP) * hits._pli.domZ
             independent_evalue = exp(domain.lnP) * hits._pli.Z
             alignment = domain.ad
-            if alignment == NULL:
+            # ``Alignment.__len__`` is ``hmm_to - hmm_from`` in PyHMMER,
+            # so a one-position alignment is false-valued even though its
+            # P7_ALIDISPLAY pointer is present.  Mirror Astra's public
+            # ``if alignment`` formatting branch exactly: use the envelope
+            # coordinates and leave the HMM coordinates empty in that case.
+            if alignment == NULL or alignment.hmmto == alignment.hmmfrom:
                 rows.append(
                     f"{hit_name}\t{cog}\t{hit.score:.2f}\t{full_evalue:.2e}\t"
                     f"{conditional_evalue:.2e}\t{independent_evalue:.2e}\t"

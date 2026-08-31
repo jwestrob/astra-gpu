@@ -496,6 +496,43 @@ class MaskedPipelineTests(unittest.TestCase):
         empty = pyhmmer.plan7.TopHits(self.hmms[0])
         self.assertEqual(_pipeline._astra_tsv_rows_bound(empty), "")
 
+    def test_private_astra_tsv_renderer_matches_false_alignment_fallback(self):
+        background = pyhmmer.plan7.Background(self.alphabet)
+        builder = pyhmmer.plan7.Builder(self.alphabet)
+        query = pyhmmer.easel.TextSequence(
+            name=b"one-position-query",
+            sequence="AAAAAAAAAA",
+        ).digitize(self.alphabet)
+        hmm, _, _ = builder.build(query, background)
+        targets = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet,
+            [
+                pyhmmer.easel.TextSequence(
+                    name=b"one-position-target",
+                    sequence="AA",
+                ).digitize(self.alphabet)
+            ],
+        )
+        pipeline = pyhmmer.plan7.Pipeline(
+            self.alphabet,
+            E=1.0e100,
+            domE=1.0e100,
+            incE=1.0e100,
+            incdomE=1.0e100,
+            F1=1.0,
+            F2=1.0,
+            F3=1.0,
+            bias_filter=False,
+        )
+        hits = pipeline.search_hmm(hmm, targets)
+        domains = [domain for hit in hits for domain in hit.domains.reported]
+
+        self.assertEqual(len(domains), 1)
+        self.assertFalse(domains[0].alignment)
+        expected = self.astra_tsv_rows_reference(hits)
+        self.assertEqual(_pipeline._astra_tsv_rows_bound(hits), expected)
+        self.assertTrue(expected.endswith("\t1\t2\t\t\n"))
+
     def test_all_rejects_keep_database_accounting_and_automatic_z(self):
         hmm = self.hmms[0]
         hits = _pipeline._search_hmm_candidates(
