@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import io
@@ -597,12 +597,12 @@ class ProfileSelection:
         self.close()
 
 
-def load_pressed_profiles(
+def _iter_pressed_profile_pairs(
     path: str | Path,
     *,
     manifest: str | Path | None = None,
-) -> tuple[PressedProfilePair, ...]:
-    """Load a pressed HMM database as provenance-bound lockstep pairs.
+) -> Iterator[PressedProfilePair]:
+    """Yield a pressed HMM database as provenance-bound lockstep pairs.
 
     ``manifest`` is an unsigned trust anchor and must come from a trusted
     source, such as this repository's reviewed ``results/pressed`` records.
@@ -624,7 +624,7 @@ def load_pressed_profiles(
         from . import _pipeline  # type: ignore[attr-defined]
 
         pipeline_module = _pipeline
-    pairs = []
+    model_count = 0
     with _pinned_pressed_database(base) as (pinned_base, pinned_token):
         before = _PressedStatToken(*(_FileStat(*member) for member in pinned_token))
         if (
@@ -677,28 +677,64 @@ def load_pressed_profiles(
                     raise ValueError(
                         f"pressed HMM/profile score mismatch at ordinal {ordinal}"
                     )
-                pairs.append(
-                    _new_pressed_profile_pair(
-                        hmm,
-                        optimized_profile,
-                        base,
-                        ordinal,
-                        before,
-                        _CutoffSnapshot(
-                            hmm.cutoffs.gathering,
-                            hmm.cutoffs.noise,
-                            hmm.cutoffs.trusted,
-                        ),
-                        _background_fingerprint(canonical_background),
-                    )
+                model_count = ordinal + 1
+                yield _new_pressed_profile_pair(
+                    hmm,
+                    optimized_profile,
+                    base,
+                    ordinal,
+                    before,
+                    _CutoffSnapshot(
+                        hmm.cutoffs.gathering,
+                        hmm.cutoffs.noise,
+                        hmm.cutoffs.trusted,
+                    ),
+                    _background_fingerprint(canonical_background),
                 )
 
     if (
         manifest_validation is not None
-        and len(pairs) != manifest_validation.model_count
+        and model_count != manifest_validation.model_count
     ):
         raise ValueError("pressed profile count does not match the validated manifest")
-    return tuple(pairs)
+
+
+def _iter_pressed_profile_chunks(
+    path: str | Path,
+    chunk_size: int,
+    *,
+    manifest: str | Path | None = None,
+) -> Iterator[tuple[PressedProfilePair, ...]]:
+    """Yield bounded, canonical chunks from one pinned pressed database."""
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+        raise TypeError("chunk_size must be a positive integer")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    chunk: list[PressedProfilePair] = []
+    pairs = _iter_pressed_profile_pairs(path, manifest=manifest)
+    try:
+        for pair in pairs:
+            chunk.append(pair)
+            if len(chunk) == chunk_size:
+                yield tuple(chunk)
+                chunk = []
+        if chunk:
+            yield tuple(chunk)
+    finally:
+        pairs.close()
+
+
+def load_pressed_profiles(
+    path: str | Path,
+    *,
+    manifest: str | Path | None = None,
+) -> tuple[PressedProfilePair, ...]:
+    """Load a pressed HMM database as provenance-bound lockstep pairs.
+
+    ``manifest`` is an unsigned trust anchor and must come from a trusted
+    source, such as this repository's reviewed ``results/pressed`` records.
+    """
+    return tuple(_iter_pressed_profile_pairs(path, manifest=manifest))
 
 
 class _PackedProfiles(NamedTuple):
