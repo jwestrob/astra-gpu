@@ -232,6 +232,7 @@ def _continuation_task_bounds(
     candidates: CandidateBatch,
     max_rows: int,
     policy: str,
+    shard_trigger: tuple[int, int] | None = None,
 ) -> tuple[tuple[int, int, int, int, int, int], ...]:
     if policy in (_TASK_POLICY_BALANCED, _TASK_POLICY_SHARDED):
         state = _candidate_state(candidates)
@@ -262,7 +263,11 @@ def _continuation_task_bounds(
                         hints,
                         shard_hints,
                         max_rows,
-                        continuation_shard_trigger(),
+                        (
+                            continuation_shard_trigger()
+                            if shard_trigger is None
+                            else shard_trigger
+                        ),
                     )
                 return tuple(
                     (start, stop, work, -1, -1, 1)
@@ -387,13 +392,60 @@ class _ContinuationPool:
     can occupy workers while an earlier chunk drains a pathological tail.
     """
 
-    def __init__(self, cpus: int, *, allow_concurrent_calls: bool = False) -> None:
+    def __init__(
+        self,
+        cpus: int,
+        *,
+        allow_concurrent_calls: bool = False,
+        task_policy: str | None = None,
+        shard_trigger: tuple[int, int] | None = None,
+        pipeline_madvise_work_hint: int | None = None,
+    ) -> None:
         self.cpus = _positive_cpus(cpus)
         if type(allow_concurrent_calls) is not bool:
             raise TypeError("allow_concurrent_calls must be bool")
+        if task_policy is not None and task_policy not in (
+            _TASK_POLICY_FIXED,
+            _TASK_POLICY_BALANCED,
+            _TASK_POLICY_SHARDED,
+        ):
+            raise ValueError(
+                "task_policy must be 'fixed', 'balanced', 'sharded', or None"
+            )
+        if shard_trigger is not None:
+            if (
+                type(shard_trigger) is not tuple
+                or len(shard_trigger) != 2
+                or any(type(value) is not int for value in shard_trigger)
+            ):
+                raise TypeError(
+                    "shard_trigger must be an exact integer ratio tuple "
+                    "or None"
+                )
+            numerator, denominator = shard_trigger
+            if (
+                denominator <= 0
+                or not denominator <= numerator <= 2 * denominator
+            ):
+                raise ValueError("shard_trigger must be from 1.0 through 2.0")
+            if task_policy != _TASK_POLICY_SHARDED:
+                raise ValueError(
+                    "shard_trigger requires request-local sharded task policy"
+                )
+        if pipeline_madvise_work_hint is not None and (
+            type(pipeline_madvise_work_hint) is not int
+            or pipeline_madvise_work_hint <= 0
+        ):
+            raise ValueError(
+                "pipeline_madvise_work_hint must be a positive integer or None"
+            )
         self._allow_concurrent_calls = allow_concurrent_calls
+        self._task_policy = task_policy
+        self._shard_trigger = shard_trigger
         self._pipeline_madvise_work_hint = (
             _continuation_pipeline_madvise_work_hint()
+            if pipeline_madvise_work_hint is None
+            else pipeline_madvise_work_hint
         )
         self._executor = ThreadPoolExecutor(
             max_workers=self.cpus,
@@ -724,7 +776,17 @@ def _threaded_hmmsearch(
     worker_state = local() if continuation_pool is None else None
     owns_executor = continuation_pool is None
     scheduler_mode = _continuation_scheduler_mode()
-    task_policy = _continuation_task_policy()
+    task_policy = (
+        continuation_pool._task_policy
+        if continuation_pool is not None
+        and continuation_pool._task_policy is not None
+        else _continuation_task_policy()
+    )
+    shard_trigger = (
+        continuation_pool._shard_trigger
+        if continuation_pool is not None
+        else None
+    )
     if task_policy == _TASK_POLICY_SHARDED and (
         telemetry or collector is not None
     ):
@@ -755,7 +817,7 @@ def _threaded_hmmsearch(
         ),
     )
     task_bounds = _continuation_task_bounds(
-        candidates, chunk_size, task_policy
+        candidates, chunk_size, task_policy, shard_trigger
     )
     candidate_state = _candidate_state(candidates)
     sealed_postfilter = candidate_state.sealed_postfilter

@@ -1233,6 +1233,7 @@ cdef uint64_t _shard_z_audit_nonzero_offset_count = 0
 cdef uint64_t _shard_z_audit_restored_count = 0
 cdef uint64_t _shard_z_audit_offset_sum = 0
 cdef uint64_t _shard_z_audit_offset_max = 0
+cdef int _avx512_tail_madvise_override = -1
 
 _continuation_seam_resolve_lock = _Lock()
 cdef uint8_t _consumed_journal_sentinel = 0
@@ -1422,6 +1423,16 @@ def _reset_avx512_tail_madvise_statistics_bound():
     """Reset private AVX result-release counters for exact host gates."""
     with nogil:
         plan7_avx512_tail_madvise_statistics_reset()
+
+
+def _configure_avx512_tail_madvise_bound(enabled):
+    """Override AVX result-page release; None restores environment policy."""
+    global _avx512_tail_madvise_override
+    if enabled is not None and type(enabled) is not bool:
+        raise TypeError("enabled must be bool or None")
+    _avx512_tail_madvise_override = (
+        -1 if enabled is None else int(enabled)
+    )
 
 
 def _configure_intrarow_page_release_bound(min_allocation_bytes):
@@ -11929,8 +11940,12 @@ cdef int _search_loop_continuation_journal_v3(
         and strcmp(filter_simd_test_fallback_env, b"1") == 0
     )
     cdef bint tail_madvise = (
-        tail_madvise_env != NULL
-        and strcmp(tail_madvise_env, b"1") == 0
+        _avx512_tail_madvise_override == 1
+        or (
+            _avx512_tail_madvise_override < 0
+            and tail_madvise_env != NULL
+            and strcmp(tail_madvise_env, b"1") == 0
+        )
     )
     cdef uint64_t tail_madvise_released_bytes = 0
     cdef int tail_madvise_status
