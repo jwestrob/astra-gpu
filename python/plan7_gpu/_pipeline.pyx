@@ -127,6 +127,17 @@ cdef extern from "unistd.h" nogil:
     long sysconf(int name)
 
 
+cdef extern from "hmmer.h" nogil:
+    int p7_pipeline_IntraRowPageReleaseConfigure(
+        uint64_t min_allocation_bytes,
+    ) noexcept
+    void p7_pipeline_IntraRowPageReleaseResetStatistics() noexcept
+    void p7_pipeline_IntraRowPageReleaseStatistics(
+        uint64_t *call_count,
+        uint64_t *released_bytes,
+    ) noexcept
+
+
 cdef extern from "impl_sse/impl_sse.h" nogil:
     int p7X_NSCELLS
     int p7X_NXCELLS
@@ -1411,6 +1422,45 @@ def _reset_avx512_tail_madvise_statistics_bound():
     """Reset private AVX result-release counters for exact host gates."""
     with nogil:
         plan7_avx512_tail_madvise_statistics_reset()
+
+
+def _configure_intrarow_page_release_bound(min_allocation_bytes):
+    """Configure HMMER intra-row page release; zero disables it."""
+    cdef uint64_t threshold
+    cdef int status
+
+    if type(min_allocation_bytes) is not int:
+        raise TypeError("min_allocation_bytes must be an integer")
+    if min_allocation_bytes < 0 or min_allocation_bytes > 0xffffffffffffffff:
+        raise ValueError("min_allocation_bytes is outside uint64 range")
+    threshold = <uint64_t> min_allocation_bytes
+    with nogil:
+        status = p7_pipeline_IntraRowPageReleaseConfigure(threshold)
+    if status != eslOK:
+        raise RuntimeError(
+            "p7_pipeline_IntraRowPageReleaseConfigure failed "
+            f"with status {status}"
+        )
+
+
+def _intrarow_page_release_statistics_bound():
+    """Return process-wide counters for HMMER intra-row page release."""
+    cdef uint64_t call_count = 0
+    cdef uint64_t released_bytes = 0
+    with nogil:
+        p7_pipeline_IntraRowPageReleaseStatistics(
+            &call_count, &released_bytes
+        )
+    return {
+        "call_count": int(call_count),
+        "released_bytes": int(released_bytes),
+    }
+
+
+def _reset_intrarow_page_release_statistics_bound():
+    """Reset HMMER intra-row page-release counters."""
+    with nogil:
+        p7_pipeline_IntraRowPageReleaseResetStatistics()
 
 
 def _filter_scores_seam_available():
