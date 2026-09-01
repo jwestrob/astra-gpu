@@ -52,6 +52,18 @@ int plan7_avx512_backward4_varlen(
     int backward_has_own_scales[PLAN7_AVX512_TAIL_LANES],
     uint64_t *elapsed_ns);
 
+/* Discard only complete resident pages from the two thread-local result
+ * backings. The result objects, sizes, capacities, and data pointers remain
+ * unchanged; callers must have consumed every pointer returned by the most
+ * recent four-lane calls before invoking this function. */
+int plan7_avx512_tail_madvise_pages(uint64_t *released_bytes);
+
+/* Process-wide observability for the private, caller-controlled release. */
+void plan7_avx512_tail_madvise_statistics(
+    uint64_t *call_count,
+    uint64_t *released_bytes);
+void plan7_avx512_tail_madvise_statistics_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

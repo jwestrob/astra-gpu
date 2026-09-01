@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -9,6 +10,8 @@
 #include <immintrin.h>
 #include <iostream>
 #include <string>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 extern "C" {
@@ -46,6 +49,41 @@ struct Forward4Result {
     }
   }
 };
+
+thread_local Forward4Result forward_output;
+thread_local Forward4Result backward_output;
+
+std::atomic<uint64_t> tail_madvise_calls{0};
+std::atomic<uint64_t> tail_madvise_released_bytes{0};
+
+bool madvise_full_pages(void *allocation, size_t allocation_bytes,
+                        size_t page_size, uint64_t *released_bytes) {
+  if (allocation == nullptr || allocation_bytes < page_size) return true;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(allocation);
+  const uintptr_t first =
+      ((start + page_size - 1u) / page_size) * page_size;
+  const uintptr_t end =
+      ((start + allocation_bytes) / page_size) * page_size;
+  if (end <= first) return true;
+  if (madvise(reinterpret_cast<void *>(first),
+              static_cast<size_t>(end - first), MADV_DONTNEED) != 0) {
+    return false;
+  }
+  *released_bytes += static_cast<uint64_t>(end - first);
+  return true;
+}
+
+bool madvise_result_pages(Forward4Result *result, size_t page_size,
+                          uint64_t *released_bytes) {
+  bool ok = madvise_full_pages(
+      result->dp.data(), result->dp.capacity() * sizeof(__m512), page_size,
+      released_bytes);
+  for (auto &row : result->xmx) {
+    ok = madvise_full_pages(row.data(), row.capacity() * sizeof(float),
+                            page_size, released_bytes) && ok;
+  }
+  return ok;
+}
 
 inline __m512 pack4(__m128 a, __m128 b, __m128 c, __m128 d) {
   __m512 value = _mm512_castps128_ps512(a);
@@ -1308,7 +1346,6 @@ extern "C" int plan7_avx512_forward4_varlen(
   }
 
   try {
-    static thread_local Forward4Result forward_output;
     const auto start = std::chrono::steady_clock::now();
     const int status = forward4_parser_varlen(
         sequence_array, length_array, profile, &forward_output);
@@ -1370,7 +1407,6 @@ extern "C" int plan7_avx512_backward4_varlen(
   }
 
   try {
-    static thread_local Forward4Result backward_output;
     const auto start = std::chrono::steady_clock::now();
     std::array<const float *, kCandidates> forward_array{};
     std::array<uint64_t, kCandidates> forward_count_array{};
@@ -1404,6 +1440,39 @@ extern "C" int plan7_avx512_backward4_varlen(
     return eslEINVAL;
   }
   return eslOK;
+}
+
+extern "C" int plan7_avx512_tail_madvise_pages(
+    uint64_t *released_bytes) {
+  if (released_bytes == nullptr) return eslEINVAL;
+  *released_bytes = 0;
+  tail_madvise_calls.fetch_add(1, std::memory_order_relaxed);
+  const long observed_page_size = sysconf(_SC_PAGESIZE);
+  if (observed_page_size <= 0) return eslESYS;
+  const size_t page_size = static_cast<size_t>(observed_page_size);
+  bool ok = madvise_result_pages(
+      &forward_output, page_size, released_bytes);
+  ok = madvise_result_pages(
+      &backward_output, page_size, released_bytes) && ok;
+  tail_madvise_released_bytes.fetch_add(
+      *released_bytes, std::memory_order_relaxed);
+  return ok ? eslOK : eslESYS;
+}
+
+extern "C" void plan7_avx512_tail_madvise_statistics(
+    uint64_t *call_count, uint64_t *released_bytes) {
+  if (call_count != nullptr) {
+    *call_count = tail_madvise_calls.load(std::memory_order_relaxed);
+  }
+  if (released_bytes != nullptr) {
+    *released_bytes =
+        tail_madvise_released_bytes.load(std::memory_order_relaxed);
+  }
+}
+
+extern "C" void plan7_avx512_tail_madvise_statistics_reset(void) {
+  tail_madvise_calls.store(0, std::memory_order_relaxed);
+  tail_madvise_released_bytes.store(0, std::memory_order_relaxed);
 }
 
 #ifndef PLAN7_AVX512_TAIL_LIBRARY

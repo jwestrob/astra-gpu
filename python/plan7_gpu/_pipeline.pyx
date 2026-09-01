@@ -203,6 +203,14 @@ cdef extern from "avx512_tail.h" nogil:
         int backward_has_own_scales[4],
         uint64_t *elapsed_ns,
     ) noexcept
+    int plan7_avx512_tail_madvise_pages(
+        uint64_t *released_bytes,
+    ) noexcept
+    void plan7_avx512_tail_madvise_statistics(
+        uint64_t *call_count,
+        uint64_t *released_bytes,
+    ) noexcept
+    void plan7_avx512_tail_madvise_statistics_reset() noexcept
 
 
 cdef extern from * nogil:
@@ -1383,6 +1391,26 @@ def _madvise_pipeline_pages_bound(Pipeline pipeline):
     if failed:
         raise OSError("madvise(MADV_DONTNEED) failed for Pipeline DP pages")
     return int(released)
+
+
+def _avx512_tail_madvise_statistics_bound():
+    """Return process-wide counters for the private AVX result release."""
+    cdef uint64_t call_count = 0
+    cdef uint64_t released_bytes = 0
+    with nogil:
+        plan7_avx512_tail_madvise_statistics(
+            &call_count, &released_bytes
+        )
+    return {
+        "call_count": int(call_count),
+        "released_bytes": int(released_bytes),
+    }
+
+
+def _reset_avx512_tail_madvise_statistics_bound():
+    """Reset private AVX result-release counters for exact host gates."""
+    with nogil:
+        plan7_avx512_tail_madvise_statistics_reset()
 
 
 def _filter_scores_seam_available():
@@ -11843,10 +11871,19 @@ cdef int _search_loop_continuation_journal_v3(
     cdef const char *filter_simd_test_fallback_env = getenv(
         b"PLAN7_GPU_FILTER_TAIL_SIMD_TEST_FALLBACK"
     )
+    cdef const char *tail_madvise_env = getenv(
+        b"PLAN7_GPU_AVX512_TAIL_MADVISE"
+    )
     cdef bint filter_simd_test_fallback = (
         filter_simd_test_fallback_env != NULL
         and strcmp(filter_simd_test_fallback_env, b"1") == 0
     )
+    cdef bint tail_madvise = (
+        tail_madvise_env != NULL
+        and strcmp(tail_madvise_env, b"1") == 0
+    )
+    cdef uint64_t tail_madvise_released_bytes = 0
+    cdef int tail_madvise_status
     cdef bint simd_available = (
         forward_backward_scores_seam != NULL
         and plan7_avx512_tail_available() != 0
@@ -12208,6 +12245,17 @@ cdef int _search_loop_continuation_journal_v3(
                     if filter_simd_lane == PLAN7_AVX512_TAIL_LANES:
                         filter_simd_lane = -1
                         filter_simd_backward_ready = False
+                        if tail_madvise:
+                            tail_madvise_status = (
+                                plan7_avx512_tail_madvise_pages(
+                                    &tail_madvise_released_bytes
+                                )
+                            )
+                            if (
+                                status == eslOK
+                                and tail_madvise_status != eslOK
+                            ):
+                                status = tail_madvise_status
                 else:
                     status = filter_scores_seam(
                         pli,
@@ -12326,6 +12374,17 @@ cdef int _search_loop_continuation_journal_v3(
                     simd_lane += 1
                     if simd_lane == PLAN7_AVX512_TAIL_LANES:
                         simd_lane = -1
+                        if tail_madvise:
+                            tail_madvise_status = (
+                                plan7_avx512_tail_madvise_pages(
+                                    &tail_madvise_released_bytes
+                                )
+                            )
+                            if (
+                                status == eslOK
+                                and tail_madvise_status != eslOK
+                            ):
+                                status = tail_madvise_status
                     used_forward_backward_seam = True
                 else:
                     status = forward_scores_seam(
