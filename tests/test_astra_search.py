@@ -71,6 +71,41 @@ def bridge_available():
     "Astra continuation bridge unavailable",
 )
 class ContinuationPoolLifecycleTests(unittest.TestCase):
+    def test_madvise_is_strictly_thresholded_and_keeps_pipeline(self):
+        options = {"alphabet": pyhmmer.easel.Alphabet.amino(), "E": 10.0}
+        with mock.patch.dict(
+            os.environ,
+            {"PLAN7_GPU_CONTINUATION_PIPELINE_MADVISE_WORK_HINT": "100"},
+        ):
+            pool = _ContinuationPool(1)
+        try:
+            with mock.patch.object(
+                _pipeline,
+                "_madvise_pipeline_pages_bound",
+                return_value=8192,
+            ) as release:
+                def exercise():
+                    pipeline = pool._pipeline(options)
+                    equal = pool._madvise_pipeline_after(pipeline, 100)
+                    heavy = pool._madvise_pipeline_after(pipeline, 101)
+                    same = pool._pipeline(options)
+                    return pipeline, equal, heavy, same
+
+                pipeline, equal, heavy, same = pool._executor.submit(
+                    exercise
+                ).result()
+            statistics = pool.statistics
+        finally:
+            pool.close()
+
+        self.assertEqual(equal, 0)
+        self.assertEqual(heavy, 8192)
+        self.assertIs(same, pipeline)
+        release.assert_called_once_with(pipeline)
+        self.assertEqual(statistics["pipeline_count"], 1)
+        self.assertEqual(statistics["pipeline_madvise_count"], 1)
+        self.assertEqual(statistics["pipeline_madvise_bytes"], 8192)
+
     def test_concurrency_is_explicit_and_bounded(self):
         default_pool = _ContinuationPool(2)
         try:

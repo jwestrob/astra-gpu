@@ -48,6 +48,9 @@ _COMPLETION_REORDER_WINDOWS = 1
 _CONTINUATION_SCHEDULER_ENV = "PLAN7_GPU_CONTINUATION_SCHEDULER"
 _CONTINUATION_TASK_POLICY_ENV = "PLAN7_GPU_CONTINUATION_TASK_POLICY"
 _CONTINUATION_PROFILE_ENV = "PLAN7_GPU_CONTINUATION_PROFILE"
+_CONTINUATION_PIPELINE_MADVISE_WORK_HINT_ENV = (
+    "PLAN7_GPU_CONTINUATION_PIPELINE_MADVISE_WORK_HINT"
+)
 _SCHEDULER_OLDEST = "oldest"
 _SCHEDULER_COMPLETION = "completion"
 _TASK_POLICY_FIXED = "fixed"
@@ -70,6 +73,8 @@ _scheduler_statistics: dict[str, Any] = {
     "maximum_pending_tasks": 0,
     "maximum_completed_tasks": 0,
     "maximum_active_workers": 0,
+    "pipeline_madvise_count": 0,
+    "pipeline_madvise_bytes": 0,
     "task_records": [],
 }
 
@@ -276,6 +281,25 @@ def _continuation_profile_enabled() -> bool:
     return value is not None and value not in ("", "0", "false", "False")
 
 
+def _continuation_pipeline_madvise_work_hint() -> int | None:
+    """Return the strict private threshold for releasing invalid DP pages."""
+    value = os.environ.get(_CONTINUATION_PIPELINE_MADVISE_WORK_HINT_ENV)
+    if value is None:
+        return None
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError(
+            f"{_CONTINUATION_PIPELINE_MADVISE_WORK_HINT_ENV} must be a "
+            "positive integer"
+        )
+    threshold = int(value, 10)
+    if threshold <= 0:
+        raise ValueError(
+            f"{_CONTINUATION_PIPELINE_MADVISE_WORK_HINT_ENV} must be a "
+            "positive integer"
+        )
+    return threshold
+
+
 def _reset_continuation_scheduler_statistics() -> None:
     """Reset private opt-in scheduler measurements."""
     with _scheduler_statistics_lock:
@@ -294,6 +318,8 @@ def _reset_continuation_scheduler_statistics() -> None:
             maximum_pending_tasks=0,
             maximum_completed_tasks=0,
             maximum_active_workers=0,
+            pipeline_madvise_count=0,
+            pipeline_madvise_bytes=0,
             task_records=[],
         )
 
@@ -366,6 +392,9 @@ class _ContinuationPool:
         if type(allow_concurrent_calls) is not bool:
             raise TypeError("allow_concurrent_calls must be bool")
         self._allow_concurrent_calls = allow_concurrent_calls
+        self._pipeline_madvise_work_hint = (
+            _continuation_pipeline_madvise_work_hint()
+        )
         self._executor = ThreadPoolExecutor(
             max_workers=self.cpus,
             thread_name_prefix="plan7-gpu-astra",
@@ -379,6 +408,8 @@ class _ContinuationPool:
         self._closed = False
         self._call_count = 0
         self._pipeline_count = 0
+        self._pipeline_madvise_count = 0
+        self._pipeline_madvise_bytes = 0
 
     def _acquire(self, cpus: int, pipeline_options: dict[str, Any]) -> None:
         if cpus != self.cpus:
@@ -416,8 +447,30 @@ class _ContinuationPool:
                 self._pipeline_count += 1
         return pipeline
 
+    def _madvise_pipeline_after(self, pipeline: Any, work_hint: int) -> int:
+        threshold = self._pipeline_madvise_work_hint
+        if threshold is None or work_hint <= threshold:
+            return 0
+        if getattr(self._worker_state, "pipeline", None) is not pipeline:
+            raise RuntimeError("continuation worker Pipeline ownership changed")
+        from . import _pipeline  # type: ignore[attr-defined]
+
+        release = getattr(_pipeline, "_madvise_pipeline_pages_bound", None)
+        if not callable(release):
+            raise RuntimeError("Pipeline DP-page release is unavailable")
+        released = release(pipeline)
+        if type(released) is not int or released < 0:
+            raise RuntimeError("Pipeline DP-page release accounting changed")
+        with self._statistics_lock:
+            self._pipeline_madvise_count += 1
+            self._pipeline_madvise_bytes += released
+        with _scheduler_statistics_lock:
+            _scheduler_statistics["pipeline_madvise_count"] += 1
+            _scheduler_statistics["pipeline_madvise_bytes"] += released
+        return released
+
     @property
-    def statistics(self) -> dict[str, int | bool]:
+    def statistics(self) -> dict[str, int | bool | None]:
         with self._lock:
             active_call_count = self._active_call_count
             maximum_active_call_count = self._maximum_active_call_count
@@ -425,8 +478,10 @@ class _ContinuationPool:
             call_count = self._call_count
         with self._statistics_lock:
             pipeline_count = self._pipeline_count
+            pipeline_madvise_count = self._pipeline_madvise_count
+            pipeline_madvise_bytes = self._pipeline_madvise_bytes
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "cpus": self.cpus,
             "call_count": call_count,
             "pipeline_count": pipeline_count,
@@ -434,6 +489,11 @@ class _ContinuationPool:
             "active_call_count": active_call_count,
             "maximum_active_call_count": maximum_active_call_count,
             "allow_concurrent_calls": self._allow_concurrent_calls,
+            "pipeline_madvise_work_hint_threshold": (
+                self._pipeline_madvise_work_hint
+            ),
+            "pipeline_madvise_count": pipeline_madvise_count,
+            "pipeline_madvise_bytes": pipeline_madvise_bytes,
             "closed": closed,
         }
 
@@ -780,6 +840,10 @@ def _threaded_hmmsearch(
             # the failing row are yielded before this exact error.
             error = caught
         finally:
+            if continuation_pool is not None and error is None:
+                continuation_pool._madvise_pipeline_after(
+                    pipeline, work_hint
+                )
             finished_ns = time.perf_counter_ns() if collect_profile else 0
             if collect_profile:
                 with active_lock:

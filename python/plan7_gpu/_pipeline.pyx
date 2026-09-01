@@ -116,6 +116,21 @@ from pathlib import Path as _Path
 import struct as _struct
 from threading import Lock as _Lock
 
+
+cdef extern from "sys/mman.h" nogil:
+    int MADV_DONTNEED
+    int madvise(void *address, size_t length, int advice)
+
+
+cdef extern from "unistd.h" nogil:
+    int _SC_PAGESIZE
+    long sysconf(int name)
+
+
+cdef extern from "impl_sse/impl_sse.h" nogil:
+    int p7X_NSCELLS
+    int p7X_NXCELLS
+
 # Keep the extension's established direct-file loading boundary usable by
 # provenance/concurrency tests: a relative import has no parent package when
 # importlib loads this DSO under its bare ``_pipeline`` initialization name.
@@ -1296,6 +1311,78 @@ cdef _pipeline_from_filter_scores_f _cached_filter_scores_seam():
                 _filter_scores_seam_cache = _resolve_filter_scores_seam()
                 _filter_scores_seam_resolved = True
     return _filter_scores_seam_cache
+
+
+cdef size_t _madvise_full_pages(
+    void *allocation,
+    size_t allocation_bytes,
+    size_t page_size,
+    int *failed,
+) noexcept nogil:
+    """Discard only pages wholly contained in one live allocation."""
+    cdef uintptr_t start
+    cdef uintptr_t first
+    cdef uintptr_t end
+
+    if allocation == NULL or allocation_bytes < page_size:
+        return 0
+    start = <uintptr_t> allocation
+    first = ((start + page_size - 1) // page_size) * page_size
+    end = ((start + allocation_bytes) // page_size) * page_size
+    if end <= first:
+        return 0
+    if madvise(<void *> first, <size_t> (end - first), MADV_DONTNEED) != 0:
+        failed[0] = 1
+        return 0
+    return <size_t> (end - first)
+
+
+cdef size_t _madvise_omx_pages(
+    P7_OMX *matrix,
+    size_t page_size,
+    int *failed,
+) noexcept nogil:
+    cdef size_t released = 0
+    cdef size_t dp_bytes
+    cdef size_t x_bytes
+
+    if matrix == NULL:
+        return 0
+    # p7_omx_GrowTo() records scalar DP capacity in ncells.  The SSE
+    # allocation contains three 16-byte striped vectors per four scalar cells.
+    dp_bytes = matrix.ncells * 12 + 15
+    x_bytes = <size_t> matrix.allocXR * 4 * p7X_NXCELLS + 15
+    released += _madvise_full_pages(
+        matrix.dp_mem, dp_bytes, page_size, failed
+    )
+    released += _madvise_full_pages(
+        matrix.x_mem, x_bytes, page_size, failed
+    )
+    return released
+
+
+def _madvise_pipeline_pages_bound(Pipeline pipeline):
+    """Release invalid reusable DP pages without changing Pipeline capacity."""
+    cdef P7_PIPELINE *pli = pipeline._pli
+    cdef long observed_page_size
+    cdef size_t page_size
+    cdef size_t released = 0
+    cdef int failed = 0
+
+    if pli == NULL:
+        raise RuntimeError("pipeline state is unavailable")
+    observed_page_size = sysconf(_SC_PAGESIZE)
+    if observed_page_size <= 0:
+        raise RuntimeError("could not resolve the system page size")
+    page_size = <size_t> observed_page_size
+    with nogil:
+        released += _madvise_omx_pages(pli.oxf, page_size, &failed)
+        released += _madvise_omx_pages(pli.oxb, page_size, &failed)
+        released += _madvise_omx_pages(pli.fwd, page_size, &failed)
+        released += _madvise_omx_pages(pli.bck, page_size, &failed)
+    if failed:
+        raise OSError("madvise(MADV_DONTNEED) failed for Pipeline DP pages")
+    return int(released)
 
 
 def _filter_scores_seam_available():
