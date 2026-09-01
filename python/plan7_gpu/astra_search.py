@@ -355,13 +355,17 @@ class _ContinuationPool:
     """Private request-scoped continuation workers reused across chunks.
 
     Astra creates one pool for each immutable set of Pipeline options and closes
-    it after the last profile chunk. Calls are deliberately sequential: the GPU
-    producer may overlap a call, but two continuation calls may not share the
-    same worker Pipelines concurrently.
+    it after the last profile chunk. Calls remain sequential by default.  The
+    private ``allow_concurrent_calls`` experiment permits several ordered chunk
+    coordinators to submit work to the same fixed worker set, so a later chunk
+    can occupy workers while an earlier chunk drains a pathological tail.
     """
 
-    def __init__(self, cpus: int) -> None:
+    def __init__(self, cpus: int, *, allow_concurrent_calls: bool = False) -> None:
         self.cpus = _positive_cpus(cpus)
+        if type(allow_concurrent_calls) is not bool:
+            raise TypeError("allow_concurrent_calls must be bool")
+        self._allow_concurrent_calls = allow_concurrent_calls
         self._executor = ThreadPoolExecutor(
             max_workers=self.cpus,
             thread_name_prefix="plan7-gpu-astra",
@@ -370,7 +374,8 @@ class _ContinuationPool:
         self._lock = Lock()
         self._statistics_lock = Lock()
         self._pipeline_options: dict[str, Any] | None = None
-        self._active = False
+        self._active_call_count = 0
+        self._maximum_active_call_count = 0
         self._closed = False
         self._call_count = 0
         self._pipeline_count = 0
@@ -381,7 +386,7 @@ class _ContinuationPool:
         with self._lock:
             if self._closed:
                 raise RuntimeError("continuation pool is closed")
-            if self._active:
+            if self._active_call_count and not self._allow_concurrent_calls:
                 raise RuntimeError("continuation pool is already in use")
             if self._pipeline_options is None:
                 self._pipeline_options = dict(pipeline_options)
@@ -389,12 +394,18 @@ class _ContinuationPool:
                 raise ValueError(
                     "continuation pool Pipeline options changed between chunks"
                 )
-            self._active = True
+            self._active_call_count += 1
+            self._maximum_active_call_count = max(
+                self._maximum_active_call_count,
+                self._active_call_count,
+            )
             self._call_count += 1
 
     def _release(self) -> None:
         with self._lock:
-            self._active = False
+            if self._active_call_count <= 0:
+                raise RuntimeError("continuation pool call accounting underflow")
+            self._active_call_count -= 1
 
     def _pipeline(self, pipeline_options: dict[str, Any]) -> Any:
         pipeline = getattr(self._worker_state, "pipeline", None)
@@ -408,7 +419,8 @@ class _ContinuationPool:
     @property
     def statistics(self) -> dict[str, int | bool]:
         with self._lock:
-            active = self._active
+            active_call_count = self._active_call_count
+            maximum_active_call_count = self._maximum_active_call_count
             closed = self._closed
             call_count = self._call_count
         with self._statistics_lock:
@@ -418,7 +430,10 @@ class _ContinuationPool:
             "cpus": self.cpus,
             "call_count": call_count,
             "pipeline_count": pipeline_count,
-            "active": active,
+            "active": bool(active_call_count),
+            "active_call_count": active_call_count,
+            "maximum_active_call_count": maximum_active_call_count,
+            "allow_concurrent_calls": self._allow_concurrent_calls,
             "closed": closed,
         }
 
@@ -426,7 +441,7 @@ class _ContinuationPool:
         with self._lock:
             if self._closed:
                 return
-            if self._active:
+            if self._active_call_count:
                 raise RuntimeError("cannot close an active continuation pool")
             self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=True)
@@ -648,8 +663,6 @@ def _threaded_hmmsearch(
     worker_count = min(cpus, len(candidates))
     worker_state = local() if continuation_pool is None else None
     owns_executor = continuation_pool is None
-    if continuation_pool is not None:
-        continuation_pool._acquire(cpus, pipeline_options)
     scheduler_mode = _continuation_scheduler_mode()
     task_policy = _continuation_task_policy()
     if task_policy == _TASK_POLICY_SHARDED and (
@@ -896,11 +909,14 @@ def _threaded_hmmsearch(
     active_task_limit = min(
         len(task_bounds), _TASKS_PER_WORKER_WINDOW * worker_count
     )
+    pool_acquired = False
+    pending_oldest: deque[tuple[Future[Any], tuple[int, ...]]] = deque()
+    pending_completion: dict[Future[Any], tuple[int, ...]] = {}
     try:
+        if continuation_pool is not None:
+            continuation_pool._acquire(cpus, pipeline_options)
+            pool_acquired = True
         if scheduler_mode == _SCHEDULER_OLDEST:
-            pending_oldest: deque[
-                tuple[Future[Any], tuple[int, ...]]
-            ] = deque()
             next_task_ordinal = 0
             while len(pending_oldest) < active_task_limit:
                 pending_oldest.append(submit(next_task_ordinal))
@@ -938,7 +954,6 @@ def _threaded_hmmsearch(
                 if error is not None:
                     raise error
         else:
-            pending_completion: dict[Future[Any], tuple[int, ...]] = {}
             completed: dict[
                 int, tuple[list[Any], BaseException | None, dict[str, int]]
             ] = {}
@@ -1030,7 +1045,7 @@ def _threaded_hmmsearch(
             future.cancel()
         if owns_executor:
             executor.shutdown(wait=True, cancel_futures=True)
-        else:
+        elif pool_acquired:
             continuation_pool._release()
         if collect_profile:
             _record_continuation_scheduler_call(
