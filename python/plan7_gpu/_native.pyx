@@ -5989,12 +5989,20 @@ cdef class SequenceBatch:
         const uint64_t[::1] offsets,
         int alphabet_size,
         int _execution_policy=PLAN7_GPU_EXECUTION_POLICY_AUTO,
+        object _forward_cpu_max_cells=None,
     ):
         cdef char error[512]
         cdef int status
         cdef size_t i
         cdef object forward_ownership
         cdef object forward_threshold
+        cdef tuple forward_override_environments = (
+            "PLAN7_GPU_FORWARD_OWNERSHIP",
+            "PLAN7_GPU_FORWARD_CPU_MIN_CELLS",
+            "PLAN7_GPU_FORWARD_CPU_MIN_LENGTH",
+            "PLAN7_GPU_FORWARD_CPU_MAX_CELLS",
+            "ASTRA_GPU_CONTINUATION_POOL",
+        )
 
         self._batch = NULL
         self._sequence_count = 0
@@ -6024,7 +6032,39 @@ cdef class SequenceBatch:
         self._gpu_forward_selected_count = 0
         self._gpu_forward_selected_cells = 0
         forward_ownership = _os.environ.get("PLAN7_GPU_FORWARD_OWNERSHIP")
-        if (
+        if _forward_cpu_max_cells is not None:
+            if any(
+                name in _os.environ for name in forward_override_environments
+            ):
+                raise ValueError(
+                    "request-local Forward ownership conflicts with an "
+                    "environment override"
+                )
+            if type(_forward_cpu_max_cells) is not int:
+                raise TypeError(
+                    "_forward_cpu_max_cells must be an integer or None"
+                )
+            if (
+                _forward_cpu_max_cells <= 0
+                or _forward_cpu_max_cells > 0xffffffffffffffff
+            ):
+                raise ValueError(
+                    "_forward_cpu_max_cells is outside positive uint64 range"
+                )
+            if (
+                _execution_policy == PLAN7_GPU_EXECUTION_POLICY_SIMPLE
+                or offsets.shape[0] <= 65537
+                or not self._cpu_domain_route
+            ):
+                raise ValueError(
+                    "request-local Forward ownership requires a large "
+                    "non-simple CPU-domain target batch"
+                )
+            self._cpu_forward_route_mode = 4
+            self._cpu_forward_route_auto = True
+            self._cpu_forward_max_cells = <uint64_t> _forward_cpu_max_cells
+            forward_ownership = "hybrid_cells_below"
+        elif (
             forward_ownership is None
             and _os.environ.get("ASTRA_GPU_CONTINUATION_POOL") == "1"
             and _execution_policy != PLAN7_GPU_EXECUTION_POLICY_SIMPLE

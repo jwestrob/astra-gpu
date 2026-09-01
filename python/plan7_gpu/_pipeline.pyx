@@ -1427,17 +1427,39 @@ def _reset_avx512_tail_madvise_statistics_bound():
 
 def _configure_avx512_tail_madvise_bound(enabled):
     """Override AVX result-page release; None restores environment policy."""
+    _swap_avx512_tail_madvise_bound(enabled)
+
+
+def _swap_avx512_tail_madvise_bound(enabled):
+    """Set AVX result-page release and return the prior scoped override."""
     global _avx512_tail_madvise_override
+    cdef int previous = _avx512_tail_madvise_override
     if enabled is not None and type(enabled) is not bool:
         raise TypeError("enabled must be bool or None")
     _avx512_tail_madvise_override = (
         -1 if enabled is None else int(enabled)
     )
+    return None if previous < 0 else bool(previous)
 
 
 def _configure_intrarow_page_release_bound(min_allocation_bytes):
     """Configure HMMER intra-row page release; zero disables it."""
+    _swap_intrarow_page_release_bound(min_allocation_bytes)
+
+
+cdef uint64_t _intrarow_page_release_min_bytes_bound = 0
+
+
+def _intrarow_page_release_configuration_bound():
+    """Return the threshold last installed through this private binding."""
+    return int(_intrarow_page_release_min_bytes_bound)
+
+
+def _swap_intrarow_page_release_bound(min_allocation_bytes):
+    """Install a HMMER release threshold and return the prior threshold."""
+    global _intrarow_page_release_min_bytes_bound
     cdef uint64_t threshold
+    cdef uint64_t previous = _intrarow_page_release_min_bytes_bound
     cdef int status
 
     if type(min_allocation_bytes) is not int:
@@ -1452,6 +1474,8 @@ def _configure_intrarow_page_release_bound(min_allocation_bytes):
             "p7_pipeline_IntraRowPageReleaseConfigure failed "
             f"with status {status}"
         )
+    _intrarow_page_release_min_bytes_bound = threshold
+    return int(previous)
 
 
 def _intrarow_page_release_statistics_bound():

@@ -27,6 +27,11 @@ POLICY_ENVIRONMENT = (
     "PLAN7_GPU_SSV_LENGTH_METADATA",
     "PLAN7_GPU_FULL_MSV_POLICY",
     "PLAN7_GPU_FULL_MSV_ARITHMETIC",
+    "PLAN7_GPU_FORWARD_OWNERSHIP",
+    "PLAN7_GPU_FORWARD_CPU_MIN_CELLS",
+    "PLAN7_GPU_FORWARD_CPU_MIN_LENGTH",
+    "PLAN7_GPU_FORWARD_CPU_MAX_CELLS",
+    "ASTRA_GPU_CONTINUATION_POOL",
 )
 
 
@@ -162,3 +167,63 @@ class ExecutionPolicyCudaTests(unittest.TestCase):
         self.assertEqual(
             throughput["execution_policy_forward_candidates_per_warp"], 1
         )
+
+    def test_request_local_forward_threshold_is_exact_and_override_safe(self):
+        target_count = 65_537
+        residues = bytearray(b"A" * target_count)
+        offsets = array("Q", range(target_count + 1))
+        clean_environment = {
+            name: value
+            for name, value in os.environ.items()
+            if name not in POLICY_ENVIRONMENT
+        }
+        with mock.patch.dict(os.environ, clean_environment, clear=True):
+            with _native.SequenceBatch(
+                residues,
+                offsets,
+                29,
+                _native.EXECUTION_POLICY_AUTO,
+                200_000,
+            ) as batch:
+                statistics = batch.workspace_statistics
+                self.assertEqual(statistics["cpu_forward_ownership_mode"], 4)
+                self.assertTrue(statistics["cpu_forward_ownership_auto"])
+                self.assertEqual(
+                    statistics["cpu_forward_max_cells"], 200_000
+                )
+            with _native.SequenceBatch(
+                residues,
+                offsets,
+                29,
+                _native.EXECUTION_POLICY_AUTO,
+            ) as batch:
+                self.assertEqual(
+                    batch.workspace_statistics["cpu_forward_ownership_mode"],
+                    0,
+                )
+
+            for invalid in (True, 0, -1, 1 << 64):
+                with self.subTest(invalid=invalid), self.assertRaises(
+                    (TypeError, ValueError)
+                ):
+                    _native.SequenceBatch(
+                        residues,
+                        offsets,
+                        29,
+                        _native.EXECUTION_POLICY_AUTO,
+                        invalid,
+                    )
+
+        for environment in POLICY_ENVIRONMENT[-5:]:
+            with self.subTest(environment=environment), mock.patch.dict(
+                os.environ,
+                {**clean_environment, environment: "1"},
+                clear=True,
+            ), self.assertRaisesRegex(ValueError, "conflicts"):
+                _native.SequenceBatch(
+                    residues,
+                    offsets,
+                    29,
+                    _native.EXECUTION_POLICY_AUTO,
+                    200_000,
+                )

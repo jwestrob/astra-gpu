@@ -1414,6 +1414,7 @@ class SequenceBatch:
         *,
         alphabet: Any | None = None,
         execution_policy: str = "auto",
+        _forward_cpu_max_cells: int | None = None,
     ):
         policy_name, policy_code = _normalize_execution_policy(execution_policy)
         inherited_alphabet = getattr(sequences, "alphabet", None)
@@ -1450,11 +1451,13 @@ class SequenceBatch:
         )
         if sequence_block_content_fingerprint(targets) != content_fingerprint:
             raise RuntimeError("copied target content fingerprint changed")
-        native = _native.SequenceBatch(
-            residues,
-            offsets,
-            alphabet.Kp,
-            policy_code,
+        native_arguments = (residues, offsets, alphabet.Kp, policy_code)
+        native = (
+            _native.SequenceBatch(*native_arguments)
+            if _forward_cpu_max_cells is None
+            else _native.SequenceBatch(
+                *native_arguments, _forward_cpu_max_cells
+            )
         )
         native_generation, native_content_fingerprint = (
             native._generation_and_content_for_seal()
