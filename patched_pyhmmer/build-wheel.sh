@@ -36,6 +36,7 @@ patch --batch --forward -d "$source_root" -p1 < "$here/pyhmmer-0.12.0-plan7gpu.p
 patch --batch --forward -d "$source_root" -p1 < "$here/pyhmmer-0.12.0-simple-regions.patch"
 patch --batch --forward -d "$source_root" -p1 < "$here/pyhmmer-0.12.0-compact-domains.patch"
 patch --batch --forward -d "$source_root" -p1 < "$here/pyhmmer-0.12.0-avx512-tail.patch"
+patch --batch --forward -d "$source_root" -p1 < "$here/pyhmmer-0.12.0-intrarow-release.patch"
 
 $bootstrap_python -m venv "$work/build-venv"
 build_python=$work/build-venv/bin/python
@@ -72,3 +73,4 @@ printf 'patch_sha256=%s\n' "$(sha256sum "$here/pyhmmer-0.12.0-plan7gpu.patch" | 
 printf 'simple_regions_patch_sha256=%s\n' "$(sha256sum "$here/pyhmmer-0.12.0-simple-regions.patch" | cut -d' ' -f1)"
 printf 'compact_domains_patch_sha256=%s\n' "$(sha256sum "$here/pyhmmer-0.12.0-compact-domains.patch" | cut -d' ' -f1)"
 printf 'avx512_tail_patch_sha256=%s\n' "$(sha256sum "$here/pyhmmer-0.12.0-avx512-tail.patch" | cut -d' ' -f1)"
+printf 'intrarow_release_patch_sha256=%s\n' "$(sha256sum "$here/pyhmmer-0.12.0-intrarow-release.patch" | cut -d' ' -f1)"
