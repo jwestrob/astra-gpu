@@ -1234,6 +1234,7 @@ cdef uint64_t _shard_z_audit_restored_count = 0
 cdef uint64_t _shard_z_audit_offset_sum = 0
 cdef uint64_t _shard_z_audit_offset_max = 0
 cdef int _avx512_tail_madvise_override = -1
+cdef int _filter_tail_simd_override = -1
 
 _continuation_seam_resolve_lock = _Lock()
 cdef uint8_t _consumed_journal_sentinel = 0
@@ -1437,6 +1438,23 @@ def _swap_avx512_tail_madvise_bound(enabled):
     if enabled is not None and type(enabled) is not bool:
         raise TypeError("enabled must be bool or None")
     _avx512_tail_madvise_override = (
+        -1 if enabled is None else int(enabled)
+    )
+    return None if previous < 0 else bool(previous)
+
+
+def _configure_filter_tail_simd_bound(enabled):
+    """Override filter-tail SIMD; None restores environment policy."""
+    _swap_filter_tail_simd_bound(enabled)
+
+
+def _swap_filter_tail_simd_bound(enabled):
+    """Set filter-tail SIMD and return the prior scoped override."""
+    global _filter_tail_simd_override
+    cdef int previous = _filter_tail_simd_override
+    if enabled is not None and type(enabled) is not bool:
+        raise TypeError("enabled must be bool or None")
+    _filter_tail_simd_override = (
         -1 if enabled is None else int(enabled)
     )
     return None if previous < 0 else bool(previous)
@@ -11978,8 +11996,14 @@ cdef int _search_loop_continuation_journal_v3(
         and plan7_avx512_tail_available() != 0
     )
     cdef bint filter_simd_available = (
-        filter_simd_env != NULL
-        and strcmp(filter_simd_env, b"1") == 0
+        (
+            _filter_tail_simd_override == 1
+            or (
+                _filter_tail_simd_override < 0
+                and filter_simd_env != NULL
+                and strcmp(filter_simd_env, b"1") == 0
+            )
+        )
         and forward_scores_seam != NULL
         and forward_backward_scores_seam != NULL
         and plan7_avx512_tail_available() != 0
