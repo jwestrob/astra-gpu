@@ -16,7 +16,7 @@
  #include "easel.h"
  #include "esl_exponential.h"
  #include "esl_random.h"
-@@ -62,6 +68,108 @@
+@@ -62,6 +68,136 @@
      uint64_t final_target_count,
      const P7_PIPELINE_COMPACT_DOMAIN *domains, uint64_t domain_count,
      const float *null2);
@@ -68,8 +68,7 @@
 +}
 +
 +static void
-+intrarow_release_pages(void *allocation, uint64_t allocation_bytes,
-+                       uint64_t min_allocation_bytes, size_t page_size)
++intrarow_release_pages(void *touched, uint64_t touched_bytes, size_t page_size)
 +{
 +#if defined(__linux__)
 +  uintptr_t start;
@@ -77,21 +76,18 @@
 +  uintptr_t end;
 +  size_t advised_bytes;
 +
-+  if (allocation == NULL || allocation_bytes < min_allocation_bytes ||
-+      allocation_bytes < page_size)
-+    return;
-+  start = (uintptr_t) allocation;
++  if (touched == NULL || touched_bytes < page_size) return;
++  start = (uintptr_t) touched;
 +  first = ((start + page_size - 1) / page_size) * page_size;
-+  end = ((start + allocation_bytes) / page_size) * page_size;
++  end = ((start + touched_bytes) / page_size) * page_size;
 +  if (end <= first) return;
 +  advised_bytes = (size_t) (end - first);
 +  if (madvise((void *) first, advised_bytes, MADV_DONTNEED) != 0) return;
 +  __atomic_fetch_add(&intrarow_release_calls, 1, __ATOMIC_RELAXED);
 +  __atomic_fetch_add(&intrarow_release_bytes, advised_bytes, __ATOMIC_RELAXED);
 +#else
-+  (void) allocation;
-+  (void) allocation_bytes;
-+  (void) min_allocation_bytes;
++  (void) touched;
++  (void) touched_bytes;
 +  (void) page_size;
 +#endif
 +}
@@ -101,21 +97,53 @@
 +{
 +#if defined(__linux__) && defined(eslENABLE_SSE)
 +  uint64_t min_allocation_bytes;
++  uint64_t logical_bytes;
++  uint64_t logical_row_bytes;
++  uint64_t row_count;
++  uint64_t retained_row_bytes;
 +  size_t page_size;
++  int row;
 +
 +  min_allocation_bytes = __atomic_load_n(&intrarow_release_min_bytes,
 +                                         __ATOMIC_ACQUIRE);
-+  if (min_allocation_bytes == 0 || ox == NULL) return;
++  if (min_allocation_bytes == 0 || ox == NULL || ox->M <= 0 || ox->L < 0)
++    return;
 +  page_size = __atomic_load_n(&intrarow_release_page_size, __ATOMIC_RELAXED);
 +  if (page_size == 0) return;
++  row_count = (uint64_t) ox->L + 1;
 +  if (release_dp)
-+    intrarow_release_pages(ox->dp_mem, (uint64_t) ox->ncells * 12 + 15,
-+                           min_allocation_bytes, page_size);
++    {
++      logical_row_bytes = (uint64_t) p7O_NQF(ox->M) * sizeof(__m128) *
++                          p7X_NSCELLS;
++      retained_row_bytes = (uint64_t) ox->allocQ4 * sizeof(__m128) *
++                           p7X_NSCELLS;
++      if (row_count <= (uint64_t) ox->validR &&
++          logical_row_bytes <= retained_row_bytes &&
++          logical_row_bytes <= UINT64_MAX / row_count)
++        {
++          logical_bytes = logical_row_bytes * row_count;
++          if (logical_bytes >= min_allocation_bytes)
++            {
++              if (logical_row_bytes == retained_row_bytes)
++                intrarow_release_pages(ox->dpf[0], logical_bytes, page_size);
++              else if (logical_row_bytes >= page_size)
++                for (row = 0; row <= ox->L; row++)
++                  intrarow_release_pages(ox->dpf[row], logical_row_bytes,
++                                         page_size);
++            }
++        }
++    }
 +  if (release_x)
-+    intrarow_release_pages(ox->x_mem,
-+                           (uint64_t) ox->allocXR * sizeof(float) *
-+                               p7X_NXCELLS + 15,
-+                           min_allocation_bytes, page_size);
++    {
++      logical_row_bytes = sizeof(float) * p7X_NXCELLS;
++      if (row_count <= (uint64_t) ox->allocXR &&
++          logical_row_bytes <= UINT64_MAX / row_count)
++        {
++          logical_bytes = logical_row_bytes * row_count;
++          if (logical_bytes >= min_allocation_bytes)
++            intrarow_release_pages(ox->xmx, logical_bytes, page_size);
++        }
++    }
 +#else
 +  (void) ox;
 +  (void) release_dp;
@@ -125,7 +153,7 @@
  
  
  /*****************************************************************
-@@ -412,6 +520,8 @@
+@@ -412,6 +548,8 @@
  
    if ((status = p7_domaindef_GrowTo(ddef, sq->n))      != eslOK) return status;  /* ddef's btot,etot,mocc now ready for seq of length n */
    if ((status = p7_DomainDecoding(om, oxf, oxb, ddef)) != eslOK) return status;  /* ddef->{btot,etot,mocc} now made.                    */
@@ -134,7 +162,7 @@
  
    esl_vec_FSet(ddef->n2sc, sq->n+1, 0.0);          /* ddef->n2sc null2 scores are initialized                        */
    ddef->nexpected = ddef->btot[sq->n];             /* posterior expectation for # of domains (same as etot[sq->n])   */
-@@ -1793,6 +1903,8 @@
+@@ -1793,6 +1931,8 @@
    ddef->ndom++;
  
    p7_trace_Reuse(ddef->tr);
