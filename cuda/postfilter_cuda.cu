@@ -763,14 +763,20 @@ __global__ void prepare_bias_inputs_kernel(
 }
 
 __global__ void viterbi_kernel(
-    const uint8_t *residues, const uint64_t *sequence_offsets,
-    const VitProfile *profiles, const int16_t *emissions,
-    const int16_t *transitions, const plan7_bias_candidate *candidates,
-    const uint8_t *states, const plan7_bias_result *bias_results,
-    const VitLengthTransitions *length_transitions,
-    const uint64_t *dp_offsets, size_t candidate_begin, size_t tile_count,
+    const uint8_t *__restrict__ residues,
+    const uint64_t *__restrict__ sequence_offsets,
+    const VitProfile *__restrict__ profiles,
+    const int16_t *__restrict__ emissions,
+    const int16_t *__restrict__ transitions,
+    const plan7_bias_candidate *__restrict__ candidates,
+    const uint8_t *__restrict__ states,
+    const plan7_bias_result *__restrict__ bias_results,
+    const VitLengthTransitions *__restrict__ length_transitions,
+    const uint64_t *__restrict__ dp_offsets,
+    size_t candidate_begin, size_t tile_count,
     uint64_t tile_dp_begin, int skip_bias_reject_viterbi,
-    int16_t *dp_storage, VitResult *results) {
+    int16_t *__restrict__ dp_storage,
+    VitResult *__restrict__ results) {
   const int warp_in_block = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
   const size_t tile_candidate =
