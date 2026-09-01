@@ -170,7 +170,7 @@ class ExecutionPolicyCudaTests(unittest.TestCase):
 
     def test_request_local_forward_threshold_is_exact_and_override_safe(self):
         target_count = 65_537
-        residues = bytearray(b"A" * target_count)
+        residues = bytearray(b"\x01" * target_count)
         offsets = array("Q", range(target_count + 1))
         clean_environment = {
             name: value
