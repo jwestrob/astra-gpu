@@ -396,16 +396,22 @@ __device__ __forceinline__ float sse_horizontal_sum(float value,
 
 template<int CandidatesPerWarp>
 __global__ void forward_kernel(
-    const uint8_t *residues, const uint64_t *sequence_offsets,
-    const plan7_forward_device_profile *profiles, const float *emissions,
-    const float *transitions, const uint32_t *candidate_profiles,
-    const uint32_t *candidate_sequences, const float *filter_scores,
-    const uint32_t *f3_threshold_bits,
-    const ForwardLengthTransitions *length_transitions,
-    const uint64_t *dp_offsets, const uint64_t *x_offsets,
+    const uint8_t *__restrict__ residues,
+    const uint64_t *__restrict__ sequence_offsets,
+    const plan7_forward_device_profile *__restrict__ profiles,
+    const float *__restrict__ emissions,
+    const float *__restrict__ transitions,
+    const uint32_t *__restrict__ candidate_profiles,
+    const uint32_t *__restrict__ candidate_sequences,
+    const float *__restrict__ filter_scores,
+    const uint32_t *__restrict__ f3_threshold_bits,
+    const ForwardLengthTransitions *__restrict__ length_transitions,
+    const uint64_t *__restrict__ dp_offsets,
+    const uint64_t *__restrict__ x_offsets,
     size_t candidate_begin, size_t tile_count, uint64_t tile_dp_begin,
-    uint64_t tile_x_begin, float *dp_storage, float *xmx_storage,
-    ForwardKernelResult *results) {
+    uint64_t tile_x_begin, float *__restrict__ dp_storage,
+    float *__restrict__ xmx_storage,
+    ForwardKernelResult *__restrict__ results) {
   const int lane = threadIdx.x & 31;
   const int warp_in_block = threadIdx.x >> 5;
   const int candidate_in_warp = lane >> 2;
